@@ -1375,6 +1375,50 @@ pub extern "C" fn bn_doodad_texture(
     1
 }
 
+/// Model path of doodad `i` into `buf` (NUL-terminated). 1 on success.
+/// Lets the host pick animation state through the `bn_model_anim_*` family
+/// without the tile's MDDF reaching across the FFI any other way.
+#[no_mangle]
+pub extern "C" fn bn_doodad_model_path(
+    world: *const BnWorld,
+    i: u32,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(path) = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.doodads.get(i as usize).map(|d| d.model.clone()))
+    else {
+        return 0;
+    };
+    // MMDX ships `.mdx`; the archives hold `.m2` (load_m2_mesh's normalizer,
+    // mirrored here) so the returned path is directly usable by the
+    // bn_model_* family (anim counts, skinned positions).
+    let path = {
+        let lower = path.to_ascii_lowercase();
+        match lower
+            .strip_suffix(".mdx")
+            .or_else(|| lower.strip_suffix(".mdl"))
+        {
+            Some(stem) => format!("{stem}.m2"),
+            None => lower,
+        }
+    };
+    let bytes = path.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    1
+}
+
 #[cfg(test)]
 mod wmo_placement_tests {
     use super::*;
