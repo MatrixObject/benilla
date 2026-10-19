@@ -4131,3 +4131,389 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
+// ---- UI glue (stage 7): the main menu (GlueXML) + pointer feedback ----
+//
+// The client's menus live in `Interface\GlueXML`, on a VM the reference never
+// shares with the in-game FrameXML state (so loading one replaces the other in
+// `BN_UI`). `bn_ui_load_glue` builds that state from the stock toc with a stub
+// `GlueHost` behind `CGlueMgr`: benilla-ffi stays offline (no networking), so
+// login and the character roster answer in place, and world entry is queued for
+// the render host to collect through `bn_ui_poll_event`. `bn_ui_tick` drives
+// OnUpdate and applies the ops the stub queued (a call fan-out borrows the
+// script, so the roster cannot load inside the call itself). Geometry arrives
+// through the same `bn_ui_dump` as the in-game UI.
+
+use benilla_ui::script::{
+    GlueCall, GlueCharacter, GlueHost, GlueNotice, GlueSignal, GlueText, NoticeState, ScriptValue,
+    UiScript,
+};
+
+/// Side-channel ops the stub host queues while a verb's call fan-out holds the
+/// script: the fake roster (loaded by the next `bn_ui_tick`) and the events the
+/// render host polls.
+#[derive(Default)]
+struct MenuPending {
+    roster: Option<Vec<GlueCharacter>>,
+    events: Vec<String>,
+}
+
+thread_local! {
+    static BN_MENU: RefCell<MenuPending> =
+        const { RefCell::new(MenuPending { roster: None, events: Vec::new() }) };
+}
+
+/// The menu's `CGlueMgr` host, offline: every screen transition the reference
+/// would reach through the login server happens in place, and the one step that
+/// needs a world server (entering the world) becomes a queued event instead.
+struct MenuHost;
+
+impl MenuHost {
+    fn queue_roster() {
+        BN_MENU.with(|p| {
+            p.borrow_mut().roster = Some(vec![GlueCharacter {
+                guid: 1,
+                name: "Nezha".to_string(),
+                race: "人类".to_string(),
+                class: "战士".to_string(),
+                level: 1,
+                zone: None,
+                file_string: String::new(),
+                gender: 0,
+                flags: 0,
+                // No M2 build: the render host draws no glue scene pane anyway.
+                model: false,
+            }]);
+        });
+    }
+}
+
+impl GlueHost for MenuHost {
+    fn call(&self, call: GlueCall) -> Vec<GlueSignal> {
+        match call {
+            // `CGlueMgr::Login`'s own dialog half; auth "succeeds" at once:
+            // drop the status dialog, tear any roster down and put character
+            // select up, whose OnShow asks for the character list.
+            GlueCall::Login(c) => {
+                if c.account.is_empty() {
+                    return vec![GlueSignal::Open {
+                        which: "OKAY",
+                        text: Some(GlueText::Key("LOGIN_ENTER_NAME")),
+                        data: None,
+                    }];
+                }
+                if c.password.is_empty() {
+                    return vec![GlueSignal::Open {
+                        which: "OKAY",
+                        text: Some(GlueText::Key("LOGIN_ENTER_PASSWORD")),
+                        data: None,
+                    }];
+                }
+                vec![
+                    GlueSignal::Close,
+                    GlueSignal::Teardown,
+                    GlueSignal::Screen("charselect"),
+                ]
+            }
+            // The reference's reply lands a frame later and loads the roster
+            // with the script free; queue it for `bn_ui_tick`.
+            GlueCall::GetCharacterList => {
+                Self::queue_roster();
+                vec![]
+            }
+            // The one flow a world server owns: report it to the render host.
+            GlueCall::EnterWorld { .. } => {
+                BN_MENU.with(|p| p.borrow_mut().events.push("enter_world".to_string()));
+                vec![]
+            }
+            GlueCall::StatusDialogClick => vec![GlueSignal::Close],
+            // No servers to list or dial in the offline menu.
+            GlueCall::RequestRealmList { .. }
+            | GlueCall::CancelRealmListQuery
+            | GlueCall::CancelLogon
+            | GlueCall::ChangeRealm(_)
+            | GlueCall::DisconnectFromServer
+            | GlueCall::QuitGame
+            | GlueCall::DeleteCharacter(_)
+            | GlueCall::RenameCharacter { .. }
+            | GlueCall::CreateCharacter(_) => vec![],
+        }
+    }
+
+    fn resume(&self, _step: u32) -> Vec<GlueSignal> {
+        Vec::new()
+    }
+
+    /// The offline menu is always "connected": the EnterWorld guards are the
+    /// host's half and must not open a disconnect dialog.
+    fn connected(&self) -> bool {
+        true
+    }
+
+    fn selected_realm_type(&self) -> Option<u32> {
+        Some(0)
+    }
+}
+
+/// Load the stock menus (`Interface\GlueXML\GlueXML.toc`) into a fresh glue VM
+/// (`UiScript::new_glue`), seat the offline `MenuHost`, and put the login
+/// screen up (`SET_GLUE_SCREEN "login"`), mirroring the reference's glue build.
+/// Returns the live frame count, or 0 on failure. Loading glue replaces any
+/// in-game UI session in `BN_UI` and vice versa (the reference keeps the two
+/// states apart).
+#[no_mangle]
+pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees a valid exclusive handle for the call's span.
+    let w = unsafe { &*world };
+    let Some(chain) = w.chain.as_ref() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(mut script) = UiScript::new_glue() else {
+            return 0u32;
+        };
+        BN_MENU.with(|p| *p.borrow_mut() = MenuPending::default());
+        // The agreements the login's first tests read; a returning player's
+        // flags, so the menu is not parked on the ToU screen.
+        for notice in GlueNotice::ALL {
+            script.set_glue_notice(
+                notice,
+                NoticeState {
+                    accepted: true,
+                    show_notice: false,
+                },
+            );
+        }
+        let toc_bytes = chain
+            .read(r"Interface\GlueXML\GlueXML.toc")
+            .unwrap_or_default();
+        let toc = benilla_ui::toc::Toc::parse(&benilla_ui::source::decode(&toc_bytes));
+        // Same loader contract as `bn_ui_load`: forward slashes in `load_in`
+        // entries (dir_of splits on `/` only), backslashes for the MPQ reads.
+        let read = |req: &str| -> Option<Vec<u8>> {
+            chain.read(&req.replace('/', "\\")).ok()
+        };
+        let mut rows = 0u32;
+        let mut failures: Vec<String> = Vec::new();
+        for row in &toc.files {
+            let path = format!(r"Interface\GlueXML\{row}");
+            let Some(bytes) = read(&path) else {
+                failures.push(format!("{path}: not found"));
+                continue;
+            };
+            rows += 1;
+            if row.to_ascii_lowercase().ends_with(".lua") {
+                let name = format!("@{}", path.replace('/', "\\"));
+                if let Err(e) = script.run_chunk_named(&bytes, &name) {
+                    failures.push(format!("{path}: {e}"));
+                }
+                continue;
+            }
+            let Ok(doc) = benilla_ui::framexml::parse(&benilla_ui::source::decode(&bytes)) else {
+                failures.push(format!("{path}: parse error"));
+                continue;
+            };
+            let entry = path.replace('\\', "/");
+            let report = benilla_ui::loader::load_in(&script, &doc, &entry, &read);
+            failures.extend(
+                report
+                    .errors
+                    .iter()
+                    .map(|e| format!("{path}: {e}"))
+                    .chain(
+                        report
+                            .missing_files
+                            .iter()
+                            .map(|m| format!("{path}: missing {m}")),
+                    ),
+            );
+        }
+        // `GetBillingPlan` is one of benilla's NOT_YET glue verbs (upstream's own
+        // list), but zhCN's `CharacterSelect_OnShow` calls it and aborts on the
+        // nil, skipping its tail (`GlueFrameFadeIn`). Stand it in only while
+        // benilla leaves it unset, so a real binding is never shadowed.
+        let _ = script.run(
+            "if not GetBillingPlan then GetBillingPlan = function() return 0, 0, 0 end end",
+        );
+        script.fire_event("FRAMES_LOADED", Vec::new());
+        // Seat the host after the load (as the reference does) and run the
+        // calls the load made while it waited.
+        let host = std::rc::Rc::new(MenuHost);
+        script.set_glue_host(host.clone());
+        for call in script.take_glue_calls() {
+            for signal in host.call(call) {
+                script.fire_glue_signal(signal);
+            }
+        }
+        script.set_glue_screen_name("login");
+        script.fire_event(
+            "SET_GLUE_SCREEN",
+            vec![ScriptValue::Str("login".to_string())],
+        );
+        let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
+        BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
+        eprintln!(
+            "bn_ui_load_glue: {} toc rows, {} failures, {frames} frames",
+            rows,
+            failures.len()
+        );
+        for f in failures.iter().take(12) {
+            eprintln!("  fail {f}");
+        }
+        frames
+    }));
+    out.unwrap_or(0)
+}
+
+/// Advance the loaded UI (OnUpdate handlers, hover re-pick, queued events) and
+/// apply the menu host's pending ops (the fake roster load). `elapsed` is
+/// seconds since the last call. Returns 1 with a session, 0 without.
+#[no_mangle]
+pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let roster = BN_MENU.with(|p| p.borrow_mut().roster.take());
+            if let Some(roster) = roster {
+                script.load_glue_roster(roster);
+            }
+            script.tick(elapsed);
+            for e in script.take_errors() {
+                eprintln!("bn_ui_tick: {e}");
+            }
+            1u32
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Move the UI pointer to `(x, y)` in the dump's screen space (800x600,
+/// y up). Fires hover enter/leave like the reference's cursor walk. Returns 1
+/// with a session, 0 without.
+#[no_mangle]
+pub extern "C" fn bn_ui_mouse_move(x: f32, y: f32) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => {
+                    script.mouse_move(x, y);
+                    1u32
+                }
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Press or release a mouse button at `(x, y)`; `button` is the WoW name
+/// ("LeftButton", ...), `down` 1 = press, 0 = release. Returns whether the UI
+/// consumed the event (0 without a session).
+#[no_mangle]
+pub extern "C" fn bn_ui_mouse_button(x: f32, y: f32, button: *const c_char, down: u32) -> u32 {
+    if button.is_null() {
+        return 0;
+    }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(button) }).to_str() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => u32::from(script.mouse_button(x, y, name, down != 0)),
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Pop one event the menu host queued ("enter_world", ...) into `buf` as NUL-
+/// terminated UTF-8; returns bytes written (0 = none pending). The render host
+/// polls this to learn when the UI wants the game world up.
+#[no_mangle]
+pub extern "C" fn bn_ui_poll_event(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let event = BN_MENU.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.events.is_empty() {
+            None
+        } else {
+            Some(p.events.remove(0))
+        }
+    });
+    let Some(text) = event else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// Run `code` (a Lua chunk, `return` for a value) in the loaded VM and write
+/// its result to `buf` as text; returns bytes written (0 = no session or no
+/// result). For menu actions the host drives directly and for probes.
+#[no_mangle]
+pub extern "C" fn bn_ui_eval(code: *const c_char, buf: *mut c_char, cap: u32) -> u32 {
+    if code.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(code) = (unsafe { std::ffi::CStr::from_ptr(code) }).to_str() else {
+        return 0;
+    };
+    let text = {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BN_UI.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let Some(script) = slot.as_mut() else {
+                    return None;
+                };
+                let result = {
+                    use benilla_ui::mlua::Value;
+                    match script.eval::<Value>(code) {
+                        Ok(v) => Some(match v {
+                            Value::Nil => String::new(),
+                            Value::String(s) => s.to_string_lossy().to_string(),
+                            Value::Number(n) => format!("{n}"),
+                            Value::Boolean(b) if b => "true".to_string(),
+                            Value::Boolean(_) => "false".to_string(),
+                            other => other.type_name().to_string(),
+                        }),
+                        Err(e) => {
+                            eprintln!("bn_ui_eval: {e}");
+                            None
+                        }
+                    }
+                };
+                // pcall'd handlers the eval's events ran (screen switches etc.)
+                for e in script.take_errors() {
+                    eprintln!("bn_ui_eval handler: {e}");
+                }
+                result
+            })
+        }));
+        match out {
+            Ok(Some(t)) => t,
+            _ => return 0,
+        }
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
