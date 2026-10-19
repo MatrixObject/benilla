@@ -16,6 +16,8 @@
 
 // functions `extern "C"` and links against the .dll.
 
+use std::collections::HashMap;
+
 use std::ffi::c_char;
 
 // ---- WoW <-> UE5 coordinate-system converter (single source of truth) ----
@@ -85,6 +87,16 @@ pub struct BnWorld {
 
     /// Real ADT terrain of the last `bn_load_tile`, when one loaded.
     tile: Option<TileFlat>,
+
+    /// Official `benilla_formats::Chain` over the same Data dir, for `load_wmo`
+    /// (the WMO reader takes a `Chain`, not the raw `Archive` list).
+    chain: Option<benilla_formats::Chain>,
+
+    /// Parsed WMO geometry by root path, shared by every placement of a model.
+    wmo_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
+
+    /// Baked tile-local WMO geometry by instance index (rebuilt on tile load).
+    wmo_flats: HashMap<u32, WmoFlat>,
 
 }
 
@@ -209,6 +221,12 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         mcnk: Vec::new(),
 
         tile: None,
+
+        chain: benilla_formats::Chain::open(data).ok(),
+
+        wmo_models: HashMap::new(),
+
+        wmo_flats: HashMap::new(),
 
     }))
 
@@ -401,6 +419,9 @@ pub extern "C" fn bn_load_tile(
                     w.mcnk = root.mcnk_chunks;
 
                     w.tile = build_tile_flat(&bytes);
+
+                    // Instance indices address the new tile's MODF list; drop stale bakes.
+                    w.wmo_flats.clear();
 
                     return w.mcnk.len() as u32;
 
@@ -674,30 +695,350 @@ pub extern "C" fn bn_terrain_height_at(world: *const BnWorld, x: f32, y: f32) ->
 
 }
 
-/// Fill WMO mesh vertices + triangles for a WMO path. POC: returns 0 until
+// ---- WMO buildings (phase 2) ----
+//
+// Placement math ports `benilla-assets::coords::placement_rotation` (read-only,
+// no official source edits): the wowdev `createPlacementMatrix`
+// `Rx(90°)·Ry(ry−180°)·Rz(−rx)·Rx(rz−90°)` runs in WoW space, then the baked
+// vertex goes through the same tile-local + WoW->UE mirror as the terrain.
 
-/// the WMO renderer is ported through the FFI.
+/// One baked WMO submesh's slot in the flat buffers (element counts).
+pub struct WmoSub {
+    vtx0: u32,
+    vtx_n: u32,
+    idx0: u32,
+    idx_n: u32,
+    /// MOMT material texture path ("" when none).
+    tex: String,
+    /// MOMT flag 0x04: emit triangles two-sided (no back-face culling).
+    two_sided: bool,
+}
 
+/// One WMO instance baked into tile-local UE axes: `world = position + in_wow·v`,
+/// then `(world − centre)` through the WoW->UE mirror, contiguous per submesh.
+pub struct WmoFlat {
+    verts: Vec<BnVertex>,
+    idx: Vec<u16>,
+    subs: Vec<WmoSub>,
+}
+
+/// Hamilton product `a·b` on `[x, y, z, w]` (apply `b` first, then `a`), the
+/// convention bevy's `Quat * Quat` uses, so the port composes identically.
+fn q_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// Rotate `v` by unit quaternion `q` (`t = 2·q.xyz × v` form).
+fn q_rot(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let t = [
+        2.0 * (q[1] * v[2] - q[2] * v[1]),
+        2.0 * (q[2] * v[0] - q[0] * v[2]),
+        2.0 * (q[0] * v[1] - q[1] * v[0]),
+    ];
+    [
+        v[0] + q[3] * t[0] + q[1] * t[2] - q[2] * t[1],
+        v[1] + q[3] * t[1] + q[2] * t[0] - q[0] * t[2],
+        v[2] + q[3] * t[2] + q[0] * t[1] - q[1] * t[0],
+    ]
+}
+
+fn q_rot_x(a: f32) -> [f32; 4] {
+    let (s, c) = (a * 0.5).sin_cos();
+    [s, 0.0, 0.0, c]
+}
+
+fn q_rot_y(a: f32) -> [f32; 4] {
+    let (s, c) = (a * 0.5).sin_cos();
+    [0.0, s, 0.0, c]
+}
+
+fn q_rot_z(a: f32) -> [f32; 4] {
+    let (s, c) = (a * 0.5).sin_cos();
+    [0.0, 0.0, s, c]
+}
+
+/// An MDDF/MODF Euler triple (degrees) as the placement quaternion, the port of
+/// `benilla-assets::coords::placement_rotation` without the bevy conjugation
+/// (we rotate in WoW space and mirror afterwards, not bake into a foreign basis).
+fn placement_quat(rotation_deg: [f32; 3]) -> [f32; 4] {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let (rx, ry, rz) = (
+        rotation_deg[0].to_radians(),
+        rotation_deg[1].to_radians(),
+        rotation_deg[2].to_radians(),
+    );
+    q_mul(
+        q_rot_x(FRAC_PI_2),
+        q_mul(q_rot_y(ry - PI), q_mul(q_rot_z(-rx), q_rot_x(rz - FRAC_PI_2))),
+    )
+}
+
+/// Bake every submesh of one placement into tile-local UE axes. Submesh ranges
+/// stay contiguous (vertex order = submesh order); stops at the u16 vertex cap
+/// so every published range remains addressable from the C side.
+fn build_wmo_flat(
+    subs: &[benilla_formats::RenderSubmesh],
+    position: [f32; 3],
+    rotation_deg: [f32; 3],
+    center: (f32, f32),
+) -> WmoFlat {
+    let q = placement_quat(rotation_deg);
+    let mut out = WmoFlat {
+        verts: Vec::new(),
+        idx: Vec::new(),
+        subs: Vec::new(),
+    };
+    for sm in subs {
+        if out.verts.len() + sm.positions.len() > u16::MAX as usize {
+            break;
+        }
+        let vtx0 = out.verts.len() as u32;
+        for (i, p) in sm.positions.iter().enumerate() {
+            let r = q_rot(q, *p);
+            let (wx, wy, wz) = (
+                r[0] + position[0],
+                r[1] + position[1],
+                r[2] + position[2],
+            );
+            let (x, y, z) = wow_vec_to_ue(wx - center.0, wy - center.1, wz);
+            let (nx, ny, nz) = if sm.normals.len() == sm.positions.len() {
+                let n = q_rot(q, sm.normals[i]);
+                wow_vec_to_ue(n[0], n[1], n[2])
+            } else {
+                (0.0, 0.0, 1.0)
+            };
+            let uv = sm.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+            out.verts.push(BnVertex {
+                x,
+                y,
+                z,
+                nx,
+                ny,
+                nz,
+                u: uv[0],
+                v: uv[1],
+            });
+        }
+        let idx0 = out.idx.len() as u32;
+        for t in sm.indices.chunks(3) {
+            if t.len() < 3 {
+                break;
+            }
+            out.idx.push((vtx0 + t[0]) as u16);
+            out.idx.push((vtx0 + t[1]) as u16);
+            out.idx.push((vtx0 + t[2]) as u16);
+        }
+        out.subs.push(WmoSub {
+            vtx0,
+            vtx_n: sm.positions.len() as u32,
+            idx0,
+            idx_n: out.idx.len() as u32 - idx0,
+            tex: sm.texture.clone().unwrap_or_default(),
+            two_sided: sm.two_sided,
+        });
+    }
+    out
+}
+
+/// The baked flat for instance `i`, or `None` before `bn_wmo_instance_load`.
+fn wmo_flat<'a>(world: *const BnWorld, i: u32) -> Option<&'a WmoFlat> {
+    if world.is_null() {
+        return None;
+    }
+    // SAFETY: caller owns a valid const handle.
+    unsafe { &*world }.wmo_flats.get(&i)
+}
+
+/// MODF WMO instances in the loaded tile (0 when no tile).
 #[no_mangle]
+pub extern "C" fn bn_wmo_instance_count(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile.as_ref().map_or(0, |t| t.wmos.len() as u32)
+}
 
-pub extern "C" fn bn_wmo_fill(
+/// Bake instance `i` (load its WMO model through the official `load_wmo`,
+/// transform into tile-local UE axes, cache). Returns the submesh count on
+/// success (UE iterates `[0, n)`), 0 on a miss or load failure.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees an exclusive valid handle.
+    let w = unsafe { &mut *world };
+    if let Some(f) = w.wmo_flats.get(&i) {
+        return f.subs.len() as u32;
+    }
+    let Some((model_path, pos, rot, center)) = w.tile.as_ref().and_then(|t| {
+        t.wmos
+            .get(i as usize)
+            .map(|inst| (inst.model.clone(), inst.position, inst.rotation, t.center))
+    }) else {
+        return 0;
+    };
+    if !w.wmo_models.contains_key(&model_path) {
+        let Some(chain) = w.chain.as_mut() else {
+            return 0;
+        };
+        let Ok(subs) = benilla_formats::load_wmo(chain, &model_path) else {
+            return 0;
+        };
+        w.wmo_models.insert(model_path.clone(), subs);
+    }
+    let subs = &w.wmo_models[&model_path];
+    let flat = build_wmo_flat(subs, pos, rot, center);
+    let n = flat.subs.len() as u32;
+    w.wmo_flats.insert(i, flat);
+    n
+}
 
+/// Baked vertex count of instance `i` (0 before load).
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_vertex_count(world: *const BnWorld, i: u32) -> u32 {
+    wmo_flat(world, i).map_or(0, |f| f.verts.len() as u32)
+}
+
+/// Baked triangle-index count of instance `i` (0 before load).
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_index_count(world: *const BnWorld, i: u32) -> u32 {
+    wmo_flat(world, i).map_or(0, |f| f.idx.len() as u32)
+}
+
+/// Fill `out` (pre-allocated to `cap`) with instance `i`'s vertices.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_fill_vertices(
     world: *const BnWorld,
-
-    wmo_path: *const c_char,
-
-    out_vertices: *mut BnVertex,
-
-    out_triangles: *mut BnTriangle,
-
+    i: u32,
+    out: *mut BnVertex,
     cap: u32,
-
 ) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let n = f.verts.len().min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr(), out, n) };
+    n as u32
+}
 
-    let _ = (world, wmo_path, out_vertices, out_triangles, cap);
+/// Fill `out` (pre-allocated to `cap`) with instance `i`'s triangles;
+/// `material` carries the submesh index, `flags` the submesh two-sided bit
+/// (MOMT 0x04), matching the M2/terrain convention the UE builder reads.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_fill_triangles(
+    world: *const BnWorld,
+    i: u32,
+    out: *mut BnTriangle,
+    cap: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let n = f.idx.len().min(cap as usize);
+    for (j, sm) in f.subs.iter().enumerate() {
+        if (sm.idx0 as usize) >= n {
+            break;
+        }
+        let end = (sm.idx0 as usize + sm.idx_n as usize).min(n);
+        for k in (sm.idx0 as usize..end).step_by(3) {
+            unsafe {
+                *out.add(k) = BnTriangle {
+                    a: f.idx[k],
+                    b: f.idx[k + 1],
+                    c: f.idx[k + 2],
+                    material: j.min(255) as u8,
+                    flags: if sm.two_sided { 1 } else { 0 },
+                };
+            }
+        }
+    }
+    n as u32
+}
 
-    0
+/// Submesh `j` of instance `i`: writes {vtx0, vtx_n, idx0, idx_n}. Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_submesh(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    out: *mut u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(sm) = wmo_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
+        return 0;
+    };
+    unsafe {
+        *out = sm.vtx0;
+        *out.add(1) = sm.vtx_n;
+        *out.add(2) = sm.idx0;
+        *out.add(3) = sm.idx_n;
+    }
+    1
+}
 
+/// Submesh `j` of instance `i` texture path into `buf` (NUL-terminated).
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_texture(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(sm) = wmo_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
+        return 0;
+    };
+    let bytes = sm.tex.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    1
+}
+
+#[cfg(test)]
+mod wmo_placement_tests {
+    use super::*;
+
+    /// Golden from `benilla-assets::coords` `placement_rotation_goldens`. The
+    /// official test asserts `to_bevy · in_wow · to_bevy⁻¹` (rotation in baked
+    /// Bevy space); our pipeline keeps `in_wow` (rotate in WoW space, mirror
+    /// afterwards). Conjugating by a unit quaternion rotates the vector part
+    /// by `wow_to_bevy` = (−y, z, −x) and leaves w, so apply that to compare —
+    /// q and −q are the same rotation, hence |dot|.
+    #[test]
+    fn placement_quat_matches_official_goldens() {
+        use std::f32::consts::FRAC_1_SQRT_2;
+        let cases = [
+            (
+                [86.0_f32, 252.0, 93.5],
+                [-0.691160, -0.107332, -0.156292, 0.697388],
+            ),
+            ([0.0, 0.0, 90.0], [FRAC_1_SQRT_2, -FRAC_1_SQRT_2, 0.0, 0.0]),
+            ([30.0, 45.0, 60.0], [0.360423, -0.822363, -0.391904, 0.200562]),
+        ];
+        for (deg, expected) in cases {
+            let q = placement_quat(deg);
+            let bevy = [-q[1], q[2], -q[0], q[3]]; // B·q·B⁻¹, B = wow_to_bevy
+            let dot: f32 = (0..4).map(|k| bevy[k] * expected[k]).sum();
+            assert!(dot.abs() > 0.9999, "placement_quat({deg:?}) = {q:?} → bevy {bevy:?}, expected ~{expected:?} (dot {dot})");
+        }
+    }
 }
 
 // ---- M2 model ----
