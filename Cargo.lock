@@ -584,6 +584,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla-ffi"
+version = "0.2.0"
+dependencies = [
+ "benilla-adt",
+ "benilla-blp",
+ "benilla-m2",
+ "benilla-mpq",
+ "benilla-wmo",
+]
+
+[[package]]
 name = "benilla-formats"
 version = "0.2.0"
 dependencies = [

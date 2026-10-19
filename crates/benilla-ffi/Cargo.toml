@@ -1,0 +1,78 @@
+[package]
+name = "benilla-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI export layer for the UE5 render host: WoW 1.12.1 format readers (MPQ/ADT/M2/WMO/BLP) behind a cdylib."
+
+[lib]
+name = "benilla"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Only the standalone format readers; no Bevy, no app, no networking.
+benilla-mpq = { path = "../benilla-mpq" }
+benilla-adt = { path = "../benilla-adt" }
+benilla-m2 = { path = "../benilla-m2" }
+benilla-wmo = { path = "../benilla-wmo" }
+benilla-blp = { path = "../benilla-blp" }
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[[example]]
+name = "mpqtest"
+path = "examples/mpqtest.rs"
+
+[[example]]
+name = "mpqprobe"
+path = "examples/mpqprobe.rs"
+
+[[example]]
+name = "mpqscan"
+path = "examples/mpqscan.rs"
+
+[[example]]
+name = "wdt"
+path = "examples/wdt.rs"
+
+[[example]]
+name = "maplist"
+path = "examples/maplist.rs"
+
+[[example]]
+name = "adt"
+path = "examples/adt.rs"
+
+[[example]]
+name = "duro"
+path = "examples/duro.rs"
+
+[[example]]
+name = "probe2"
+path = "examples/probe2.rs"
+
+[[example]]
+name = "probe3"
+path = "examples/probe3.rs"
+
+[[example]]
+name = "probe_m2_layout"
+path = "examples/probe_m2_layout.rs"
+
+[[example]]
+name = "probe_static_models"
+path = "examples/probe_static_models.rs"
+
+[[example]]
+name = "probe_static2"
+path = "examples/probe_static2.rs"
+
+[[example]]
+name = "probe_ffi_fill"
+path = "examples/probe_ffi_fill.rs"
+
+[[example]]
+name = "probe_modelspace"
+path = "examples/probe_modelspace.rs"
