@@ -807,6 +807,112 @@ pub extern "C" fn bn_liquid_fill_indices(world: *const BnWorld, out: *mut u16, c
     n as u32
 }
 
+/// The animated liquid frame sets per material class (0 water, 1 ocean,
+/// 2 magma): `XTextures\<dir>\<stem>.<1..=count>.blp`, the reference's fixed
+/// queues (`lake_a` `0x6851b0`, `ocean_h` `0x685010`, `lava` `0x6855a0`),
+/// mirroring `benilla-world`'s FRAME_SETS.
+const LIQUID_FRAME_SETS: [(&str, &str, u32); 3] = [
+    ("river", "lake_a", 30),
+    ("ocean", "ocean_h", 30),
+    ("lava", "lava", 30),
+];
+
+/// Scan `kind`'s frame set, writing {width, height, frame_count} to `out`
+/// (stops at the first missing or mis-sized frame, as the official loader).
+/// Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_liquid_frame_info(world: *mut BnWorld, kind: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(&(dir, stem, max)) = LIQUID_FRAME_SETS.get(kind as usize) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees an exclusive valid handle.
+    let w = unsafe { &mut *world };
+    let Some(chain) = w.chain.as_mut() else {
+        return 0;
+    };
+    let mut wh = (0u32, 0u32);
+    let mut count = 0u32;
+    for i in 1..=max {
+        let path = format!("XTextures\\{dir}\\{stem}.{i}.blp");
+        let Ok((ww, hh, _)) = benilla_formats::read_texture_rgba(chain, &path) else {
+            break;
+        };
+        if count == 0 {
+            wh = (ww, hh);
+        } else if (ww, hh) != wh {
+            break;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    unsafe {
+        *out = wh.0;
+        *out.add(1) = wh.1;
+        *out.add(2) = count;
+    }
+    1
+}
+
+/// Decode `kind`'s frames into one single-row RGBA atlas (frame `f` over rows
+/// `[f·h, (f+1)·h)`, so a mip chain stays frame-aligned). Returns bytes
+/// written, 0 on a miss or cap overrun. `out` holds w·count·h·4 bytes.
+#[no_mangle]
+pub extern "C" fn bn_liquid_frame_atlas(
+    world: *mut BnWorld,
+    kind: u32,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(&(dir, stem, max)) = LIQUID_FRAME_SETS.get(kind as usize) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees an exclusive valid handle and an out buffer
+    // of `cap` bytes.
+    let w = unsafe { &mut *world };
+    let Some(chain) = w.chain.as_mut() else {
+        return 0;
+    };
+    let mut wh = (0u32, 0u32);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for i in 1..=max {
+        let path = format!("XTextures\\{dir}\\{stem}.{i}.blp");
+        let Ok((ww, hh, rgba)) = benilla_formats::read_texture_rgba(chain, &path) else {
+            break;
+        };
+        if frames.is_empty() {
+            wh = (ww, hh);
+        } else if (ww, hh) != wh {
+            break;
+        }
+        if rgba.len() != ww as usize * hh as usize * 4 {
+            break;
+        }
+        frames.push(rgba);
+    }
+    if frames.is_empty() {
+        return 0;
+    }
+    let frame_bytes = wh.0 as usize * wh.1 as usize * 4;
+    let total = frame_bytes * frames.len();
+    if total > cap as usize {
+        return 0;
+    }
+    for (f, rgba) in frames.iter().enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), out.add(f * frame_bytes), frame_bytes);
+        }
+    }
+    total as u32
+}
+
 /// Per-chunk count of the loaded tile (0 when no tile).
 
 #[no_mangle]

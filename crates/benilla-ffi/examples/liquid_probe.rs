@@ -77,4 +77,28 @@ fn main() {
         assert!(bad == 0, "malformed liquid ranges");
     }
     bn_shutdown(world);
+
+    // Liquid frame sets (24 fps flipbook source): info + full atlas decode
+    // per material class (0 water, 1 ocean, 2 magma).
+    let world = bn_init(cdir.as_ptr());
+    if world.is_null() {
+        eprintln!("bn_init failed (frames)");
+        std::process::exit(1);
+    }
+    for kind in 0..3u32 {
+        let mut info = [0u32; 3];
+        if bn_liquid_frame_info(world, kind, info.as_mut_ptr()) == 0 {
+            println!("liquid frames kind {kind}: MISSING");
+            continue;
+        }
+        let (w, h, n) = (info[0], info[1], info[2]);
+        let total = w * h * n * 4;
+        let mut buf = vec![0u8; total as usize];
+        let got = bn_liquid_frame_atlas(world, kind, buf.as_mut_ptr(), total);
+        let nonzero = buf.iter().filter(|&&b| b != 0).count();
+        println!("liquid frames kind {kind}: {w}x{h} x{n} atlas={got} nonzero={nonzero}");
+        assert_eq!(got, total, "atlas byte count kind {kind}");
+        assert!(nonzero > 0, "atlas is all zeros kind {kind}");
+    }
+    bn_shutdown(world);
 }
