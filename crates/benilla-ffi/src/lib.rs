@@ -5660,3 +5660,167 @@ pub extern "C" fn bn_ui_eval(code: *const c_char, buf: *mut c_char, cap: u32) ->
     n as u32
 }
 
+// ---- glue booth ----
+
+/// The login / character-screen backdrop booth (benilla-app's glue_booth):
+/// the shown `<Model>` frame's inputs for the UE render host. `cam_*` is
+/// **raw WoW model space** - the UE side maps it through (x, -y, z) × 100
+/// exactly like `bn_model_fill` maps the vertices, so camera and mesh land in
+/// one space. `path` is `.m2`-normalized, ready for `bn_model_fill`.
+#[repr(C)]
+pub struct BnBooth {
+    /// NUL-terminated model path (GlueXML's `.mdx`, normalized to `.m2`).
+    pub path: [c_char; 260],
+    /// The Model frame rect: left, top, width, height (VM units, Y up).
+    pub rect: [f32; 4],
+    /// `GetFacing()` yaw (radians), `GetModelScale()`, `GetPosition()`.
+    pub facing: f32,
+    pub scale: f32,
+    pub pos: [f32; 3],
+    /// camera0, the glue pane's `Model:SetCamera(0)` record.
+    pub cam_eye: [f32; 3],
+    pub cam_target: [f32; 3],
+    pub cam_roll: f32,
+    /// Diagonal radians; 0 = the model has no camera record.
+    pub cam_fov: f32,
+    pub cam_near: f32,
+    pub cam_far: f32,
+    /// The scene's stock fog, mirroring glue_booth.rs `stock_fog`
+    /// (AccountLogin.xml `<FogColor>`/`fogFar`, GlueParent.lua `CharModelFogInfo`).
+    pub fog_rgb: [f32; 3],
+    pub fog_near: f32,
+    pub fog_far: f32,
+}
+
+#[no_mangle]
+pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees a valid out pointer.
+    unsafe { std::ptr::write_bytes(out, 0, 1) };
+    if world.is_null() {
+        return 0;
+    }
+    // SAFETY: valid handle.
+    let w = unsafe { &*world };
+
+    // First shown Model frame with a model set (the login screen's booth is
+    // AccountLogin; later screens swap the token, e.g. UI_Orc). The VM's
+    // script dialect has no `#` and EnumerateFrames takes the frame itself.
+    const LUA: &str = r#"
+        local f = EnumerateFrames()
+        while f do
+            local okm, m = pcall(function()
+                if f.GetModel then return f:GetModel() end
+            end)
+            if okm and type(m) == "string" and m ~= "" then
+                local oks, sh = pcall(function() return f:IsShown() end)
+                if oks and sh then
+                    local okb, l, t, w, h, fa, sc, px, py, pz = pcall(function()
+                        return f:GetLeft(), f:GetTop(), f:GetWidth(), f:GetHeight(),
+                               f:GetFacing(), f:GetModelScale(), f:GetPosition()
+                    end)
+                    if not okb then
+                        l, t, w, h, fa, sc, px, py, pz = 0, 0, 0, 0, 0, 1, 0, 0, 0
+                    end
+                    return string.format(
+                        "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+                        tostring(f:GetName()), m, tostring(l), tostring(t),
+                        tostring(w), tostring(h), tostring(fa), tostring(sc),
+                        tostring(px), tostring(py), tostring(pz))
+                end
+            end
+            f = EnumerateFrames(f)
+        end
+        return ""
+    "#;
+    let Ok(code) = std::ffi::CString::new(LUA) else {
+        return 0;
+    };
+    let mut buf = vec![0u8; 2048];
+    let n = bn_ui_eval(code.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len() as u32);
+    if n == 0 {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+    let f: Vec<&str> = text.split('\t').collect();
+    if f.len() < 11 {
+        return 0;
+    }
+    let num = |i: usize, d: f32| f.get(i).and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+
+    // GlueXML names a .mdx stem, the archives hold .m2 only (booth_probe).
+    let mut path = f[1].trim().to_string();
+    if path.get(path.len().saturating_sub(4)..).is_some_and(|e| e.eq_ignore_ascii_case(".mdx")) {
+        path.truncate(path.len() - 4);
+        path.push_str(".m2");
+    }
+
+    // The stock fog by the scene token after `UI_` (glue_booth stock_fog);
+    // an unknown stem falls on MainMenu's own row (the login backdrop).
+    let stem = path.rsplit(['\\', '/']).next().unwrap_or("");
+    let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
+    let token = if stem.len() > 3 && stem[..3].eq_ignore_ascii_case("UI_") {
+        stem[3..].to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    let (fog_rgb, fog_far): ([f32; 3], f32) = match token.as_str() {
+        "orc" => ([0.5, 0.5, 0.5], 270.0),
+        "dwarf" => ([0.85, 0.88, 1.0], 500.0),
+        "nightelf" => ([0.25, 0.22, 0.55], 611.0),
+        "scourge" => ([0.0, 0.22, 0.22], 26.0),
+        "tauren" => ([1.0, 0.61, 0.42], 153.0),
+        "human" => ([0.8, 0.65, 0.73], 222.0),
+        _ => ([0.25, 0.06, 0.015], 1200.0), // MainMenu
+    };
+
+    // camera0 by model path: the booth M2 is ~866KB decompressed, far too
+    // heavy to re-read from the MPQ on every poll (files are immutable).
+    thread_local! {
+        static CAM_CACHE: std::cell::RefCell<HashMap<String, Option<[f32; 10]>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let cam = CAM_CACHE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if !cell.contains_key(&path) {
+            let v = m2_bytes(w, &path)
+                .and_then(|b| benilla_formats::parse_m2_camera(&b, 0))
+                .map(|c| {
+                    [
+                        c.position[0], c.position[1], c.position[2],
+                        c.target[0], c.target[1], c.target[2],
+                        c.roll, c.fov, c.near_clip, c.far_clip,
+                    ]
+                });
+            cell.insert(path.clone(), v);
+        }
+        cell.get(&path).copied().flatten()
+    });
+
+    // SAFETY: out points at a caller-owned BnBooth.
+    unsafe {
+        let o = &mut *out;
+        for (i, b) in path.bytes().enumerate().take(o.path.len() - 1) {
+            o.path[i] = b as c_char;
+        }
+        o.rect = [num(2, 0.0), num(3, 0.0), num(4, 0.0), num(5, 0.0)];
+        o.facing = num(6, 0.0);
+        o.scale = num(7, 1.0);
+        o.pos = [num(8, 0.0), num(9, 0.0), num(10, 0.0)];
+        if let Some(c) = cam {
+            o.cam_eye = [c[0], c[1], c[2]];
+            o.cam_target = [c[3], c[4], c[5]];
+            o.cam_roll = c[6];
+            o.cam_fov = c[7];
+            o.cam_near = c[8];
+            o.cam_far = c[9];
+        }
+        o.fog_rgb = fog_rgb;
+        o.fog_near = 0.0;
+        o.fog_far = fog_far;
+    }
+    1
+}
+

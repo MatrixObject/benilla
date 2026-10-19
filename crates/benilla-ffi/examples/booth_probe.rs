@@ -152,5 +152,32 @@ fn main() {
         println!("== bn_model_fill loader: {cand} -> {nv} verts, {nt} tris");
     }
 
+    // 5. The FFI itself: one call must hand back the whole booth payload
+    //    (path normalized, camera raw-WoW, stock fog) the UE host consumes.
+    let mut booth: BnBooth = unsafe { std::mem::zeroed() };
+    let has = bn_ui_booth(cworld, &mut booth);
+    let path = booth
+        .path
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8 as char)
+        .collect::<String>();
+    println!("== bn_ui_booth: has={has} path={path}");
+    if has != 0 {
+        println!(
+            "   rect={:?} facing={:.4} scale={} pos={:?}",
+            booth.rect, booth.facing, booth.scale, booth.pos
+        );
+        println!(
+            "   cam eye={:?} target={:?} roll={:.4} fov={:.4} near={:.3} far={:.1}",
+            booth.cam_eye, booth.cam_target, booth.cam_roll, booth.cam_fov,
+            booth.cam_near, booth.cam_far
+        );
+        println!(
+            "   fog rgb={:?} near={} far={:.1}",
+            booth.fog_rgb, booth.fog_near, booth.fog_far
+        );
+    }
+
     bn_shutdown(world);
 }
