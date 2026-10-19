@@ -4666,6 +4666,131 @@ pub extern "C" fn bn_ui_mouse_button(x: f32, y: f32, button: *const c_char, down
     out.unwrap_or(0)
 }
 
+// ---- keyboard: key names in, one fixed Windows chord table applied here ----
+// (the reference leaves the per-OS keymap to the host; keeping it in the
+// middle layer leaves the UE side a pure event forwarder).
+
+/// The editing action for a taken key-down on an EditBox, from the key name
+/// and chord bits (bit0 Shift, bit1 Ctrl, bit2 Alt); `None` for keys with no
+/// editing action (letters, ENTER/ESCAPE/TAB — those the box handles itself).
+fn editbox_chord(key: &str, mods: u32) -> Option<benilla_ui::widget::EditAction> {
+    use benilla_ui::widget::{EditAction, EditUnit};
+    let shift = mods & 1 != 0;
+    let ctrl = mods & 2 != 0;
+    let k = key.to_ascii_uppercase();
+    let mv = |unit: EditUnit, back: bool| {
+        Some(EditAction::Move { unit, back, extend: shift })
+    };
+    match (k.as_str(), ctrl) {
+        ("LEFT", false) => mv(EditUnit::Char, true),
+        ("LEFT", true) => mv(EditUnit::Word, true),
+        ("RIGHT", false) => mv(EditUnit::Char, false),
+        ("RIGHT", true) => mv(EditUnit::Word, false),
+        ("UP", _) => mv(EditUnit::Row, true),
+        ("DOWN", _) => mv(EditUnit::Row, false),
+        ("HOME", false) => mv(EditUnit::Line, true),
+        ("HOME", true) => mv(EditUnit::Edge, true),
+        ("END", false) => mv(EditUnit::Line, false),
+        ("END", true) => mv(EditUnit::Edge, false),
+        ("BACKSPACE", false) => Some(EditAction::Delete { unit: EditUnit::Char, back: true }),
+        ("BACKSPACE", true) => Some(EditAction::Delete { unit: EditUnit::Word, back: true }),
+        ("DELETE", false) => Some(EditAction::Delete { unit: EditUnit::Char, back: false }),
+        ("DELETE", true) => Some(EditAction::Delete { unit: EditUnit::Word, back: false }),
+        ("A", true) => Some(EditAction::SelectAll),
+        ("U", true) => Some(EditAction::DeleteToEdge { back: true }),
+        ("K", true) => Some(EditAction::DeleteToEdge { back: false }),
+        ("P", true) => Some(EditAction::History { older: true }),
+        ("N", true) => Some(EditAction::History { older: false }),
+        _ => None,
+    }
+}
+
+/// Press or release a key by WoW name ("A", "ENTER", "LEFT", ...). `mods` is
+/// the chord state (bit0 Shift, bit1 Ctrl, bit2 Alt; for a modifier's own
+/// event include its own bit — the state after the event), `down` 1 = press.
+/// A press runs the key-down walk and, when it lands on an EditBox, our keymap
+/// applies the key's editing action (the reference's host job). Returns the
+/// KeyWalk of a press (0 declined / 1 frame / 2 box), 1/0 taken for a release,
+/// 0 with no session.
+#[no_mangle]
+pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
+    if key.is_null() {
+        return 0;
+    }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(key) }).to_str() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else { return 0u32 };
+            // The alt-arrow gate reads this: arrows pass through an
+            // ignoreArrows box only while ALT is held.
+            script.set_alt_down(mods & 4 != 0);
+            if down != 0 {
+                let walk = script.key_down(name);
+                if walk == benilla_ui::script::KeyWalk::Box {
+                    if let Some(action) = editbox_chord(name, mods) {
+                        script.editbox_action(action);
+                    }
+                }
+                match walk {
+                    benilla_ui::script::KeyWalk::Declined => 0u32,
+                    benilla_ui::script::KeyWalk::Frame => 1,
+                    benilla_ui::script::KeyWalk::Box => 2,
+                }
+            } else {
+                u32::from(script.key_up(name).taken())
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// A typed character (UTF-8: "a", "5", "中") into the focused EditBox, or the
+/// char walk with no box. Returns 1 if consumed, 0 otherwise (or no session).
+#[no_mangle]
+pub extern "C" fn bn_ui_char(text: *const c_char) -> u32 {
+    if text.is_null() {
+        return 0;
+    }
+    let Ok(s) = (unsafe { std::ffi::CStr::from_ptr(text) }).to_str() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => u32::from(script.char_input(s)),
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Paste host clipboard text into the focused EditBox, typed a character at a
+/// time as the reference's paste is. Returns 1 if consumed, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn bn_ui_paste(text: *const c_char) -> u32 {
+    if text.is_null() {
+        return 0;
+    }
+    let Ok(s) = (unsafe { std::ffi::CStr::from_ptr(text) }).to_str() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => u32::from(script.paste(s)),
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
 /// Pop one event the menu host queued ("enter_world", ...) into `buf` as NUL-
 /// terminated UTF-8; returns bytes written (0 = none pending). The render host
 /// polls this to learn when the UI wants the game world up.
