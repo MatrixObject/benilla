@@ -587,6 +587,7 @@ dependencies = [
 name = "benilla-ffi"
 version = "0.2.0"
 dependencies = [
+ "ab_glyph",
  "benilla-adt",
  "benilla-blp",
  "benilla-formats",

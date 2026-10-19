@@ -21,6 +21,8 @@ benilla-blp = { path = "../benilla-blp" }
 benilla-formats = { path = "../benilla-formats", default-features = false }
 # Stock WoW UI engine (FrameXML loader + Lua VM), read-only use for stage 3.
 benilla-ui = { path = "../benilla-ui" }
+# Glyph outlines for `bn_ui_text_bitmap` (FontString -> RGBA for the UE HUD).
+ab_glyph = "0.2"
 
 [[example]]
 name = "smoke"

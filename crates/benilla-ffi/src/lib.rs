@@ -24,6 +24,10 @@ use std::ffi::c_char;
 
 mod coords;
 
+// ---- WoW FontString rasterization (client TTFs -> RGBA for the UE HUD) ----
+
+mod ui_font;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -4207,10 +4211,25 @@ const UI_DUMP_LUA: &str = r#"
                 extra = clean(r:GetText())
                 colr = colour_str(function() return r:GetTextColor() end)
             end
+            -- Font/justification slots, appended for every region row so the
+            -- TSV stays rectangular (textures carry the defaults).
+            local font, size, flags, jh, jv = "", "0.0", "", "LEFT", "CENTER"
+            if ty == "FontString" then
+                local okf, fp, fs, ff = pcall(function() return r:GetFont() end)
+                if okf then
+                    font = clean(fp)
+                    size = num(fs)
+                    flags = clean(ff)
+                end
+                local okh, vh = pcall(function() return r:GetJustifyH() end)
+                if okh then jh = clean(vh) end
+                local okv, vv = pcall(function() return r:GetJustifyV() end)
+                if okv then jv = clean(vv) end
+            end
             table.insert(mine, table.concat({ "R", clean(f:GetName()),
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
-                colr, region_alpha_str(r) }, "\t"))
+                colr, region_alpha_str(r), font, size, flags, jh, jv }, "\t"))
         end
         return mine
     end
@@ -4342,6 +4361,86 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
         *buf.add(n) = 0;
     }
     n as u32
+}
+
+/// Rasterize one FontString to RGBA8 for the UE HUD painter (see `ui_font`).
+///
+/// `size_px` is the drawn pixel size (the host applies WoW's em cap and the
+/// seam scale); `outline` is 0 none / 1 thin / 2 thick. Metrics
+/// (`out_w/h` = bitmap size, `out_ox/oy` = pen-box origin inside the bitmap,
+/// `out_pw/ph` = the WoW-measured string extent) are written whenever the
+/// raster succeeds — including when `cap` is too small, so the host can grow
+/// its buffer and retry. Returns the byte count written, 0 = nothing to draw
+/// (empty text, face missing, or `cap` too small).
+#[no_mangle]
+pub extern "C" fn bn_ui_text_bitmap(
+    world: *const BnWorld,
+    font_path: *const c_char,
+    size_px: f32,
+    outline: u32,
+    text: *const c_char,
+    out_rgba: *mut u8,
+    cap: u32,
+    out_w: *mut u32,
+    out_h: *mut u32,
+    out_ox: *mut f32,
+    out_oy: *mut f32,
+    out_pw: *mut f32,
+    out_ph: *mut f32,
+) -> u32 {
+    // SAFETY: FFI contract — pointers are valid (or null) for the call's span.
+    let Some(text_str) = cstr_to_str(text) else {
+        return 0;
+    };
+    let font_str = cstr_to_str(font_path);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if world.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees a valid exclusive handle for the call's span.
+        let w = unsafe { &*world };
+        let Some(chain) = w.chain.as_ref() else {
+            return None;
+        };
+        ui_font::rasterize(
+            chain,
+            font_str.unwrap_or(ui_font::DEFAULT_FONT),
+            size_px,
+            outline,
+            text_str,
+        )
+    }));
+    let Ok(Some(bm)) = out else {
+        return 0;
+    };
+    unsafe {
+        if !out_w.is_null() {
+            *out_w = bm.w;
+        }
+        if !out_h.is_null() {
+            *out_h = bm.h;
+        }
+        if !out_ox.is_null() {
+            *out_ox = bm.ox;
+        }
+        if !out_oy.is_null() {
+            *out_oy = bm.oy;
+        }
+        if !out_pw.is_null() {
+            *out_pw = bm.pw;
+        }
+        if !out_ph.is_null() {
+            *out_ph = bm.ph;
+        }
+    }
+    let need = bm.rgba.len() as u32;
+    if out_rgba.is_null() || cap < need {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bm.rgba.as_ptr(), out_rgba, need as usize);
+    }
+    need
 }
 
 // ---- UI glue (stage 7): the main menu (GlueXML) + pointer feedback ----
