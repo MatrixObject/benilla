@@ -90,6 +90,47 @@ fn main() {
         println!("== login bounds: right={max_r} top={max_t}");
     }
 
+    // Texcoord columns (19..22): every R row must now be 23 fields wide, and
+    // Texture rows should carry sub-rects (9-slice boxes) where set.
+    {
+        let mut buf = vec![0u8; 16 * 1024 * 1024];
+        let n = bn_ui_dump(buf.as_mut_ptr() as *mut i8, buf.len() as u32) as usize;
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        let (mut rows, mut wide, mut sub) = (0usize, 0usize, 0usize);
+        let (mut out_of_range, mut login_rows) = (0usize, 0usize);
+        let mut samples: Vec<String> = Vec::new();
+        for line in text.lines().filter(|l| l.starts_with("R\t")) {
+            let f: Vec<&str> = line.split('\t').collect();
+            rows += 1;
+            if f.len() >= 23 {
+                wide += 1;
+                let uv = &f[19..23];
+                let full = uv == ["0.0000", "0.0000", "1.0000", "1.0000"];
+                if f[3] == "Texture" && !full {
+                    sub += 1;
+                }
+                let vals: Vec<f32> = uv.iter().map(|s| s.parse().unwrap_or(0.0)).collect();
+                if vals.iter().any(|v| *v < -0.001 || *v > 1.001) {
+                    out_of_range += 1;
+                    if out_of_range <= 4 {
+                        samples.push(format!("OOR {} {} uv={:?}", f[1], f[2], uv));
+                    }
+                }
+                if f[1].contains("AccountLogin") && f[3] == "Texture" && login_rows < 12 {
+                    samples.push(format!("LOGIN {} {} uv={:?}", f[1], f[2], uv));
+                    login_rows += 1;
+                }
+            }
+        }
+        println!(
+            "== texcoord: {rows} R rows, {wide} with 23 cols, {sub} texture sub-rects, \
+             {out_of_range} out-of-[0,1], {login_rows} login samples"
+        );
+        for s in &samples {
+            println!("   {s}");
+        }
+    }
+
     // Frame names the login screen actually uses (1.12 spelling).
     {
         let mut buf = vec![0u8; 16 * 1024 * 1024];

@@ -46,6 +46,21 @@ fn main() {
             cap,
         );
         println!("{m:<45} vertices={vc}  triangles={filled}");
+        // UV range: a mesh whose texcoords all collapse to 0 samples a single
+        // texel and renders as one flat colour (black when that texel is the
+        // transparent margin).
+        let n = (vc as usize).min(vbuf.len());
+        let (mut umin, mut umax, mut vmin, mut vmax) =
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for v in &vbuf[..n] {
+            umin = umin.min(v.u);
+            umax = umax.max(v.u);
+            vmin = vmin.min(v.v);
+            vmax = vmax.max(v.v);
+        }
+        println!(
+            "   uv range: u [{umin:.3}, {umax:.3}]  v [{vmin:.3}, {vmax:.3}]  (n={n})"
+        );
     }
 
     let _ = ptr::null::<u8>();

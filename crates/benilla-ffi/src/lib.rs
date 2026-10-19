@@ -4832,6 +4832,28 @@ const UI_DUMP_LUA: &str = r#"
         if not ok then return "1.00" end
         return ratio(ra)
     end
+    -- Texture UV sub-rect. GetTexCoord returns the four corner UVs in the
+    -- order ULx,ULy,LLx,LLy,URx,URy,LRx,LRy. The renderer's DrawTexture is an
+    -- affine (u1,v1)->(u2,v2) map from the region's top-left to its bottom-
+    -- right corner, so emit exactly that pair: UL and LR. Going through a
+    -- min/max bounding box would drop mirrored texcoords (UL.x > UR.x), which
+    -- WoW uses for horizontal flips. Without this every region drew its whole
+    -- texture stretched over the widget (9-slice input backgrounds smeared
+    -- into vertical stripes). Non-texture regions and absent methods fall
+    -- back to the full 0..1 quad.
+    local function texcoord_str(r)
+        if not r.GetTexCoord then return "0\t0\t1\t1" end
+        local ok, ax, ay, bx, by, cx, cy, dx, dy =
+            pcall(function() return r:GetTexCoord() end)
+        if not ok or type(ax) ~= "number" or type(dx) ~= "number" then
+            return "0\t0\t1\t1"
+        end
+        -- %.4f, not num()'s %.1f: 9-slice insets like 6/256 = 0.023 round
+        -- to 0.0 at one decimal and shift the border by half the texture.
+        return table.concat({
+            string.format("%.4f", ax), string.format("%.4f", ay),
+            string.format("%.4f", dx), string.format("%.4f", dy) }, "\t")
+    end
     local function dump_one(f)
         local mine = {}
         -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
@@ -4879,7 +4901,8 @@ const UI_DUMP_LUA: &str = r#"
             table.insert(mine, table.concat({ "R", clean(f:GetName()),
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
-                colr, region_alpha_str(r), font, size, flags, jh, jv }, "\t"))
+                colr, region_alpha_str(r), font, size, flags, jh, jv,
+                texcoord_str(r) }, "\t"))
             end
         end
         return mine

@@ -31,6 +31,25 @@ fn main() {
             let mut w2: u32 = 0; let mut h2: u32 = 0;
             let tok = bn_texture(cworld, cbn.as_ptr(), &mut w2, &mut h2, buf.as_mut_ptr(), cap);
             println!("   [{i}] name={name:?}  via_name_bytes={tok}  ({}x{})", w2, h2);
+            // Pixel stats: a bound-but-black texture shows up here as a near-0
+            // mean with a sane alpha; alpha 0 everywhere means the mask kills it.
+            if tok > 0 && w2 > 0 && h2 > 0 && (tok as usize) == (w2 * h2 * 4) as usize {
+                let n = (w2 * h2) as usize;
+                let (mut sr, mut sg, mut sb, mut sa, mut opaque) = (0u64, 0u64, 0u64, 0u64, 0u64);
+                for px in buf[..n * 4].chunks_exact(4) {
+                    sr += px[0] as u64;
+                    sg += px[1] as u64;
+                    sb += px[2] as u64;
+                    sa += px[3] as u64;
+                    if px[3] > 8 { opaque += 1; }
+                }
+                println!(
+                    "        mean RGBA = ({:.0},{:.0},{:.0},{:.0})  opaque={:.1}%",
+                    sr as f64 / n as f64, sg as f64 / n as f64,
+                    sb as f64 / n as f64, sa as f64 / n as f64,
+                    opaque as f64 * 100.0 / n as f64
+                );
+            }
         }
     }
     bn_shutdown(world);
