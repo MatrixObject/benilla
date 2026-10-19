@@ -83,6 +83,9 @@ pub struct BnWorld {
 
     mcnk: Vec<McnkChunk>,
 
+    /// Real ADT terrain of the last `bn_load_tile`, when one loaded.
+    tile: Option<TileFlat>,
+
 }
 
 /// Convert a WoW position to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
@@ -205,6 +208,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         mcnk: Vec::new(),
 
+        tile: None,
+
     }))
 
 }
@@ -244,6 +249,102 @@ pub extern "C" fn bn_num_archives(world: *const BnWorld) -> u32 {
 }
 
 // ---- map / terrain ----
+
+/// One chunk's slot in the flattened tile buffers (element counts).
+pub struct TerrainChunkRange {
+    vtx0: u32,
+    vtx_n: u32,
+    idx0: u32,
+    idx_n: u32,
+    /// MTEX base texture of the chunk ("" when none).
+    tex: String,
+}
+
+/// Flattened real ADT terrain, built once in `bn_load_tile` via the official
+/// `benilla_formats::adt_to_tile_mesh` (read-only, no official source edits):
+/// contiguous tile-local vertices + one global u16 index buffer, one range
+/// per chunk. Also keeps the tile's WMO/doodad placements for later phases.
+pub struct TileFlat {
+    verts: Vec<BnVertex>,
+    idx: Vec<u16>,
+    chunks: Vec<TerrainChunkRange>,
+    /// WMO instances (MODF) in raw WoW world coords.
+    wmos: Vec<benilla_formats::WmoInstance>,
+    /// M2 doodad placements (MDDF) in raw WoW world coords.
+    doodads: Vec<benilla_formats::Doodad>,
+    /// Tile centre in WoW world axes (X/Y only); verts are world - centre.
+    center: (f32, f32),
+}
+
+/// Build the flattened tile from ADT bytes. Vertices become tile-local
+/// (tile centre at origin, X/Y only; Z stays world-absolute) and then go
+/// through the same WoW->UE mirror as every other mesh.
+fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
+    let tile = benilla_formats::adt_to_tile_mesh(bytes).ok()?;
+    if tile.chunks.is_empty() {
+        return None;
+    }
+    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+    for c in &tile.chunks {
+        for p in &c.positions {
+            min_x = min_x.min(p[0]);
+            max_x = max_x.max(p[0]);
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+    }
+    let center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+
+    let mut out = TileFlat {
+        verts: Vec::new(),
+        idx: Vec::new(),
+        chunks: Vec::new(),
+        wmos: tile.wmos.clone(),
+        doodads: tile.doodads.clone(),
+        center,
+    };
+    for c in &tile.chunks {
+        // The UE builder uses u16 indices; never overflow the global buffer.
+        if out.verts.len() + c.positions.len() > u16::MAX as usize {
+            break;
+        }
+        let vtx0 = out.verts.len() as u32;
+        for (i, p) in c.positions.iter().enumerate() {
+            let (nx, ny, nz) = if c.normals.len() == c.positions.len() {
+                wow_vec_to_ue(c.normals[i][0], c.normals[i][1], c.normals[i][2])
+            } else {
+                (0.0, 0.0, 1.0) // no MCNR: flat up (WoW +Z == UE +Z)
+            };
+            let (x, y, z) = wow_vec_to_ue(p[0] - center.0, p[1] - center.1, p[2]);
+            let uv = c.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+            out.verts.push(BnVertex {
+                x,
+                y,
+                z,
+                nx,
+                ny,
+                nz,
+                // Official layer tiling: base texture repeats 8x per chunk.
+                u: uv[0] * benilla_formats::TERRAIN_LAYER_TILES,
+                v: uv[1] * benilla_formats::TERRAIN_LAYER_TILES,
+            });
+        }
+        let idx0 = out.idx.len() as u32;
+        for &i in &c.indices {
+            out.idx.push((vtx0 + i) as u16);
+        }
+        out.chunks.push(TerrainChunkRange {
+            vtx0,
+            vtx_n: c.positions.len() as u32,
+            idx0,
+            idx_n: out.idx.len() as u32 - idx0,
+            tex: c.base_texture.clone().unwrap_or_default(),
+        });
+    }
+    Some(out)
+}
+
 
 /// Load and parse a terrain tile `World\Maps\<map>\<map>_<x>_<z>.adt` from the
 
@@ -299,6 +400,8 @@ pub extern "C" fn bn_load_tile(
 
                     w.mcnk = root.mcnk_chunks;
 
+                    w.tile = build_tile_flat(&bytes);
+
                     return w.mcnk.len() as u32;
 
                 }
@@ -331,9 +434,25 @@ pub extern "C" fn bn_terrain_vertex_count(world: *const BnWorld) -> u32 {
 
     let w = unsafe { &*world };
 
-    // POC: a 3x3 node per chunk (chunk base position + small grid).
+    w.tile.as_ref().map_or(0, |t| t.verts.len() as u32)
 
-    (w.mcnk.len() as u32).max(1) * 9
+}
+
+/// Terrain index count the UE side should pre-allocate.
+
+#[no_mangle]
+
+pub extern "C" fn bn_terrain_index_count(world: *const BnWorld) -> u32 {
+
+    if world.is_null() {
+
+        return 0;
+
+    }
+
+    let w = unsafe { &*world };
+
+    w.tile.as_ref().map_or(0, |t| t.idx.len() as u32)
 
 }
 
@@ -359,65 +478,199 @@ pub extern "C" fn bn_terrain_fill_vertices(
 
     let w = unsafe { &*world };
 
-    let mut n = 0u32;
+    let Some(t) = w.tile.as_ref() else { return 0 };
 
-    for c in w.mcnk.iter() {
+    let n = t.verts.len().min(cap as usize);
 
-        if n >= cap {
+    // SAFETY: caller pre-allocated `cap` BnVertex slots at `out`.
 
-            break;
+    unsafe { std::ptr::copy_nonoverlapping(t.verts.as_ptr(), out, n) };
 
-        }
+    n as u32
 
-        let base = c.header.position;
+}
 
-        // 3x3 small grid centred on the chunk origin, Z-up in UE axes.
+/// Fill `out` (pre-allocated) with terrain triangle indices. Returns count written.
 
-        for dz in -1..=1 {
+#[no_mangle]
 
-            for dx in -1..=1 {
+pub extern "C" fn bn_terrain_fill_indices(
 
-                if n >= cap {
+    world: *const BnWorld,
 
-                    break;
+    out: *mut u16,
 
-                }
+    cap: u32,
 
-                let (gx, gy, gz) = wow_vec_to_ue(base[0] + dx as f32, base[1], base[2] + dz as f32);
+) -> u32 {
 
-                unsafe {
+    if world.is_null() || out.is_null() {
 
-                    *out.add(n as usize) = BnVertex {
+        return 0;
 
-                        x: gx,
+    }
 
-                        y: gy,
+    let w = unsafe { &*world };
 
-                        z: gz,
+    let Some(t) = w.tile.as_ref() else { return 0 };
 
-                        nx: 0.0,
+    let n = t.idx.len().min(cap as usize);
 
-                        ny: 1.0,
+    unsafe { std::ptr::copy_nonoverlapping(t.idx.as_ptr(), out, n) };
 
-                        nz: 0.0,
+    n as u32
 
-                        u: 0.0,
+}
 
-                        v: 0.0,
+/// Per-chunk count of the loaded tile (0 when no tile).
 
-                    };
+#[no_mangle]
 
-                }
+pub extern "C" fn bn_terrain_chunk_count(world: *const BnWorld) -> u32 {
 
-                n += 1;
+    if world.is_null() {
 
-            }
+        return 0;
+
+    }
+
+    let w = unsafe { &*world };
+
+    w.tile.as_ref().map_or(0, |t| t.chunks.len() as u32)
+
+}
+
+/// Chunk `i` index range: writes {vtx0, vtx_n, idx0, idx_n}. Returns 1 on success.
+
+#[no_mangle]
+
+pub extern "C" fn bn_terrain_chunk_range(
+
+    world: *const BnWorld,
+
+    i: u32,
+
+    out: *mut u32,
+
+) -> u32 {
+
+    if world.is_null() || out.is_null() {
+
+        return 0;
+
+    }
+
+    let w = unsafe { &*world };
+
+    let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
+
+        return 0;
+
+    };
+
+    unsafe {
+
+        *out = c.vtx0;
+
+        *out.add(1) = c.vtx_n;
+
+        *out.add(2) = c.idx0;
+
+        *out.add(3) = c.idx_n;
+
+    }
+
+    1
+
+}
+
+/// Chunk `i` MTEX base texture name into `buf` (NUL-terminated). Returns 1 on success.
+
+#[no_mangle]
+
+pub extern "C" fn bn_terrain_chunk_texture(
+
+    world: *const BnWorld,
+
+    i: u32,
+
+    buf: *mut c_char,
+
+    cap: u32,
+
+) -> u32 {
+
+    if world.is_null() || buf.is_null() || cap == 0 {
+
+        return 0;
+
+    }
+
+    let w = unsafe { &*world };
+
+    let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
+
+        return 0;
+
+    };
+
+    let bytes = c.tex.as_bytes();
+
+    let n = bytes.len().min(cap as usize - 1);
+
+    unsafe {
+
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+
+        *buf.add(n) = 0;
+
+    }
+
+    1
+
+}
+
+/// Terrain height (UE-local, WoW units) under tile-local (x, y): nearest
+
+/// flattened vertex height minus tile centre Z offset (Z is world-absolute
+
+/// in `verts`, so this returns the raw world Z in WoW units).
+
+#[no_mangle]
+
+pub extern "C" fn bn_terrain_height_at(world: *const BnWorld, x: f32, y: f32) -> f32 {
+
+    if world.is_null() {
+
+        return 0.0;
+
+    }
+
+    let w = unsafe { &*world };
+
+    let Some(t) = w.tile.as_ref() else { return 0.0 };
+
+    // verts are (world - center) through wow_vec_to_ue: X/Y are mirrored.
+
+    // Invert the mirror to search in tile-local space.
+
+    let (mut best, mut best_d) = (0.0f32, f32::MAX);
+
+    for v in &t.verts {
+
+        let d = (v.x - x) * (v.x - x) + (v.y - y) * (v.y - y);
+
+        if d < best_d {
+
+            best_d = d;
+
+            best = v.z;
 
         }
 
     }
 
-    n
+    best
 
 }
 
