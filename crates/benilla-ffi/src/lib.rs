@@ -276,6 +276,10 @@ pub struct TerrainChunkRange {
     idx_n: u32,
     /// MTEX base texture of the chunk ("" when none).
     tex: String,
+    /// MCLY layer textures (up to 4, index 0 = base = `tex`).
+    layers: Vec<String>,
+    /// Combined 64x64 RGBA alpha map for layers 1..3 (None with a single layer).
+    alpha: Option<Vec<u8>>,
 }
 
 /// Flattened real ADT terrain, built once in `bn_load_tile` via the official
@@ -358,6 +362,8 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
             idx0,
             idx_n: out.idx.len() as u32 - idx0,
             tex: c.base_texture.clone().unwrap_or_default(),
+            layers: c.layer_textures.clone(),
+            alpha: c.alpha_map.clone(),
         });
     }
     Some(out)
@@ -649,6 +655,87 @@ pub extern "C" fn bn_terrain_chunk_texture(
 
     1
 
+}
+
+/// Chunk `i` MCLY layer count (0..4; 0 when no tile/chunk).
+#[no_mangle]
+pub extern "C" fn bn_terrain_chunk_layer_count(world: *const BnWorld, i: u32) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile
+        .as_ref()
+        .and_then(|t| t.chunks.get(i as usize))
+        .map_or(0, |c| c.layers.len().min(4) as u32)
+}
+
+/// Chunk `i` layer `slot` texture path into `buf` (NUL-terminated). Returns 1
+/// on success (path may be "" when the slot is empty).
+#[no_mangle]
+pub extern "C" fn bn_terrain_chunk_layer(
+    world: *const BnWorld,
+    i: u32,
+    slot: u32,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
+        return 0;
+    };
+    let Some(path) = c.layers.get(slot as usize) else {
+        // Empty slot: write the NUL so callers see "".
+        unsafe { *buf = 0 };
+        return 1;
+    };
+    let bytes = path.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    1
+}
+
+/// Chunk `i` combined 64x64 RGBA alpha map (R/G/B = layers 1/2/3 blend
+/// weights, A unused). Returns the byte count written (0 = single-layer
+/// chunk, caller should bind a black alpha). Channels for absent layers are
+/// forced to 0 so a partial layer stack blends correctly.
+#[no_mangle]
+pub extern "C" fn bn_terrain_chunk_alpha(
+    world: *const BnWorld,
+    i: u32,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
+        return 0;
+    };
+    let Some(alpha) = c.alpha.as_ref() else {
+        return 0;
+    };
+    let n = (64 * 64 * 4).min(alpha.len()).min(cap as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(alpha.as_ptr(), out, n);
+    }
+    // R/G/B serve layers 1..3; zero the channels whose layer is absent.
+    let layers = c.layers.len().min(4);
+    for ch in (layers.saturating_sub(1))..3 {
+        let mut k = ch;
+        while k < n {
+            unsafe { *out.add(k) = 0; }
+            k += 4;
+        }
+    }
+    n as u32
 }
 
 /// Terrain height (UE-local, WoW units) under tile-local (x, y): nearest
