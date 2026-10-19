@@ -4834,12 +4834,23 @@ const UI_DUMP_LUA: &str = r#"
     end
     local function dump_one(f)
         local mine = {}
+        -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
+        -- gating on it would emit every child of a hidden screen (RealmList,
+        -- AddonList, ... at the login screen: 299 shown vs 12 visible) and
+        -- the renderer would draw all of them stacked.
         table.insert(mine, table.concat({ "F", clean(f:GetName()),
-            f:IsShown() and "1" or "0", clean(f:GetFrameStrata()),
+            f:IsVisible() and "1" or "0", clean(f:GetFrameStrata()),
             tostring(f:GetFrameLevel() or 0), num(f:GetLeft()), num(f:GetTop()),
             num(f:GetWidth()), num(f:GetHeight()),
             ratio(f:GetAlpha()) }, "\t"))
         for _, r in ipairs({ f:GetRegions() }) do
+            -- A hidden region draws nothing: button state textures and
+            -- highlights are Show/Hide-swapped, so emitting them stacks the
+            -- pressed/disabled look over the resting one. Absent method (a
+            -- non-region object) keeps the row.
+            if r.IsShown and not r:IsShown() then
+                -- skip
+            else
             local ty = clean(r:GetObjectType())
             local extra = ""
             local colr = ""
@@ -4869,6 +4880,7 @@ const UI_DUMP_LUA: &str = r#"
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv }, "\t"))
+            end
         end
         return mine
     end
