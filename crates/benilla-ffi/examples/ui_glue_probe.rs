@@ -90,46 +90,58 @@ fn main() {
         println!("== login bounds: right={max_r} top={max_t}");
     }
 
-    // Texcoord columns (19..22): every R row must now be 23 fields wide, and
-    // Texture rows should carry sub-rects (9-slice boxes) where set.
+    // Texcoord columns (19..26, four corners): every R row must be 27 fields
+    // wide; list the login screen's rows (frame name + 8-corner UV + tint) to
+    // attribute which region paints what (background / button label / edits).
     {
         let mut buf = vec![0u8; 16 * 1024 * 1024];
         let n = bn_ui_dump(buf.as_mut_ptr() as *mut i8, buf.len() as u32) as usize;
         let text = String::from_utf8_lossy(&buf[..n]).to_string();
         let (mut rows, mut wide, mut sub) = (0usize, 0usize, 0usize);
         let (mut out_of_range, mut login_rows) = (0usize, 0usize);
+        // Shown frames (dump col 2 = IsVisible gate) for the "screen-sized" filter.
+        let mut shown: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in text.lines().filter(|l| l.starts_with("F\t")) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() >= 3 && f[2] == "1" {
+                shown.insert(f[1].to_string());
+            }
+        }
         let mut samples: Vec<String> = Vec::new();
         for line in text.lines().filter(|l| l.starts_with("R\t")) {
             let f: Vec<&str> = line.split('\t').collect();
             rows += 1;
-            if f.len() >= 23 {
+            if f.len() >= 27 {
                 wide += 1;
                 let uv = &f[19..23];
-                let full = uv == ["0.0000", "0.0000", "1.0000", "1.0000"];
+                let full = uv == ["0.0000", "0.0000", "1.0000", "0.0000"];
                 if f[3] == "Texture" && !full {
                     sub += 1;
                 }
-                let vals: Vec<f32> = uv.iter().map(|s| s.parse().unwrap_or(0.0)).collect();
+                let vals: Vec<f32> = f[19..27].iter().map(|s| s.parse().unwrap_or(0.0)).collect();
                 if vals.iter().any(|v| *v < -0.001 || *v > 1.001) {
                     out_of_range += 1;
                 }
-                // Full listing of every row on the login screen: the drawn
-                // stripes/edge-tearing needs positions + tex paths + UVs to
-                // attribute which region paints what.
-                if f[1].starts_with("AccountLogin") && login_rows < 140 {
+                let is_login = f[1].starts_with("AccountLogin");
+                let is_big = shown.contains(f[1])
+                    && (f[6].parse::<f32>().unwrap_or(0.0) >= 600.0
+                        || f[7].parse::<f32>().unwrap_or(0.0) >= 500.0);
+                if (is_login || is_big) && login_rows < 200 {
                     samples.push(format!(
-                        "{0:9} {1:38} l={2:>8} t={3:>8} w={4:>8} h={5:>8} uv=[{6},{7},{8},{9}] tex={10}",
-                        f[3], &f[2][..f[2].len().min(38)],
+                        "{0:9} fr={1:28} rg={2:30} l={3:>7} t={4:>7} w={5:>7} h={6:>7} \
+                         uv=[{7},{8} | {9},{10} | {11},{12} | {13},{14}] tint=[{15},{16},{17},{18},{19}] tex={20}",
+                        f[3], &f[1][..f[1].len().min(28)], &f[2][..f[2].len().min(30)],
                         f[4], f[5], f[6], f[7],
-                        f[19], f[20], f[21], f[22], f[8]
+                        f[19], f[20], f[21], f[22], f[23], f[24], f[25], f[26],
+                        f[9], f[10], f[11], f[12], f[13], f[8]
                     ));
                     login_rows += 1;
                 }
             }
         }
         println!(
-            "== texcoord: {rows} R rows, {wide} with 23 cols, {sub} texture sub-rects, \
-             {out_of_range} out-of-[0,1], {login_rows} login rows"
+            "== texcoord: {rows} R rows, {wide} with 27 cols, {sub} texture sub-rects, \
+             {out_of_range} out-of-[0,1], {login_rows} listed rows"
         );
         for s in &samples {
             println!("   {s}");

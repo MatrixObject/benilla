@@ -21,6 +21,24 @@ fn main() {
         r#"Interface\ChatFrame\ChatFrameBackground"#,
         r#"Interface\Buttons\UI-Quickslot2"#,
         r#"Interface\Tooltips\UI-Tooltip-Border"#,
+        r#"Interface\Glues\Common\Glue-Tooltip-Border"#,
+        r#"Interface\Glues\Common\Glue-Panel-Button-Up"#,
+        r#"Interface\Tooltips\UI-Tooltip-Background"#,
+    ];
+    // Raw RGBA dumps for visual inspection (Python/PIL renders them to PNG).
+    const DUMP: &[(&str, &str)] = &[
+        (
+            r#"Interface\Glues\Common\Glue-Tooltip-Border"#,
+            r#"C:\Users\Administrator\AppData\Local\Temp\glue_tooltip_border.rgba"#,
+        ),
+        (
+            r#"Interface\Glues\Common\Glue-Panel-Button-Up"#,
+            r#"C:\Users\Administrator\AppData\Local\Temp\glue_panel_button_up.rgba"#,
+        ),
+        (
+            r#"Interface\Tooltips\UI-Tooltip-Background"#,
+            r#"C:\Users\Administrator\AppData\Local\Temp\ui_tooltip_background.rgba"#,
+        ),
     ];
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     for p in paths {
@@ -34,6 +52,12 @@ fn main() {
             let n = bn_texture(cworld, cv.as_ptr(), &mut w, &mut h, buf.as_mut_ptr(), buf.len() as u32);
             println!("{:<62} -> {} bytes ({}x{})", v, n, w, h);
             if n > 0 {
+                for (dp, out) in DUMP {
+                    if *dp == p {
+                        std::fs::write(*out, &buf[..n as usize]).expect("write rgba dump");
+                        println!("    dumped {n} bytes ({w}x{h}) -> {out}");
+                    }
+                }
                 break;
             }
         }

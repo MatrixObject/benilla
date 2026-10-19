@@ -4859,6 +4859,15 @@ const UI_DUMP_LUA: &str = r#"
             string.format("%.4f", bx), string.format("%.4f", by)   -- BL
         }, "\t")
     end
+    -- Draw layer (col 27), the ZKey field above batch rank: the client emits
+    -- every frame's BACKGROUND quads before any BORDER/ARTWORK, and within a
+    -- layer every quad before every font string (order.rs). The renderer must
+    -- sort on this or a button's own texture paints over its label.
+    local function layer_str(r)
+        local ok, dl = pcall(function() return r:GetDrawLayer() end)
+        if not ok or type(dl) ~= "string" then return "ARTWORK" end
+        return dl
+    end
     local function dump_one(f)
         local mine = {}
         -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
@@ -4907,7 +4916,7 @@ const UI_DUMP_LUA: &str = r#"
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv,
-                texcoord_str(r) }, "\t"))
+                texcoord_str(r), layer_str(r) }, "\t"))
             end
         end
         return mine
