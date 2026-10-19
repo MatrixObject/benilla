@@ -112,19 +112,24 @@ fn main() {
                 let vals: Vec<f32> = uv.iter().map(|s| s.parse().unwrap_or(0.0)).collect();
                 if vals.iter().any(|v| *v < -0.001 || *v > 1.001) {
                     out_of_range += 1;
-                    if out_of_range <= 4 {
-                        samples.push(format!("OOR {} {} uv={:?}", f[1], f[2], uv));
-                    }
                 }
-                if f[1].contains("AccountLogin") && f[3] == "Texture" && login_rows < 12 {
-                    samples.push(format!("LOGIN {} {} uv={:?}", f[1], f[2], uv));
+                // Full listing of every row on the login screen: the drawn
+                // stripes/edge-tearing needs positions + tex paths + UVs to
+                // attribute which region paints what.
+                if f[1].starts_with("AccountLogin") && login_rows < 140 {
+                    samples.push(format!(
+                        "{0:9} {1:38} l={2:>8} t={3:>8} w={4:>8} h={5:>8} uv=[{6},{7},{8},{9}] tex={10}",
+                        f[3], &f[2][..f[2].len().min(38)],
+                        f[4], f[5], f[6], f[7],
+                        f[19], f[20], f[21], f[22], f[8]
+                    ));
                     login_rows += 1;
                 }
             }
         }
         println!(
             "== texcoord: {rows} R rows, {wide} with 23 cols, {sub} texture sub-rects, \
-             {out_of_range} out-of-[0,1], {login_rows} login samples"
+             {out_of_range} out-of-[0,1], {login_rows} login rows"
         );
         for s in &samples {
             println!("   {s}");

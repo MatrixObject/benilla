@@ -4832,27 +4832,32 @@ const UI_DUMP_LUA: &str = r#"
         if not ok then return "1.00" end
         return ratio(ra)
     end
-    -- Texture UV sub-rect. GetTexCoord returns the four corner UVs in the
-    -- order ULx,ULy,LLx,LLy,URx,URy,LRx,LRy. The renderer's DrawTexture is an
-    -- affine (u1,v1)->(u2,v2) map from the region's top-left to its bottom-
-    -- right corner, so emit exactly that pair: UL and LR. Going through a
-    -- min/max bounding box would drop mirrored texcoords (UL.x > UR.x), which
-    -- WoW uses for horizontal flips. Without this every region drew its whole
-    -- texture stretched over the widget (9-slice input backgrounds smeared
-    -- into vertical stripes). Non-texture regions and absent methods fall
-    -- back to the full 0..1 quad.
+    -- Texture UV corners. GetTexCoord answers eight values in the order
+    -- UL, LL, UR, LR (paint.rs maps stored Corners [TL,TR,BR,BL] to
+    -- [c0,c3,c1,c2], and Rect edges to [[l,t],[l,b],[r,t],[r,b]]), so:
+    --   TL = out0, BL = out1, TR = out2, BR = out3.
+    -- The dump emits all four corners as TL,TR,BR,BL (cols 19..26) because a
+    -- backdrop's top/bottom edge strips transpose the atlas axes (atlas u runs
+    -- down the screen, v right-to-left, backdrop.rs run_uvs) - an axis-aligned
+    -- (u1,v1)-(u2,v2) quad cannot express that; the renderer needs per-corner
+    -- UVs to draw those with two triangles. Non-texture regions and absent
+    -- methods fall back to the full quad.
+    local FULL = "0.0000\t0.0000\t1.0000\t0.0000\t1.0000\t1.0000\t0.0000\t1.0000"
     local function texcoord_str(r)
-        if not r.GetTexCoord then return "0\t0\t1\t1" end
+        if not r.GetTexCoord then return FULL end
         local ok, ax, ay, bx, by, cx, cy, dx, dy =
             pcall(function() return r:GetTexCoord() end)
         if not ok or type(ax) ~= "number" or type(dx) ~= "number" then
-            return "0\t0\t1\t1"
+            return FULL
         end
         -- %.4f, not num()'s %.1f: 9-slice insets like 6/256 = 0.023 round
         -- to 0.0 at one decimal and shift the border by half the texture.
         return table.concat({
-            string.format("%.4f", ax), string.format("%.4f", ay),
-            string.format("%.4f", dx), string.format("%.4f", dy) }, "\t")
+            string.format("%.4f", ax), string.format("%.4f", ay),  -- TL
+            string.format("%.4f", cx), string.format("%.4f", cy),  -- TR
+            string.format("%.4f", dx), string.format("%.4f", dy),  -- BR
+            string.format("%.4f", bx), string.format("%.4f", by)   -- BL
+        }, "\t")
     end
     local function dump_one(f)
         local mine = {}
