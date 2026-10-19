@@ -3977,27 +3977,50 @@ const UI_DUMP_LUA: &str = r#"
         if v == nil then return "0" end
         return string.format("%.1f", v)
     end
+    local function ratio(v)
+        if type(v) ~= "number" then return "1.00" end
+        return string.format("%.2f", v)
+    end
     local function clean(s)
         if s == nil then return "" end
         return (string.gsub(tostring(s), "[\t\r\n]", " "))
+    end
+    -- The colour slot (GetTextColor / GetVertexColor): r g b a, 0..1.
+    -- pcall'd because one bad region must not sink its frame's rows.
+    local function colour_str(fn)
+        local ok, a, b, c, d = pcall(fn)
+        if not ok then return "1.00\t1.00\t1.00\t1.00" end
+        return table.concat({ ratio(a), ratio(b), ratio(c), ratio(d) }, "\t")
+    end
+    -- The region's own alpha slot (SetAlpha), kept apart from the colour's
+    -- alpha: the drawn product multiplies both with the owner frame's.
+    local function region_alpha_str(r)
+        local ok, ra = pcall(function() return r:GetAlpha() end)
+        if not ok then return "1.00" end
+        return ratio(ra)
     end
     local function dump_one(f)
         local mine = {}
         table.insert(mine, table.concat({ "F", clean(f:GetName()),
             f:IsShown() and "1" or "0", clean(f:GetFrameStrata()),
             tostring(f:GetFrameLevel() or 0), num(f:GetLeft()), num(f:GetTop()),
-            num(f:GetWidth()), num(f:GetHeight()) }, "\t"))
+            num(f:GetWidth()), num(f:GetHeight()),
+            ratio(f:GetAlpha()) }, "\t"))
         for _, r in ipairs({ f:GetRegions() }) do
             local ty = clean(r:GetObjectType())
             local extra = ""
+            local colr = ""
             if ty == "Texture" then
                 extra = clean(r:GetTexture())
+                colr = colour_str(function() return r:GetVertexColor() end)
             elseif ty == "FontString" then
                 extra = clean(r:GetText())
+                colr = colour_str(function() return r:GetTextColor() end)
             end
             table.insert(mine, table.concat({ "R", clean(f:GetName()),
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
-                num(r:GetWidth()), num(r:GetHeight()), extra }, "\t"))
+                num(r:GetWidth()), num(r:GetHeight()), extra,
+                colr, region_alpha_str(r) }, "\t"))
         end
         return mine
     end

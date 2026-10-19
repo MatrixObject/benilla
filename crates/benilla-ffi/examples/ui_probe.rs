@@ -30,9 +30,12 @@ fn main() {
 
     // TSV stats: F lines / R lines, sample named frames, texture + text hits.
     let (mut nf, mut nr, mut tex_hits, mut text_hits) = (0u32, 0u32, 0u32, 0u32);
+    let (mut f_alpha, mut r_colour) = (0u32, 0u32);
     let mut named = Vec::new();
     let mut tex_samples = Vec::new();
     let mut text_samples = Vec::new();
+    let mut colour_samples = Vec::new();
+    let mut nonwhite = 0u32;
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         if f.is_empty() {
@@ -42,6 +45,10 @@ fn main() {
         match get(0) {
             "F" => {
                 nf += 1;
+                // Extended format: field 9 = frame alpha (10 fields total).
+                if f.len() >= 10 {
+                    f_alpha += 1;
+                }
                 if !get(1).is_empty() && named.len() < 30 {
                     named.push(format!(
                         "{} ({} {}x{} @ {},{})",
@@ -70,11 +77,36 @@ fn main() {
                         text_samples.push(extra.to_string());
                     }
                 }
+                if f.len() >= 14 {
+                    r_colour += 1;
+                    let non_default = get(9) != "1.00" || get(10) != "1.00"
+                        || get(11) != "1.00" || get(12) != "1.00"
+                        || get(13) != "1.00";
+                    if non_default {
+                        nonwhite += 1;
+                        if colour_samples.len() < 8 {
+                            colour_samples.push(format!(
+                                "{ty} \"{extra}\" rgba=({},{},{},{}) ra={}",
+                                get(9),
+                                get(10),
+                                get(11),
+                                get(12),
+                                get(13),
+                            ));
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
     println!("lines: {nf} frames, {nr} regions");
+    println!(
+        "colour format: {f_alpha}/{nf} F lines carry alpha, {r_colour}/{nr} R lines carry rgba, {nonwhite} non-default"
+    );
+    for s in &colour_samples {
+        println!("  colour {s}");
+    }
     println!("textures with a path: {tex_hits}");
     for s in &tex_samples {
         println!("  tex {s}");
