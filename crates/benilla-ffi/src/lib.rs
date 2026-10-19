@@ -98,6 +98,12 @@ pub struct BnWorld {
     /// Baked tile-local WMO geometry by instance index (rebuilt on tile load).
     wmo_flats: HashMap<u32, WmoFlat>,
 
+    /// Parsed doodad (terrain M2) geometry by model path, shared by placements.
+    doodad_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
+
+    /// Baked tile-local doodad geometry by MDDF index (rebuilt on tile load).
+    doodad_flats: HashMap<u32, WmoFlat>,
+
 }
 
 /// Convert a WoW position to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
@@ -227,6 +233,10 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         wmo_models: HashMap::new(),
 
         wmo_flats: HashMap::new(),
+
+        doodad_models: HashMap::new(),
+
+        doodad_flats: HashMap::new(),
 
     }))
 
@@ -426,8 +436,10 @@ pub extern "C" fn bn_load_tile(
 
                     w.tile = build_tile_flat(&bytes);
 
-                    // Instance indices address the new tile's MODF list; drop stale bakes.
+                    // Instance indices address the new tile's MODF/MDDF lists;
+                    // drop stale bakes (models stay cached: path-keyed).
                     w.wmo_flats.clear();
+                    w.doodad_flats.clear();
 
                     return w.mcnk.len() as u32;
 
@@ -950,12 +962,15 @@ fn placement_quat(rotation_deg: [f32; 3]) -> [f32; 4] {
 
 /// Bake every submesh of one placement into tile-local UE axes. Submesh ranges
 /// stay contiguous (vertex order = submesh order); stops at the u16 vertex cap
-/// so every published range remains addressable from the C side.
+/// so every published range remains addressable from the C side. `scale` is the
+/// MDDF uniform scale (WMO placements pass 1.0): applied to model-space
+/// positions before rotation, matching the official placement order.
 fn build_wmo_flat(
     subs: &[benilla_formats::RenderSubmesh],
     position: [f32; 3],
     rotation_deg: [f32; 3],
     center: (f32, f32),
+    scale: f32,
 ) -> WmoFlat {
     let q = placement_quat(rotation_deg);
     let mut out = WmoFlat {
@@ -969,7 +984,7 @@ fn build_wmo_flat(
         }
         let vtx0 = out.verts.len() as u32;
         for (i, p) in sm.positions.iter().enumerate() {
-            let r = q_rot(q, *p);
+            let r = q_rot(q, [p[0] * scale, p[1] * scale, p[2] * scale]);
             let (wx, wy, wz) = (
                 r[0] + position[0],
                 r[1] + position[1],
@@ -1064,7 +1079,7 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
         w.wmo_models.insert(model_path.clone(), subs);
     }
     let subs = &w.wmo_models[&model_path];
-    let flat = build_wmo_flat(subs, pos, rot, center);
+    let flat = build_wmo_flat(subs, pos, rot, center, 1.0);
     let n = flat.subs.len() as u32;
     w.wmo_flats.insert(i, flat);
     n
@@ -1170,6 +1185,181 @@ pub extern "C" fn bn_wmo_instance_texture(
         return 0;
     }
     let Some(sm) = wmo_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
+        return 0;
+    };
+    let bytes = sm.tex.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    1
+}
+
+// ---- doodads (MDDF terrain M2 placements): the WMO instance FFI mirrored ----
+
+/// MDDF doodad placements in the loaded tile (0 when no tile).
+#[no_mangle]
+pub extern "C" fn bn_doodad_count(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile.as_ref().map_or(0, |t| t.doodads.len() as u32)
+}
+
+/// The baked flat for doodad `i`, or `None` before `bn_doodad_load`.
+fn doodad_flat<'a>(world: *const BnWorld, i: u32) -> Option<&'a WmoFlat> {
+    if world.is_null() {
+        return None;
+    }
+    // SAFETY: caller owns a valid const handle.
+    unsafe { &*world }.doodad_flats.get(&i)
+}
+
+/// Bake doodad `i` (load its M2 through the official `load_m2_mesh`, apply the
+/// MDDF placement with scale, cache). Returns the submesh count on success
+/// (UE iterates `[0, n)`), 0 on a miss or load failure.
+#[no_mangle]
+pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees an exclusive valid handle.
+    let w = unsafe { &mut *world };
+    if let Some(f) = w.doodad_flats.get(&i) {
+        return f.subs.len() as u32;
+    }
+    let Some((model_path, pos, rot, scale, center)) = w.tile.as_ref().and_then(|t| {
+        t.doodads.get(i as usize).map(|d| {
+            (
+                d.model.clone(),
+                d.position,
+                d.rotation,
+                d.scale,
+                t.center,
+            )
+        })
+    }) else {
+        return 0;
+    };
+    if !w.doodad_models.contains_key(&model_path) {
+        let Some(chain) = w.chain.as_mut() else {
+            return 0;
+        };
+        // `.mdx` -> `.m2` normalization happens inside load_m2_mesh.
+        let Ok(subs) = benilla_formats::load_m2_mesh(chain, &model_path) else {
+            return 0;
+        };
+        w.doodad_models.insert(model_path.clone(), subs);
+    }
+    let subs = &w.doodad_models[&model_path];
+    let flat = build_wmo_flat(subs, pos, rot, center, scale);
+    let n = flat.subs.len() as u32;
+    w.doodad_flats.insert(i, flat);
+    n
+}
+
+/// Baked vertex count of doodad `i` (0 before load).
+#[no_mangle]
+pub extern "C" fn bn_doodad_vertex_count(world: *const BnWorld, i: u32) -> u32 {
+    doodad_flat(world, i).map_or(0, |f| f.verts.len() as u32)
+}
+
+/// Baked triangle-index count of doodad `i` (0 before load).
+#[no_mangle]
+pub extern "C" fn bn_doodad_index_count(world: *const BnWorld, i: u32) -> u32 {
+    doodad_flat(world, i).map_or(0, |f| f.idx.len() as u32)
+}
+
+/// Fill `out` (pre-allocated to `cap`) with doodad `i`'s vertices.
+#[no_mangle]
+pub extern "C" fn bn_doodad_fill_vertices(
+    world: *const BnWorld,
+    i: u32,
+    out: *mut BnVertex,
+    cap: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = doodad_flat(world, i) else { return 0 };
+    let n = f.verts.len().min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr(), out, n) };
+    n as u32
+}
+
+/// Fill `out` (pre-allocated to `cap`) with doodad `i`'s triangles;
+/// `material` carries the submesh index, `flags` the M2 material two-sided bit
+/// (0x04), matching the WMO/terrain convention the UE builder reads.
+#[no_mangle]
+pub extern "C" fn bn_doodad_fill_triangles(
+    world: *const BnWorld,
+    i: u32,
+    out: *mut BnTriangle,
+    cap: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = doodad_flat(world, i) else { return 0 };
+    let n = f.idx.len().min(cap as usize);
+    for (j, sm) in f.subs.iter().enumerate() {
+        if (sm.idx0 as usize) >= n {
+            break;
+        }
+        let end = (sm.idx0 as usize + sm.idx_n as usize).min(n);
+        for k in (sm.idx0 as usize..end).step_by(3) {
+            unsafe {
+                *out.add(k) = BnTriangle {
+                    a: f.idx[k],
+                    b: f.idx[k + 1],
+                    c: f.idx[k + 2],
+                    material: j.min(255) as u8,
+                    flags: if sm.two_sided { 1 } else { 0 },
+                };
+            }
+        }
+    }
+    n as u32
+}
+
+/// Submesh `j` of doodad `i`: writes {vtx0, vtx_n, idx0, idx_n}. Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_doodad_submesh(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    out: *mut u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(sm) = doodad_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
+        return 0;
+    };
+    unsafe {
+        *out = sm.vtx0;
+        *out.add(1) = sm.vtx_n;
+        *out.add(2) = sm.idx0;
+        *out.add(3) = sm.idx_n;
+    }
+    1
+}
+
+/// Submesh `j` of doodad `i` texture path into `buf` (NUL-terminated).
+#[no_mangle]
+pub extern "C" fn bn_doodad_texture(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(sm) = doodad_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
         return 0;
     };
     let bytes = sm.tex.as_bytes();
