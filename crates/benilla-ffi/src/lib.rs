@@ -106,6 +106,10 @@ pub struct BnWorld {
     /// Baked tile-local WMO geometry by instance index (rebuilt on tile load).
     wmo_flats: HashMap<u32, WmoFlat>,
 
+    /// Model-space group MLIQ (WMO liquid) meshes by root path: read once per
+    /// model, re-placed per instance into the tile's liquid buffer.
+    wmo_group_liquids: HashMap<String, Vec<benilla_formats::LiquidMesh>>,
+
     /// Parsed doodad (terrain M2) geometry by model path, shared by placements.
     doodad_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
 
@@ -243,6 +247,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         wmo_models: HashMap::new(),
 
         wmo_flats: HashMap::new(),
+
+        wmo_group_liquids: HashMap::new(),
 
         doodad_models: HashMap::new(),
 
@@ -1226,6 +1232,96 @@ fn wmo_flat<'a>(world: *const BnWorld, i: u32) -> Option<&'a WmoFlat> {
     unsafe { &*world }.wmo_flats.get(&i)
 }
 
+/// A WMO's model-space group MLIQ surfaces, read once per root path: the root
+/// for its group count, then each `{stem}_{gi:03}.wmo` for its liquid. Path
+/// handling mirrors the official `load_wmo` exactly (lowercased root, stem
+/// without the extension, three-digit group suffix).
+fn read_wmo_group_liquids(
+    chain: Option<&mut benilla_formats::Chain>,
+    raw_path: &str,
+) -> Vec<benilla_formats::LiquidMesh> {
+    let Some(chain) = chain else {
+        return Vec::new();
+    };
+    let root_path = raw_path.to_ascii_lowercase();
+    let Ok(root_bytes) = chain.read_file(&root_path) else {
+        return Vec::new();
+    };
+    let Ok(root) = benilla_formats::parse_wmo_root(&root_bytes) else {
+        return Vec::new();
+    };
+    let stem = root_path.strip_suffix(".wmo").unwrap_or(&root_path);
+    (0..root.group_count())
+        .filter_map(|gi| {
+            let bytes = chain.read_file(&format!("{stem}_{gi:03}.wmo")).ok()?;
+            benilla_formats::wmo_group_liquid_mesh(&bytes)
+        })
+        .collect()
+}
+
+/// Bake one WMO placement's MLIQ surfaces into the tile's liquid buffer: model
+/// space through the placement quaternion and position, then the same
+/// tile-local WoW->UE mirror `build_wmo_flat` applies to the geometry, so the
+/// host's existing liquid pass picks the canals up unchanged.
+fn append_wmo_liquids(
+    w: &mut BnWorld,
+    model_path: &str,
+    position: [f32; 3],
+    rotation_deg: [f32; 3],
+    center: (f32, f32),
+) {
+    if !w.wmo_group_liquids.contains_key(model_path) {
+        let meshes = read_wmo_group_liquids(w.chain.as_mut(), model_path);
+        w.wmo_group_liquids.insert(model_path.to_string(), meshes);
+    }
+    // Disjoint field borrows: the tile buffer and the path-keyed cache.
+    let (Some(tile), Some(meshes)) = (
+        w.tile.as_mut(),
+        w.wmo_group_liquids.get(model_path),
+    ) else {
+        return;
+    };
+    let q = placement_quat(rotation_deg);
+    for m in meshes {
+        // u16 builder cap, same as the ADT liquid loop.
+        if tile.lverts.len() + m.positions.len() > u16::MAX as usize {
+            return;
+        }
+        let vtx0 = tile.lverts.len() as u32;
+        for (vi, p) in m.positions.iter().enumerate() {
+            let r = q_rot(q, *p);
+            let (wx, wy, wz) = (
+                r[0] + position[0],
+                r[1] + position[1],
+                r[2] + position[2],
+            );
+            let (x, y, z) = wow_vec_to_ue(wx - center.0, wy - center.1, wz);
+            let uv = m.uvs.get(vi).copied().unwrap_or([0.0, 0.0]);
+            tile.lverts.push(BnVertex {
+                x,
+                y,
+                z,
+                // Flat up as on the ADT path; the host draws liquids with a
+                // constant up normal.
+                nx: 0.0,
+                ny: 0.0,
+                nz: 1.0,
+                u: uv[0],
+                v: uv[1],
+            });
+        }
+        let idx0 = tile.lidx.len() as u32;
+        for &i in &m.indices {
+            tile.lidx.push((vtx0 + i) as u16);
+        }
+        tile.liquids.push(LiquidRange {
+            idx0,
+            idx_n: tile.lidx.len() as u32 - idx0,
+            kind: liquid_kind_code(m.kind),
+        });
+    }
+}
+
 /// MODF WMO instances in the loaded tile (0 when no tile).
 #[no_mangle]
 pub extern "C" fn bn_wmo_instance_count(world: *const BnWorld) -> u32 {
@@ -1292,6 +1388,11 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     let flat = build_wmo_flat(subs, pos, rot, center, 1.0, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
     w.wmo_flats.insert(i, flat);
+    // MLIQ (Stormwind canals): place the model's group liquids beside the ADT
+    // MCLQ so the host's liquid pass picks them up unchanged. The cache above
+    // early-returns, so each instance appends exactly once per tile rebuild
+    // (`bn_load_tile` clears wmo_flats together with the old tile buffer).
+    append_wmo_liquids(w, &model_path, pos, rot, center);
     n
 }
 

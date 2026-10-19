@@ -23,6 +23,15 @@ fn main() {
             println!("{map}_{x}_{z}: load FAILED");
             continue;
         }
+        // WMO MLIQ: bake every instance first, so group liquids (Stormwind
+        // canals) join the tile's liquid buffer beside the ADT MCLQ.
+        let wn = bn_wmo_instance_count(cworld);
+        let mut wok = 0u32;
+        for i in 0..wn {
+            if bn_wmo_instance_load(world, i) > 0 {
+                wok += 1;
+            }
+        }
         let vn = bn_liquid_vertex_count(cworld);
         let ic = bn_liquid_index_count(cworld);
         let n = bn_liquid_count(cworld);
@@ -48,11 +57,24 @@ fn main() {
         }
         assert_eq!(wv, vn, "vertex fill count mismatch");
         assert_eq!(wi, ic, "index fill count mismatch");
+        // Tile-local bbox of the liquid buffer: must sit near the tile centre
+        // (|x|,|y| <= 1700), proving the WMO placement transform landed.
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for v in &verts[..vn as usize] {
+            minx = minx.min(v.x);
+            maxx = maxx.max(v.x);
+            miny = miny.min(v.y);
+            maxy = maxy.max(v.y);
+        }
+        let in_range = vn == 0
+            || (minx.abs() <= 1700.0 && maxx.abs() <= 1700.0 && miny.abs() <= 1700.0 && maxy.abs() <= 1700.0);
         println!(
             "{map}_{x}_{z}: meshes={n} verts={vn} idx={ic} \
-             water={} ocean={} magma={} bad={}",
+             water={} ocean={} magma={} bad={} wmos={wok}/{wn} bbox=({minx:.0},{miny:.0})..({maxx:.0},{maxy:.0})",
             kinds[0], kinds[1], kinds[2], bad
         );
+        assert!(in_range, "liquid bbox outside the tile-local window");
+        assert!(bad == 0, "malformed liquid ranges");
     }
     bn_shutdown(world);
 }
