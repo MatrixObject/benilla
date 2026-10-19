@@ -3781,3 +3781,183 @@ pub extern "C" fn bn_texture(
 
 }
 
+// ---- UI (stage 3): stock FrameXML load + widget-tree dump ----
+//
+// Read-only use of the official `benilla-ui` engine: `bn_ui_load` runs every
+// row of the chain's `FrameXML.toc` into a fresh in-game VM, `bn_ui_dump`
+// walks the resulting frame/region tree through the engine's own Lua API and
+// returns it as TSV text (phase 1: verify the data link in Rust; UE renders
+// in phase 2).
+
+use std::cell::RefCell;
+
+thread_local! {
+    /// The in-game UI session, created by `bn_ui_load`. mlua's Lua is `!Send`
+    /// (no `send` feature), so the VM lives on the loading thread; the host
+    /// drives load and dump from its one UI thread.
+    static BN_UI: RefCell<Option<benilla_ui::script::UiScript>> = const { RefCell::new(None) };
+}
+
+/// The dump script: one `F` line per frame, one `R` line per region, tabs
+/// within any field squashed. Each frame is `pcall`ed so one bad widget never
+/// sinks the whole dump. WoW 1.12 runs Lua 5.0: no `#` length operator —
+/// `table.getn`/`table.insert` instead.
+const UI_DUMP_LUA: &str = r#"
+    local function num(v)
+        if v == nil then return "0" end
+        return string.format("%.1f", v)
+    end
+    local function clean(s)
+        if s == nil then return "" end
+        return (string.gsub(tostring(s), "[\t\r\n]", " "))
+    end
+    local function dump_one(f)
+        local mine = {}
+        table.insert(mine, table.concat({ "F", clean(f:GetName()),
+            f:IsShown() and "1" or "0", clean(f:GetFrameStrata()),
+            tostring(f:GetFrameLevel() or 0), num(f:GetLeft()), num(f:GetTop()),
+            num(f:GetWidth()), num(f:GetHeight()) }, "\t"))
+        for _, r in ipairs({ f:GetRegions() }) do
+            local ty = clean(r:GetObjectType())
+            local extra = ""
+            if ty == "Texture" then
+                extra = clean(r:GetTexture())
+            elseif ty == "FontString" then
+                extra = clean(r:GetText())
+            end
+            table.insert(mine, table.concat({ "R", clean(f:GetName()),
+                clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
+                num(r:GetWidth()), num(r:GetHeight()), extra }, "\t"))
+        end
+        return mine
+    end
+    local out = {}
+    local f = EnumerateFrames()
+    while f do
+        local ok, lines = pcall(dump_one, f)
+        if ok and type(lines) == "table" then
+            for i = 1, table.getn(lines) do
+                table.insert(out, lines[i])
+            end
+        end
+        f = EnumerateFrames(f)
+    end
+    return table.concat(out, "\n")
+"#;
+
+/// Load the stock interface into a fresh in-game VM: every row of the chain's
+/// `Interface\FrameXML\FrameXML.toc`, in order (`.lua` runs as a chunk, `.xml`
+/// through the official loader). File and loader failures are tolerated and
+/// skipped. Returns the live frame count at load end, or 0 on failure.
+#[no_mangle]
+pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees a valid exclusive handle for the call's span.
+    let w = unsafe { &*world };
+    let Some(chain) = w.chain.as_ref() else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(script) = benilla_ui::script::UiScript::new() else {
+            return 0u32;
+        };
+        let toc_bytes = chain
+            .read(r"Interface\FrameXML\FrameXML.toc")
+            .unwrap_or_default();
+        let toc = benilla_ui::toc::Toc::parse(&benilla_ui::source::decode(&toc_bytes));
+        // The loader resolves `<Script file=>`/`<Include file=>` against the
+        // document's dir (`dir_of` splits on `/` only), so hand `load_in` the
+        // entry with forward slashes; MPQ reads take backslashes.
+        let read = |req: &str| -> Option<Vec<u8>> {
+            chain.read(&req.replace('/', "\\")).ok()
+        };
+        let mut rows = 0u32;
+        let mut failures: Vec<String> = Vec::new();
+        for row in &toc.files {
+            let path = format!(r"Interface\FrameXML\{row}");
+            let Some(bytes) = read(&path) else {
+                failures.push(format!("{path}: not found"));
+                continue;
+            };
+            rows += 1;
+            if row.to_ascii_lowercase().ends_with(".lua") {
+                let name = format!("@{}", path.replace('/', "\\"));
+                if let Err(e) = script.run_chunk_named(&bytes, &name) {
+                    failures.push(format!("{path}: {e}"));
+                }
+                continue;
+            }
+            let Ok(doc) = benilla_ui::framexml::parse(&benilla_ui::source::decode(&bytes)) else {
+                failures.push(format!("{path}: parse error"));
+                continue;
+            };
+            let entry = path.replace('\\', "/");
+            let report = benilla_ui::loader::load_in(&script, &doc, &entry, &read);
+            failures.extend(
+                report
+                    .errors
+                    .iter()
+                    .map(|e| format!("{path}: {e}"))
+                    .chain(
+                        report
+                            .missing_files
+                            .iter()
+                            .map(|m| format!("{path}: missing {m}")),
+                    ),
+            );
+        }
+        let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
+        BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
+        eprintln!(
+            "bn_ui_load: {} toc rows, {} failures, {frames} frames",
+            rows,
+            failures.len()
+        );
+        for f in failures.iter().take(12) {
+            eprintln!("  fail {f}");
+        }
+        frames
+    }));
+    out.unwrap_or(0)
+}
+
+/// Dump the loaded UI tree as TSV text (see `UI_DUMP_LUA` for the format).
+/// Writes at most `cap - 1` bytes plus a NUL; returns bytes written (0 = no
+/// session or failure). Frames come in creation order, each frame's regions
+/// directly beneath it.
+#[no_mangle]
+pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let text = {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BN_UI.with(|slot| match slot.borrow().as_ref() {
+                Some(s) => match s.eval::<String>(UI_DUMP_LUA) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!("bn_ui_dump: eval failed: {e}");
+                        None
+                    }
+                },
+                None => {
+                    eprintln!("bn_ui_dump: no UI session (call bn_ui_load first)");
+                    None
+                }
+            })
+        }));
+        match out {
+            Ok(Some(t)) => t,
+            _ => return 0,
+        }
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+

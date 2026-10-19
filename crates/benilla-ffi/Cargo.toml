@@ -19,6 +19,8 @@ benilla-blp = { path = "../benilla-blp" }
 # Read-only use of the official adapters (adt_to_tile_mesh, load_wmo, Chain).
 # default-features off: skip the `dev` feature (bakes source-tree paths).
 benilla-formats = { path = "../benilla-formats", default-features = false }
+# Stock WoW UI engine (FrameXML loader + Lua VM), read-only use for stage 3.
+benilla-ui = { path = "../benilla-ui" }
 
 [[example]]
 name = "smoke"
