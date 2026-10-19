@@ -63,6 +63,32 @@ fn main() {
     );
     let (bytes, nf, shown, _) = dump_stats();
     println!("== login dump: {bytes} bytes, {nf} frames, {shown} shown");
+    println!(
+        "== screen root: {}x{}",
+        eval_str("return tostring(GetScreenWidth())"),
+        eval_str("return tostring(GetScreenHeight())")
+    );
+    // Actual coordinate bounds the login screen lays out to.
+    {
+        let mut buf = vec![0u8; 16 * 1024 * 1024];
+        let n = bn_ui_dump(buf.as_mut_ptr() as *mut i8, buf.len() as u32) as usize;
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        let (mut max_r, mut max_t) = (0.0f32, 0.0f32);
+        for line in text.lines().filter(|l| l.starts_with("R\t")) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() >= 8 {
+                if let (Ok(l), Ok(w), Ok(t)) = (
+                    f[4].parse::<f32>(),
+                    f[6].parse::<f32>(),
+                    f[5].parse::<f32>(),
+                ) {
+                    max_r = max_r.max(l + w);
+                    max_t = max_t.max(t);
+                }
+            }
+        }
+        println!("== login bounds: right={max_r} top={max_t}");
+    }
 
     // Frame names the login screen actually uses (1.12 spelling).
     {
@@ -134,6 +160,22 @@ fn main() {
     println!(
         "== event: {:?}",
         String::from_utf8_lossy(&ev[..n as usize]).to_string()
+    );
+
+    // Resize the root to a 16:9 viewport: dump coordinates must reflow to it
+    // so the render host can draw and point 1:1 in viewport pixels.
+    println!("== set_screen_size(1920,1080) -> {}", bn_ui_set_screen_size(1920.0, 1080.0));
+    println!(
+        "== screen root now: {}x{}",
+        eval_str("return tostring(GetScreenWidth())"),
+        eval_str("return tostring(GetScreenHeight())")
+    );
+    println!(
+        "== Button1 rect after reflow: L={} T={} W={} H={}",
+        eval_str("return tostring(CharSelectCharacterButton1:GetLeft())"),
+        eval_str("return tostring(CharSelectCharacterButton1:GetTop())"),
+        eval_str("return tostring(CharSelectCharacterButton1:GetWidth())"),
+        eval_str("return tostring(CharSelectCharacterButton1:GetHeight())"),
     );
 
     bn_shutdown(world);

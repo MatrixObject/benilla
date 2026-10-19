@@ -4367,6 +4367,24 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
     out.unwrap_or(0)
 }
 
+/// Set the screen root to a pixel size (origin top-left, y up inside the VM).
+/// The render host calls this with its viewport size after a load so dump
+/// coordinates and pointer coordinates are both viewport pixels; returns 1
+/// when the root changed (a layout reflow is due), 0 without a session.
+#[no_mangle]
+pub extern "C" fn bn_ui_set_screen_size(w: f32, h: f32) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => u32::from(script.set_screen_size(w, h)),
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
 /// Advance the loaded UI (OnUpdate handlers, hover re-pick, queued events) and
 /// apply the menu host's pending ops (the fake roster load). `elapsed` is
 /// seconds since the last call. Returns 1 with a session, 0 without.
@@ -4392,9 +4410,9 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
     out.unwrap_or(0)
 }
 
-/// Move the UI pointer to `(x, y)` in the dump's screen space (800x600,
-/// y up). Fires hover enter/leave like the reference's cursor walk. Returns 1
-/// with a session, 0 without.
+/// Move the UI pointer to `(x, y)` in the root's screen space (`bn_ui_set_
+/// screen_size`, y up). Fires hover enter/leave like the reference's cursor
+/// walk. Returns 1 with a session, 0 without.
 #[no_mangle]
 pub extern "C" fn bn_ui_mouse_move(x: f32, y: f32) -> u32 {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
