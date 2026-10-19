@@ -316,6 +316,29 @@ pub struct TileFlat {
     doodads: Vec<benilla_formats::Doodad>,
     /// Tile centre in WoW world axes (X/Y only); verts are world - centre.
     center: (f32, f32),
+    /// Flattened ADT liquid (MCLQ) surfaces: one vertex/index run per mesh,
+    /// tile-local through the same WoW->UE mirror as the terrain.
+    lverts: Vec<BnVertex>,
+    lidx: Vec<u16>,
+    liquids: Vec<LiquidRange>,
+}
+
+/// One liquid mesh's index range in the flattened liquid buffer and its
+/// material class: 0 water (still/rapids), 1 ocean, 2 magma/slime.
+struct LiquidRange {
+    idx0: u32,
+    idx_n: u32,
+    kind: u32,
+}
+
+/// The liquid kind as a material class (benilla_formats::LiquidKind).
+fn liquid_kind_code(k: benilla_formats::LiquidKind) -> u32 {
+    use benilla_formats::LiquidKind::*;
+    match k {
+        Still | Rapids => 0,
+        Ocean => 1,
+        Magma | Slime => 2,
+    }
 }
 
 /// Build the flattened tile from ADT bytes. Vertices become tile-local
@@ -345,6 +368,9 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
         wmos: tile.wmos.clone(),
         doodads: tile.doodads.clone(),
         center,
+        lverts: Vec::new(),
+        lidx: Vec::new(),
+        liquids: Vec::new(),
     };
     for c in &tile.chunks {
         // The UE builder uses u16 indices; never overflow the global buffer.
@@ -385,6 +411,40 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
             layers: c.layer_textures.clone(),
             alpha: c.alpha_map.clone(),
         });
+    }
+    // ADT liquid (MCLQ): own buffer, same tile-local + WoW->UE mirror as the
+    // terrain; each wet mesh is one contiguous index range for one material.
+    for c in &tile.chunks {
+        for m in &c.liquids {
+            if out.lverts.len() + m.positions.len() > u16::MAX as usize {
+                break; // u16 builder limit; past any shipped tile
+            }
+            let vtx0 = out.lverts.len() as u32;
+            for (i, p) in m.positions.iter().enumerate() {
+                let (x, y, z) = wow_vec_to_ue(p[0] - center.0, p[1] - center.1, p[2]);
+                let uv = m.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                out.lverts.push(BnVertex {
+                    x,
+                    y,
+                    z,
+                    // No MCNR on liquid: flat up (WoW +Z == UE +Z).
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    u: uv[0],
+                    v: uv[1],
+                });
+            }
+            let idx0 = out.lidx.len() as u32;
+            for &i in &m.indices {
+                out.lidx.push((vtx0 + i) as u16);
+            }
+            out.liquids.push(LiquidRange {
+                idx0,
+                idx_n: out.lidx.len() as u32 - idx0,
+                kind: liquid_kind_code(m.kind),
+            });
+        }
     }
     Some(out)
 }
@@ -660,6 +720,85 @@ pub extern "C" fn bn_terrain_fill_indices(
 
     n as u32
 
+}
+
+/// Liquid meshes (wet MCLQ surfaces) in the loaded tile (0 when no tile).
+#[no_mangle]
+pub extern "C" fn bn_liquid_count(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile.as_ref().map_or(0, |t| t.liquids.len() as u32)
+}
+
+/// Range of liquid mesh `i`: writes {idx0, idx_n, kind} (kind: 0 water,
+/// 1 ocean, 2 magma). Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_liquid_range(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(r) = w.tile.as_ref().and_then(|t| t.liquids.get(i as usize)) else {
+        return 0;
+    };
+    unsafe {
+        *out = r.idx0;
+        *out.add(1) = r.idx_n;
+        *out.add(2) = r.kind;
+    }
+    1
+}
+
+/// Liquid vertex count the UE side should pre-allocate.
+#[no_mangle]
+pub extern "C" fn bn_liquid_vertex_count(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile.as_ref().map_or(0, |t| t.lverts.len() as u32)
+}
+
+/// Liquid index count the UE side should pre-allocate.
+#[no_mangle]
+pub extern "C" fn bn_liquid_index_count(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    w.tile.as_ref().map_or(0, |t| t.lidx.len() as u32)
+}
+
+/// Fill `out` (pre-allocated) with liquid vertices. Returns count written.
+#[no_mangle]
+pub extern "C" fn bn_liquid_fill_vertices(
+    world: *const BnWorld,
+    out: *mut BnVertex,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(t) = w.tile.as_ref() else { return 0 };
+    let n = t.lverts.len().min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(t.lverts.as_ptr(), out, n) };
+    n as u32
+}
+
+/// Fill `out` (pre-allocated) with liquid triangle indices. Returns count written.
+#[no_mangle]
+pub extern "C" fn bn_liquid_fill_indices(world: *const BnWorld, out: *mut u16, cap: u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(t) = w.tile.as_ref() else { return 0 };
+    let n = t.lidx.len().min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(t.lidx.as_ptr(), out, n) };
+    n as u32
 }
 
 /// Per-chunk count of the loaded tile (0 when no tile).
