@@ -912,6 +912,8 @@ pub struct WmoSub {
     tex: String,
     /// MOMT flag 0x04: emit triangles two-sided (no back-face culling).
     two_sided: bool,
+    /// Blend class (0..4, 0x100 = additive), `bn_doodad_blend`'s encoding.
+    blend: u32,
 }
 
 /// One WMO instance baked into tile-local UE axes: `world = position + in_wow·v`,
@@ -1064,6 +1066,13 @@ fn build_wmo_flat(
             idx_n: out.idx.len() as u32 - idx0,
             tex,
             two_sided: sm.two_sided,
+            blend: match sm.blend {
+                benilla_formats::ModelBlend::Opaque => 0,
+                benilla_formats::ModelBlend::AlphaTest => 1,
+                benilla_formats::ModelBlend::Blend => 2,
+                benilla_formats::ModelBlend::Mod => 3,
+                benilla_formats::ModelBlend::Mod2x => 4,
+            } | if sm.additive { 0x100 } else { 0 },
         });
     }
     out
@@ -1254,6 +1263,27 @@ pub extern "C" fn bn_wmo_instance_texture(
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
         *buf.add(n) = 0;
+    }
+    1
+}
+
+/// Submesh `j` of instance `i` blend class: 0 Opaque, 1 AlphaTest, 2 Blend,
+/// 3 Mod, 4 Mod2x; bit 0x100 = additive. Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_blend(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    out: *mut u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(sm) = wmo_flat(world, i).and_then(|f| f.subs.get(j as usize)) else {
+        return 0;
+    };
+    unsafe {
+        *out = sm.blend;
     }
     1
 }
