@@ -445,6 +445,89 @@ pub extern "C" fn bn_load_tile(
 
 }
 
+// ---- streaming: the official residency window (benilla-world
+// terrain_stream/window.rs reimplemented as a pure function, because
+// benilla-world pulls in the whole bevy stack and cannot be a dependency
+// here): inner = 1 + trunc(farclip / CHUNK_SIZE) chunks,
+// outer = max(inner + 2, 8) chunks; a tile is wanted when any of its chunks
+// lies in the outer window.
+
+/// Chunks per tile edge (`chunk >> 4` is the tile); grid runs 0..=1023.
+const STREAM_CHUNKS_PER_TILE: i32 = 16;
+const STREAM_CHUNK_MAX: i32 = 64 * STREAM_CHUNKS_PER_TILE - 1;
+
+/// Wanted tiles `(x, z)` around the WoW-space focus for `farclip` view
+/// distance, filtered to tiles whose ADT exists in the archive chain (ocean
+/// / never-authored tiles drop out). Writes pairs into `out` (capacity
+/// `cap` pairs); returns the number of pairs written.
+#[no_mangle]
+pub extern "C" fn bn_stream_tiles(
+    world: *const BnWorld,
+    map_name: *const c_char,
+    farclip: f32,
+    wow_x: f32,
+    wow_y: f32,
+    out: *mut i32,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(map) = cstr_to_str(map_name) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees a valid, exclusive handle and out buffer.
+    let w = unsafe { &*world };
+
+    let (fx, fy) = benilla_formats::world_to_chunk(wow_x, wow_y);
+    let inner = 1 + (farclip / benilla_formats::CHUNK_SIZE).trunc() as i32;
+    let outer = (inner + 2).max(8);
+    let lo = |c: i32| (c - outer).clamp(0, STREAM_CHUNK_MAX) / STREAM_CHUNKS_PER_TILE;
+    let hi = |c: i32| (c + outer).clamp(0, STREAM_CHUNK_MAX) / STREAM_CHUNKS_PER_TILE;
+    let (x0, y0) = (lo(fx as i32), lo(fy as i32));
+    let (x1, y1) = (hi(fx as i32), hi(fy as i32));
+
+    let mut n = 0u32;
+    for tx in x0..=x1 {
+        for ty in y0..=y1 {
+            if n >= cap {
+                return n;
+            }
+            let path = format!("World\\Maps\\{map}\\{map}_{tx}_{ty}.adt");
+            if !w.archives.iter().rev().any(|a| a.contains(&path)) {
+                continue;
+            }
+            unsafe {
+                *out.add(n as usize * 2) = tx;
+                *out.add(n as usize * 2 + 1) = ty;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The loaded tile's centre in WoW yards (pre-mirror). Writes `[cx, cy]`;
+/// returns 2 on success, 0 when no tile is loaded. The UE side places the
+/// tile actor at `(cx, -cy) * kWowUnitToCm` — vertices are tile-local with
+/// the centre at the origin, mirrored and in the same units.
+#[no_mangle]
+pub extern "C" fn bn_tile_center(world: *const BnWorld, out: *mut f32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees a valid handle and a 2-float buffer.
+    let w = unsafe { &*world };
+    let Some(t) = w.tile.as_ref() else {
+        return 0;
+    };
+    unsafe {
+        *out = t.center.0;
+        *out.add(1) = t.center.1;
+    }
+    2
+}
+
 /// Terrain vertex count the UE side should pre-allocate.
 
 #[no_mangle]
