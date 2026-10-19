@@ -92,6 +92,10 @@ pub struct BnWorld {
     /// Real ADT terrain of the last `bn_load_tile`, when one loaded.
     tile: Option<TileFlat>,
 
+    /// Lowercase ADT path backing `tile` (and `mcnk`), for the same-tile
+    /// reload fast path: per-frame height queries must not re-parse the ADT.
+    tile_path: String,
+
     /// Official `benilla_formats::Chain` over the same Data dir, for `load_wmo`
     /// (the WMO reader takes a `Chain`, not the raw `Archive` list).
     chain: Option<benilla_formats::Chain>,
@@ -231,6 +235,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         mcnk: Vec::new(),
 
         tile: None,
+
+        tile_path: String::new(),
 
         chain: benilla_formats::Chain::open(data).ok(),
 
@@ -422,6 +428,14 @@ pub extern "C" fn bn_load_tile(
 
     let path = format!("World\\Maps\\{map}\\{map}_{x}_{z}.adt");
 
+    // Same-tile fast path: the host re-loads its tile before every height
+    // query (the shared handle holds one active tile), so a repeat must not
+    // re-parse the ADT - mcnk/tile/flats are all still valid for this path.
+    let path_lower = path.to_ascii_lowercase();
+    if w.tile.is_some() && w.tile_path == path_lower {
+        return w.mcnk.len() as u32;
+    }
+
     for a in w.archives.iter().rev() {
 
         if !a.contains(&path) {
@@ -437,8 +451,8 @@ pub extern "C" fn bn_load_tile(
                 if let benilla_adt::ParsedAdt::Root(root) = parsed {
 
                     w.mcnk = root.mcnk_chunks;
-
                     w.tile = build_tile_flat(&bytes);
+                    w.tile_path = path_lower;
 
                     // Instance indices address the new tile's MODF/MDDF lists;
                     // drop stale bakes (models stay cached: path-keyed).
