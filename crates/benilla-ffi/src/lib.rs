@@ -1067,6 +1067,29 @@ pub extern "C" fn bn_wmo_instance_count(world: *const BnWorld) -> u32 {
     w.tile.as_ref().map_or(0, |t| t.wmos.len() as u32)
 }
 
+/// MODF `unique_id` of instance `i` into `out`. Returns 1 on success.
+/// A straddling WMO appears in every overlapping tile's ADT with the same
+/// uid; the reference dedups by it (`0x694bc0`), and so does the host.
+#[no_mangle]
+pub extern "C" fn bn_wmo_unique_id(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(uid) = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.wmos.get(i as usize).map(|m| m.unique_id))
+    else {
+        return 0;
+    };
+    unsafe {
+        *out = uid;
+    }
+    1
+}
+
 /// Bake instance `i` (load its WMO model through the official `load_wmo`,
 /// transform into tile-local UE axes, cache). Returns the submesh count on
 /// success (UE iterates `[0, n)`), 0 on a miss or load failure.
@@ -1429,6 +1452,29 @@ pub extern "C" fn bn_doodad_model_path(
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
         *buf.add(n) = 0;
+    }
+    1
+}
+
+/// MDDF `unique_id` of doodad `i` into `out`. Returns 1 on success.
+/// A straddling doodad appears in every overlapping tile's ADT with the same
+/// uid; the reference dedups by it (`0x694bc0`), and so does the host.
+#[no_mangle]
+pub extern "C" fn bn_doodad_unique_id(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(uid) = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.doodads.get(i as usize).map(|d| d.unique_id))
+    else {
+        return 0;
+    };
+    unsafe {
+        *out = uid;
     }
     1
 }
