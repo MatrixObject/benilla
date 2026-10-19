@@ -989,6 +989,8 @@ fn build_wmo_flat(
     rotation_deg: [f32; 3],
     center: (f32, f32),
     scale: f32,
+    model_path: &str,
+    chain: Option<&benilla_formats::Chain>,
 ) -> WmoFlat {
     let q = placement_quat(rotation_deg);
     let mut out = WmoFlat {
@@ -1036,12 +1038,31 @@ fn build_wmo_flat(
             out.idx.push((vtx0 + t[1]) as u16);
             out.idx.push((vtx0 + t[2]) as u16);
         }
+        // Monster1/2/3 slots name no file: the client looks the skin up through
+        // CreatureDisplayInfo.dbc. Skin-less load, so infer candidates beside the
+        // model (`Creature\X\X.m2` -> XSkinBrown/White/Yellow.blp, then X.blp)
+        // and keep the first the chain holds (bn_model_texture_name does the
+        // same); otherwise the batch renders textureless.
+        let tex = sm.texture.clone().unwrap_or_else(|| {
+            if sm.skin_slot.is_none() {
+                return String::new();
+            }
+            let dir_end = model_path.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
+            let stem_end = model_path.rfind('.').unwrap_or(model_path.len());
+            let dir = &model_path[..dir_end];
+            let stem = &model_path[dir_end..stem_end];
+            ["SkinBrown", "SkinWhite", "SkinYellow", ""]
+                .iter()
+                .map(|s| format!("{dir}{stem}{s}.blp"))
+                .find(|c| chain.is_some_and(|ch| ch.contains(c)))
+                .unwrap_or_default()
+        });
         out.subs.push(WmoSub {
             vtx0,
             vtx_n: sm.positions.len() as u32,
             idx0,
             idx_n: out.idx.len() as u32 - idx0,
-            tex: sm.texture.clone().unwrap_or_default(),
+            tex,
             two_sided: sm.two_sided,
         });
     }
@@ -1120,7 +1141,7 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
         w.wmo_models.insert(model_path.clone(), subs);
     }
     let subs = &w.wmo_models[&model_path];
-    let flat = build_wmo_flat(subs, pos, rot, center, 1.0);
+    let flat = build_wmo_flat(subs, pos, rot, center, 1.0, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
     w.wmo_flats.insert(i, flat);
     n
@@ -1295,7 +1316,7 @@ pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
         w.doodad_models.insert(model_path.clone(), subs);
     }
     let subs = &w.doodad_models[&model_path];
-    let flat = build_wmo_flat(subs, pos, rot, center, scale);
+    let flat = build_wmo_flat(subs, pos, rot, center, scale, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
     w.doodad_flats.insert(i, flat);
     n
@@ -1475,6 +1496,116 @@ pub extern "C" fn bn_doodad_unique_id(world: *const BnWorld, i: u32, out: *mut u
     };
     unsafe {
         *out = uid;
+    }
+    1
+}
+
+/// The baked submesh `j` of loaded doodad `i`, or `None` before load / out of
+/// range (the flat's submesh order is the model's, possibly truncated at the
+/// u16 cap, so indexing the model cache mirrors the published ranges).
+fn doodad_submesh(w: &BnWorld, i: u32, j: u32) -> Option<&benilla_formats::RenderSubmesh> {
+    if !w.doodad_flats.contains_key(&i) {
+        return None;
+    }
+    let path = w.tile.as_ref()?.doodads.get(i as usize)?.model.clone();
+    w.doodad_models.get(&path)?.get(j as usize)
+}
+
+/// Material animation of loaded doodad `i` submesh `j` at `elapsed` seconds
+/// (the instance's attach age; one clock feeds both the gseq and band
+/// channels). Writes 6 floats into `out`: `uv.x, uv.y, r, g, b, alpha`
+/// (identity for absent channels: `[0,0]`, `[1,1,1]`, `1`). Returns a channel
+/// mask — 1 uv, 2 rgb, 4 alpha — or 0 when nothing animates (or the doodad
+/// is not loaded / has no such submesh). The host builds a parameter-driven
+/// MID only for masked submeshes and re-samples each frame.
+#[no_mangle]
+pub extern "C" fn bn_doodad_mat_anim(
+    world: *const BnWorld,
+    i: u32,
+    j: u32,
+    elapsed: f64,
+    out: *mut f32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(sm) = doodad_submesh(w, i, j) else {
+        return 0;
+    };
+    let band = elapsed as f32;
+    let mut mask = 0u32;
+
+    // Shared loop first (baked against slot 0); the per-seq variant only
+    // exists when the slots disagree, where a placed doodad reads slot 0.
+    let mut uv = [0.0f32, 0.0];
+    let uv_loop = sm
+        .uv_anim
+        .as_ref()
+        .or_else(|| sm.uv_seq.as_ref().and_then(|s| s.seq(None)));
+    if let Some(a) = uv_loop {
+        uv = a.sample(a.clock(band, elapsed));
+        mask |= 1;
+    }
+
+    let mut rgb = [1.0f32, 1.0, 1.0];
+    let rgb_loop = sm
+        .rgb_anim
+        .as_ref()
+        .or_else(|| sm.rgb_seq.as_ref().and_then(|s| s.seq(None)));
+    if let Some(a) = rgb_loop {
+        rgb = a.sample(a.clock(band, elapsed));
+        mask |= 2;
+    }
+
+    // Placed-doodad lane: no playing sequence, so slot 0; color × weight.
+    let alpha = match sm.alpha_anim.as_ref() {
+        Some(a) => {
+            mask |= 4;
+            a.sample(None, band, elapsed)
+        }
+        None => 1.0,
+    };
+
+    unsafe {
+        *out.add(0) = uv[0];
+        *out.add(1) = uv[1];
+        *out.add(2) = rgb[0];
+        *out.add(3) = rgb[1];
+        *out.add(4) = rgb[2];
+        *out.add(5) = alpha;
+    }
+    mask
+}
+
+/// Blend class of loaded doodad `i` submesh `j` into `out`: 0 opaque, 1
+/// alpha-test, 2 alpha-blend, 3 mod, 4 mod2x — plus bit `0x100` when the batch
+/// draws additive (M2 blend 3/4 glow). The host picks the material's blend mode
+/// from it (foliage cutout needs masked, not opaque). Returns 1 on success, 0
+/// when the doodad is not loaded / has no such submesh.
+#[no_mangle]
+pub extern "C" fn bn_doodad_blend(world: *const BnWorld, i: u32, j: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(sm) = doodad_submesh(w, i, j) else {
+        return 0;
+    };
+    let mut v = match sm.blend {
+        benilla_formats::ModelBlend::Opaque => 0,
+        benilla_formats::ModelBlend::AlphaTest => 1,
+        benilla_formats::ModelBlend::Blend => 2,
+        benilla_formats::ModelBlend::Mod => 3,
+        benilla_formats::ModelBlend::Mod2x => 4,
+    };
+    if sm.additive {
+        v |= 0x100;
+    }
+    unsafe {
+        *out = v;
     }
     1
 }
@@ -2301,16 +2432,22 @@ pub extern "C" fn bn_model_texture_name(
 
             let is_empty = name_bytes.is_empty();
 
-            // Monster1 (11) slots name no file: the WoW client looks the skin up
-            // through CreatureDisplayInfo.dbc. POC: infer the brown-skin path
-            // from the model path (`Creature\X\X.m2` → `Creature\X\XSkinBrown.blp`).
-            // Other empty slots stay empty.
-            let text: Vec<u8> = if is_empty && tex_type == 11 {
-                let dir_end = p.rfind('\\').map(|i| i + 1).unwrap_or(0);
+            // Monster1/2/3 (11..=13) slots name no file: the WoW client looks
+            // the skin up through CreatureDisplayInfo.dbc. Skin-less load, so
+            // infer candidates beside the model (`Creature\X\X.m2` ->
+            // XSkinBrown/White/Yellow.blp, then X.blp) and keep the first the
+            // chain holds; other empty slots stay empty.
+            let text: Vec<u8> = if is_empty && (11..=13).contains(&tex_type) {
+                let dir_end = p.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
                 let stem_end = p.rfind('.').unwrap_or(p.len());
                 let dir = &p[..dir_end];
                 let stem = &p[dir_end..stem_end];
-                format!("{dir}{stem}SkinBrown.blp").into_bytes()
+                ["SkinBrown", "SkinWhite", "SkinYellow", ""]
+                    .iter()
+                    .map(|s| format!("{dir}{stem}{s}.blp"))
+                    .find(|c| w.chain.as_ref().is_some_and(|ch| ch.contains(c)))
+                    .unwrap_or_default()
+                    .into_bytes()
             } else if is_empty {
                 return 0;
             } else {
