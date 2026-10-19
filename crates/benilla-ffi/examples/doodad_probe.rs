@@ -128,7 +128,12 @@ fn main() {
             if benilla::bn_doodad_submesh(w, i, j, r.as_mut_ptr()) == 1 {
                 let t = tex_of(w, i, j);
                 uniq_tex.insert(t.clone());
-                println!("  sub {j}: vtx0={} vtx_n={} idx0={} idx_n={} tex={t}", r[0], r[1], r[2], r[3]);
+                let mut wrap = 0u32;
+                let wok = benilla::bn_doodad_wrap(w, i, j, &mut wrap);
+                println!(
+                    "  sub {j}: vtx0={} vtx_n={} idx0={} idx_n={} tex={t} wrap={wok}:{wrap:#x}",
+                    r[0], r[1], r[2], r[3]
+                );
             }
         }
     }

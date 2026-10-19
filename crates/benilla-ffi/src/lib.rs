@@ -1986,6 +1986,28 @@ pub extern "C" fn bn_doodad_blend(world: *const BnWorld, i: u32, j: u32, out: *m
     1
 }
 
+/// Texture address mode of loaded doodad `i` submesh `j` into `out`: bit0 =
+/// wrap U, bit1 = wrap V (M2 texture record `flags & 0x1/0x2`; absent record
+/// repeats both). The host keys its BLP cache per mode so a cutout card
+/// clamps to its transparent margin instead of wrapping into the opaque
+/// middle. Returns 1 on success, 0 when the doodad is not loaded / has no
+/// such submesh.
+#[no_mangle]
+pub extern "C" fn bn_doodad_wrap(world: *const BnWorld, i: u32, j: u32, out: *mut u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(sm) = doodad_submesh(w, i, j) else {
+        return 0;
+    };
+    unsafe {
+        *out = (sm.wrap_x as u32) | ((sm.wrap_y as u32) << 1);
+    }
+    1
+}
+
 #[cfg(test)]
 mod wmo_placement_tests {
     use super::*;
