@@ -4979,7 +4979,7 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
         return 0;
     };
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let Ok(script) = benilla_ui::script::UiScript::new() else {
+        let Ok(mut script) = benilla_ui::script::UiScript::new() else {
             return 0u32;
         };
         let toc_bytes = chain
@@ -5028,6 +5028,9 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
             );
         }
         let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
+        // The load's last step is arming `PLAYER_LOGIN` (UI_Init `0x49011d`);
+        // `bn_ui_world_enter` spends it once the player is in the world.
+        script.arm_player_login();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
         eprintln!(
             "bn_ui_load: {} toc rows, {} failures, {frames} frames",
@@ -5038,6 +5041,46 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
             eprintln!("  fail {f}");
         }
         frames
+    }));
+    out.unwrap_or(0)
+}
+
+/// Fire the UI's world-entry cascade after `bn_ui_load`, mirroring the app's
+/// host feed: `FRAMES_LOADED`, `VARIABLES_LOADED`, the chat loader's
+/// `UPDATE_CHAT_WINDOWS` + `UPDATE_CHAT_COLOR` rows, then the login cascade
+/// (`PLAYER_LOGIN` once, `PLAYER_ENTERING_WORLD`). Without it the stock UI
+/// stays half-initialised — e.g. the chat panel never gets its black window
+/// tint and paints as an opaque white block. Returns 1 when a session ran,
+/// 0 without one.
+#[no_mangle]
+pub extern "C" fn bn_ui_world_enter() -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else { return 0u32 };
+            script.fire_event("FRAMES_LOADED", Vec::new());
+            script.fire_event("VARIABLES_LOADED", Vec::new());
+            // `FCF_OnUpdate` reads `UIOptionsFrame:IsShown()` every frame; stand
+            // in a closed one, as the reference's chat loader does.
+            let _ = script.run(
+                "if not UIOptionsFrame then UIOptionsFrame = CreateFrame('Frame') UIOptionsFrame:Hide() end",
+            );
+            script.fire_event("UPDATE_CHAT_WINDOWS", Vec::new());
+            for entry in script.chat_colors() {
+                let norm = |b: u8| f64::from(b as f32 * (1.0f32 / 255.0f32));
+                script.fire_event(
+                    "UPDATE_CHAT_COLOR",
+                    vec![
+                        benilla_ui::script::ScriptValue::Str(entry.name),
+                        benilla_ui::script::ScriptValue::Number(norm(entry.rgb[0])),
+                        benilla_ui::script::ScriptValue::Number(norm(entry.rgb[1])),
+                        benilla_ui::script::ScriptValue::Number(norm(entry.rgb[2])),
+                    ],
+                );
+            }
+            script.fire_world_enter();
+            1
+        })
     }));
     out.unwrap_or(0)
 }
