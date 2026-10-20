@@ -5023,6 +5023,56 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
     out.unwrap_or(0)
 }
 
+/// The focused EditBox's text-region rect `(left, top, height)` from a dump's
+/// own rows: the OVERLAY FontString under `frame` (the ctor's anonymous text
+/// region; the static label sits on BACKGROUND). Script-space px, y up.
+fn editbox_text_rect_from_dump(text: &str, frame: &str) -> Option<(f32, f32, f32)> {
+    let want = format!("F\t{}\t", frame);
+    let mut in_block = false;
+    for line in text.lines() {
+        if line.starts_with("F\t") {
+            in_block = line.starts_with(&want);
+            continue;
+        }
+        if !in_block || !line.starts_with("R\t") {
+            continue;
+        }
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() > 27 && c[3] == "FontString" && c[27] == "OVERLAY" {
+            let left = c[4].parse().ok()?;
+            let top = c[5].parse().ok()?;
+            let height = c[7].parse().ok()?;
+            return Some((left, top, height));
+        }
+    }
+    None
+}
+
+/// Insert `row` at the end of `frame`'s row block (before the next F row), so
+/// the synthetic region stays attached to its frame in the TSV.
+fn insert_after_frame_block(text: &str, frame: &str, row: &str) -> String {
+    let want = format!("F\t{}\t", frame);
+    let mut out = String::with_capacity(text.len() + row.len() + 1);
+    let mut in_block = false;
+    let mut inserted = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("F\t") {
+            if in_block && !inserted {
+                out.push_str(row);
+                out.push('\n');
+                inserted = true;
+            }
+            in_block = line.starts_with(&want);
+        }
+        out.push_str(line);
+    }
+    if in_block && !inserted {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
+}
+
 /// Dump the loaded UI tree as TSV text (see `UI_DUMP_LUA` for the format).
 /// Writes at most `cap - 1` bytes plus a NUL; returns bytes written (0 = no
 /// session or failure). Only `IsVisible()` frames come out (invisible ones
@@ -5033,7 +5083,7 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     if buf.is_null() || cap == 0 {
         return 0;
     }
-    let text = {
+    let mut text = {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             BN_UI.with(|slot| match slot.borrow().as_ref() {
                 Some(s) => match s.eval::<String>(UI_DUMP_LUA) {
@@ -5054,6 +5104,63 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
             _ => return 0,
         }
     };
+    // The EditBox caret seam: the host round trip (advances in, text UI out)
+    // answered with the FFI's own font engine, then a synthetic caret region
+    // row appended for the focused box. The VM builds the caret as a
+    // textureless region the dump cannot express, and without the advance
+    // table `focused_editbox_text_ui` reports no caret at all - both reasons
+    // the host never saw one. Measured in script-space px (seam 1): the drawn
+    // size is the em-capped font height times the box's scale, so no seam
+    // division rides along.
+    let caret = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| -> Option<(String, f32, f32)> {
+            let mut held = slot.borrow_mut();
+            let s = held.as_mut()?;
+            if let Some(req) = s.editbox_advances_request() {
+                let outline = (req.outline as u8) as u32;
+                let em = req.height.map_or(12.0, |h| h.min(32.0));
+                let size_px = em * req.scale;
+                let font = req.font.as_deref();
+                let cum = ui_font::advances_bytes(font, size_px, outline, &req.text);
+                let (rows, cell_h) = match req.wrap_width {
+                    Some(w) => {
+                        let (r, ch) = ui_font::wrap_rows(
+                            font,
+                            &req.text,
+                            size_px,
+                            outline,
+                            w * req.scale,
+                            req.spacing * req.scale,
+                        );
+                        (r, ch)
+                    }
+                    None => (vec![0usize], size_px),
+                };
+                s.set_editbox_advances(req.id, req.key, cum, rows, cell_h);
+            }
+            let tui = s.focused_editbox_text_ui()?;
+            let name = s.focused_editbox_name()?;
+            Some((name, tui.caret_x, tui.cell_h))
+        })
+    }));
+    if let Ok(Some((frame, caret_x, cell_h))) = caret {
+        if let Some((left, top, height)) = editbox_text_rect_from_dump(&text, &frame) {
+            // Middle-justified single line: the cell centres in the region.
+            const FULL_UV: &str =
+                "0.0000\t0.0000\t1.0000\t0.0000\t1.0000\t1.0000\t0.0000\t1.0000";
+            let caret_top = top - (height - cell_h).max(0.0) * 0.5;
+            let row = format!(
+                "R\t{}\tbn_caret\tTexture\t{:.1}\t{:.1}\t1.5\t{:.1}\tSolid Texture\t\
+                 1.00\t1.00\t1.00\t1.00\t1.00\t\t0.0\t\tLEFT\tMIDDLE\t{}\tOVERLAY",
+                frame,
+                left + caret_x,
+                caret_top,
+                cell_h.max(1.0),
+                FULL_UV
+            );
+            text = insert_after_frame_block(&text, &frame, &row);
+        }
+    }
     let n = (text.len() as u64).min(cap as u64 - 1) as usize;
     unsafe {
         std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
@@ -5281,6 +5388,11 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
     let Some(chain) = w.chain.as_ref() else {
         return 0;
     };
+    // Warm the FONTS cache now: bn_ui_dump's EditBox advance measurement runs
+    // through cached_font, which has no world handle to read the MPQs with.
+    // (bn_ui_text_bitmap loads lazily, but the caret must measure before any
+    // label has been rasterised.)
+    ui_font::preload_fonts(chain);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Ok(mut script) = UiScript::new_glue() else {
             return 0u32;
