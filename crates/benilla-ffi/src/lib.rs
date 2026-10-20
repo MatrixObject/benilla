@@ -4924,10 +4924,20 @@ const UI_DUMP_LUA: &str = r#"
     local out = {}
     local f = EnumerateFrames()
     while f do
-        local ok, lines = pcall(dump_one, f)
-        if ok and type(lines) == "table" then
-            for i = 1, table.getn(lines) do
-                table.insert(out, lines[i])
+        -- Invisible frames emit nothing at all, not even the F row. Their
+        -- regions can never draw (the renderer gates on IsVisible), and the
+        -- per-row string building is the whole cost of the dump: walking all
+        -- frames is 4ms, dumping every row was 567ms at 3749 frames / 12482
+        -- regions (12ms skipping invisible frames; only ~58 frames are ever
+        -- visible). Creation order still holds for the rows that remain -
+        -- SortFrame only compares visible frames against each other - so the
+        -- paint order is unchanged.
+        if f:IsVisible() then
+            local ok, lines = pcall(dump_one, f)
+            if ok and type(lines) == "table" then
+                for i = 1, table.getn(lines) do
+                    table.insert(out, lines[i])
+                end
             end
         end
         f = EnumerateFrames(f)
@@ -5015,8 +5025,9 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
 
 /// Dump the loaded UI tree as TSV text (see `UI_DUMP_LUA` for the format).
 /// Writes at most `cap - 1` bytes plus a NUL; returns bytes written (0 = no
-/// session or failure). Frames come in creation order, each frame's regions
-/// directly beneath it.
+/// session or failure). Only `IsVisible()` frames come out (invisible ones
+/// can never paint), in creation order, each frame's regions directly beneath
+/// it.
 #[no_mangle]
 pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     if buf.is_null() || cap == 0 {
