@@ -36,6 +36,10 @@ mod model_anim;
 
 mod char_skin;
 
+// ---- Distant low-detail terrain (WDL far band) ----
+
+mod wdl_far;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -113,6 +117,10 @@ pub struct BnWorld {
     /// Parsed WMO geometry by root path, shared by every placement of a model.
     wmo_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
 
+    /// Distant low-detail WDL of `wdl_map` (the coarse horizon band).
+    wdl: Option<benilla_formats::WdlFile>,
+    wdl_map: String,
+
     /// Baked tile-local WMO geometry by instance index (rebuilt on tile load).
     wmo_flats: HashMap<u32, WmoFlat>,
 
@@ -156,7 +164,7 @@ fn wow_to_ue(px: f32, py: f32, pz: f32) -> BnVertex {
 
 /// Convert a WoW normal/vector to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
 
-fn wow_vec_to_ue(vx: f32, vy: f32, vz: f32) -> (f32, f32, f32) {
+pub(crate) fn wow_vec_to_ue(vx: f32, vy: f32, vz: f32) -> (f32, f32, f32) {
 
     (vx, -vy, vz)
 
@@ -255,6 +263,9 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         chain: benilla_formats::Chain::open(data).ok(),
 
         wmo_models: HashMap::new(),
+
+        wdl: None,
+        wdl_map: String::new(),
 
         wmo_flats: HashMap::new(),
 
