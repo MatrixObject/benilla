@@ -68,11 +68,13 @@ pub struct BnVertex {
 
 pub struct BnTriangle {
 
-    pub a: u16,
+    // u32, not u16: a single WMO instance bakes up to ~840k verts (Stormwind),
+    // so u16 indices silently truncated every building over 65535 verts.
+    pub a: u32,
 
-    pub b: u16,
+    pub b: u32,
 
-    pub c: u16,
+    pub c: u32,
 
     pub material: u8,
 
@@ -1171,7 +1173,7 @@ pub struct WmoSub {
 /// then `(world − centre)` through the WoW->UE mirror, contiguous per submesh.
 pub struct WmoFlat {
     verts: Vec<BnVertex>,
-    idx: Vec<u16>,
+    idx: Vec<u32>,
     subs: Vec<WmoSub>,
 }
 
@@ -1232,8 +1234,9 @@ fn placement_quat(rotation_deg: [f32; 3]) -> [f32; 4] {
 }
 
 /// Bake every submesh of one placement into tile-local UE axes. Submesh ranges
-/// stay contiguous (vertex order = submesh order); stops at the u16 vertex cap
-/// so every published range remains addressable from the C side. `scale` is the
+/// stay contiguous (vertex order = submesh order). Indices are u32: a city
+/// WMO (Stormwind ~840k verts) far exceeds the old u16 vertex cap, which
+/// dropped every submesh past 65535 verts. `scale` is the
 /// MDDF uniform scale (WMO placements pass 1.0): applied to model-space
 /// positions before rotation, matching the official placement order.
 fn build_wmo_flat(
@@ -1252,9 +1255,6 @@ fn build_wmo_flat(
         subs: Vec::new(),
     };
     for sm in subs {
-        if out.verts.len() + sm.positions.len() > u16::MAX as usize {
-            break;
-        }
         let vtx0 = out.verts.len() as u32;
         for (i, p) in sm.positions.iter().enumerate() {
             let r = q_rot(q, [p[0] * scale, p[1] * scale, p[2] * scale]);
@@ -1287,9 +1287,9 @@ fn build_wmo_flat(
             if t.len() < 3 {
                 break;
             }
-            out.idx.push((vtx0 + t[0]) as u16);
-            out.idx.push((vtx0 + t[1]) as u16);
-            out.idx.push((vtx0 + t[2]) as u16);
+            out.idx.push((vtx0 + t[0]) as u32);
+            out.idx.push((vtx0 + t[1]) as u32);
+            out.idx.push((vtx0 + t[2]) as u32);
         }
         // Monster1/2/3 slots name no file: the client looks the skin up through
         // CreatureDisplayInfo.dbc. Skin-less load, so infer candidates beside the
@@ -2515,11 +2515,11 @@ pub extern "C" fn bn_model_fill(
 
                         *out_triangles.add(ti as usize) = BnTriangle {
 
-                            a: tri[n],
+                            a: tri[n] as u32,
 
-                            b: tri[n + 1],
+                            b: tri[n + 1] as u32,
 
-                            c: tri[n + 2],
+                            c: tri[n + 2] as u32,
 
                             material: 0,
 
