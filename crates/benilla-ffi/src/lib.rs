@@ -28,6 +28,14 @@ mod coords;
 
 mod ui_font;
 
+// ---- Doodad material animation addressed by model path (no tile switch) ----
+
+mod model_anim;
+
+// ---- Character body-skin atlas composites (CharSections -> RGBA8) ----
+
+mod char_skin;
+
 use std::io::Cursor;
 
 use std::path::Path;
