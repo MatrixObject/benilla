@@ -117,6 +117,10 @@ pub struct BnWorld {
 
     archives: Vec<Archive>,
 
+    /// The Data directory the chain was opened from: the background WMO
+    /// worker opens its own chain there (the handle itself is not shareable).
+    data_dir: String,
+
     mcnk: Vec<McnkChunk>,
 
     /// Real ADT terrain of the last `bn_load_tile`, when one loaded.
@@ -136,14 +140,18 @@ pub struct BnWorld {
     lights: Option<benilla_formats::LightCatalog>,
 
     /// Parsed WMO geometry by root path, shared by every placement of a model.
-    wmo_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
+    wmo_models: HashMap<String, std::sync::Arc<Vec<benilla_formats::RenderSubmesh>>>,
 
     /// Distant low-detail WDL of `wdl_map` (the coarse horizon band).
     wdl: Option<benilla_formats::WdlFile>,
     wdl_map: String,
 
+    /// Bumped on every tile load: background flat jobs are keyed by it so a
+    /// stale parse can never answer for the tile that replaced it.
+    tile_seq: u64,
+
     /// Baked tile-local WMO geometry by instance index (rebuilt on tile load).
-    wmo_flats: HashMap<u32, WmoFlat>,
+    wmo_flats: HashMap<u32, std::sync::Arc<WmoFlat>>,
 
     /// Model-space group MLIQ (WMO liquid) meshes by root path: read once per
     /// model, re-placed per instance into the tile's liquid buffer.
@@ -286,6 +294,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         archives,
 
+        data_dir: dir.to_string(),
+
         mcnk: Vec::new(),
 
         tile: None,
@@ -300,6 +310,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         wdl: None,
         wdl_map: String::new(),
+
+        tile_seq: 0,
 
         wmo_flats: HashMap::new(),
 
@@ -590,8 +602,10 @@ pub extern "C" fn bn_load_tile(
 
                     // Instance indices address the new tile's MODF/MDDF lists;
                     // drop stale bakes (models stay cached: path-keyed).
+                    w.tile_seq += 1;
                     w.wmo_flats.clear();
                     w.doodad_flats.clear();
+                    wmo_flat_cache_clear();
 
                     return w.mcnk.len() as u32;
 
@@ -1418,7 +1432,7 @@ fn wmo_flat<'a>(world: *const BnWorld, i: u32) -> Option<&'a WmoFlat> {
         return None;
     }
     // SAFETY: caller owns a valid const handle.
-    unsafe { &*world }.wmo_flats.get(&i)
+    unsafe { &*world }.wmo_flats.get(&i).map(|f| f.as_ref())
 }
 
 /// A WMO's model-space group MLIQ surfaces, read once per root path: the root
@@ -1514,6 +1528,362 @@ fn append_wmo_liquids(
     }
 }
 
+// ---- Background WMO parse ----
+//
+// A city WMO (Stormwind) costs ~700 ms to parse, and the tile's gather stage
+// used to pay that on the game thread in one frame. The host names the tile's
+// WMO placements right after `bn_load_tile`; a worker opens its own chain over
+// the same Data directory and parses them while the tile keeps building.
+// `bn_wmo_instance_load` then consumes the shared result, and while the parse
+// is still running `bn_wmo_instance_pending` lets the host retry on a later
+// frame instead of freezing the frame.
+
+use std::sync::Arc;
+
+struct WmoEntry {
+    ready: bool,
+
+    subs: Option<Arc<Vec<benilla_formats::RenderSubmesh>>>,
+
+}
+
+/// Case-folded root path, the key both the tile's placements and the host's
+/// prefetch requests use.
+fn wmo_key(path: &str) -> String {
+    path.trim().to_ascii_lowercase()
+}
+
+fn wmo_cache() -> &'static Mutex<HashMap<String, WmoEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, WmoEntry>>> = OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One background WMO job: parse a model, or bake one placement of it for a
+/// specific tile (the bake needs the placement's transform and the tile
+/// centre, so it can only be prepared once the tile is loaded).
+enum WmoJob {
+    Parse {
+        dir: String,
+        key: String,
+        model: String,
+    },
+    Flat {
+        dir: String,
+        seq: u64,
+        i: u32,
+        model: String,
+        position: [f32; 3],
+        rotation: [f32; 3],
+        center: (f32, f32),
+    },
+}
+
+struct WmoJobs {
+    queue: Mutex<VecDeque<WmoJob>>,
+
+    ready: Condvar,
+
+}
+
+fn wmo_jobs() -> &'static WmoJobs {
+    static JOBS: OnceLock<WmoJobs> = OnceLock::new();
+
+    JOBS.get_or_init(|| WmoJobs {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+    })
+}
+
+fn wmo_lookup(key: &str) -> Option<Arc<Vec<benilla_formats::RenderSubmesh>>> {
+    let cache = wmo_cache().lock().ok()?;
+
+    cache.get(key).and_then(|e| e.subs.clone())
+}
+
+fn wmo_pending(key: &str) -> bool {
+    wmo_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(key).map(|e| !e.ready))
+        .unwrap_or(false)
+}
+
+struct WmoFlatEntry {
+    ready: bool,
+
+    flat: Option<Arc<WmoFlat>>,
+
+}
+
+fn wmo_flat_cache() -> &'static Mutex<HashMap<(u64, u32), WmoFlatEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u64, u32), WmoFlatEntry>>> = OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Some(Some(flat)) = baked, Some(None) = failed, None = not requested.
+fn wmo_flat_lookup(seq: u64, i: u32) -> Option<Option<Arc<WmoFlat>>> {
+    let cache = wmo_flat_cache().lock().ok()?;
+
+    cache.get(&(seq, i)).map(|e| e.flat.clone())
+}
+
+fn wmo_flat_pending(seq: u64, i: u32) -> bool {
+    wmo_flat_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&(seq, i)).map(|e| !e.ready))
+        .unwrap_or(false)
+}
+
+fn wmo_flat_store(seq: u64, i: u32, flat: Option<Arc<WmoFlat>>) {
+    if let Ok(mut cache) = wmo_flat_cache().lock() {
+        // Only fill a slot the host still wants: a tile load clears the table,
+        // so a job that finishes after its tile was replaced finds nothing.
+        if let Some(e) = cache.get_mut(&(seq, i)) {
+            if !e.ready {
+                *e = WmoFlatEntry {
+                    ready: true,
+                    flat,
+                };
+            }
+        }
+    }
+}
+
+fn wmo_flat_cache_clear() {
+    if let Ok(mut cache) = wmo_flat_cache().lock() {
+        cache.clear();
+    }
+}
+
+fn wmo_worker() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("bn-wmo".to_string())
+            .spawn(|| {
+                let mut chain: Option<(String, benilla_formats::Chain)> = None;
+
+                loop {
+                    let job = {
+                        let jobs = wmo_jobs();
+
+                        let mut q = match jobs.queue.lock() {
+                            Ok(q) => q,
+
+                            Err(_) => return,
+                        };
+
+                        while q.is_empty() {
+                            q = match jobs.ready.wait(q) {
+                                Ok(q) => q,
+
+                                Err(_) => return,
+                            };
+                        }
+
+                        q.pop_front()
+                    };
+
+                    let Some(job) = job else { continue };
+
+                    let dir = match &job {
+                        WmoJob::Parse { dir, .. } | WmoJob::Flat { dir, .. } => dir.clone(),
+                    };
+
+                    if chain.as_ref().map_or(true, |(d, _)| d != &dir) {
+                        chain = benilla_formats::Chain::open(Path::new(&dir))
+                            .ok()
+                            .map(|c| (dir, c));
+                    }
+
+                    match job {
+                        WmoJob::Parse { key, model, .. } => {
+                            let subs = chain
+                                .as_mut()
+                                .and_then(|(_, c)| benilla_formats::load_wmo(c, &model).ok())
+                                .map(Arc::new);
+
+                            if let Ok(mut cache) = wmo_cache().lock() {
+                                cache.insert(
+                                    key,
+                                    WmoEntry {
+                                        ready: true,
+                                        subs,
+                                    },
+                                );
+                            }
+                        }
+
+                        WmoJob::Flat {
+                            seq,
+                            i,
+                            model,
+                            position,
+                            rotation,
+                            center,
+                            ..
+                        } => {
+                            if chain.is_none() {
+                                wmo_flat_store(seq, i, None);
+
+                                continue;
+                            }
+
+                            let key = wmo_key(&model);
+
+                            let cached = wmo_cache()
+                                .lock()
+                                .ok()
+                                .and_then(|c| c.get(&key).and_then(|e| e.subs.clone()));
+
+                            let subs = match cached {
+                                Some(s) => Some(s),
+
+                                None => {
+                                    let parsed = chain
+                                        .as_mut()
+                                        .and_then(|(_, c)| {
+                                            benilla_formats::load_wmo(c, &model).ok()
+                                        })
+                                        .map(Arc::new);
+
+                                    if let (Ok(mut cache), Some(s)) =
+                                        (wmo_cache().lock(), &parsed)
+                                    {
+                                        cache.insert(
+                                            key.clone(),
+                                            WmoEntry {
+                                                ready: true,
+                                                subs: Some(s.clone()),
+                                            },
+                                        );
+                                    }
+
+                                    parsed
+                                }
+                            };
+
+                            let flat = match (subs, chain.as_ref()) {
+                                (Some(s), Some((_, c))) => Some(Arc::new(build_wmo_flat(
+                                    &s,
+                                    position,
+                                    rotation,
+                                    center,
+                                    1.0,
+                                    &model,
+                                    Some(c),
+                                ))),
+
+                                _ => None,
+                            };
+
+                            wmo_flat_store(seq, i, flat);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+/// Hand the just-loaded tile's WMO placements to the background baker.
+/// Returns the number of jobs queued. The host calls this right after
+/// `bn_load_tile`; every instance then bakes (parse + transform) off the game
+/// thread while the tile's remaining stages run.
+
+#[no_mangle]
+pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+
+    // SAFETY: caller owns a valid const handle.
+
+    let w = unsafe { &*world };
+
+    let Some(tile) = w.tile.as_ref() else {
+        return 0;
+    };
+
+    let seq = w.tile_seq;
+
+    let dir = w.data_dir.clone();
+
+    let mut jobs = Vec::new();
+
+    {
+        let mut cache = match wmo_flat_cache().lock() {
+            Ok(c) => c,
+
+            Err(_) => return 0,
+        };
+
+        for (i, inst) in tile.wmos.iter().enumerate() {
+            let i = i as u32;
+
+            let slot = (seq, i);
+
+            if cache.contains_key(&slot) {
+                continue;
+            }
+
+            cache.insert(
+                slot,
+                WmoFlatEntry {
+                    ready: false,
+                    flat: None,
+                },
+            );
+
+            jobs.push(WmoJob::Flat {
+                dir: dir.clone(),
+                seq,
+                i,
+                model: inst.model.clone(),
+                position: inst.position,
+                rotation: inst.rotation,
+                center: tile.center,
+            });
+        }
+    }
+
+    let n = jobs.len() as u32;
+
+    wmo_worker();
+
+    if let Ok(mut q) = wmo_jobs().queue.lock() {
+        for job in jobs {
+            q.push_back(job);
+        }
+
+        wmo_jobs().ready.notify_one();
+    }
+
+    n
+}
+
+/// 1 while instance `i` of the loaded tile is still being baked by the worker.
+
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_pending(world: *const BnWorld, i: u32) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+
+    // SAFETY: caller owns a valid const handle.
+
+    let w = unsafe { &*world };
+
+    if w.wmo_flats.contains_key(&i) {
+        return 0;
+    }
+
+    wmo_flat_pending(w.tile_seq, i) as u32
+}
+
 /// MODF WMO instances in the loaded tile (0 when no tile).
 #[no_mangle]
 pub extern "C" fn bn_wmo_instance_count(world: *const BnWorld) -> u32 {
@@ -1567,19 +1937,56 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     }) else {
         return 0;
     };
-    if !w.wmo_models.contains_key(&model_path) {
-        let Some(chain) = w.chain.as_mut() else {
-            return 0;
-        };
-        let Ok(subs) = benilla_formats::load_wmo(chain, &model_path) else {
-            return 0;
-        };
-        w.wmo_models.insert(model_path.clone(), subs);
+
+    // A background bake normally waits for us: consume it instead of building
+    // ~840k Stormwind vertices on the game thread. A pending bake answers 0
+    // (the host retries next frame); only an unprefetched tile bakes here.
+    match wmo_flat_lookup(w.tile_seq, i) {
+        Some(Some(flat)) => {
+            let n = flat.subs.len() as u32;
+
+            w.wmo_flats.insert(i, flat);
+
+            append_wmo_liquids(w, &model_path, pos, rot, center);
+
+            return n;
+        }
+
+        Some(None) => return 0,
+
+        None => {}
     }
-    let subs = &w.wmo_models[&model_path];
+
+    let key = wmo_key(&model_path);
+    if !w.wmo_models.contains_key(&key) {
+        if let Some(subs) = wmo_lookup(&key) {
+            w.wmo_models.insert(key.clone(), subs);
+        } else if wmo_pending(&key) {
+            return 0;
+        } else {
+            let Some(chain) = w.chain.as_mut() else {
+                return 0;
+            };
+            let Ok(subs) = benilla_formats::load_wmo(chain, &model_path) else {
+                return 0;
+            };
+            let subs = Arc::new(subs);
+            w.wmo_models.insert(key.clone(), subs.clone());
+            if let Ok(mut cache) = wmo_cache().lock() {
+                cache.insert(
+                    key.clone(),
+                    WmoEntry {
+                        ready: true,
+                        subs: Some(subs),
+                    },
+                );
+            }
+        }
+    }
+    let subs = &w.wmo_models[&key];
     let flat = build_wmo_flat(subs, pos, rot, center, 1.0, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
-    w.wmo_flats.insert(i, flat);
+    w.wmo_flats.insert(i, Arc::new(flat));
     // MLIQ (Stormwind canals): place the model's group liquids beside the ADT
     // MCLQ so the host's liquid pass picks them up unchanged. The cache above
     // early-returns, so each instance appends exactly once per tile rebuild
@@ -4760,6 +5167,364 @@ pub extern "C" fn bn_model_skinned_positions(
 
 }
 
+// ---- Background BLP decode ----
+//
+// A BLP costs 25-50 ms to decode and the tile build used to pay that on the
+// game thread inside its material stage. The host asks for a texture as soon
+// as the gather stages discover its path (`bn_texture_request`): the file
+// bytes are read here, on the calling thread (cheap - the archives are
+// already open), and the decode runs on a small worker pool. `bn_texture`
+// then just copies the decoded entry; on a miss it still decodes
+// synchronously, so a host that never requests stays correct.
+
+use std::collections::VecDeque;
+
+use std::sync::{Condvar, Mutex, OnceLock};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const TEX_PENDING: u8 = 0;
+
+const TEX_READY: u8 = 1;
+
+const TEX_FAILED: u8 = 2;
+
+/// Decoded RGBA8 kept per texture path, shared by the worker pool and the
+/// synchronous `bn_texture` fallback.
+struct TexEntry {
+    status: u8,
+
+    width: u32,
+
+    height: u32,
+
+    rgba: Vec<u8>,
+
+}
+
+fn tex_pending_entry() -> TexEntry {
+    TexEntry {
+        status: TEX_PENDING,
+        width: 0,
+        height: 0,
+        rgba: Vec::new(),
+    }
+}
+
+fn tex_failed_entry() -> TexEntry {
+    TexEntry {
+        status: TEX_FAILED,
+        width: 0,
+        height: 0,
+        rgba: Vec::new(),
+    }
+}
+
+fn tex_ready_entry(w: u32, h: u32, rgba: Vec<u8>) -> TexEntry {
+    TexEntry {
+        status: TEX_READY,
+        width: w,
+        height: h,
+        rgba,
+    }
+}
+
+/// Decoded pixels kept process-wide: 1024x1024 sheets are 4 MB each, so cap
+/// the pool and start over when it grows past the budget. The UE side owns its
+/// own UTexture2D cache, so a reset never loses a texture already built.
+const TEX_CACHE_BUDGET: u64 = 256 * 1024 * 1024;
+
+static TEX_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic counters, read by the host's per-tile log.
+static TEX_STAT_QUEUED: AtomicU64 = AtomicU64::new(0);
+
+static TEX_STAT_WORKER: AtomicU64 = AtomicU64::new(0);
+
+static TEX_STAT_SYNC: AtomicU64 = AtomicU64::new(0);
+
+static TEX_STAT_HIT: AtomicU64 = AtomicU64::new(0);
+
+/// [queued, decoded by workers, decoded synchronously, cache hits].
+#[no_mangle]
+pub extern "C" fn bn_texture_stats(out4: *mut u32) -> u32 {
+    if out4.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        *out4 = TEX_STAT_QUEUED.load(Ordering::Relaxed) as u32;
+
+        *out4.add(1) = TEX_STAT_WORKER.load(Ordering::Relaxed) as u32;
+
+        *out4.add(2) = TEX_STAT_SYNC.load(Ordering::Relaxed) as u32;
+
+        *out4.add(3) = TEX_STAT_HIT.load(Ordering::Relaxed) as u32;
+    }
+
+    4
+}
+
+fn tex_insert(cache: &mut HashMap<String, TexEntry>, key: String, entry: TexEntry) {
+    let old = cache.get(&key).map(|e| e.rgba.len() as u64).unwrap_or(0);
+
+    let add = entry.rgba.len() as u64;
+
+    // Replacing a pending/failed slot frees nothing, replacing a decoded one
+    // returns its bytes; either way the counter stays on the live total.
+    let prev = TEX_CACHE_BYTES.fetch_add(add, Ordering::Relaxed);
+
+    if prev.saturating_sub(old) + add > TEX_CACHE_BUDGET {
+        cache.retain(|_, e| e.status == TEX_PENDING);
+
+        TEX_CACHE_BYTES.store(add, Ordering::Relaxed);
+    }
+
+    cache.insert(key, entry);
+}
+
+fn tex_cache() -> &'static Mutex<HashMap<String, TexEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, TexEntry>>> = OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct TexJobs {
+    queue: Mutex<VecDeque<(String, Vec<u8>)>>,
+
+    ready: Condvar,
+
+}
+
+fn tex_jobs() -> &'static TexJobs {
+    static JOBS: OnceLock<TexJobs> = OnceLock::new();
+
+    JOBS.get_or_init(|| TexJobs {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+    })
+}
+
+/// Cache key: case folded, ".blp" dropped. The host asks both with and
+/// without the extension (UI paths carry none) and MPQ paths are
+/// case-insensitive, so one key serves every spelling.
+fn tex_key(path: &str) -> String {
+    let lower = path.trim().to_ascii_lowercase();
+
+    lower.strip_suffix(".blp").unwrap_or(&lower).to_string()
+}
+
+/// Read a BLP's bytes from the chain, trying the ".BLP" spelling when the
+/// path carries no extension (the host's UI paths are extensionless).
+fn read_texture_bytes(w: &BnWorld, path: &str) -> Option<Vec<u8>> {
+    for a in w.archives.iter().rev() {
+        if a.contains(path) {
+            if let Ok(bytes) = a.read_file(path) {
+                return Some(bytes);
+            }
+
+            break;
+        }
+    }
+
+    if !path.to_ascii_lowercase().ends_with(".blp") {
+        let alt = format!("{}.BLP", path);
+
+        for a in w.archives.iter().rev() {
+            if a.contains(&alt) {
+                if let Ok(bytes) = a.read_file(&alt) {
+                    return Some(bytes);
+                }
+
+                break;
+            }
+        }
+    }
+
+    None
+}
+
+fn decode_blp_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoded = benilla_blp::decode(bytes).ok()?;
+
+    let mip = decoded.mips.first()?;
+
+    Some((mip.width, mip.height, mip.rgba.clone()))
+}
+
+/// Some(Some(tex)) = decoded, Some(None) = known miss, None = unknown or
+/// still pending (the caller decodes synchronously then).
+fn tex_lookup(key: &str) -> Option<Option<(u32, u32, Vec<u8>)>> {
+    let cache = tex_cache().lock().ok()?;
+
+    match cache.get(key) {
+        Some(e) if e.status == TEX_READY => {
+            Some(Some((e.width, e.height, e.rgba.clone())))
+        }
+
+        Some(e) if e.status == TEX_FAILED => Some(None),
+
+        _ => None,
+    }
+}
+
+fn tex_store(key: &str, value: Option<(u32, u32, Vec<u8>)>) {
+    if let Ok(mut cache) = tex_cache().lock() {
+        let entry = match value {
+            Some((w, h, rgba)) => tex_ready_entry(w, h, rgba),
+
+            None => tex_failed_entry(),
+        };
+
+        tex_insert(&mut cache, key.to_string(), entry);
+    }
+}
+
+fn decode_texture_sync(w: &BnWorld, path: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let bytes = read_texture_bytes(w, path)?;
+
+    decode_blp_bytes(bytes.as_slice())
+}
+
+fn tex_decode_job(key: String, bytes: Vec<u8>) {
+    let decoded = decode_blp_bytes(bytes.as_slice());
+
+    if let Ok(mut cache) = tex_cache().lock() {
+        // The synchronous path may have answered while this job waited.
+        if cache.get(&key).is_some_and(|e| e.status != TEX_PENDING) {
+            return;
+        }
+
+        let entry = match decoded {
+            Some((w, h, rgba)) => {
+                TEX_STAT_WORKER.fetch_add(1, Ordering::Relaxed);
+
+                tex_ready_entry(w, h, rgba)
+            }
+
+            None => tex_failed_entry(),
+        };
+
+        tex_insert(&mut cache, key, entry);
+    }
+}
+
+/// Start the decode workers once; they live as long as the process.
+fn tex_workers() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    STARTED.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(2)
+            .clamp(1, 2);
+
+        for i in 0..n {
+            let _ = std::thread::Builder::new()
+                .name(format!("bn-blp-{i}"))
+                .spawn(|| loop {
+                    let job = {
+                        let jobs = tex_jobs();
+
+                        let mut q = match jobs.queue.lock() {
+                            Ok(q) => q,
+
+                            Err(_) => return,
+                        };
+
+                        while q.is_empty() {
+                            q = match jobs.ready.wait(q) {
+                                Ok(q) => q,
+
+                                Err(_) => return,
+                            };
+                        }
+
+                        q.pop_front()
+                    };
+
+                    if let Some((key, bytes)) = job {
+                        tex_decode_job(key, bytes);
+                    }
+                });
+        }
+    });
+}
+
+/// Queue a background decode for `internal_path`.
+///
+/// 1 = ready already, 3 = pending already, 0 = queued, 2 = not found.
+
+#[no_mangle]
+
+pub extern "C" fn bn_texture_request(
+    world: *const BnWorld,
+    internal_path: *const c_char,
+) -> u32 {
+    if world.is_null() || internal_path.is_null() {
+        return 2;
+    }
+
+    let p = match cstr_to_str(internal_path) {
+        Some(s) => s,
+
+        None => return 2,
+    };
+
+    let key = tex_key(p);
+
+    if let Ok(cache) = tex_cache().lock() {
+        if let Some(e) = cache.get(&key) {
+            return match e.status {
+                TEX_READY => 1,
+
+                TEX_PENDING => 3,
+
+                _ => 2,
+            };
+        }
+    }
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    let bytes = match read_texture_bytes(w, p) {
+        Some(b) => b,
+
+        None => {
+            tex_store(&key, None);
+
+            return 2;
+        }
+    };
+
+    // Reserve the slot before queueing: a second request for the same path
+    // then answers "pending" instead of reading and decoding it twice.
+
+    if let Ok(mut cache) = tex_cache().lock() {
+        if cache.contains_key(&key) {
+            return 3;
+        }
+
+        cache.insert(key.clone(), tex_pending_entry());
+    }
+
+    tex_workers();
+
+    let jobs = tex_jobs();
+
+    if let Ok(mut q) = jobs.queue.lock() {
+        q.push_back((key, bytes));
+
+        TEX_STAT_QUEUED.fetch_add(1, Ordering::Relaxed);
+
+        jobs.ready.notify_one();
+    }
+
+    0
+}
+
 // ---- BLP textures ----
 
 /// Decode a BLP texture from the chain into RGBA8.
@@ -4812,61 +5577,64 @@ pub extern "C" fn bn_texture(
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    // A background request normally filled this already. Pending entries fall
+    // through to the synchronous decode below: correctness first, and the tile
+    // build normally reaches its material stage long after the workers did.
+    let key = tex_key(p);
 
-        if !a.contains(p) {
+    let decoded = match tex_lookup(&key) {
 
-            continue;
+        Some(Some(v)) => {
+
+            TEX_STAT_HIT.fetch_add(1, Ordering::Relaxed);
+
+            v
 
         }
 
-        if let Ok(bytes) = a.read_file(p) {
+        Some(None) => return 0,
 
-            if let Ok(decoded) = benilla_blp::decode(bytes.as_slice()) {
+        None => {
 
-                let Some(mip) = decoded.mips.first() else {
+            TEX_STAT_SYNC.fetch_add(1, Ordering::Relaxed);
 
-                    continue;
+            let v = decode_texture_sync(w, p);
 
-                };
+            tex_store(&key, v.clone());
 
-                let need = (mip.width * mip.height * 4) as u32;
+            match v {
 
-                if need > cap {
+                Some(v) => v,
 
-                    return 0;
-
-                }
-
-                unsafe {
-
-                    *out_width = mip.width;
-
-                    *out_height = mip.height;
-
-                    std::ptr::copy_nonoverlapping(
-
-                        mip.rgba.as_ptr(),
-
-                        out_rgba,
-
-                        need as usize,
-
-                    );
-
-                }
-
-                return need;
+                None => return 0,
 
             }
 
         }
 
-        break;
+    };
+
+    let (width, height, rgba) = decoded;
+
+    let need = width.saturating_mul(height).saturating_mul(4);
+
+    if need == 0 || need > cap {
+
+        return 0;
 
     }
 
-    0
+    unsafe {
+
+        *out_width = width;
+
+        *out_height = height;
+
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), out_rgba, need as usize);
+
+    }
+
+    need
 
 }
 
