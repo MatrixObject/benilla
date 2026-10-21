@@ -643,6 +643,8 @@ pub struct Player {
     last_ground: [f32; 3],
     /// Seconds spent falling with no floor under the feet (diagnostics).
     void_time: f32,
+    /// Seconds since the last falling-trace line (diagnostics).
+    fall_time: f32,
 }
 
 impl Player {
@@ -673,6 +675,7 @@ impl Player {
             snap_pending: false,
             last_ground: [x, y, 0.0],
             void_time: 0.0,
+            fall_time: 0.0,
         }
     }
 
@@ -1334,7 +1337,8 @@ impl Player {
             self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
             self.pos[2] += self.vel[2] * dt;
             let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
-            match self.ground(self.pos[0], self.pos[1], ceil) {
+            let found = self.ground(self.pos[0], self.pos[1], ceil);
+            match found {
                 Some((z, _)) => {
                     self.void_time = 0.0;
                     if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
@@ -1382,6 +1386,33 @@ impl Player {
             }
             if self.grounded {
                 self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
+            }
+            // Falling-trace: a body that drops through a city floor lands on the
+            // terrain, where `ground` still answers - so the no-ground warning
+            // never fires. Log the trajectory (with the tile's WMO cell count)
+            // every half second instead, so a "fell through here" report has
+            // coordinates and tells us whether the cell held any geometry.
+            self.fall_time = if self.grounded { 0.0 } else { self.fall_time + dt };
+            if !self.grounded && self.vel[2] < -10.0 && self.fall_time >= 0.5 {
+                self.fall_time = 0.0;
+                let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                let (ready, wmos, cell_tris) = match self.tiles.get(&(tx, ty)) {
+                    Some(t) => (
+                        t.wmo_ready,
+                        t.wmos.len(),
+                        TileCol::wmo_cell(tx, ty, self.pos[0], self.pos[1])
+                            .map_or(0, |i| t.wmo_cells[i as usize].len()),
+                    ),
+                    None => (false, 0, 0),
+                };
+                eprintln!(
+                    "bn_player: falling ({:.1},{:.1}) z={:.2} floor={:?} tile=({tx},{ty}) \
+                     wmo_ready={ready} wmos={wmos} celltris={cell_tris}",
+                    self.pos[0],
+                    self.pos[1],
+                    self.pos[2],
+                    found.map(|(z, _)| z)
+                );
             }
         }
 
