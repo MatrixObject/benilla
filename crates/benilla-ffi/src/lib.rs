@@ -40,6 +40,14 @@ mod char_skin;
 
 mod char_body;
 
+// ---- Player locomotion, collision probe and third-person camera ----
+//
+// The reference client's player state/mover/camera live in benilla-app (Bevy),
+// which cannot be linked here; this module carries the same laws over the
+// ADT/WMO data this handle already loads.
+
+mod player;
+
 // ---- Distant low-detail terrain (WDL far band) ----
 
 mod wdl_far;
@@ -142,6 +150,13 @@ pub struct BnWorld {
 
     /// Baked tile-local doodad geometry by MDDF index (rebuilt on tile load).
     doodad_flats: HashMap<u32, WmoFlat>,
+
+    /// Middle-layer player (locomotion, collision, camera) once `bn_player_reset`.
+    player: Option<player::Player>,
+
+    /// WMO walking-collision triangles by root path (the gather the player and
+    /// camera probe use), shared by every placement of the model.
+    wmo_collision: HashMap<String, benilla_formats::CollisionMesh>,
 
 }
 
@@ -285,6 +300,10 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         doodad_models: HashMap::new(),
 
         doodad_flats: HashMap::new(),
+
+        player: None,
+
+        wmo_collision: HashMap::new(),
 
     }))
 
