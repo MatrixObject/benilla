@@ -37,14 +37,44 @@ const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
 // ---- benilla-app/src/player/camera.rs ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-const CAM_PIVOT_FALLBACK: f32 = 1.8;
 const LOOK_SENSITIVITY: f32 = 0.003;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
+/// The shortest boom the collision probe will pull to: any closer and the eye
+/// sits inside the body (the reference's first-person cut is not modelled).
+const CAM_BOOM_MIN: f32 = 1.0;
 /// `cameraYawSmoothSpeed` default 180°/s: the smart follow's return rate.
 const FOLLOW_RATE: f32 = std::f32::consts::PI;
 /// `creature_anim::select::STRAFE_BLEND_RATE`: the body heading eases to the
 /// strafe offset at this rate (/s).
 const STRAFE_BLEND_RATE: f32 = 17.26;
+/// `state.rs::TURN_RATE`: the keyboard turn rate, π rad/s (the server's own
+/// value; the client ships no default).
+const TURN_RATE: f32 = std::f32::consts::PI;
+/// `state.rs::TURN_RATE_MOVING`: the scale while translating or falling.
+const TURN_RATE_MOVING: f32 = 0.75;
+
+// ---- benilla-app/src/player/camera.rs pivot presets ----
+/// A scale-1 Human Male's framing pivot: standing 1.9002692, swimming
+/// 0.3882572 lower (`model_pivot_height`, `cam+0x124`).
+const CAM_PIVOT_STAND: f32 = 1.900_269_2;
+const CAM_PIVOT_SWIM: f32 = 1.512_012;
+/// The pivot channel eases at 1.2 yd/s (the reference's `|Δh| / 1.2` s).
+const CAM_PIVOT_SMOOTH: f32 = 1.2;
+/// `model_pivot_height`'s `[5/6, 15]` band.
+const CAM_PIVOT_FLOOR: f32 = 5.0 / 6.0;
+const CAM_PIVOT_CEIL: f32 = 15.0;
+
+// ---- benilla-app/src/player/camera_water.rs ----
+/// The resting corridor floor, and the pivot's depth under the surface while
+/// submerged (`[0x8089cc]`).
+const WATER_REST: f32 = 5.0 / 6.0;
+/// The surface band's width, and the pivot's lift above the waterline in it
+/// (`[0x8089d0]`).
+const WATER_SURFACE_BAND: f32 = 2.0 / 9.0;
+/// The submerge band's outer edge (`[0x8089d4]`).
+const WATER_SUBMERGE_EDGE: f32 = 5.0 / 9.0;
+/// The least head-room the pivot keeps above the corridor floor (`[0x808a04]`).
+const WATER_MIN_HEADROOM: f32 = 1.0 / 9.0;
 
 /// Mount speed bonus in 1.12: +60% (the client's riding speed).
 const MOUNT_SPEED_RATIO: f32 = 1.6;
@@ -96,6 +126,33 @@ fn wrap_pi(a: f32) -> f32 {
         a += std::f32::consts::TAU;
     }
     a
+}
+
+/// The water corridor's pivot height (`camera_water::classify` + `corridor` +
+/// `pivot_height`), in yards above the feet. `target` is the model preset, `live`
+/// the eased channel value; the reference's head-room probe is not built, so the
+/// reach is full. A surface swimmer's pivot rises to `surface + 2/9` and a diver's
+/// sits `5/6` under the surface, which is what keeps the boom out of the water.
+fn camera_pivot_height(target: f32, live: f32, surface: Option<f32>, feet: f32) -> f32 {
+    let (floor, cap) = match surface {
+        None => (WATER_REST, live),
+        Some(s) => {
+            let d = s - feet;
+            let excess = d - target;
+            // A tie at 2/9 lands in the submerge band and one at 5/9 in clear,
+            // the reference's own tie-breaks.
+            if excess < WATER_SURFACE_BAND {
+                let floor = d + WATER_SURFACE_BAND;
+                (floor, live.max(floor))
+            } else if excess < WATER_SUBMERGE_EDGE {
+                (WATER_REST, (d - WATER_REST).max(WATER_REST))
+            } else {
+                (WATER_REST, live)
+            }
+        }
+    };
+    let reach = (target.max(live) - floor).max(WATER_MIN_HEADROOM);
+    (floor + reach).min(cap).clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
 }
 
 /// The strafe body offset from the aim (`creature_anim::select::strafe_body_offset`):
@@ -289,6 +346,38 @@ fn liquid_height(m: &benilla_formats::LiquidMesh, x: f32, y: f32) -> Option<f32>
         + br * u * v)
 }
 
+/// Ray/triangle intersection (Möller-Trumbore, both faces): the ray length to
+/// the hit, if any.
+fn ray_tri(o: [f32; 3], d: [f32; 3], t: &Tri) -> Option<f32> {
+    let [a, b, c] = t.v;
+    let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = |u: [f32; 3], v: [f32; 3]| {
+        [u[1] * v[2] - u[2] * v[1],
+         u[2] * v[0] - u[0] * v[2],
+         u[0] * v[1] - u[1] * v[0]]
+    };
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let pv = cross(d, e2);
+    let det = dot(e1, pv);
+    if det.abs() < 1.0e-8 {
+        return None; // parallel
+    }
+    let inv = 1.0 / det;
+    let tv = [o[0] - a[0], o[1] - a[1], o[2] - a[2]];
+    let u = dot(tv, pv) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let qv = cross(tv, e1);
+    let v = dot(d, qv) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let dist = dot(e2, qv) * inv;
+    (dist > 1.0e-4).then_some(dist)
+}
+
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
 fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
     let [a, b, c] = t.v;
@@ -348,6 +437,10 @@ fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
 struct Input {
     forward: f32,
     strafe: f32,
+    /// The keyboard turn axis, left-positive (`TURN_LEFT` keys); the host sends
+    /// it only while the right mouse button is up, when A/D turn instead of
+    /// strafing (`0x7c5360`).
+    turn: f32,
     jump: bool,
     walk: bool,
 }
@@ -374,6 +467,14 @@ pub struct Player {
     cam_pitch: f32,
     cam_distance: f32,
     cam_target_distance: f32,
+    /// The framing pivot's live height above the feet, easing between the
+    /// standing and swimming presets (`cam+0xfc`, 1.2 yd/s).
+    pivot_height: f32,
+    /// The liquid surface under the feet sampled this tick, kept for the
+    /// camera's water corridor and boom clip.
+    surface: Option<f32>,
+    /// The live boom length: snaps in when geometry intrudes, eases back out.
+    cam_live: f32,
     mounted: bool,
     attack_left: f32,
     tiles: HashMap<(i32, i32), TileCol>,
@@ -401,6 +502,9 @@ impl Player {
             cam_pitch: 0.0,
             cam_distance: CAM_DIST_DEFAULT,
             cam_target_distance: CAM_DIST_DEFAULT,
+            pivot_height: CAM_PIVOT_STAND,
+            surface: None,
+            cam_live: CAM_DIST_DEFAULT,
             mounted: false,
             attack_left: 0.0,
             tiles: HashMap::new(),
@@ -698,6 +802,121 @@ impl Player {
         })
     }
 
+    /// The framing pivot for this frame: the standing/swimming preset above
+    /// the feet, run through the water corridor.
+    fn camera_pivot(&self) -> [f32; 3] {
+        let target = if self.swimming {
+            CAM_PIVOT_SWIM
+        } else {
+            CAM_PIVOT_STAND
+        }
+        .clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL);
+        let h = camera_pivot_height(target, self.pivot_height, self.surface, self.pos[2]);
+        [self.pos[0], self.pos[1], self.pos[2] + h]
+    }
+
+    /// The orbit's forward (up-positive pitch) in WoW axes: the eye sits at
+    /// `pivot - fwd * boom`.
+    fn camera_fwd(&self) -> [f32; 3] {
+        let (sp, cp) = self.cam_pitch.sin_cos();
+        let (sy, cy) = self.cam_yaw.sin_cos();
+        [cp * cy, -cp * sy, sp]
+    }
+
+    /// True when the boom may reach `p`: 0.3 yd clear of the floor.
+    fn boom_clear(&self, p: [f32; 3]) -> bool {
+        match self.ground(p[0], p[1], p[2]) {
+            Some((g, _)) => p[2] >= g + 0.3,
+            None => true,
+        }
+    }
+
+    /// Where the boom first enters a steep WMO face, if it does. Point probes
+    /// miss walls seen edge-on (a wall joining two samples falls between
+    /// them), so the segment is tested against the triangles itself.
+    fn boom_wall_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
+        let end = [pivot[0] + dir[0] * max, pivot[1] + dir[1] * max,
+                   pivot[2] + dir[2] * max];
+        let mut best: Option<f32> = None;
+        let mut scan = |tx: i32, ty: i32, tile: &TileCol| {
+            let (ax, ay) = TileCol::wmo_local(tx, ty, pivot[0], pivot[1]);
+            let (bx, by) = TileCol::wmo_local(tx, ty, end[0], end[1]);
+            for gy in (ay.min(by) - WMO_MARGIN)..=(ay.max(by) + WMO_MARGIN) {
+                for gx in (ax.min(bx) - WMO_MARGIN)..=(ax.max(bx) + WMO_MARGIN) {
+                    if !(0..WMO_GRID).contains(&gx) || !(0..WMO_GRID).contains(&gy) {
+                        continue;
+                    }
+                    for t in &tile.wmo_cells[(gy * WMO_GRID + gx) as usize] {
+                        if t.n[2].abs() >= GROUND_COS {
+                            continue; // a floor, left to the ground probe
+                        }
+                        if let Some(d) = ray_tri(pivot, dir, t) {
+                            if d <= max && best.map_or(true, |b| d < b) {
+                                best = Some(d);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let k0 = Self::tile_of(pivot[0], pivot[1]);
+        let k1 = Self::tile_of(end[0], end[1]);
+        match self.tiles.get(&k0) {
+            Some(tile) => {
+                scan(k0.0, k0.1, tile);
+                if k1 != k0 {
+                    if let Some(tile) = self.tiles.get(&k1) {
+                        scan(k1.0, k1.1, tile);
+                    }
+                }
+            }
+            // Border frame with the tile still loading: scan what is loaded.
+            None => {
+                for (&(k0, k1), tile) in &self.tiles {
+                    scan(k0, k1, tile);
+                }
+            }
+        }
+        best
+    }
+
+    /// The longest clear boom up to `max`: the wall the segment first enters
+    /// (less a 0.3 yd stand-off), then eight floor samples and a bisection for
+    /// the exact stand-off, floored at [`CAM_BOOM_MIN`] so the eye never ends
+    /// up inside the body.
+    fn solid_boom(&self, pivot: [f32; 3], fwd: [f32; 3], max: f32) -> f32 {
+        if max <= 0.0 {
+            return 0.0;
+        }
+        let dir = [-fwd[0], -fwd[1], -fwd[2]];
+        let mut limit = max;
+        if let Some(t) = self.boom_wall_hit(pivot, dir, max) {
+            limit = (t - 0.3).max(0.0);
+        }
+        let at = |f: f32| {
+            [pivot[0] + dir[0] * f, pivot[1] + dir[1] * f, pivot[2] + dir[2] * f]
+        };
+        let mut prev = 0.0;
+        for i in 1..=8 {
+            let f = limit * i as f32 / 8.0;
+            if self.boom_clear(at(f)) {
+                prev = f;
+                continue;
+            }
+            let (mut lo, mut hi) = (prev, f);
+            for _ in 0..6 {
+                let mid = 0.5 * (lo + hi);
+                if self.boom_clear(at(mid)) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo.max(CAM_BOOM_MIN.min(max));
+        }
+        limit.max(CAM_BOOM_MIN.min(max))
+    }
+
     /// The lowest upward-facing WMO surface over (x, y) between `floor` and
     /// `floor + max_rise`: the street a spawn under a city should stand on
     /// (ADT terrain under a WMO footprint is holed, so the raw terrain height
@@ -760,7 +979,36 @@ impl Player {
             // The client dismounts on entering deep water.
             self.mounted = false;
         }
+        // The pivot channel (`0x50f160`): the standing preset, the swim drop in
+        // water, eased at 1.2 yd/s.
+        let pivot_target = if self.swimming {
+            CAM_PIVOT_SWIM
+        } else {
+            CAM_PIVOT_STAND
+        }
+        .clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL);
+        let glide = CAM_PIVOT_SMOOTH * dt;
+        self.pivot_height += (pivot_target - self.pivot_height).clamp(-glide, glide);
+        self.surface = surface;
         let backpedal = forward < 0.0 && strafe.abs() < 0.01;
+
+        // The 1.12 control model (`0x7c5360`): A/D turn the character unless the
+        // right mouse button is held, when the host reports them as strafe. A
+        // keyboard turn is left-positive and carries the body and the camera
+        // rigidly (`camera.rs`); translating or falling scales it by 0.75.
+        let turn = self.input.turn.clamp(-1.0, 1.0);
+        if turn != 0.0 {
+            let rate = TURN_RATE
+                * if forward != 0.0 || strafe != 0.0 || !self.grounded {
+                    TURN_RATE_MOVING
+                } else {
+                    1.0
+                };
+            let d = turn * rate * dt;
+            self.yaw = wrap_pi(self.yaw + d);
+            self.model_yaw = wrap_pi(self.model_yaw + d);
+            self.cam_yaw = wrap_pi(self.cam_yaw - d);
+        }
 
         // WASD moves in the aim's basis, as the reference does (`state.rs`:
         // "the facing ... is the basis WASD move in"); orbiting the camera
@@ -936,40 +1184,37 @@ impl Player {
         let step_d = 8.33 * dt;
         self.cam_distance += (self.cam_target_distance - self.cam_distance)
             .clamp(-step_d, step_d);
+
+        // Boom collision: snap in at once when geometry intrudes (a wall the
+        // player turns into), ease back out at the zoom glide's 8.33 yd/s.
+        let want = self.solid_boom(self.camera_pivot(), self.camera_fwd(), self.cam_distance);
+        self.cam_live = if want <= self.cam_live {
+            want
+        } else {
+            (self.cam_live + 8.33 * dt).min(want)
+        };
     }
 
-    /// The camera eye/target for this frame: pivot at the feet + head height,
-    /// eye on the orbit at the current pitch/yaw, pulled in when the boom
-    /// would enter the ground.
+    /// The camera eye/target for this frame: the framing pivot at the model
+    /// preset above the feet (clamped by the water corridor), the eye on the
+    /// orbit at the current pitch/yaw, at the boom length the collision probe
+    /// settled on, clipped by the waterline.
     fn camera(&self) -> ([f32; 3], [f32; 3]) {
-        let pivot = [self.pos[0], self.pos[1], self.pos[2] + CAM_PIVOT_FALLBACK];
-        let (sp, cp) = self.cam_pitch.sin_cos();
-        let (sy, cy) = self.cam_yaw.sin_cos();
-        // Forward (up-positive pitch) in WoW axes.
-        let fwd = [cp * cy, -cp * sy, sp];
-        let mut dist = self.cam_distance;
-        // Shrink when a sample of the boom is under the floor.
-        for i in 1..=8 {
-            let f = (i as f32 / 8.0) * self.cam_distance;
-            if f <= 0.0 {
-                continue;
-            }
-            let p = [pivot[0] - fwd[0] * f, pivot[1] - fwd[1] * f,
-                     pivot[2] - fwd[2] * f];
-            if let Some((g, _)) = self.ground(p[0], p[1], p[2]) {
-                if p[2] < g + 0.3 {
-                    dist = dist.min((i as f32 - 1.0) / 8.0 * self.cam_distance);
-                    break;
-                }
-            }
-            // A wall between the pivot and the eye pulls the boom in too.
-            if self.hit_steep(p, 0.3, f32::NEG_INFINITY) {
-                dist = dist.min((i as f32 - 1.0) / 8.0 * self.cam_distance);
-                break;
+        let pivot = self.camera_pivot();
+        let fwd = self.camera_fwd();
+        let mut dist = self.cam_live.min(self.cam_distance);
+        let mut eye = [pivot[0] - fwd[0] * dist, pivot[1] - fwd[1] * dist,
+                       pivot[2] - fwd[2] * dist];
+        // `cameraWaterCollision`'s ray: the waterline is solid, so a boom that
+        // would put the eye under the surface stops at it instead (`0x50e5ec`).
+        if let Some(s) = self.surface {
+            if eye[2] < s && pivot[2] > s {
+                let t = (pivot[2] - s) / (pivot[2] - eye[2]);
+                dist *= t.max(0.0);
+                eye = [pivot[0] - fwd[0] * dist, pivot[1] - fwd[1] * dist,
+                       pivot[2] - fwd[2] * dist];
             }
         }
-        let eye = [pivot[0] - fwd[0] * dist, pivot[1] - fwd[1] * dist,
-                   pivot[2] - fwd[2] * dist];
         (eye, pivot)
     }
 
@@ -993,21 +1238,29 @@ impl Player {
         if self.mounted {
             return 91; // Mount
         }
+        let f = self.input.forward;
+        let s = self.input.strafe;
+        let turning = self.input.turn;
         if self.swimming {
-            // AnimationData 41 SwimIdle, 42 Swim, 43 SwimLeft, 44 SwimRight,
-            // 45 SwimBackwards (`creature_anim::select`'s swim picks).
-            let f = self.input.forward;
-            let s = self.input.strafe;
-            if f.abs() < 0.01 && s.abs() < 0.01 {
+            // `creature_anim::select`'s swim picks: turn -> SwimIdle 41,
+            // strafe -> SwimLeft 43 / SwimRight 44, back -> SwimBackwards 45,
+            // forward -> Swim 42.
+            if turning != 0.0 {
                 return 41;
             }
-            if f < -0.01 && s.abs() < 0.01 {
+            if s < -0.01 {
+                return 43;
+            }
+            if s > 0.01 {
+                return 44;
+            }
+            if f < -0.01 {
                 return 45;
             }
-            if f.abs() < 0.01 {
-                return if s < 0.0 { 43 } else { 44 };
+            if f > 0.01 {
+                return 42;
             }
-            return 42;
+            return 41;
         }
         if self.attack_left > 0.0 {
             return 16; // AttackUnarmed
@@ -1016,16 +1269,22 @@ impl Player {
             return if self.vel[2] > 0.0 { 37 } else { 40 }; // JumpStart / Fall
         }
         let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
-        if hs < 0.05 {
+        if hs < 0.1 {
+            // Turning in place plays the shuffle (11 left, 12 right).
+            if turning > 0.0 {
+                return 11;
+            }
+            if turning < 0.0 {
+                return 12;
+            }
             return 0; // Stand
         }
-        let back = self.input.forward < 0.0 && self.input.strafe.abs() < 0.01;
-        if back {
-            13 // WalkBackwards
-        } else if hs <= RUN_SPEED * WALK_RATIO * 1.1 {
-            4 // Walk
+        if f < -0.01 {
+            13 // WalkBackwards dominates strafe
+        } else if hs > 2.0 * 2.5 {
+            5 // Run above twice the walk speed
         } else {
-            5 // Run
+            4 // Walk
         }
     }
 
@@ -1126,19 +1385,22 @@ pub extern "C" fn bn_player_reset(
     1
 }
 
-/// Held movement input: forward/strafe -1..1 (in the aim's basis), jump and
-/// walk as 0/1. The host forwards the raw key state each frame.
+/// Held movement input: forward/strafe/turn -1..1 (in the aim's basis; turn is
+/// left-positive and the host sends it only while the right button is up), jump
+/// and walk as 0/1. The host forwards the raw key state each frame.
 #[no_mangle]
 pub extern "C" fn bn_player_input(
     world: *mut BnWorld,
     forward: f32,
     strafe: f32,
+    turn: f32,
     jump: u32,
     walk: u32,
 ) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
     p.input.forward = forward;
     p.input.strafe = strafe;
+    p.input.turn = turn;
     p.input.jump = jump != 0;
     p.input.walk = walk != 0;
     1
@@ -1283,6 +1545,28 @@ mod tests {
     }
 
     #[test]
+    fn the_boom_snaps_in_at_a_wall_and_eases_back_out() {
+        // Facing +X with the wall 3 yd west of the feet, the default 15 yd boom
+        // would put the eye behind the wall: it must stop just short of it, and
+        // never shrink to zero (that would put the eye inside the body).
+        let mut p = player_with_wall();
+        p.pos = [-8797.0, -800.0, 0.0];
+        p.tick(0.1);
+        assert!(
+            (p.cam_live - 2.6).abs() < 0.5,
+            "the boom stops at the wall: {}",
+            p.cam_live
+        );
+        assert!(p.cam_live >= CAM_BOOM_MIN, "never inside the body");
+        // Turn the orbit away from the wall: the boom eases out at 8.33 yd/s,
+        // not in one frame.
+        p.cam_yaw = std::f32::consts::FRAC_PI_2;
+        p.tick(0.1);
+        assert!(p.cam_live > 2.6, "released from the wall");
+        assert!(p.cam_live < CAM_DIST_DEFAULT, "eased, not snapped");
+    }
+
+    #[test]
     fn right_drag_turns_the_aim_with_the_camera() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         p.look(100.0, 0.0, true);
@@ -1302,6 +1586,48 @@ mod tests {
         assert!(p.yaw.abs() < 1.0e-6, "the aim stays put");
         assert!(p.model_yaw.abs() < 1.0e-6);
         assert!((p.cam_yaw - 100.0 * LOOK_SENSITIVITY).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn keyboard_turn_carries_the_aim_the_body_and_the_camera() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.grounded = true;
+        p.input.turn = 1.0;
+        p.tick(0.1);
+        let d = TURN_RATE * 0.1;
+        assert!((p.yaw - d).abs() < 1.0e-5, "turning left grows the WoW yaw");
+        assert!((p.model_yaw - d).abs() < 1.0e-5, "the body turns with it");
+        assert!((p.cam_yaw + d).abs() < 1.0e-5, "the camera mirrors the yaw");
+        // The smart follow sees the camera already behind.
+        assert!(wrap_pi(wrap_pi(-p.yaw) - p.cam_yaw).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn turning_in_place_shuffles_and_a_turn_in_water_is_the_swim_idle() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.grounded = true;
+        p.input.turn = 1.0;
+        assert_eq!(p.anim(), 11, "ShuffleLeft");
+        p.input.turn = -1.0;
+        assert_eq!(p.anim(), 12, "ShuffleRight");
+        p.swimming = true;
+        assert_eq!(p.anim(), 41, "SwimIdle");
+    }
+
+    #[test]
+    fn the_camera_pivot_lifts_to_the_surface_band_and_sinks_when_diving() {
+        // A surface swimmer's feet 1.52 under the surface lands in the surface
+        // band: the corridor lifts the pivot to `surface + 2/9`.
+        let surface = 1.52;
+        let pivot = camera_pivot_height(CAM_PIVOT_SWIM, CAM_PIVOT_SWIM, Some(surface), 0.0);
+        assert!((pivot - (surface + WATER_SURFACE_BAND)).abs() < 1.0e-5);
+        // The submerge band puts it `5/6` under the surface.
+        let surface = 1.8;
+        let pivot = camera_pivot_height(CAM_PIVOT_SWIM, CAM_PIVOT_SWIM, Some(surface), 0.0);
+        assert!((pivot - (surface - WATER_REST)).abs() < 1.0e-5);
+        // Dry land keeps the standing preset.
+        let pivot = camera_pivot_height(CAM_PIVOT_STAND, CAM_PIVOT_STAND, None, 0.0);
+        assert!((pivot - CAM_PIVOT_STAND).abs() < 1.0e-5);
     }
 
     #[test]
