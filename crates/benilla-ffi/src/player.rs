@@ -1309,9 +1309,18 @@ impl Player {
             self.vel[2] = 0.0;
         } else {
             // Vertical: gravity then the floor probe (benilla's order).
+            //
+            // The probe's ceiling has to cover the whole step, not just the
+            // new feet: at terminal velocity a hitched 0.1s frame drops 6 yd,
+            // so probing from `pos.z + STEP_UP_HEIGHT` lets the feet pass a
+            // floor by more than 1 yd in one tick - the floor is then above
+            // the ceiling, `ground` misses it and the body leaves the world.
+            // Probing from the pre-gravity feet finds every surface crossed
+            // this frame, and the `pos.z <= z` test below snaps onto it.
+            let prev_z = self.pos[2];
             self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
             self.pos[2] += self.vel[2] * dt;
-            let ceil = self.pos[2] + STEP_UP_HEIGHT;
+            let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
             match self.ground(self.pos[0], self.pos[1], ceil) {
                 Some((z, _)) => {
                     if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
@@ -1693,6 +1702,43 @@ mod tests {
         p.tiles.insert((tx, ty), col);
         assert!(!p.wall_hit(-8800.0, -800.0, 0.0), "a floor never blocks");
         assert_eq!(p.ground(-8800.0, -800.0, 100.0), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn a_terminal_velocity_fall_lands_instead_of_tunnelling() {
+        // A hitched frame (dt clamped to 0.1) at terminal velocity drops 6 yd:
+        // probing only `pos.z + STEP_UP_HEIGHT` misses the floor once the feet
+        // pass it by more than that, and the body leaves the map.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let mut col = TileCol::new();
+        let a = Tri::new(
+            [-8820.0, -820.0, 0.0],
+            [-8780.0, -820.0, 0.0],
+            [-8820.0, -780.0, 0.0],
+        );
+        let b = Tri::new(
+            [-8780.0, -820.0, 0.0],
+            [-8780.0, -780.0, 0.0],
+            [-8820.0, -780.0, 0.0],
+        );
+        for t in [a, b] {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &t);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(t);
+                }
+            }
+        }
+        p.tiles.insert((tx, ty), col);
+        p.pos[2] = 500.0;
+        p.vel[2] = -TERMINAL_VELOCITY;
+        p.grounded = false;
+        for _ in 0..120 {
+            p.tick(0.1);
+        }
+        assert!(p.grounded, "landed, not still falling at {}", p.pos[2]);
+        assert!(p.pos[2].abs() < 1.0e-3, "feet on the floor: {}", p.pos[2]);
     }
 
     #[test]
