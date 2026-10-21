@@ -155,7 +155,7 @@ pub struct BnWorld {
 
     /// Model-space group MLIQ (WMO liquid) meshes by root path: read once per
     /// model, re-placed per instance into the tile's liquid buffer.
-    wmo_group_liquids: HashMap<String, Vec<benilla_formats::LiquidMesh>>,
+    wmo_group_liquids: HashMap<String, Arc<Vec<benilla_formats::LiquidMesh>>>,
 
     /// Parsed doodad (terrain M2) geometry by model path, shared by placements.
     doodad_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
@@ -605,7 +605,6 @@ pub extern "C" fn bn_load_tile(
                     w.tile_seq += 1;
                     w.wmo_flats.clear();
                     w.doodad_flats.clear();
-                    wmo_flat_cache_clear();
 
                     return w.mcnk.len() as u32;
 
@@ -1462,6 +1461,33 @@ fn read_wmo_group_liquids(
         .collect()
 }
 
+/// Group MLIQ surfaces keyed by normalized model path. Filled by the WMO
+/// background worker (and by the sync fallback), so the gather only has to
+/// transform them. A city model like Stormwind reads 3042 group files.
+fn wmo_liquid_cache() -> &'static Mutex<HashMap<String, Arc<Vec<benilla_formats::LiquidMesh>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<benilla_formats::LiquidMesh>>>>> =
+        OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wmo_liquid_has(key: &str) -> bool {
+    wmo_liquid_cache()
+        .lock()
+        .map(|c| c.contains_key(key))
+        .unwrap_or(false)
+}
+
+fn wmo_liquid_lookup(key: &str) -> Option<Arc<Vec<benilla_formats::LiquidMesh>>> {
+    wmo_liquid_cache().lock().ok()?.get(key).cloned()
+}
+
+fn wmo_liquid_store(key: &str, meshes: Arc<Vec<benilla_formats::LiquidMesh>>) {
+    if let Ok(mut cache) = wmo_liquid_cache().lock() {
+        cache.insert(key.to_string(), meshes);
+    }
+}
+
 /// Bake one WMO placement's MLIQ surfaces into the tile's liquid buffer: model
 /// space through the placement quaternion and position, then the same
 /// tile-local WoW->UE mirror `build_wmo_flat` applies to the geometry, so the
@@ -1474,7 +1500,20 @@ fn append_wmo_liquids(
     center: (f32, f32),
 ) {
     if !w.wmo_group_liquids.contains_key(model_path) {
-        let meshes = read_wmo_group_liquids(w.chain.as_mut(), model_path);
+        let key = wmo_key(model_path);
+
+        let meshes = match wmo_liquid_lookup(&key) {
+            Some(m) => m,
+
+            None => {
+                let meshes = Arc::new(read_wmo_group_liquids(w.chain.as_mut(), model_path));
+
+                wmo_liquid_store(&key, meshes.clone());
+
+                meshes
+            }
+        };
+
         w.wmo_group_liquids.insert(model_path.to_string(), meshes);
     }
     // Disjoint field borrows: the tile buffer and the path-keyed cache.
@@ -1485,7 +1524,7 @@ fn append_wmo_liquids(
         return;
     };
     let q = placement_quat(rotation_deg);
-    for m in meshes {
+    for m in meshes.iter() {
         // u16 builder cap, same as the ADT liquid loop.
         if tile.lverts.len() + m.positions.len() > u16::MAX as usize {
             return;
@@ -1570,7 +1609,8 @@ enum WmoJob {
     },
     Flat {
         dir: String,
-        seq: u64,
+        /// Tile path the placement belongs to (the flat cache key).
+        path: String,
         i: u32,
         model: String,
         position: [f32; 3],
@@ -1616,45 +1656,143 @@ struct WmoFlatEntry {
 
 }
 
-fn wmo_flat_cache() -> &'static Mutex<HashMap<(u64, u32), WmoFlatEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<(u64, u32), WmoFlatEntry>>> = OnceLock::new();
+/// Baked placements of one tile path. Keyed by path, not by the tile serial:
+/// a streaming burst loads the neighbour tiles right after the focus tile, and
+/// the old serial-keyed table was wiped by every one of those loads, so the
+/// focus tile's prefetch was always thrown away and its city WMO re-baked
+/// synchronously on the game thread (~340 ms for Stormwind).
+struct WmoFlatTile {
+    entries: HashMap<u32, WmoFlatEntry>,
 
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    bytes: u64,
+}
+
+struct WmoFlatCache {
+    tiles: HashMap<String, WmoFlatTile>,
+
+    /// Least-recently prefetched first; trimmed past the byte budget.
+    order: VecDeque<String>,
+
+    bytes: u64,
+}
+
+/// A city tile bakes ~36 MB (Stormwind: 815k verts + 2.5M index slots), so the
+/// pooled bakes need a cap; the 3x3 residency window fits well inside it.
+const WMO_FLAT_CACHE_BYTES: u64 = 384 * 1024 * 1024;
+
+fn wmo_flat_cache() -> &'static Mutex<WmoFlatCache> {
+    static CACHE: OnceLock<Mutex<WmoFlatCache>> = OnceLock::new();
+
+    CACHE.get_or_init(|| {
+        Mutex::new(WmoFlatCache {
+            tiles: HashMap::new(),
+
+            order: VecDeque::new(),
+
+            bytes: 0,
+        })
+    })
+}
+
+fn wmo_flat_size(flat: &WmoFlat) -> u64 {
+    (flat.verts.len() * std::mem::size_of::<BnVertex>() + flat.idx.len() * 4) as u64
+}
+
+fn wmo_flat_touch(cache: &mut WmoFlatCache, path: &str) {
+    if let Some(pos) = cache.order.iter().position(|p| p == path) {
+        cache.order.remove(pos);
+    }
+
+    cache.order.push_back(path.to_string());
+}
+
+/// Drop the least recently prefetched tiles past the byte budget. `keep` is
+/// the tile being filled right now and is never dropped.
+fn wmo_flat_trim(cache: &mut WmoFlatCache, keep: &str) {
+    while cache.bytes > WMO_FLAT_CACHE_BYTES && cache.order.len() > 1 {
+        let Some(victim) = cache.order.front().cloned() else {
+            break;
+        };
+
+        if victim == keep {
+            break;
+        }
+
+        cache.order.pop_front();
+
+        if let Some(t) = cache.tiles.remove(&victim) {
+            cache.bytes = cache.bytes.saturating_sub(t.bytes);
+        }
+    }
 }
 
 /// Some(Some(flat)) = baked, Some(None) = failed, None = not requested.
-fn wmo_flat_lookup(seq: u64, i: u32) -> Option<Option<Arc<WmoFlat>>> {
+fn wmo_flat_lookup(path: &str, i: u32) -> Option<Option<Arc<WmoFlat>>> {
     let cache = wmo_flat_cache().lock().ok()?;
 
-    cache.get(&(seq, i)).map(|e| e.flat.clone())
+    cache
+        .tiles
+        .get(path)
+        .and_then(|t| t.entries.get(&i))
+        .map(|e| e.flat.clone())
 }
 
-fn wmo_flat_pending(seq: u64, i: u32) -> bool {
+fn wmo_flat_pending(path: &str, i: u32) -> bool {
     wmo_flat_cache()
         .lock()
         .ok()
-        .and_then(|c| c.get(&(seq, i)).map(|e| !e.ready))
+        .and_then(|c| {
+            c.tiles
+                .get(path)
+                .and_then(|t| t.entries.get(&i))
+                .map(|e| !e.ready)
+        })
         .unwrap_or(false)
 }
 
-fn wmo_flat_store(seq: u64, i: u32, flat: Option<Arc<WmoFlat>>) {
+fn wmo_flat_store(path: &str, i: u32, flat: Option<Arc<WmoFlat>>) {
     if let Ok(mut cache) = wmo_flat_cache().lock() {
-        // Only fill a slot the host still wants: a tile load clears the table,
-        // so a job that finishes after its tile was replaced finds nothing.
-        if let Some(e) = cache.get_mut(&(seq, i)) {
-            if !e.ready {
-                *e = WmoFlatEntry {
-                    ready: true,
-                    flat,
-                };
+        let add = flat.as_ref().map_or(0, |f| wmo_flat_size(f));
+
+        // Only fill a slot the host still wants: trimming drops a tile's
+        // entries, so a job that finishes after its tile was evicted finds
+        // nothing here and its result is dropped.
+        if let Some(t) = cache.tiles.get_mut(path) {
+            if let Some(e) = t.entries.get_mut(&i) {
+                if !e.ready {
+                    let old = e.flat.as_ref().map_or(0, |f| wmo_flat_size(f));
+
+                    *e = WmoFlatEntry {
+                        ready: true,
+                        flat,
+                    };
+
+                    t.bytes = t.bytes.saturating_sub(old) + add;
+
+                    cache.bytes = cache.bytes.saturating_sub(old) + add;
+                }
             }
         }
     }
 }
 
-fn wmo_flat_cache_clear() {
+/// Drop every baked placement of the active tile. The host calls this once its
+/// gather has copied the geometry: a city tile's flats are ~36 MB and the
+/// residency window holds several of them, so keeping them past their use just
+/// forces the byte budget to evict tiles that are still being assembled.
+fn wmo_flat_release(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+
     if let Ok(mut cache) = wmo_flat_cache().lock() {
-        cache.clear();
+        if let Some(t) = cache.tiles.remove(path) {
+            cache.bytes = cache.bytes.saturating_sub(t.bytes);
+        }
+
+        if let Some(pos) = cache.order.iter().position(|p| p == path) {
+            cache.order.remove(pos);
+        }
     }
 }
 
@@ -1719,7 +1857,7 @@ fn wmo_worker() {
                         }
 
                         WmoJob::Flat {
-                            seq,
+                            path,
                             i,
                             model,
                             position,
@@ -1728,7 +1866,7 @@ fn wmo_worker() {
                             ..
                         } => {
                             if chain.is_none() {
-                                wmo_flat_store(seq, i, None);
+                                wmo_flat_store(&path, i, None);
 
                                 continue;
                             }
@@ -1781,7 +1919,21 @@ fn wmo_worker() {
                                 _ => None,
                             };
 
-                            wmo_flat_store(seq, i, flat);
+                            // The placement's MLIQ surfaces are read here too:
+                            // a city model's 3042 group files cost ~320 ms of
+                            // MPQ reads, which used to land on the game thread
+                            // inside the gather. bn_wmo_instance_load then finds
+                            // them cached and only transforms them.
+                            if !wmo_liquid_has(&key) {
+                                if let Some((_, c)) = chain.as_mut() {
+                                    let meshes =
+                                        read_wmo_group_liquids(Some(c), &model);
+
+                                    wmo_liquid_store(&key, Arc::new(meshes));
+                                }
+                            }
+
+                            wmo_flat_store(&path, i, flat);
                         }
                     }
                 }
@@ -1808,9 +1960,13 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
         return 0;
     };
 
-    let seq = w.tile_seq;
-
     let dir = w.data_dir.clone();
+
+    let path = w.tile_path.clone();
+
+    if path.is_empty() {
+        return 0;
+    }
 
     let mut jobs = Vec::new();
 
@@ -1821,17 +1977,26 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
             Err(_) => return 0,
         };
 
+        wmo_flat_touch(&mut cache, &path);
+
+        let entries = cache
+            .tiles
+            .entry(path.clone())
+            .or_insert_with(|| WmoFlatTile {
+                entries: HashMap::new(),
+
+                bytes: 0,
+            });
+
         for (i, inst) in tile.wmos.iter().enumerate() {
             let i = i as u32;
 
-            let slot = (seq, i);
-
-            if cache.contains_key(&slot) {
+            if entries.entries.contains_key(&i) {
                 continue;
             }
 
-            cache.insert(
-                slot,
+            entries.entries.insert(
+                i,
                 WmoFlatEntry {
                     ready: false,
                     flat: None,
@@ -1840,7 +2005,7 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
 
             jobs.push(WmoJob::Flat {
                 dir: dir.clone(),
-                seq,
+                path: path.clone(),
                 i,
                 model: inst.model.clone(),
                 position: inst.position,
@@ -1848,6 +2013,8 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
                 center: tile.center,
             });
         }
+
+        wmo_flat_trim(&mut cache, &path);
     }
 
     let n = jobs.len() as u32;
@@ -1865,8 +2032,24 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
     n
 }
 
-/// 1 while instance `i` of the loaded tile is still being baked by the worker.
+/// Release the active tile's baked placements once the host has copied them.
+/// Pairs with `bn_wmo_prefetch_tile`; a later prefetch of the same tile bakes
+/// it again.
 
+#[no_mangle]
+pub extern "C" fn bn_wmo_release_tile(world: *const BnWorld) {
+    if world.is_null() {
+        return;
+    }
+
+    // SAFETY: caller owns a valid const handle.
+
+    let w = unsafe { &*world };
+
+    wmo_flat_release(&w.tile_path);
+}
+
+/// 1 while instance `i` of the loaded tile is still being baked by the worker.
 #[no_mangle]
 pub extern "C" fn bn_wmo_instance_pending(world: *const BnWorld, i: u32) -> u32 {
     if world.is_null() {
@@ -1881,7 +2064,7 @@ pub extern "C" fn bn_wmo_instance_pending(world: *const BnWorld, i: u32) -> u32 
         return 0;
     }
 
-    wmo_flat_pending(w.tile_seq, i) as u32
+    wmo_flat_pending(&w.tile_path, i) as u32
 }
 
 /// MODF WMO instances in the loaded tile (0 when no tile).
@@ -1941,7 +2124,7 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     // A background bake normally waits for us: consume it instead of building
     // ~840k Stormwind vertices on the game thread. A pending bake answers 0
     // (the host retries next frame); only an unprefetched tile bakes here.
-    match wmo_flat_lookup(w.tile_seq, i) {
+    match wmo_flat_lookup(&w.tile_path, i) {
         Some(Some(flat)) => {
             let n = flat.subs.len() as u32;
 
@@ -2054,6 +2237,76 @@ pub extern "C" fn bn_wmo_instance_fill_triangles(
                     flags: if sm.two_sided { 1 } else { 0 },
                 };
             }
+        }
+    }
+    n as u32
+}
+
+/// Copy `count` vertices starting at `first` of instance `i` into `out`
+/// (0-based, capacity `cap`). Returns the number copied. The host walks a
+/// city WMO's ~815k vertices in chunks so no single frame copies them all.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_fill_vertices_range(
+    world: *const BnWorld,
+    i: u32,
+    first: u32,
+    count: u32,
+    out: *mut BnVertex,
+    cap: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let start = (first as usize).min(f.verts.len());
+    let n = (f.verts.len() - start).min(count as usize).min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr().add(start), out, n) };
+    n as u32
+}
+
+/// Fill index slots `[first, first + count)` of instance `i` into `out`
+/// (0-based, capacity `cap`), one BnTriangle per slot as
+/// `bn_wmo_instance_fill_triangles` does. Returns the number of slots walked
+/// (the destination advance), which is 0 past the end.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_fill_triangles_range(
+    world: *const BnWorld,
+    i: u32,
+    first: u32,
+    count: u32,
+    out: *mut BnTriangle,
+    cap: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let begin = (first as usize).min(f.idx.len());
+    let n = (f.idx.len() - begin).min(count as usize).min(cap as usize);
+    let end = begin + n;
+    for (j, sm) in f.subs.iter().enumerate() {
+        let sub0 = sm.idx0 as usize;
+        if sub0 >= end {
+            break;
+        }
+        let sub_end = (sub0 + sm.idx_n as usize).min(end);
+        let mut k = sub0.max(begin);
+        // Slots are 3-aligned inside a submesh: step from the submesh start.
+        let align = (k - sub0) % 3;
+        if align != 0 {
+            k += 3 - align;
+        }
+        while k + 2 < sub_end {
+            unsafe {
+                *out.add(k - begin) = BnTriangle {
+                    a: f.idx[k],
+                    b: f.idx[k + 1],
+                    c: f.idx[k + 2],
+                    material: j.min(255) as u8,
+                    flags: if sm.two_sided { 1 } else { 0 },
+                };
+            }
+            k += 3;
         }
     }
     n as u32
@@ -5290,7 +5543,10 @@ fn tex_cache() -> &'static Mutex<HashMap<String, TexEntry>> {
 }
 
 struct TexJobs {
-    queue: Mutex<VecDeque<(String, Vec<u8>)>>,
+    /// (cache key, data dir, internal path). The worker reads the file: an MPQ
+    /// read on the calling thread used to cost a millisecond or two per WMO
+    /// submesh (3042 of them in one city tile).
+    queue: Mutex<VecDeque<(String, String, String)>>,
 
     ready: Condvar,
 
@@ -5344,6 +5600,29 @@ fn read_texture_bytes(w: &BnWorld, path: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Same read through the worker's own chain. The background decode must not
+/// read (and decompress) MPQ files on the game thread: 3042 WMO submesh
+/// requests used to cost 874 ms in one gather slice just doing this.
+fn read_texture_bytes_chain(chain: &mut benilla_formats::Chain, path: &str) -> Option<Vec<u8>> {
+    if chain.contains(path) {
+        if let Ok(bytes) = chain.read_file(path) {
+            return Some(bytes);
+        }
+    }
+
+    if !path.to_ascii_lowercase().ends_with(".blp") {
+        let alt = format!("{}.BLP", path);
+
+        if chain.contains(&alt) {
+            if let Ok(bytes) = chain.read_file(&alt) {
+                return Some(bytes);
+            }
+        }
+    }
+
+    None
+}
+
 fn decode_blp_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let decoded = benilla_blp::decode(bytes).ok()?;
 
@@ -5386,9 +5665,7 @@ fn decode_texture_sync(w: &BnWorld, path: &str) -> Option<(u32, u32, Vec<u8>)> {
     decode_blp_bytes(bytes.as_slice())
 }
 
-fn tex_decode_job(key: String, bytes: Vec<u8>) {
-    let decoded = decode_blp_bytes(bytes.as_slice());
-
+fn tex_decode_job(key: String, decoded: Option<(u32, u32, Vec<u8>)>) {
     if let Ok(mut cache) = tex_cache().lock() {
         // The synchronous path may have answered while this job waited.
         if cache.get(&key).is_some_and(|e| e.status != TEX_PENDING) {
@@ -5422,29 +5699,46 @@ fn tex_workers() {
         for i in 0..n {
             let _ = std::thread::Builder::new()
                 .name(format!("bn-blp-{i}"))
-                .spawn(|| loop {
-                    let job = {
-                        let jobs = tex_jobs();
+                .spawn(|| {
+                    // Each worker reads from its own chain: the game thread
+                    // only names the file.
+                    let mut chain: Option<(String, benilla_formats::Chain)> = None;
 
-                        let mut q = match jobs.queue.lock() {
-                            Ok(q) => q,
+                    loop {
+                        let job = {
+                            let jobs = tex_jobs();
 
-                            Err(_) => return,
-                        };
-
-                        while q.is_empty() {
-                            q = match jobs.ready.wait(q) {
+                            let mut q = match jobs.queue.lock() {
                                 Ok(q) => q,
 
                                 Err(_) => return,
                             };
+
+                            while q.is_empty() {
+                                q = match jobs.ready.wait(q) {
+                                    Ok(q) => q,
+
+                                    Err(_) => return,
+                                };
+                            }
+
+                            q.pop_front()
+                        };
+
+                        let Some((key, dir, path)) = job else { continue };
+
+                        if chain.as_ref().map_or(true, |(d, _)| d != &dir) {
+                            chain = benilla_formats::Chain::open(Path::new(&dir))
+                                .ok()
+                                .map(|c| (dir, c));
                         }
 
-                        q.pop_front()
-                    };
+                        let decoded = chain
+                            .as_mut()
+                            .and_then(|(_, c)| read_texture_bytes_chain(c, &path))
+                            .and_then(|b| decode_blp_bytes(b.as_slice()));
 
-                    if let Some((key, bytes)) = job {
-                        tex_decode_job(key, bytes);
+                        tex_decode_job(key, decoded);
                     }
                 });
         }
@@ -5453,7 +5747,8 @@ fn tex_workers() {
 
 /// Queue a background decode for `internal_path`.
 ///
-/// 1 = ready already, 3 = pending already, 0 = queued, 2 = not found.
+/// 1 = ready already, 3 = pending already, 0 = queued, 2 = bad arguments.
+/// The worker resolves and decodes the file, so this never touches the MPQ.
 
 #[no_mangle]
 
@@ -5489,19 +5784,10 @@ pub extern "C" fn bn_texture_request(
 
     let w = unsafe { &*world };
 
-    let bytes = match read_texture_bytes(w, p) {
-        Some(b) => b,
-
-        None => {
-            tex_store(&key, None);
-
-            return 2;
-        }
-    };
+    let dir = w.data_dir.clone();
 
     // Reserve the slot before queueing: a second request for the same path
-    // then answers "pending" instead of reading and decoding it twice.
-
+    // then answers "pending" instead of queueing it twice.
     if let Ok(mut cache) = tex_cache().lock() {
         if cache.contains_key(&key) {
             return 3;
@@ -5515,7 +5801,7 @@ pub extern "C" fn bn_texture_request(
     let jobs = tex_jobs();
 
     if let Ok(mut q) = jobs.queue.lock() {
-        q.push_back((key, bytes));
+        q.push_back((key, dir, p.to_string()));
 
         TEX_STAT_QUEUED.fetch_add(1, Ordering::Relaxed);
 
