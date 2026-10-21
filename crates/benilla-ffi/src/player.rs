@@ -25,6 +25,10 @@ const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
 const GRAVITY: f32 = 19.291_105;
 const JUMP_SPEED: f32 = 7.955_547;
 const TERMINAL_VELOCITY: f32 = 60.148_003;
+/// How far below the last real floor the void guard lets a body fall before it
+/// is restored there (yd). A real floor anywhere below is found by `ground`
+/// long before this; only a true hole in the collision data gets here.
+const VOID_GUARD_DEPTH: f32 = 100.0;
 const GROUND_COS: f32 = 0.642_788;
 const STEP_UP_HEIGHT: f32 = 1.0;
 // The capsule the reference traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
@@ -37,7 +41,7 @@ const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
 // ---- benilla-app/src/player/camera.rs ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-const LOOK_SENSITIVITY: f32 = 0.008;
+const LOOK_SENSITIVITY: f32 = 0.02;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
 /// sits inside the body (the reference's first-person cut is not modelled).
@@ -633,6 +637,12 @@ pub struct Player {
     /// Set when a tile's WMO floors are built: the spawn sits on the terrain
     /// under a city, so climb to the lowest walkable WMO floor over it.
     snap_pending: bool,
+    /// Last feet position that stood on a floor. The void guard restores it if
+    /// the body ever falls far below: a hole in the collision data must never
+    /// drop the player out of the world.
+    last_ground: [f32; 3],
+    /// Seconds spent falling with no floor under the feet (diagnostics).
+    void_time: f32,
 }
 
 impl Player {
@@ -661,6 +671,8 @@ impl Player {
             footprints: HashMap::new(),
             missing: Vec::new(),
             snap_pending: false,
+            last_ground: [x, y, 0.0],
+            void_time: 0.0,
         }
     }
 
@@ -1104,6 +1116,7 @@ impl Player {
                 self.pos[2] = z;
                 self.vel[2] = 0.0;
                 self.grounded = true;
+                self.last_ground = self.pos;
             }
         }
         let feet = self.pos;
@@ -1323,15 +1336,49 @@ impl Player {
             let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
             match self.ground(self.pos[0], self.pos[1], ceil) {
                 Some((z, _)) => {
+                    self.void_time = 0.0;
                     if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
                         self.pos[2] = z;
                         self.vel[2] = 0.0;
                         self.grounded = true;
+                        self.last_ground = self.pos;
                     } else {
                         self.grounded = false;
                     }
                 }
-                None => self.grounded = false,
+                None => {
+                    // No floor under the feet at all: a hole in the terrain
+                    // (a tunnel mouth), a tile that has not streamed in yet, or
+                    // a body that is already below the world. Never keep
+                    // falling forever - report the spot once and restore the
+                    // last floor when the fall is clearly out of the map.
+                    self.grounded = false;
+                    self.void_time += dt;
+                    if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
+                        let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                        let state = match self.tiles.get(&(tx, ty)) {
+                            None => "missing",
+                            Some(t) if t.wmo_ready => "ready",
+                            Some(_) => "loading",
+                        };
+                        eprintln!(
+                            "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
+                             {state} resident={}",
+                            self.pos[0], self.pos[1], self.pos[2], self.tiles.len()
+                        );
+                    }
+                    if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH {
+                        eprintln!(
+                            "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
+                            self.pos[0], self.pos[1], self.pos[2],
+                            self.last_ground[0], self.last_ground[1], self.last_ground[2]
+                        );
+                        self.pos = self.last_ground;
+                        self.vel = [0.0; 3];
+                        self.grounded = true;
+                        self.void_time = 0.0;
+                    }
+                }
             }
             if self.grounded {
                 self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
@@ -1540,6 +1587,7 @@ pub extern "C" fn bn_player_reset(
     if let Some((z, _)) = p.ground(x, y, f32::MAX) {
         p.pos[2] = z;
         p.grounded = true;
+        p.last_ground = p.pos;
     }
     w.player = Some(p);
     1
@@ -1702,6 +1750,25 @@ mod tests {
         p.tiles.insert((tx, ty), col);
         assert!(!p.wall_hit(-8800.0, -800.0, 0.0), "a floor never blocks");
         assert_eq!(p.ground(-8800.0, -800.0, 100.0), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn a_hole_in_the_collision_data_never_drops_the_body_out_of_the_world() {
+        // No geometry at all under the feet: the body falls, and the void guard
+        // restores the last real floor once it is clearly through the map.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.pos[2] = 10.0;
+        p.last_ground = [p.pos[0], p.pos[1], 10.0];
+        p.grounded = true;
+        let mut restored = false;
+        for _ in 0..400 {
+            p.tick(0.1);
+            assert!(p.pos[2] > -100.0, "never falls out of the world: {}", p.pos[2]);
+            if p.grounded && (p.pos[2] - 10.0).abs() < 1.0e-3 {
+                restored = true;
+            }
+        }
+        assert!(restored, "the void guard put the body back on the floor");
     }
 
     #[test]
