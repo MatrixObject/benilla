@@ -158,6 +158,10 @@ pub struct BnWorld {
     /// camera probe use), shared by every placement of the model.
     wmo_collision: HashMap<String, benilla_formats::CollisionMesh>,
 
+    /// `md5translate.trs`: ADT tile -> minimap BLP hash, loaded on the first
+    /// `bn_minimap_tile_path`. The minimap tiles are authored art, not a 3D pass.
+    minimap: Option<benilla_formats::MinimapTranslate>,
+
 }
 
 /// Convert a WoW position to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
@@ -304,6 +308,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         player: None,
 
         wmo_collision: HashMap::new(),
+
+        minimap: None,
 
     }))
 
@@ -6087,5 +6093,96 @@ pub extern "C" fn bn_light_sample(
     // SAFETY: `out` holds at least `cap >= N` floats.
     unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
     N
+}
+
+/// The zone's water tint bands at a WoW-space position (`sRGB 0..1`): the same Light row
+/// `bn_light_sample` resolves, but the swatch endpoints the ADT liquid pass uses
+/// (`IB_RIVER_SHALLOW/DEEP` and `IB_OCEAN_SHALLOW/DEEP`, with their `LightParams` alphas).
+/// Writes 16 floats: river shallow rgba, river deep rgba, ocean shallow rgba, ocean deep rgba.
+/// Returns 16, 0 when the tables or the row are missing.
+#[no_mangle]
+pub extern "C" fn bn_light_water(
+    world: *mut BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    map: u32,
+    time: u32,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    const N: u32 = 16;
+    if world.is_null() || out.is_null() || cap < N {
+        return 0;
+    }
+    // SAFETY: the caller passes the handle `bn_init` returned.
+    let w = unsafe { &mut *world };
+    if w.lights.is_none() {
+        let loaded = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::LightCatalog::load(c).ok());
+        w.lights = loaded;
+    }
+    let Some(cat) = w.lights.as_ref() else {
+        return 0;
+    };
+    let a = cat.sample(map, [x, y, z], time, false);
+    let mut vals = [0.0f32; N as usize];
+    vals[0..3].copy_from_slice(&a.water_river[0]);
+    vals[3] = a.water_river_alpha[0];
+    vals[4..7].copy_from_slice(&a.water_river[1]);
+    vals[7] = a.water_river_alpha[1];
+    vals[8..11].copy_from_slice(&a.water_ocean[0]);
+    vals[11] = a.water_ocean_alpha[0];
+    vals[12..15].copy_from_slice(&a.water_ocean[1]);
+    vals[15] = a.water_ocean_alpha[1];
+    // SAFETY: `out` holds at least `cap >= N` floats.
+    unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
+    N
+}
+
+/// Resolve one minimap tile through `md5translate.trs`: writes the MPQ path stem
+/// `textures\\Minimap\\<hash>` (NUL-terminated, the caller appends "`.BLP`") into
+/// `buf` and returns its length; 0 when the tile has no authored art.
+#[no_mangle]
+pub extern "C" fn bn_minimap_tile_path(
+    world: *mut BnWorld,
+    dir: *const c_char,
+    tx: u32,
+    ty: u32,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(dir) = cstr_to_str(dir) else {
+        return 0;
+    };
+    // SAFETY: the caller passes the handle `bn_init` returned.
+    let w = unsafe { &mut *world };
+    if w.minimap.is_none() {
+        let loaded = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::load_minimap_translate(c).ok());
+        w.minimap = loaded;
+    }
+    let Some(translate) = w.minimap.as_ref() else {
+        return 0;
+    };
+    let Some(hash) = translate.tile(dir, tx, ty) else {
+        return 0;
+    };
+    let path = format!("textures\\Minimap\\{hash}");
+    let bytes = path.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    // SAFETY: `buf` has `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
 }
 

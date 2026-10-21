@@ -41,7 +41,7 @@ const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
 // ---- benilla-app/src/player/camera.rs ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-const LOOK_SENSITIVITY: f32 = 0.02;
+const LOOK_SENSITIVITY: f32 = 0.028;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
 /// sits inside the body (the reference's first-person cut is not modelled).
@@ -56,6 +56,8 @@ const STRAFE_BLEND_RATE: f32 = 17.26;
 const TURN_RATE: f32 = std::f32::consts::PI;
 /// `state.rs::TURN_RATE_MOVING`: the scale while translating or falling.
 const TURN_RATE_MOVING: f32 = 0.75;
+/// Roam-mode flight speed (yd/s): a zone tour without waiting on terrain.
+const FLY_SPEED: f32 = 30.0;
 
 // ---- benilla-app/src/player/camera.rs pivot presets ----
 /// A scale-1 Human Male's framing pivot: standing 1.9002692, swimming
@@ -594,6 +596,8 @@ struct Input {
     turn: f32,
     jump: bool,
     walk: bool,
+    /// Vertical axis for roam/fly mode (-1..1): Space up, Ctrl down.
+    up: f32,
 }
 
 pub struct Player {
@@ -645,6 +649,12 @@ pub struct Player {
     void_time: f32,
     /// Seconds since the last falling-trace line (diagnostics).
     fall_time: f32,
+    /// Roam mode (F8): no gravity, no collision, no water - free flight for
+    /// inspecting the world. The ICC/M2 body still follows the pose.
+    fly: bool,
+    /// A mouse button was held for a look drag this frame: the smart follow
+    /// must not fight the drag by swinging the camera back behind the body.
+    look_active: bool,
 }
 
 impl Player {
@@ -676,6 +686,8 @@ impl Player {
             last_ground: [x, y, 0.0],
             void_time: 0.0,
             fall_time: 0.0,
+            fly: false,
+            look_active: false,
         }
     }
 
@@ -1105,11 +1117,72 @@ impl Player {
         best
     }
 
+    /// Roam mode: fly where the body faces (the mouse still turns the aim),
+    /// W/A/S/D level, Space/Ctrl vertical, with no gravity, collision or water.
+    /// The camera keeps the third-person framing but skips the boom probe, so
+    /// walls and floors never pull it into the body.
+    fn tick_fly(&mut self, dt: f32) {
+        let forward = self.input.forward.clamp(-1.0, 1.0);
+        let strafe = self.input.strafe.clamp(-1.0, 1.0);
+        let up = self.input.up.clamp(-1.0, 1.0);
+        let turn = self.input.turn.clamp(-1.0, 1.0);
+        if turn != 0.0 {
+            let d = turn * TURN_RATE * TURN_RATE_MOVING * dt;
+            self.yaw = wrap_pi(self.yaw + d);
+            self.model_yaw = wrap_pi(self.model_yaw + d);
+            self.cam_yaw = wrap_pi(self.cam_yaw - d);
+        }
+        let (sy, cy) = self.yaw.sin_cos();
+        let mut v = [cy * forward + sy * strafe, sy * forward - cy * strafe, up];
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len > 1.0 {
+            for c in &mut v {
+                *c /= len;
+            }
+        }
+        for i in 0..3 {
+            self.pos[i] += v[i] * FLY_SPEED * dt;
+        }
+        self.vel = [0.0; 3];
+        self.grounded = false;
+        self.swimming = false;
+        self.surface = None;
+        self.void_time = 0.0;
+        self.fall_time = 0.0;
+        // Body: the aim plus the same strafe counter-twist as walking.
+        let offset = strafe_body_offset(forward, strafe);
+        let cur = wrap_pi(self.model_yaw - self.yaw);
+        let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
+        self.model_yaw = wrap_pi(self.yaw + eased);
+        // Smart follow behind the aim, as on the ground.
+        if forward.abs() + strafe.abs() > 0.01 {
+            let target = wrap_pi(-self.yaw);
+            let d = wrap_pi(target - self.cam_yaw);
+            let max = FOLLOW_RATE * dt;
+            self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
+        }
+        let glide = CAM_PIVOT_SMOOTH * dt;
+        self.pivot_height += (CAM_PIVOT_STAND - self.pivot_height).clamp(-glide, glide);
+        self.attack_left = (self.attack_left - dt).max(0.0);
+        let step_d = 8.33 * dt;
+        self.cam_distance +=
+            (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
+        self.cam_live = self.cam_distance;
+    }
+
     /// One frame: integrate benilla's locomotion, resolve the floor, then place
     /// the camera. `dt` is clamped like the client's frame slice.
     fn tick(&mut self, dt: f32) {
+        // Consume the drag latch first: the host reports the held look button
+        // on every frame, including frames with no pointer delta.
+        let looking = self.look_active;
+        self.look_active = false;
         let dt = dt.clamp(0.0, 0.1);
         if dt <= 0.0 {
+            return;
+        }
+        if self.fly {
+            self.tick_fly(dt);
             return;
         }
         if self.snap_pending {
@@ -1252,7 +1325,7 @@ impl Player {
 
         // Smart follow (`cameraSmoothStyle` default): while the character is
         // driven, the camera returns behind the aim at `cameraYawSmoothSpeed`.
-        if mag > 0.01 {
+        if mag > 0.01 && !looking {
             let target = wrap_pi(-self.yaw); // UE yaw is the mirror of WoW yaw
             let d = wrap_pi(target - self.cam_yaw);
             let max = FOLLOW_RATE * dt;
@@ -1456,10 +1529,15 @@ impl Player {
         (eye, pivot)
     }
 
-    /// Mouse look: `dx`/`dy` are raw pointer counts (0.003 rad each). With
+    /// Mouse look: `dx`/`dy` are raw pointer counts (`LOOK_SENSITIVITY` rad
+    /// each). Called every frame a button is held, so a still drag latches
+    /// `look_active`. With
     /// `turn_body` the aim and the rendered body turn with the camera, as
     /// `camera.rs` does on the right button; otherwise only the orbit moves.
     fn look(&mut self, dx: f32, dy: f32, turn_body: bool) {
+        // The button is held this frame (the host calls even for a zero
+        // delta), so the smart follow yields to the drag.
+        self.look_active = true;
         let turn = dx * LOOK_SENSITIVITY;
         if turn_body {
             // `cam_yaw` is UE yaw, the mirror of the WoW aim: the same turn
@@ -1626,7 +1704,8 @@ pub extern "C" fn bn_player_reset(
 
 /// Held movement input: forward/strafe/turn -1..1 (in the aim's basis; turn is
 /// left-positive and the host sends it only while the right button is up), jump
-/// and walk as 0/1. The host forwards the raw key state each frame.
+/// and walk as 0/1, and `up` (-1..1) for roam mode's Space/Ctrl. The host
+/// forwards the raw key state each frame.
 #[no_mangle]
 pub extern "C" fn bn_player_input(
     world: *mut BnWorld,
@@ -1635,6 +1714,7 @@ pub extern "C" fn bn_player_input(
     turn: f32,
     jump: u32,
     walk: u32,
+    up: f32,
 ) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
     p.input.forward = forward;
@@ -1642,6 +1722,22 @@ pub extern "C" fn bn_player_input(
     p.input.turn = turn;
     p.input.jump = jump != 0;
     p.input.walk = walk != 0;
+    p.input.up = up;
+    1
+}
+
+/// Roam mode on/off: free flight for touring the map (no gravity, collision or
+/// water). Returns 1 with the flag applied. Turning it off leaves the body to
+/// gravity from wherever it is, so the void guard still catches a bad drop.
+#[no_mangle]
+pub extern "C" fn bn_player_fly(world: *mut BnWorld, on: u32) -> u32 {
+    let Some(p) = player_mut(world) else { return 0 };
+    p.fly = on != 0;
+    if !p.fly {
+        p.vel = [0.0; 3];
+        p.grounded = false;
+        p.snap_pending = true;
+    }
     1
 }
 
