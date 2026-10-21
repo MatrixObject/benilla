@@ -22,7 +22,6 @@ use crate::{placement_quat, q_rot, BnWorld};
 const RUN_SPEED: f32 = 7.0;
 const WALK_RATIO: f32 = 2.5 / 7.0;
 const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
-const TURN_RATE: f32 = std::f32::consts::PI;
 const GRAVITY: f32 = 19.291_105;
 const JUMP_SPEED: f32 = 7.955_547;
 const TERMINAL_VELOCITY: f32 = 60.148_003;
@@ -41,6 +40,11 @@ const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
 const CAM_PIVOT_FALLBACK: f32 = 1.8;
 const LOOK_SENSITIVITY: f32 = 0.003;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
+/// `cameraYawSmoothSpeed` default 180°/s: the smart follow's return rate.
+const FOLLOW_RATE: f32 = std::f32::consts::PI;
+/// `creature_anim::select::STRAFE_BLEND_RATE`: the body heading eases to the
+/// strafe offset at this rate (/s).
+const STRAFE_BLEND_RATE: f32 = 17.26;
 
 /// Mount speed bonus in 1.12: +60% (the client's riding speed).
 const MOUNT_SPEED_RATIO: f32 = 1.6;
@@ -51,7 +55,8 @@ const MOUNT_SPEED_RATIO: f32 = 1.6;
 pub struct BnPlayerState {
     /// Feet position in WoW world yards.
     pub pos: [f32; 3],
-    /// Body facing: 0 looks along +X, π/2 along +Y.
+    /// Rendered body facing (aim plus the eased strafe twist): 0 looks along
+    /// +X, π/2 along +Y.
     pub yaw: f32,
     /// Camera eye in WoW world yards.
     pub cam_eye: [f32; 3],
@@ -68,6 +73,37 @@ pub struct BnPlayerState {
     /// AnimationData.dbc id to play (0 Stand, 4 Walk, 5 Run, 13 WalkBackwards,
     /// 16 AttackUnarmed, 37 JumpStart, 40 Fall, 91 Mount).
     pub anim: u32,
+}
+
+/// Wrap an angle to (-π, π].
+fn wrap_pi(a: f32) -> f32 {
+    let mut a = a % std::f32::consts::TAU;
+    if a > std::f32::consts::PI {
+        a -= std::f32::consts::TAU;
+    } else if a <= -std::f32::consts::PI {
+        a += std::f32::consts::TAU;
+    }
+    a
+}
+
+/// The strafe body offset from the aim (`creature_anim::select::strafe_body_offset`):
+/// ±π/2 for a pure strafe, ±π/4 with forward or back, mirrored backpedaling,
+/// left positive in WoW axes.
+fn strafe_body_offset(forward: f32, strafe: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+    let left = strafe < -0.01; // A = -1 (left of the facing)
+    let right = strafe > 0.01;
+    if left == right {
+        return 0.0;
+    }
+    let diagonal = forward.abs() > 0.01;
+    let magnitude = if diagonal { FRAC_PI_4 } else { FRAC_PI_2 };
+    let back = forward < -0.01;
+    if left != back {
+        magnitude
+    } else {
+        -magnitude
+    }
 }
 
 /// One triangle in WoW world coords, with a computed unit normal.
@@ -134,6 +170,8 @@ struct TileCol {
     wmo_cells: Vec<Vec<Tri>>,
     /// MODF placements, kept from the ADT so the WMO floors can be built once.
     wmos: Vec<benilla_formats::WmoInstance>,
+    /// MDDF placements, whose M2 hulls the reference also collides with.
+    doodads: Vec<benilla_formats::Doodad>,
     wmo_ready: bool,
 }
 
@@ -143,6 +181,7 @@ impl TileCol {
             buckets: (0..256).map(|_| Vec::new()).collect(),
             wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
             wmos: Vec::new(),
+            doodads: Vec::new(),
             wmo_ready: false,
         }
     }
@@ -249,8 +288,11 @@ pub struct Player {
     map: String,
     /// Feet, WoW world yards.
     pos: [f32; 3],
-    /// Facing angle: 0 = +X (north), π/2 = +Y (west).
+    /// Body facing (the aim): 0 looks along +X, π/2 along +Y. Only the right
+    /// mouse button and the turn keys move it - WASD never does.
     yaw: f32,
+    /// Rendered body heading: `yaw` plus the eased strafe counter-twist.
+    model_yaw: f32,
     vel: [f32; 3],
     grounded: bool,
     input: Input,
@@ -266,6 +308,9 @@ pub struct Player {
     tiles: HashMap<(i32, i32), TileCol>,
     /// Tiles already asked for and found missing in the archives.
     missing: Vec<(i32, i32)>,
+    /// Set when a tile's WMO floors are built: the spawn sits on the terrain
+    /// under a city, so climb to the lowest walkable WMO floor over it.
+    snap_pending: bool,
 }
 
 impl Player {
@@ -274,6 +319,7 @@ impl Player {
             map: map.to_string(),
             pos: [x, y, 0.0],
             yaw: 0.0,
+            model_yaw: 0.0,
             vel: [0.0; 3],
             grounded: false,
             input: Input::default(),
@@ -287,6 +333,7 @@ impl Player {
             attack_left: 0.0,
             tiles: HashMap::new(),
             missing: Vec::new(),
+            snap_pending: false,
         }
     }
 
@@ -345,6 +392,7 @@ impl Player {
         }
         t.wmo_ready = true;
         let Some(chain) = chain.as_mut() else { return };
+        let mut built = false;
         for inst in &t.wmos {
             if !cache.contains_key(&inst.model) {
                 let Ok(mesh) = benilla_formats::load_wmo_collision_tris(chain, &inst.model)
@@ -357,6 +405,7 @@ impl Player {
             if mesh.is_empty() {
                 continue;
             }
+            built = true;
             let q = placement_quat(inst.rotation);
             let mut world = Vec::with_capacity(mesh.positions.len());
             for p in &mesh.positions {
@@ -382,6 +431,49 @@ impl Player {
                     }
                 }
             }
+        }
+        // Doodad hulls: the reference collides with the coarse M2 hull too
+        // (a tree trunk, a crate), transformed by the MDDF placement.
+        for d in &t.doodads {
+            if !cache.contains_key(&d.model) {
+                let Ok(mesh) = benilla_formats::load_m2_collision_hull(chain, &d.model)
+                else {
+                    continue;
+                };
+                cache.insert(d.model.clone(), mesh);
+            }
+            let Some(mesh) = cache.get(&d.model) else { continue };
+            if mesh.is_empty() {
+                continue;
+            }
+            let q = placement_quat(d.rotation);
+            let mut world = Vec::with_capacity(mesh.positions.len());
+            for p in &mesh.positions {
+                let r = q_rot(q, [p[0] * d.scale, p[1] * d.scale, p[2] * d.scale]);
+                world.push([
+                    r[0] + d.position[0],
+                    r[1] + d.position[1],
+                    r[2] + d.position[2],
+                ]);
+            }
+            for tri in mesh.indices.chunks_exact(3) {
+                let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let (Some(&va), Some(&vb), Some(&vc)) =
+                    (world.get(a), world.get(b), world.get(c))
+                else {
+                    continue;
+                };
+                let tri_c = Tri::new(va, vb, vc);
+                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
+                for ly in y0..=y1 {
+                    for lx in x0..=x1 {
+                        t.wmo_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                    }
+                }
+            }
+        }
+        if built {
+            self.snap_pending = true;
         }
     }
 
@@ -475,6 +567,28 @@ impl Player {
         })
     }
 
+    /// The lowest upward-facing WMO surface over (x, y) between `floor` and
+    /// `floor + max_rise`: the street a spawn under a city should stand on
+    /// (ADT terrain under a WMO footprint is holed, so the raw terrain height
+    /// leaves the player below the city).
+    fn lowest_floor_above(&self, x: f32, y: f32, floor: f32, max_rise: f32) -> Option<f32> {
+        let (tx, ty) = Self::tile_of(x, y);
+        let tile = self.tiles.get(&(tx, ty))?;
+        let i = TileCol::wmo_cell(tx, ty, x, y)?;
+        let mut best: Option<f32> = None;
+        for t in &tile.wmo_cells[i] {
+            if t.n[2] < GROUND_COS {
+                continue; // a ceiling or a wall is not a street
+            }
+            if let Some(z) = t.height_at(x, y, floor + max_rise) {
+                if z > floor + 0.1 && best.map_or(true, |b| z < b) {
+                    best = Some(z);
+                }
+            }
+        }
+        best
+    }
+
     /// One frame: integrate benilla's locomotion, resolve the floor, then place
     /// the camera. `dt` is clamped like the client's frame slice.
     fn tick(&mut self, dt: f32) {
@@ -482,16 +596,27 @@ impl Player {
         if dt <= 0.0 {
             return;
         }
+        if self.snap_pending {
+            self.snap_pending = false;
+            if let Some(z) = self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0)
+            {
+                self.pos[2] = z;
+                self.vel[2] = 0.0;
+                self.grounded = true;
+            }
+        }
         let feet = self.pos;
         let forward = self.input.forward.clamp(-1.0, 1.0);
         let strafe = self.input.strafe.clamp(-1.0, 1.0);
         let backpedal = forward < 0.0 && strafe.abs() < 0.01;
 
-        // Camera-relative axis: UE yaw convention's forward is
-        // (cos yaw, -sin yaw) in WoW XY (the mirror flips Y).
-        let (sy, cy) = self.cam_yaw.sin_cos();
-        let fwd = [cy, -sy];
-        let right = [sy, cy];
+        // WASD moves in the aim's basis, as the reference does (`state.rs`:
+        // "the facing ... is the basis WASD move in"); orbiting the camera
+        // does not steer the body. WoW axes: +X north, +Y west, so facing
+        // yaw gives forward (cos, sin) and the player's right (sin, -cos).
+        let (sy, cy) = self.yaw.sin_cos();
+        let fwd = [cy, sy];
+        let right = [sy, -cy];
         let mut dir = [fwd[0] * forward + right[0] * strafe,
                        fwd[1] * forward + right[1] * strafe];
         let mag = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
@@ -510,19 +635,21 @@ impl Player {
         self.vel[0] = dir[0] * speed;
         self.vel[1] = dir[1] * speed;
 
-        // Facing: the body turns toward the direction it walks (a backpedal
-        // keeps the facing and plays WalkBackwards, as the reference does).
-        if mag > 0.01 && !backpedal {
-            let want = dir[1].atan2(dir[0]);
-            let mut d = want - self.yaw;
-            while d > std::f32::consts::PI {
-                d -= std::f32::consts::TAU;
-            }
-            while d < -std::f32::consts::PI {
-                d += std::f32::consts::TAU;
-            }
-            let step = TURN_RATE * dt;
-            self.yaw += d.clamp(-step, step);
+        // The rendered body eases to the aim plus the strafe counter-twist
+        // (`creature_anim::select::strafe_body_offset`): ±π/2 for a pure
+        // strafe, ±π/4 with forward or back, mirrored while backpedaling.
+        let offset = strafe_body_offset(forward, strafe);
+        let cur = wrap_pi(self.model_yaw - self.yaw);
+        let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
+        self.model_yaw = wrap_pi(self.yaw + eased);
+
+        // Smart follow (`cameraSmoothStyle` default): while the character is
+        // driven, the camera returns behind the aim at `cameraYawSmoothSpeed`.
+        if mag > 0.01 {
+            let target = wrap_pi(-self.yaw); // UE yaw is the mirror of WoW yaw
+            let d = wrap_pi(target - self.cam_yaw);
+            let max = FOLLOW_RATE * dt;
+            self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
         }
 
         // Jump: an edge, only from the ground.
@@ -624,6 +751,22 @@ impl Player {
         (eye, pivot)
     }
 
+    /// Mouse look: `dx`/`dy` are raw pointer counts (0.003 rad each). With
+    /// `turn_body` the aim and the rendered body turn with the camera, as
+    /// `camera.rs` does on the right button; otherwise only the orbit moves.
+    fn look(&mut self, dx: f32, dy: f32, turn_body: bool) {
+        let turn = dx * LOOK_SENSITIVITY;
+        if turn_body {
+            // `cam_yaw` is UE yaw, the mirror of the WoW aim: the same turn
+            // has the opposite sign, so the camera stays locked to the body.
+            self.yaw = wrap_pi(self.yaw - turn);
+            self.model_yaw = wrap_pi(self.model_yaw - turn);
+        }
+        self.cam_yaw = wrap_pi(self.cam_yaw + turn);
+        self.cam_pitch =
+            (self.cam_pitch + dy * LOOK_SENSITIVITY).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+    }
+
     fn anim(&self) -> u32 {
         if self.mounted {
             return 91; // Mount
@@ -652,7 +795,7 @@ impl Player {
         let (eye, target) = self.camera();
         BnPlayerState {
             pos: self.pos,
-            yaw: self.yaw,
+            yaw: self.model_yaw,
             cam_eye: eye,
             cam_target: target,
             cam_pitch: self.cam_pitch,
@@ -680,6 +823,7 @@ fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32)
     let mesh = adt_to_tile_mesh(&bytes).ok()?;
     let mut col = TileCol::new();
     col.wmos = mesh.wmos.clone();
+    col.doodads = mesh.doodads.clone();
     for c in &mesh.chunks {
         if c.positions.len() < 3 || c.indices.len() < 3 {
             continue;
@@ -743,8 +887,8 @@ pub extern "C" fn bn_player_reset(
     1
 }
 
-/// Held movement input: forward/strafe -1..1 (camera-relative), jump and walk
-/// as 0/1. The host forwards the raw key state each frame.
+/// Held movement input: forward/strafe -1..1 (in the aim's basis), jump and
+/// walk as 0/1. The host forwards the raw key state each frame.
 #[no_mangle]
 pub extern "C" fn bn_player_input(
     world: *mut BnWorld,
@@ -763,11 +907,18 @@ pub extern "C" fn bn_player_input(
 
 /// Mouse look: raw pointer delta in pixels. The reference's law is 0.003 rad
 /// per unit on both axes (`LOOK_SENSITIVITY`), pitch clamped to ±89°.
+/// `turn_body` != 0 is the right button: `camera.rs` turns the character with
+/// the camera, so the aim and the rendered body turn too. The left button
+/// only orbits, leaving the aim (and WASD's basis) where it was.
 #[no_mangle]
-pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32) -> u32 {
+pub extern "C" fn bn_player_mouse(
+    world: *mut BnWorld,
+    dx: f32,
+    dy: f32,
+    turn_body: u32,
+) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
-    p.cam_yaw += dx * LOOK_SENSITIVITY;
-    p.cam_pitch = (p.cam_pitch + dy * LOOK_SENSITIVITY).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+    p.look(dx, dy, turn_body != 0);
     1
 }
 
@@ -890,6 +1041,56 @@ mod tests {
         p.tiles.insert((tx, ty), col);
         assert!(!p.wall_hit(-8800.0, -800.0, 0.0), "a floor never blocks");
         assert_eq!(p.ground(-8800.0, -800.0, 100.0), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn right_drag_turns_the_aim_with_the_camera() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.look(100.0, 0.0, true);
+        let turn = 100.0 * LOOK_SENSITIVITY;
+        assert!((p.cam_yaw - turn).abs() < 1.0e-5, "cam_yaw follows the drag");
+        assert!((p.yaw + turn).abs() < 1.0e-5, "the aim is the mirror of cam_yaw");
+        assert!((p.model_yaw + turn).abs() < 1.0e-5, "the body turns at once");
+        // The Smart follow sees the camera already behind, so it does not move.
+        let target = wrap_pi(-p.yaw);
+        assert!(wrap_pi(target - p.cam_yaw).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn left_drag_only_orbits() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.look(100.0, 0.0, false);
+        assert!(p.yaw.abs() < 1.0e-6, "the aim stays put");
+        assert!(p.model_yaw.abs() < 1.0e-6);
+        assert!((p.cam_yaw - 100.0 * LOOK_SENSITIVITY).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn forward_moves_along_the_aim() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        // Aim to WoW yaw π/2 (+Y), then run forward for a second (the tick
+        // clamps dt to the client's frame slice, so step in slices).
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        p.input.forward = 1.0;
+        for _ in 0..10 {
+            p.tick(0.1);
+        }
+        assert!(p.pos[0] > -8800.1, "no drift along the old facing");
+        assert!(p.pos[0] < -8799.9);
+        assert!(p.pos[1] > -800.0 + RUN_SPEED * 0.9, "run up +Y");
+    }
+
+    #[test]
+    fn strafing_twists_the_body_but_not_the_aim() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.input.strafe = 1.0; // D: right of the facing
+        for _ in 0..120 {
+            p.tick(1.0 / 60.0);
+        }
+        assert!(p.yaw.abs() < 1.0e-6, "the aim never follows WASD");
+        let offset = wrap_pi(p.model_yaw - p.yaw);
+        assert!((offset + std::f32::consts::FRAC_PI_2).abs() < 0.05,
+                "a pure right strafe turns the body a quarter left in WoW yaw");
     }
 }
 
