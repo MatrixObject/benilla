@@ -49,6 +49,18 @@ const STRAFE_BLEND_RATE: f32 = 17.26;
 /// Mount speed bonus in 1.12: +60% (the client's riding speed).
 const MOUNT_SPEED_RATIO: f32 = 1.6;
 
+// ---- benilla-app/src/player/swim.rs (read-only port) ----
+/// Stock `MOVE_SWIM` (yd/s), vmangos `Unit.cpp:71`.
+const SWIM_SPEED: f32 = 4.722_222;
+/// Stock `MOVE_SWIM_BACK` (yd/s), vmangos `Unit.cpp:72`.
+const SWIM_BACK_SPEED: f32 = 2.5;
+/// The swim jump's seed (yd/s), about 14 % over the land jump.
+const SWIM_JUMP_SPEED: f32 = 9.096_748;
+/// The share of the collision height the water must cover to swim (`0x8012cc`).
+const SWIM_DEPTH_FRAC: f32 = 0.75;
+/// The enter/leave band (yd, `0x7ff9d0`): hold between `0.75·h - 1/36` and `0.75·h`.
+const SWIM_HYSTERESIS: f32 = 1.0 / 36.0;
+
 /// The state the host applies (plain C; yaw/pitch radians, positions yards).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -172,6 +184,11 @@ struct TileCol {
     wmos: Vec<benilla_formats::WmoInstance>,
     /// MDDF placements, whose M2 hulls the reference also collides with.
     doodads: Vec<benilla_formats::Doodad>,
+    /// MCLQ surfaces, sampled for the swim latch and the floating resolver.
+    liquids: Vec<benilla_formats::LiquidMesh>,
+    /// WMO MLIQ surfaces (the canals and fountains) with their placement, in
+    /// model space: a query is mirrored into model space instead of baking.
+    wmo_liquids: Vec<(benilla_formats::WmoInstance, benilla_formats::LiquidMesh)>,
     wmo_ready: bool,
 }
 
@@ -182,6 +199,8 @@ impl TileCol {
             wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
             wmos: Vec::new(),
             doodads: Vec::new(),
+            liquids: Vec::new(),
+            wmo_liquids: Vec::new(),
             wmo_ready: false,
         }
     }
@@ -219,6 +238,55 @@ impl TileCol {
             ay.max(by).clamp(0, WMO_GRID - 1),
         )
     }
+}
+
+/// The liquid surface height under (x, y) in one liquid mesh, sampled
+/// bilinearly over the containing cell as the reference does (`0x6b7500`).
+/// `None` outside the mesh or over a dry cell.
+///
+/// The cell axes are taken from the vertex grid itself (vertex 0 to vertex 1
+/// along the columns, vertex 0 to vertex `cols` along the rows), so the ADT's
+/// south/east stepping grid and the WMO's north/west stepping one both sample
+/// correctly, in any placement rotation.
+fn liquid_height(m: &benilla_formats::LiquidMesh, x: f32, y: f32) -> Option<f32> {
+    let cols = m.grid[0] as usize;
+    let rows = m.grid[1] as usize;
+    if cols < 2 || rows < 2 || m.positions.len() < cols * rows {
+        return None;
+    }
+    let p0 = m.positions[0];
+    let pc = m.positions[1];
+    let pr = m.positions[cols];
+    let proj = |v: [f32; 3]| -> f32 {
+        let (dx, dy) = (x - p0[0], y - p0[1]);
+        let (ax, ay) = (v[0] - p0[0], v[1] - p0[1]);
+        let len2 = ax * ax + ay * ay;
+        if len2 < 1.0e-9 {
+            return -1.0;
+        }
+        (dx * ax + dy * ay) / len2
+    };
+    let (fc, fr) = (proj(pc), proj(pr));
+    if fr < 0.0 || fc < 0.0 {
+        return None;
+    }
+    let (row, col) = (fr.floor(), fc.floor());
+    let (row, col) = (row as usize, col as usize);
+    if row + 1 >= rows || col + 1 >= cols {
+        return None;
+    }
+    if !m.wet[row * (cols - 1) + col] {
+        return None;
+    }
+    let (u, v) = (fr - row as f32, fc - col as f32);
+    let tl = m.positions[row * cols + col][2];
+    let tr = m.positions[row * cols + col + 1][2];
+    let bl = m.positions[(row + 1) * cols + col][2];
+    let br = m.positions[(row + 1) * cols + col + 1][2];
+    Some(tl * (1.0 - u) * (1.0 - v)
+        + tr * (1.0 - u) * v
+        + bl * u * (1.0 - v)
+        + br * u * v)
 }
 
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
@@ -295,6 +363,9 @@ pub struct Player {
     model_yaw: f32,
     vel: [f32; 3],
     grounded: bool,
+    /// Latched by the water depth over the feet (`0x6030c0`); gravity is
+    /// bypassed while set and the feet float at `0.75·h` under the surface.
+    swimming: bool,
     input: Input,
     jump_was_down: bool,
     /// Camera yaw in the UE convention (0 = +X, clockwise positive) and pitch
@@ -322,6 +393,7 @@ impl Player {
             model_yaw: 0.0,
             vel: [0.0; 3],
             grounded: false,
+            swimming: false,
             input: Input::default(),
             jump_was_down: false,
             // UE yaw of "facing +X" is 0; looking down the +X axis in WoW.
@@ -432,6 +504,19 @@ impl Player {
                 }
             }
         }
+        // WMO MLIQ: the canals' and fountains' water, model space + placement
+        // (a rotation-safe query, so an arbitrary yaw still samples).
+        let mut liquid_cache: HashMap<String, Vec<benilla_formats::LiquidMesh>> = HashMap::new();
+        for inst in &t.wmos {
+            if !liquid_cache.contains_key(&inst.model) {
+                let meshes = crate::read_wmo_group_liquids(Some(&mut *chain), &inst.model);
+                liquid_cache.insert(inst.model.clone(), meshes);
+            }
+            let Some(meshes) = liquid_cache.get(&inst.model) else { continue };
+            for m in meshes {
+                t.wmo_liquids.push((inst.clone(), m.clone()));
+            }
+        }
         // Doodad hulls: the reference collides with the coarse M2 hull too
         // (a tree trunk, a crate), transformed by the MDDF placement.
         for d in &t.doodads {
@@ -518,8 +603,46 @@ impl Player {
         best
     }
 
+    /// The liquid surface over (x, y), the lowest of any stacked blocks
+    /// (`benilla_world`'s `liquid_at`, so a stream over the sea reads as the
+    /// stream). Magma and slime are swum in like water.
+    fn water(&self, x: f32, y: f32) -> Option<f32> {
+        let (tx, ty) = Self::tile_of(x, y);
+        let mut best: Option<f32> = None;
+        let mut consider = |tile: &TileCol| {
+            for m in &tile.liquids {
+                if let Some(z) = liquid_height(m, x, y) {
+                    best = Some(best.map_or(z, |b: f32| b.min(z)));
+                }
+            }
+            for (inst, m) in &tile.wmo_liquids {
+                // Mirror the query into the model, sample there, and rotate the
+                // surface point back out: rotation-independent, so a building
+                // placed at any yaw still answers.
+                let q = placement_quat(inst.rotation);
+                let local = q_rot(
+                    [-q[0], -q[1], -q[2], q[3]],
+                    [x - inst.position[0], y - inst.position[1], 0.0],
+                );
+                if let Some(lz) = liquid_height(m, local[0], local[1]) {
+                    let wz = q_rot(q, [local[0], local[1], lz])[2] + inst.position[2];
+                    best = Some(best.map_or(wz, |b: f32| b.min(wz)));
+                }
+            }
+        };
+        match self.tiles.get(&(tx, ty)) {
+            Some(tile) => consider(tile),
+            // Border frame with the neighbour still loading.
+            None => self.tiles.values().for_each(consider),
+        }
+        best
+    }
+
     /// A steep WMO face within `radius` of `p` (a wall; floors are excluded).
-    fn hit_steep(&self, p: [f32; 3], radius: f32) -> bool {
+    /// Faces entirely below `step_base + STEP_UP_HEIGHT` are steps, not walls:
+    /// the reference's mover climbs them, so its wall test must not see them.
+    /// Pass `f32::NEG_INFINITY` to keep every face (the camera's probe).
+    fn hit_steep(&self, p: [f32; 3], radius: f32, step_base: f32) -> bool {
         let (tx, ty) = Self::tile_of(p[0], p[1]);
         let probe = |ktx: i32, kty: i32, tile: &TileCol| -> bool {
             let Some(i) = TileCol::wmo_cell(ktx, kty, p[0], p[1]) else {
@@ -536,6 +659,10 @@ impl Player {
                     for t in &tile.wmo_cells[(gy * WMO_GRID + gx) as usize] {
                         if t.n[2].abs() >= GROUND_COS {
                             continue;
+                        }
+                        let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                        if top <= step_base + STEP_UP_HEIGHT {
+                            continue; // a curb the mover steps over
                         }
                         let q = closest_on_tri(p, t);
                         let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
@@ -563,7 +690,11 @@ impl Player {
         let lo = feet + CAPSULE_RADIUS;
         let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
         (0..3).any(|k| {
-            self.hit_steep([x, y, lo + (hi - lo) * (k as f32 / 2.0)], CAPSULE_RADIUS)
+            self.hit_steep(
+                [x, y, lo + (hi - lo) * (k as f32 / 2.0)],
+                CAPSULE_RADIUS,
+                feet,
+            )
         })
     }
 
@@ -608,6 +739,27 @@ impl Player {
         let feet = self.pos;
         let forward = self.input.forward.clamp(-1.0, 1.0);
         let strafe = self.input.strafe.clamp(-1.0, 1.0);
+
+        // The swim latch (`0x6030c0`): the depth over the feet against
+        // `0.75·h`, held in a 1/36-yd band. A rising launch is not caught, so
+        // a swim jump can leave the water.
+        let surface = self.water(self.pos[0], self.pos[1]);
+        let enter = SWIM_DEPTH_FRAC * CAPSULE_HEIGHT;
+        self.swimming = match surface {
+            None => false,
+            Some(s) => {
+                let depth = s - self.pos[2];
+                if self.swimming {
+                    depth >= enter - SWIM_HYSTERESIS
+                } else {
+                    depth > enter && self.vel[2] <= 0.0
+                }
+            }
+        };
+        if self.swimming {
+            // The client dismounts on entering deep water.
+            self.mounted = false;
+        }
         let backpedal = forward < 0.0 && strafe.abs() < 0.01;
 
         // WASD moves in the aim's basis, as the reference does (`state.rs`:
@@ -617,23 +769,63 @@ impl Player {
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = [cy, sy];
         let right = [sy, -cy];
-        let mut dir = [fwd[0] * forward + right[0] * strafe,
-                       fwd[1] * forward + right[1] * strafe];
-        let mag = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
-        if mag > 1.0 {
-            dir[0] /= mag;
-            dir[1] /= mag;
+        let mag;
+        if self.swimming {
+            // The travel basis (`0x7c5880`): forward is the facing pitched by
+            // the aim, strafe stays level, and there is no vertical input.
+            let (sp, cp) = self.cam_pitch.sin_cos();
+            let mut v = [fwd[0] * cp * forward + right[0] * strafe,
+                         fwd[1] * cp * forward + right[1] * strafe,
+                         sp * forward];
+            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if len > 1.0 {
+                for c in &mut v {
+                    *c /= len;
+                }
+            }
+            mag = len.min(1.0);
+            let speed = if forward < -0.01 { SWIM_BACK_SPEED } else { SWIM_SPEED };
+            self.vel = [v[0] * speed, v[1] * speed, v[2] * speed];
+            // The rise cap (`0x632ba0`): the stroke's upward speed is clamped
+            // to what reaches the rest line this frame; the surplus turns into
+            // level travel at the same speed.
+            if let Some(s) = surface {
+                let cap = ((s - enter - self.pos[2]) / dt).max(0.0);
+                if self.vel[2] > cap {
+                    let speed = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]
+                        + self.vel[2] * self.vel[2]).sqrt();
+                    let hl = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
+                    let level = (speed * speed - cap * cap).max(0.0).sqrt();
+                    if hl > 1.0e-6 {
+                        self.vel[0] *= level / hl;
+                        self.vel[1] *= level / hl;
+                    } else {
+                        self.vel[0] = 0.0;
+                        self.vel[1] = 0.0;
+                    }
+                    self.vel[2] = cap;
+                }
+            }
+        } else {
+            let mut dir = [fwd[0] * forward + right[0] * strafe,
+                           fwd[1] * forward + right[1] * strafe];
+            let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+            if len > 1.0 {
+                dir[0] /= len;
+                dir[1] /= len;
+            }
+            mag = len.min(1.0);
+            let mut speed = RUN_SPEED;
+            if self.mounted {
+                speed *= MOUNT_SPEED_RATIO;
+            } else if self.input.walk {
+                speed *= WALK_RATIO;
+            } else if backpedal {
+                speed *= RUN_BACK_RATIO;
+            }
+            self.vel[0] = dir[0] * speed;
+            self.vel[1] = dir[1] * speed;
         }
-        let mut speed = RUN_SPEED;
-        if self.mounted {
-            speed *= MOUNT_SPEED_RATIO;
-        } else if self.input.walk {
-            speed *= WALK_RATIO;
-        } else if backpedal {
-            speed *= RUN_BACK_RATIO;
-        }
-        self.vel[0] = dir[0] * speed;
-        self.vel[1] = dir[1] * speed;
 
         // The rendered body eases to the aim plus the strafe counter-twist
         // (`creature_anim::select::strafe_body_offset`): ±π/2 for a pure
@@ -652,13 +844,21 @@ impl Player {
             self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
         }
 
-        // Jump: an edge, only from the ground.
+        // Jump: an edge. In water Space is the swim jump (`0x7c6230`), which
+        // clears the latch with a stronger seed at any depth.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
-        if jump && self.grounded {
-            self.vel[2] = JUMP_SPEED;
-            self.grounded = false;
-            self.pos[2] += 0.05;
+        if jump {
+            if self.swimming {
+                self.swimming = false;
+                self.vel[2] = SWIM_JUMP_SPEED;
+                self.grounded = false;
+                self.pos[2] += 0.05;
+            } else if self.grounded {
+                self.vel[2] = JUMP_SPEED;
+                self.grounded = false;
+                self.pos[2] += 0.05;
+            }
         }
 
         // Horizontal step with the reference's wall response: a floor more
@@ -688,24 +888,46 @@ impl Player {
             }
         }
 
-        // Vertical: gravity then the floor probe (benilla's order).
-        self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
-        self.pos[2] += self.vel[2] * dt;
-        let ceil = self.pos[2] + STEP_UP_HEIGHT;
-        match self.ground(self.pos[0], self.pos[1], ceil) {
-            Some((z, _)) => {
-                if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
-                    self.pos[2] = z;
-                    self.vel[2] = 0.0;
-                    self.grounded = true;
-                } else {
-                    self.grounded = false;
-                }
+        if self.swimming {
+            // The floating resolver (`0x634640`): no gravity, the vertical only
+            // from the stroke. The feet sink to the rest line
+            // `surface - 0.75·h` when the surface falls, and a shallow bottom
+            // still holds them higher.
+            let mut z = self.pos[2] + self.vel[2] * dt;
+            if let Some(s) = surface {
+                let rest = s - enter;
+                let bed = self
+                    .ground(self.pos[0], self.pos[1], z + STEP_UP_HEIGHT)
+                    .map(|(b, _)| b)
+                    .filter(|b| *b > z - 0.05);
+                z = match bed {
+                    Some(b) if b > rest => b,
+                    _ => z.min(rest),
+                };
             }
-            None => self.grounded = false,
-        }
-        if self.grounded {
-            self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
+            self.pos[2] = z;
+            self.grounded = false;
+            self.vel[2] = 0.0;
+        } else {
+            // Vertical: gravity then the floor probe (benilla's order).
+            self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
+            self.pos[2] += self.vel[2] * dt;
+            let ceil = self.pos[2] + STEP_UP_HEIGHT;
+            match self.ground(self.pos[0], self.pos[1], ceil) {
+                Some((z, _)) => {
+                    if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
+                        self.pos[2] = z;
+                        self.vel[2] = 0.0;
+                        self.grounded = true;
+                    } else {
+                        self.grounded = false;
+                    }
+                }
+                None => self.grounded = false,
+            }
+            if self.grounded {
+                self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
+            }
         }
 
         self.attack_left = (self.attack_left - dt).max(0.0);
@@ -741,7 +963,7 @@ impl Player {
                 }
             }
             // A wall between the pivot and the eye pulls the boom in too.
-            if self.hit_steep(p, 0.3) {
+            if self.hit_steep(p, 0.3, f32::NEG_INFINITY) {
                 dist = dist.min((i as f32 - 1.0) / 8.0 * self.cam_distance);
                 break;
             }
@@ -770,6 +992,22 @@ impl Player {
     fn anim(&self) -> u32 {
         if self.mounted {
             return 91; // Mount
+        }
+        if self.swimming {
+            // AnimationData 41 SwimIdle, 42 Swim, 43 SwimLeft, 44 SwimRight,
+            // 45 SwimBackwards (`creature_anim::select`'s swim picks).
+            let f = self.input.forward;
+            let s = self.input.strafe;
+            if f.abs() < 0.01 && s.abs() < 0.01 {
+                return 41;
+            }
+            if f < -0.01 && s.abs() < 0.01 {
+                return 45;
+            }
+            if f.abs() < 0.01 {
+                return if s < 0.0 { 43 } else { 44 };
+            }
+            return 42;
         }
         if self.attack_left > 0.0 {
             return 16; // AttackUnarmed
@@ -825,6 +1063,7 @@ fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32)
     col.wmos = mesh.wmos.clone();
     col.doodads = mesh.doodads.clone();
     for c in &mesh.chunks {
+        col.liquids.extend(c.liquids.iter().cloned());
         if c.positions.len() < 3 || c.indices.len() < 3 {
             continue;
         }
@@ -1091,6 +1330,104 @@ mod tests {
         let offset = wrap_pi(p.model_yaw - p.yaw);
         assert!((offset + std::f32::consts::FRAC_PI_2).abs() < 0.05,
                 "a pure right strafe turns the body a quarter left in WoW yaw");
+    }
+
+    /// One wet 2×2 liquid block at `z`, over the world's north-west corner.
+    const LIQUID_UNIT: f32 = 33.333_336 / 8.0;
+
+    fn flat_liquid(z: f32) -> benilla_formats::LiquidMesh {
+        let mut positions = Vec::new();
+        for r in 0..2 {
+            for c in 0..2 {
+                positions.push([
+                    17066.666 - r as f32 * LIQUID_UNIT,
+                    17066.666 - c as f32 * LIQUID_UNIT,
+                    z,
+                ]);
+            }
+        }
+        benilla_formats::LiquidMesh {
+            grid: [2, 2],
+            wet: vec![true],
+            shared: vec![false],
+            positions,
+            uvs: vec![[0.0, 0.0]; 4],
+            depths: vec![0.0; 4],
+            indices: vec![0, 1, 2, 1, 3, 2],
+            sound_nibble: 0,
+            material_id: None,
+            kind: benilla_formats::LiquidKind::Still,
+        }
+    }
+
+    fn swimmer(surface: f32, feet: f32) -> Player {
+        let mut p = Player::new("Azeroth", 17064.0, 17064.0);
+        p.pos[2] = feet;
+        let mut tile = TileCol::new();
+        tile.liquids.push(flat_liquid(surface));
+        p.tiles.insert(Player::tile_of(p.pos[0], p.pos[1]), tile);
+        p
+    }
+
+    #[test]
+    fn water_samples_bilinearly_and_only_over_wet_cells() {
+        let m = flat_liquid(12.0);
+        let x = 17066.666 - 0.5 * LIQUID_UNIT;
+        let y = 17066.666 - 0.5 * LIQUID_UNIT;
+        assert!((liquid_height(&m, x, y).unwrap() - 12.0).abs() < 1.0e-4);
+        assert_eq!(liquid_height(&m, 17066.666 + LIQUID_UNIT, y), None, "dry corner");
+    }
+
+    #[test]
+    fn deep_water_latches_the_swim_and_freezes_gravity() {
+        // 1.6 yd over the feet is past the 0.75·h = 1.521 entry depth.
+        let mut p = swimmer(0.0, -1.6);
+        p.tick(0.1);
+        assert!(p.swimming);
+        assert!(!p.grounded);
+        assert!((p.pos[2] + 1.6).abs() < 1.0e-4, "an idle swimmer keeps its depth");
+        assert_eq!(p.anim(), 41, "SwimIdle");
+    }
+
+    #[test]
+    fn shallow_water_is_waded() {
+        let mut p = swimmer(0.0, -1.0);
+        p.tick(0.1);
+        assert!(!p.swimming, "1.0 yd is under the 0.75·h entry depth");
+    }
+
+    #[test]
+    fn the_stroke_rises_to_the_rest_line_and_stops() {
+        let mut p = swimmer(0.0, -3.0);
+        p.cam_pitch = 1.4; // steep up
+        p.input.forward = 1.0;
+        for _ in 0..8 {
+            p.tick(0.1);
+        }
+        assert!(p.swimming);
+        let rest = -(SWIM_DEPTH_FRAC * CAPSULE_HEIGHT);
+        assert!((p.pos[2] - rest).abs() < 0.02, "held just under the surface: {}", p.pos[2]);
+    }
+
+    #[test]
+    fn space_is_the_swim_jump() {
+        let mut p = swimmer(0.0, -1.6);
+        p.input.jump = true;
+        p.tick(0.1);
+        assert!(!p.swimming, "the launch clears the latch");
+        assert!(p.vel[2] > 0.0, "rising");
+    }
+
+    #[test]
+    fn leaving_the_water_releases_the_latch() {
+        let mut p = swimmer(0.0, -1.6);
+        p.tick(0.1);
+        assert!(p.swimming);
+        // The surface falls a yard: the 1/36 band lets go.
+        p.pos[2] = -2.0;
+        p.tiles.clear();
+        p.tick(0.1);
+        assert!(!p.swimming);
     }
 }
 
