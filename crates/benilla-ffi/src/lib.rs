@@ -114,6 +114,11 @@ pub struct BnWorld {
     /// (the WMO reader takes a `Chain`, not the raw `Archive` list).
     chain: Option<benilla_formats::Chain>,
 
+    /// Parsed `Light.dbc`/`LightParams`/`LightIntBand` tables for the zone
+    /// atmosphere (fog, sky gradient, sun/ambient), loaded once on the first
+    /// `bn_light_sample` and reused every query.
+    lights: Option<benilla_formats::LightCatalog>,
+
     /// Parsed WMO geometry by root path, shared by every placement of a model.
     wmo_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
 
@@ -261,6 +266,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         tile_path: String::new(),
 
         chain: benilla_formats::Chain::open(data).ok(),
+
+        lights: None,
 
         wmo_models: HashMap::new(),
 
@@ -6007,5 +6014,55 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
         o.fog_far = fog_far;
     }
     1
+}
+
+/// The zone atmosphere at a WoW-space position (`x`/`y`/`z` in yards) on
+/// `map` (0 = Eastern Kingdoms, 1 = Kalimdor) at `time` half-minutes
+/// (1440 = noon), exactly as `LightCatalog::sample` resolves it for the
+/// reference client. Writes 26 floats:
+///   [0] fog end (yd), [1] fog start as a fraction of the end,
+///   [2..5] fog colour, [5..8] sun diffuse, [8..11] ambient,
+///   [11..26] the five sky-gradient stops, zenith to horizon.
+/// Returns the float count written, 0 when the tables or the row are missing.
+#[no_mangle]
+pub extern "C" fn bn_light_sample(
+    world: *mut BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    map: u32,
+    time: u32,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    const N: u32 = 26;
+    if world.is_null() || out.is_null() || cap < N {
+        return 0;
+    }
+    // SAFETY: the caller passes the handle `bn_init` returned.
+    let w = unsafe { &mut *world };
+    if w.lights.is_none() {
+        let loaded = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::LightCatalog::load(c).ok());
+        w.lights = loaded;
+    }
+    let Some(cat) = w.lights.as_ref() else {
+        return 0;
+    };
+    let a = cat.sample(map, [x, y, z], time, false);
+    let mut vals = [0.0f32; N as usize];
+    vals[0] = a.fog_end;
+    vals[1] = a.fog_start_frac;
+    vals[2..5].copy_from_slice(&a.fog_color);
+    vals[5..8].copy_from_slice(&a.sun_diffuse);
+    vals[8..11].copy_from_slice(&a.ambient);
+    for (i, s) in a.sky.iter().enumerate() {
+        vals[11 + i * 3..14 + i * 3].copy_from_slice(s);
+    }
+    // SAFETY: `out` holds at least `cap >= N` floats.
+    unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
+    N
 }
 
