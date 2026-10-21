@@ -382,6 +382,11 @@ pub struct TileFlat {
     /// Flattened ADT liquid (MCLQ) surfaces: one vertex/index run per mesh,
     /// tile-local through the same WoW->UE mirror as the terrain.
     lverts: Vec<BnVertex>,
+    /// Per-liquid-vertex depth coordinate, parallel to `lverts`: the ADT
+    /// depth byte through the reference's LUT (0..1) and the WMO per-vertex
+    /// authored alpha. `liquid.wgsl` carries it in UV1.x and it drives both the
+    /// swatch row and the sheet opacity.
+    ldepth: Vec<f32>,
     lidx: Vec<u16>,
     liquids: Vec<LiquidRange>,
 }
@@ -432,6 +437,7 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
         doodads: tile.doodads.clone(),
         center,
         lverts: Vec::new(),
+        ldepth: Vec::new(),
         lidx: Vec::new(),
         liquids: Vec::new(),
     };
@@ -497,6 +503,7 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
                     u: uv[0],
                     v: uv[1],
                 });
+                out.ldepth.push(m.depths.get(i).copied().unwrap_or(0.0));
             }
             let idx0 = out.lidx.len() as u32;
             for &i in &m.indices {
@@ -861,6 +868,23 @@ pub extern "C" fn bn_liquid_fill_indices(world: *const BnWorld, out: *mut u16, c
     let Some(t) = w.tile.as_ref() else { return 0 };
     let n = t.lidx.len().min(cap as usize);
     unsafe { std::ptr::copy_nonoverlapping(t.lidx.as_ptr(), out, n) };
+    n as u32
+}
+
+/// Fill `out` (pre-allocated) with the per-liquid-vertex depth coordinate,
+/// parallel to `bn_liquid_fill_vertices`. Returns count written.
+///
+/// `liquid.wgsl` reads this as UV1.x: on ADT water it indexes the depth swatch
+/// (and its alpha), on WMO water it is the authored per-vertex opacity.
+#[no_mangle]
+pub extern "C" fn bn_liquid_fill_depths(world: *const BnWorld, out: *mut f32, cap: u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(t) = w.tile.as_ref() else { return 0 };
+    let n = t.ldepth.len().min(cap as usize);
+    unsafe { std::ptr::copy_nonoverlapping(t.ldepth.as_ptr(), out, n) };
     n as u32
 }
 
@@ -1470,6 +1494,9 @@ fn append_wmo_liquids(
                 u: uv[0],
                 v: uv[1],
             });
+            // WMO water carries the authored per-vertex opacity byte through
+            // the zone's alpha ramp; the reference reads it as the sheet alpha.
+            tile.ldepth.push(m.depths.get(vi).copied().unwrap_or(0.0));
         }
         let idx0 = tile.lidx.len() as u32;
         for &i in &m.indices {
