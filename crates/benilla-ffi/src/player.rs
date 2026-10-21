@@ -37,7 +37,7 @@ const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
 // ---- benilla-app/src/player/camera.rs ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-const LOOK_SENSITIVITY: f32 = 0.003;
+const LOOK_SENSITIVITY: f32 = 0.008;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
 /// sits inside the body (the reference's first-person cut is not modelled).
@@ -228,6 +228,81 @@ const WMO_MARGIN: i32 = 1;
 /// One map cell is half a chunk (16.67 yd); the map corner is -17066.67.
 const WMO_CELL: f32 = 33.333_336 / 2.0;
 
+// ---- doodad footprints ----
+/// The slice of a model that counts as its base (yd above the model origin):
+/// knee height keeps trunks, crates, fences and sign posts, and leaves out
+/// canopies and awnings the body walks under.
+const DOODAD_SLICE: f32 = 1.0;
+/// Below this base extent (yd) a doodad is scenery, not an obstacle.
+const DOODAD_MIN_EXTENT: f32 = 0.15;
+
+/// A doodad's standing obstacle: an oriented box over its base slice (a
+/// cylinder would turn a fence into a blob). `ux`/`uy` are the model's local
+/// axes projected to the world.
+#[derive(Clone, Copy)]
+struct DoodadCollider {
+    /// Base centre (x, y) and the lowest point of the model, world yards.
+    c: [f32; 3],
+    ux: [f32; 2],
+    uy: [f32; 2],
+    hx: f32,
+    hy: f32,
+    /// Top of the model; a footprint floating above the body does not block.
+    top: f32,
+}
+
+/// An M2's base footprint in model-local yards.
+#[derive(Clone, Copy)]
+struct Footprint {
+    cx: f32,
+    cy: f32,
+    hx: f32,
+    hy: f32,
+    zmin: f32,
+    zmax: f32,
+}
+
+/// The base footprint of an M2 doodad from its render mesh: the vertices
+/// within knee height of the model origin decide the box, so a crate's sides
+/// or a trunk are solid while its canopy is not.
+fn m2_footprint(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Footprint> {
+    let subs = benilla_formats::load_m2_mesh(chain, raw_path).ok()?;
+    let mut lo = [f32::INFINITY; 2];
+    let mut hi = [f32::NEG_INFINITY; 2];
+    let mut zmin = f32::INFINITY;
+    let mut zmax = f32::NEG_INFINITY;
+    let mut any = false;
+    for s in &subs {
+        for p in &s.positions {
+            zmin = zmin.min(p[2]);
+            zmax = zmax.max(p[2]);
+            if p[2] >= -0.5 && p[2] <= DOODAD_SLICE {
+                any = true;
+                lo[0] = lo[0].min(p[0]);
+                lo[1] = lo[1].min(p[1]);
+                hi[0] = hi[0].max(p[0]);
+                hi[1] = hi[1].max(p[1]);
+            }
+        }
+    }
+    if !any || zmax <= zmin {
+        return None;
+    }
+    let hx = (hi[0] - lo[0]) * 0.5;
+    let hy = (hi[1] - lo[1]) * 0.5;
+    if hx.max(hy) < DOODAD_MIN_EXTENT {
+        return None;
+    }
+    Some(Footprint {
+        cx: (lo[0] + hi[0]) * 0.5,
+        cy: (lo[1] + hi[1]) * 0.5,
+        hx,
+        hy,
+        zmin,
+        zmax,
+    })
+}
+
 /// One ADT tile's collision: terrain triangles bucketed by the chunk they
 /// came from (16x16 buckets = the chunks), plus the WMO floors once built.
 struct TileCol {
@@ -237,9 +312,12 @@ struct TileCol {
     /// lands in every cell its XY bounds overlap, so the huge city floors
     /// answer from any point instead of a full-scan every frame.
     wmo_cells: Vec<Vec<Tri>>,
+    /// Doodad base footprints on the same grid (the 1.12 M2s ship no collision
+    /// hull: a crate's sides or a trunk are their own base slice).
+    doodad_cells: Vec<Vec<DoodadCollider>>,
     /// MODF placements, kept from the ADT so the WMO floors can be built once.
     wmos: Vec<benilla_formats::WmoInstance>,
-    /// MDDF placements, whose M2 hulls the reference also collides with.
+    /// MDDF placements, whose base footprints become collision cylinders.
     doodads: Vec<benilla_formats::Doodad>,
     /// MCLQ surfaces, sampled for the swim latch and the floating resolver.
     liquids: Vec<benilla_formats::LiquidMesh>,
@@ -247,6 +325,10 @@ struct TileCol {
     /// model space: a query is mirrored into model space instead of baking.
     wmo_liquids: Vec<(benilla_formats::WmoInstance, benilla_formats::LiquidMesh)>,
     wmo_ready: bool,
+    /// Doodad cursor: footprints are built a few models at a time (the first
+    /// cold parse of ~200 unique M2 meshes costs half a second), so the frame
+    /// never stalls on a tile load.
+    doodad_next: usize,
 }
 
 impl TileCol {
@@ -254,11 +336,13 @@ impl TileCol {
         Self {
             buckets: (0..256).map(|_| Vec::new()).collect(),
             wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
+            doodad_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
             wmos: Vec::new(),
             doodads: Vec::new(),
             liquids: Vec::new(),
             wmo_liquids: Vec::new(),
             wmo_ready: false,
+            doodad_next: 0,
         }
     }
 
@@ -295,6 +379,69 @@ impl TileCol {
             ay.max(by).clamp(0, WMO_GRID - 1),
         )
     }
+}
+
+/// Bake one tile's WMO walking triangles + MLIQ surfaces into its grid.
+/// Returns true when at least one model contributed geometry (the caller
+/// then re-snaps the body so it does not start under a floor).
+fn build_wmo_collision(
+    t: &mut TileCol,
+    tx: i32,
+    ty: i32,
+    chain: &mut benilla_formats::Chain,
+    cache: &mut HashMap<String, benilla_formats::CollisionMesh>,
+) -> bool {
+    let mut built = false;
+    for inst in &t.wmos {
+        if !cache.contains_key(&inst.model) {
+            let Ok(mesh) = benilla_formats::load_wmo_collision_tris(chain, &inst.model) else {
+                continue;
+            };
+            cache.insert(inst.model.clone(), mesh);
+        }
+        let Some(mesh) = cache.get(&inst.model) else { continue };
+        if mesh.is_empty() {
+            continue;
+        }
+        built = true;
+        let q = placement_quat(inst.rotation);
+        let mut world = Vec::with_capacity(mesh.positions.len());
+        for p in &mesh.positions {
+            let r = q_rot(q, *p);
+            world.push([
+                r[0] + inst.position[0],
+                r[1] + inst.position[1],
+                r[2] + inst.position[2],
+            ]);
+        }
+        for tri in mesh.indices.chunks_exact(3) {
+            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let (Some(&va), Some(&vb), Some(&vc)) = (world.get(a), world.get(b), world.get(c)) else {
+                continue;
+            };
+            let tri_c = Tri::new(va, vb, vc);
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    t.wmo_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                }
+            }
+        }
+    }
+    // WMO MLIQ: the canals' and fountains' water, model space + placement
+    // (a rotation-safe query, so an arbitrary yaw still samples).
+    let mut liquid_cache: HashMap<String, Vec<benilla_formats::LiquidMesh>> = HashMap::new();
+    for inst in &t.wmos {
+        if !liquid_cache.contains_key(&inst.model) {
+            let meshes = crate::read_wmo_group_liquids(Some(&mut *chain), &inst.model);
+            liquid_cache.insert(inst.model.clone(), meshes);
+        }
+        let Some(meshes) = liquid_cache.get(&inst.model) else { continue };
+        for m in meshes {
+            t.wmo_liquids.push((inst.clone(), m.clone()));
+        }
+    }
+    built
 }
 
 /// The liquid surface height under (x, y) in one liquid mesh, sampled
@@ -478,6 +625,9 @@ pub struct Player {
     mounted: bool,
     attack_left: f32,
     tiles: HashMap<(i32, i32), TileCol>,
+    /// Doodad model footprints, parsed once per model path (`None` = nothing
+    /// at body height).
+    footprints: HashMap<String, Option<Footprint>>,
     /// Tiles already asked for and found missing in the archives.
     missing: Vec<(i32, i32)>,
     /// Set when a tile's WMO floors are built: the spawn sits on the terrain
@@ -508,6 +658,7 @@ impl Player {
             mounted: false,
             attack_left: 0.0,
             tiles: HashMap::new(),
+            footprints: HashMap::new(),
             missing: Vec::new(),
             snap_pending: false,
         }
@@ -563,106 +714,73 @@ impl Player {
         let Some(t) = self.tiles.get_mut(&(tx, ty)) else {
             return;
         };
-        if t.wmo_ready {
-            return;
-        }
-        t.wmo_ready = true;
         let Some(chain) = chain.as_mut() else { return };
-        let mut built = false;
-        for inst in &t.wmos {
-            if !cache.contains_key(&inst.model) {
-                let Ok(mesh) = benilla_formats::load_wmo_collision_tris(chain, &inst.model)
-                else {
-                    continue;
-                };
-                cache.insert(inst.model.clone(), mesh);
-            }
-            let Some(mesh) = cache.get(&inst.model) else { continue };
-            if mesh.is_empty() {
-                continue;
-            }
-            built = true;
-            let q = placement_quat(inst.rotation);
-            let mut world = Vec::with_capacity(mesh.positions.len());
-            for p in &mesh.positions {
-                let r = q_rot(q, *p);
-                world.push([
-                    r[0] + inst.position[0],
-                    r[1] + inst.position[1],
-                    r[2] + inst.position[2],
-                ]);
-            }
-            for tri in mesh.indices.chunks_exact(3) {
-                let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-                let (Some(&va), Some(&vb), Some(&vc)) =
-                    (world.get(a), world.get(b), world.get(c))
-                else {
-                    continue;
-                };
-                let tri_c = Tri::new(va, vb, vc);
-                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
-                for ly in y0..=y1 {
-                    for lx in x0..=x1 {
-                        t.wmo_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
-                    }
-                }
+        if !t.wmo_ready {
+            t.wmo_ready = true;
+            if build_wmo_collision(t, tx, ty, chain, cache) {
+                self.snap_pending = true;
             }
         }
-        // WMO MLIQ: the canals' and fountains' water, model space + placement
-        // (a rotation-safe query, so an arbitrary yaw still samples).
-        let mut liquid_cache: HashMap<String, Vec<benilla_formats::LiquidMesh>> = HashMap::new();
-        for inst in &t.wmos {
-            if !liquid_cache.contains_key(&inst.model) {
-                let meshes = crate::read_wmo_group_liquids(Some(&mut *chain), &inst.model);
-                liquid_cache.insert(inst.model.clone(), meshes);
+        // Doodad footprints: the 1.12 M2s ship no collision hull (all 5,115
+        // doodads around Stormwind have an empty one), so the base slice of
+        // the render mesh stands in - a crate's sides, a trunk, a fence post -
+        // but not the canopy, which would wall off a forest. The first tile
+        // cold-parses ~200 unique models, so this runs on a 2ms budget per
+        // tick instead of all at once.
+        let start = std::time::Instant::now();
+        while t.doodad_next < t.doodads.len() {
+            let i = t.doodad_next;
+            t.doodad_next += 1;
+            let d = &t.doodads[i];
+            if !self.footprints.contains_key(&d.model) {
+                let fp = m2_footprint(chain, &d.model);
+                self.footprints.insert(d.model.clone(), fp);
             }
-            let Some(meshes) = liquid_cache.get(&inst.model) else { continue };
-            for m in meshes {
-                t.wmo_liquids.push((inst.clone(), m.clone()));
-            }
-        }
-        // Doodad hulls: the reference collides with the coarse M2 hull too
-        // (a tree trunk, a crate), transformed by the MDDF placement.
-        for d in &t.doodads {
-            if !cache.contains_key(&d.model) {
-                let Ok(mesh) = benilla_formats::load_m2_collision_hull(chain, &d.model)
-                else {
-                    continue;
-                };
-                cache.insert(d.model.clone(), mesh);
-            }
-            let Some(mesh) = cache.get(&d.model) else { continue };
-            if mesh.is_empty() {
-                continue;
-            }
+            let Some(Some(fp)) = self.footprints.get(&d.model) else { continue };
             let q = placement_quat(d.rotation);
-            let mut world = Vec::with_capacity(mesh.positions.len());
-            for p in &mesh.positions {
-                let r = q_rot(q, [p[0] * d.scale, p[1] * d.scale, p[2] * d.scale]);
-                world.push([
-                    r[0] + d.position[0],
-                    r[1] + d.position[1],
-                    r[2] + d.position[2],
-                ]);
+            let off = q_rot(q, [fp.cx * d.scale, fp.cy * d.scale, 0.0]);
+            let ax = q_rot(q, [1.0, 0.0, 0.0]);
+            let ay = q_rot(q, [0.0, 1.0, 0.0]);
+            let (ax, ay) = ([ax[0], ax[1]], [ay[0], ay[1]]);
+            let (lx, ly) = (
+                (ax[0] * ax[0] + ax[1] * ax[1]).sqrt(),
+                (ay[0] * ay[0] + ay[1] * ay[1]).sqrt(),
+            );
+            if lx < 1.0e-4 || ly < 1.0e-4 {
+                continue;
             }
-            for tri in mesh.indices.chunks_exact(3) {
-                let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-                let (Some(&va), Some(&vb), Some(&vc)) =
-                    (world.get(a), world.get(b), world.get(c))
-                else {
-                    continue;
-                };
-                let tri_c = Tri::new(va, vb, vc);
-                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
-                for ly in y0..=y1 {
-                    for lx in x0..=x1 {
-                        t.wmo_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
-                    }
+            let (hx, hy) = (fp.hx * d.scale, fp.hy * d.scale);
+            let reach = (hx * hx + hy * hy).sqrt();
+            let col = DoodadCollider {
+                c: [
+                    d.position[0] + off[0],
+                    d.position[1] + off[1],
+                    d.position[2] + fp.zmin * d.scale,
+                ],
+                ux: [ax[0] / lx, ax[1] / lx],
+                uy: [ay[0] / ly, ay[1] / ly],
+                hx,
+                hy,
+                top: d.position[2] + fp.zmax * d.scale,
+            };
+            let (ax0, ay0) = TileCol::wmo_local(tx, ty, col.c[0] - reach, col.c[1] - reach);
+            let (bx0, by0) = TileCol::wmo_local(tx, ty, col.c[0] + reach, col.c[1] + reach);
+            let (x0, x1) = (
+                ax0.min(bx0).clamp(0, WMO_GRID - 1),
+                ax0.max(bx0).clamp(0, WMO_GRID - 1),
+            );
+            let (y0, y1) = (
+                ay0.min(by0).clamp(0, WMO_GRID - 1),
+                ay0.max(by0).clamp(0, WMO_GRID - 1),
+            );
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    t.doodad_cells[(ly * WMO_GRID + lx) as usize].push(col);
                 }
             }
-        }
-        if built {
-            self.snap_pending = true;
+            if start.elapsed().as_millis() >= 2 {
+                break;
+            }
         }
     }
 
@@ -799,7 +917,40 @@ impl Player {
                 CAPSULE_RADIUS,
                 feet,
             )
-        })
+        }) || self.doodad_hit(x, y, feet)
+    }
+
+    /// True when a doodad's base cylinder overlaps the body at (`x`, `y`).
+    fn doodad_hit(&self, x: f32, y: f32, feet: f32) -> bool {
+        let (tx, ty) = Self::tile_of(x, y);
+        let Some(tile) = self.tiles.get(&(tx, ty)) else { return false };
+        let Some(ci) = TileCol::wmo_cell(tx, ty, x, y) else { return false };
+        let (gx, gy) = ((ci % WMO_GRID as usize) as i32, (ci / WMO_GRID as usize) as i32);
+        let lo = feet + 0.1;
+        let hi = feet + CAPSULE_HEIGHT;
+        for ly in (gy - 1)..=(gy + 1) {
+            for lx in (gx - 1)..=(gx + 1) {
+                if !(0..WMO_GRID).contains(&lx) || !(0..WMO_GRID).contains(&ly) {
+                    continue;
+                }
+                for d in &tile.doodad_cells[(ly * WMO_GRID + lx) as usize] {
+                    if d.top <= lo || d.c[2] >= hi {
+                        continue;
+                    }
+                    let dx = x - d.c[0];
+                    let dy = y - d.c[1];
+                    // Closest point on the oriented base box to the body axis.
+                    let lx = dx * d.ux[0] + dy * d.ux[1];
+                    let ly = dx * d.uy[0] + dy * d.uy[1];
+                    let ex = lx - lx.clamp(-d.hx, d.hx);
+                    let ey = ly - ly.clamp(-d.hy, d.hy);
+                    if ex * ex + ey * ey < CAPSULE_RADIUS * CAPSULE_RADIUS {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// The framing pivot for this frame: the standing/swimming preset above
@@ -1567,6 +1718,34 @@ mod tests {
     }
 
     #[test]
+    fn a_doodad_footprint_blocks_the_body() {
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let (cx, cy) = (p.pos[0] + 2.0, p.pos[1]);
+        let mut tile = TileCol::new();
+        let ci = TileCol::wmo_cell(tx, ty, cx, cy).unwrap();
+        let boxed = DoodadCollider {
+            c: [cx, cy, 0.0],
+            ux: [1.0, 0.0],
+            uy: [0.0, 1.0],
+            hx: 0.5,
+            hy: 0.5,
+            top: 3.0,
+        };
+        tile.doodad_cells[ci].push(boxed);
+        // A footprint floating over the head does not block the feet.
+        tile.doodad_cells[ci].push(DoodadCollider {
+            c: [cx, cy + 4.0, 4.0],
+            top: 6.0,
+            ..boxed
+        });
+        p.tiles.insert((tx, ty), tile);
+        assert!(p.wall_hit(cx, cy, 0.0), "inside the base cylinder");
+        assert!(!p.wall_hit(cx + 2.0, cy, 0.0), "clear of it");
+        assert!(!p.wall_hit(cx, cy + 4.0, 0.0), "canopy is above the body");
+    }
+
+    #[test]
     fn right_drag_turns_the_aim_with_the_camera() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         p.look(100.0, 0.0, true);
@@ -1754,6 +1933,76 @@ mod tests {
         p.tiles.clear();
         p.tick(0.1);
         assert!(!p.swimming);
+    }
+
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn doodad_footprints_on_city_tiles() {
+        use crate::{bn_doodad_count, bn_doodad_model_path, bn_init, bn_load_tile};
+        let dir = std::ffi::CString::new(
+            r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data",
+        )
+        .unwrap();
+        let w = bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        let (tx, ty) = Player::tile_of(-8800.0, -800.0);
+        let mut buf = [0i8; 260];
+        let mut paths: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut placed = 0;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if bn_load_tile(w, map.as_ptr(), tx + dx, ty + dy) == 0 {
+                    continue;
+                }
+                for i in 0..bn_doodad_count(w) {
+                    if bn_doodad_model_path(w, i, buf.as_mut_ptr(), buf.len() as u32) == 0 {
+                        continue;
+                    }
+                    placed += 1;
+                    let path = unsafe {
+                        std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap()
+                    };
+                    if seen.insert(path.to_string()) {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+        let start = std::time::Instant::now();
+        let (mut solid, mut skipped) = (0, 0);
+        let (mut rsum, mut rmax) = (0.0f32, 0.0f32);
+        let mut buckets = [0usize; 6];
+        let mut biggest: Vec<(f32, String)> = Vec::new();
+        for path in &paths {
+            let chain = unsafe { (*w).chain.as_mut().unwrap() };
+            match m2_footprint(chain, path) {
+                Some(f) => {
+                    let r = f.hx.max(f.hy);
+                    solid += 1;
+                    rsum += r;
+                    rmax = rmax.max(r);
+                    let b = if r < 0.3 { 1 } else if r < 0.6 { 2 } else if r < 1.0 { 3 } else if r < 2.0 { 4 } else { 5 };
+                    buckets[b] += 1;
+                    biggest.push((r, path.clone()));
+                }
+                _ => skipped += 1,
+            }
+        }
+        biggest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!(
+            "placed {placed}, unique models {}, solid {solid}, skipped {skipped}, \
+             avg r {:.2} max r {:.2}, buckets {buckets:?}, parsed in {:?}",
+            paths.len(),
+            if solid > 0 { rsum / solid as f32 } else { 0.0 },
+            rmax,
+            start.elapsed()
+        );
+        for (r, p) in biggest.iter().take(5) {
+            println!("  r {r:.2} {p}");
+        }
+        crate::bn_shutdown(w);
     }
 }
 
