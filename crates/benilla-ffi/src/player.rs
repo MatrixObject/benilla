@@ -2081,6 +2081,96 @@ mod tests {
 
     #[test]
     #[ignore = "needs the installed 1.12.1 data"]
+    fn probe_city_fall_spot() {
+        use crate::bn_init;
+        let dir = std::ffi::CString::new(
+            r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data",
+        )
+        .unwrap();
+        let w = bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (sx, sy) = (-8975.69f32, 783.32f32);
+        let (tx, ty) = Player::tile_of(sx, sy);
+        println!("spot ({sx},{sy}) z=98.14 tile ({tx},{ty})");
+        let mut tiles: HashMap<(i32, i32), TileCol> = HashMap::new();
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                match load_tile(&w.archives, "Azeroth", tx + dx, ty + dy) {
+                    Some(col) => {
+                        println!(
+                            "tile ({},{}) wmos={} doodads={}",
+                            tx + dx,
+                            ty + dy,
+                            col.wmos.len(),
+                            col.doodads.len()
+                        );
+                        for inst in &col.wmos {
+                            println!(
+                                "    wmo uid={} {} at {:?} rot {:?}",
+                                inst.unique_id, inst.model, inst.position, inst.rotation
+                            );
+                        }
+                        tiles.insert((tx + dx, ty + dy), col);
+                    }
+                    None => println!("tile ({},{}) MISSING", tx + dx, ty + dy),
+                }
+            }
+        }
+        let (cx, cy) = world_to_chunk(sx.clamp(-17066.0, 17066.0), sy.clamp(-17066.0, 17066.0));
+        let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+        // Terrain-only floor at the spot: a fresh tile with no WMO baked.
+        let terrain_only = {
+            let mut q = Player::new("Azeroth", sx, sy);
+            if let Some(c) = load_tile(&w.archives, "Azeroth", tx, ty) {
+                q.tiles.insert((tx, ty), c);
+            }
+            q.ground(sx, sy, 1000.0)
+        };
+        println!("terrain-only z {terrain_only:?}");
+        let mut cache = HashMap::new();
+        let chain = w.chain.as_mut().unwrap();
+        for (&(k0, k1), t) in tiles.iter_mut() {
+            let built = build_wmo_collision(t, k0, k1, chain, &mut cache);
+            println!("baked tile ({k0},{k1}) built={built}");
+        }
+        let mut p = Player::new("Azeroth", sx, sy);
+        p.tiles = tiles;
+        let tile = p.tiles.get(&(tx, ty)).unwrap();
+        let cell = TileCol::wmo_cell(tx, ty, sx, sy);
+        println!(
+            "spot cell {:?} wmo tris {:?} terrain tris {}",
+            cell,
+            cell.map(|i| tile.wmo_cells[i as usize].len()),
+            tile.buckets[b].len()
+        );
+        println!("collision z {:?}", p.ground(sx, sy, 1000.0));
+        let mut hits: Vec<f32> = cell
+            .map(|i| {
+                tile.wmo_cells[i as usize]
+                    .iter()
+                    .filter_map(|t| t.height_at(sx, sy, 1000.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        hits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        hits.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        println!("wmo floors at the spot: {:?}", hits);
+        for gy in (-40..=40).step_by(4) {
+            let mut row = String::new();
+            for gx in (-40..=40).step_by(4) {
+                let z = p.ground(sx + gx as f32, sy + gy as f32, 1000.0);
+                row.push_str(&match z {
+                    Some((z, _)) => format!("{z:7.1}"),
+                    None => "   none".to_string(),
+                });
+            }
+            println!("y{gy:+04}: {row}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
     fn doodad_footprints_on_city_tiles() {
         use crate::{bn_doodad_count, bn_doodad_model_path, bn_init, bn_load_tile};
         let dir = std::ffi::CString::new(
