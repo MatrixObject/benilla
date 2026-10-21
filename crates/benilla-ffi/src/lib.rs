@@ -36,6 +36,10 @@ mod model_anim;
 
 mod char_skin;
 
+// ---- Character textures, geosets and animation-id selection (middle layer) ----
+
+mod char_body;
+
 // ---- Distant low-detail terrain (WDL far band) ----
 
 mod wdl_far;
