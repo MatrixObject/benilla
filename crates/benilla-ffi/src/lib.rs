@@ -32,6 +32,10 @@ mod ui_font;
 
 mod model_anim;
 
+// ---- Placed-doodad skeletal rigs (bone animation of the MDDF props) ----
+
+mod doodad_rig;
+
 // ---- Character body-skin atlas composites (CharSections -> RGBA8) ----
 
 mod char_skin;
