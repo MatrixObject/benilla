@@ -211,6 +211,8 @@ enum Cmd {
     QuestAccept { npc: u64, quest: u32 },
     QuestComplete { npc: u64, quest: u32 },
     QuestQuery(u32),
+    /// Cast `spell` at `target` (0 = self), answered by `SMSG_CAST_RESULT`.
+    Cast { spell: u32, target: u64 },
     Logout,
 }
 
@@ -441,6 +443,16 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::QuestQuery(quest)) => {
                     let _ = session.quest_query(quest);
+                }
+                Ok(Cmd::Cast { spell, target }) => {
+                    let dest = (target != 0).then_some(target);
+                    match session.cast_spell(spell, dest) {
+                        Ok(()) => sh.event(format!(
+                            "cast|{spell}|{}",
+                            if target != 0 { target } else { 0 }
+                        )),
+                        Err(e) => sh.event(format!("error|cast|{e}")),
+                    }
                 }
                 Ok(Cmd::Logout) | Err(TryRecvError::Disconnected) => {
                     let _ = session.logout(std::time::Duration::from_secs(2));
@@ -745,9 +757,19 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         7 => Cmd::QuestComplete { npc: a, quest: b },
         8 => Cmd::QuestQuery(b),
         9 => Cmd::Logout,
+        // 10 = cast at self (a = spell id); targeted casts go through
+        // `bn_net_cast`, which can carry the full 64-bit guid.
+        10 => Cmd::Cast { spell: a as u32, target: 0 },
         _ => return 0,
     };
     send_cmd(cmd) as u32
+}
+
+/// Cast `spell` at `target` (0 = self). Answers arrive as `cast|spell|target`
+/// or `error|cast|...` event lines.
+#[no_mangle]
+pub extern "C" fn bn_net_cast(spell: u32, target: u64) -> u32 {
+    send_cmd(Cmd::Cast { spell, target }) as u32
 }
 
 /// Pop queued event lines ("kind|field|...") into `buf`, NUL-terminated.
