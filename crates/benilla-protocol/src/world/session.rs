@@ -264,6 +264,13 @@ impl WorldSession {
         )
     }
 
+    /// Directly emit one opcode+body. Used by the FFI middle layer to drive
+    /// its own movement-state edge machine without going through the limited
+    /// `start_forward`/`heartbeat`/`stop` wrapper set above.
+    pub fn send_body(&mut self, opcode: u16, body: &[u8]) -> Result<()> {
+        self.send(opcode, body)
+    }
+
     /// Request and return the character list, remembering each race for the chat language.
     pub fn char_enum(&mut self) -> Result<Vec<Character>> {
         self.send(opcode::CMSG_CHAR_ENUM, &[])?;

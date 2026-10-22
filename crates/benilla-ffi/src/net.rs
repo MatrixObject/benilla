@@ -24,9 +24,12 @@ use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
-    AttackSwingError, CastOutcome, Object, ObjectFields, ObjectType, ServerPacket,
+    movement as build_movement, MovementInfo, AttackSwingError, CastOutcome, Object, ObjectFields,
+    ObjectType, ServerPacket,
 };
+use benilla_protocol::wire::Vector3d;
 use benilla_protocol::WorldSession;
 
 /// Stage codes returned by `bn_net_status`.
@@ -718,6 +721,10 @@ struct Shared {
     /// The guid handed to `player_login`; `UpdateObject` entries for it feed
     /// `player`.
     self_guid: AtomicU64,
+    /// 0 = mover claim still pending, 1 = set_active_mover + worldport_ack sent.
+    /// Only flips to 1 once the server has streamed our own UpdateObject
+    /// (apply_object checks); claiming before that is discarded by vmangos.
+    mover_ready: AtomicU32,
     events: Mutex<VecDeque<String>>,
     chars: Mutex<Vec<BnNetChar>>,
     /// Every tracked object in the stream window (the client's own object
@@ -756,6 +763,14 @@ struct Shared {
     giver: Mutex<BnNetGiver>,
     /// The live group roster plus the pending-invite popup state.
     party: Mutex<BnNetParty>,
+    /// Latest player pose fed by the host (UE pawn) so the world worker can
+    /// echo it back to the server on every heartbeat. None before the host
+    /// starts its tick, (pos, yaw) afterward.
+    last_pose: Mutex<Option<([f32; 3], f32)>>,
+    /// Host's latest directional input: (forward, strafe, turn) each -1..1.
+    /// Positive forward = W, negative = S. Positive strafe = D, negative = A.
+    /// Positive turn = right, negative = left.
+    last_input: Mutex<(f32, f32, f32)>,
 }
 
 impl Shared {
@@ -797,6 +812,7 @@ fn shared() -> &'static Shared {
     SHARED.get_or_init(|| Shared {
         status: AtomicU32::new(ST_IDLE),
         self_guid: AtomicU64::new(0),
+        mover_ready: AtomicU32::new(0),
         events: Mutex::new(VecDeque::new()),
         chars: Mutex::new(Vec::new()),
         units: Mutex::new(HashMap::new()),
@@ -815,6 +831,8 @@ fn shared() -> &'static Shared {
         loot: Mutex::new(BnNetLoot::default()),
         giver: Mutex::new(BnNetGiver::default()),
         party: Mutex::new(BnNetParty::default()),
+        last_pose: Mutex::new(None),
+        last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
 }
 
@@ -968,6 +986,25 @@ fn worker(host: String, user: String, pass: String, rx: std::sync::mpsc::Receive
 /// commands (chat, attack, loot) go out promptly even when the server is quiet.
 fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh: &Shared) {
     let _ = session.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+
+    // Client tick for MovementInfo timestamps: matches benilla-protocol's
+    // `world::movement::client_uptime_ms` (pub(super), so we mirror it here).
+    fn uptime_ms() -> u32 {
+        use std::sync::OnceLock;
+        static START: OnceLock<Instant> = OnceLock::new();
+        (START.get_or_init(|| Instant::now()).elapsed().as_millis() as u32).max(1)
+    }
+
+    // Movement state machine: mirror the host's directional input to emit the
+    // right MSG_MOVE_* opcode edges vmangos expects. Without StartForward the
+    // server would just drop every heartbeat and rubber-band us back on the
+    // next object update.
+    const HB_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    let mut next_hb = std::time::Instant::now();
+    let mut prev_input: (f32, f32, f32) = (0.0, 0.0, 0.0);
+    let mut last_move_flags: u32 = 0;
+    let mut last_pose_sent: Option<([f32; 3], f32)> = None;
+
     loop {
         // Commands first: sending is cheap and must not wait a server packet.
         loop {
@@ -1088,6 +1125,191 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::Enter(_)) => {}
                 Err(TryRecvError::Empty) => break,
             }
+        }
+
+        // Mover claim: vmangos discards MSG_MOVE_* before we claim our guid
+        // as the active mover (MovementHandler.cpp:291-293). Only send once,
+        // after the server has actually streamed our own UpdateObject -
+        // applying that object flips mover_ready from 0 to 1.
+        if sh.mover_ready.load(Ordering::SeqCst) == 1 {
+            let guid = sh.self_guid.load(Ordering::SeqCst);
+            if guid != 0 {
+                // Use compare_exchange_weak so only the first tick flips it.
+                let claimed =
+                    sh.mover_ready.compare_exchange_weak(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+                if claimed.is_ok() {
+                    if let Err(e) = session.set_active_mover(guid) {
+                        sh.event(format!("error|set_active_mover|{e}"));
+                    } else {
+                        sh.event(format!("move|set_active_mover|{guid}"));
+                    }
+                    if let Err(e) = session.worldport_ack() {
+                        sh.event(format!("error|worldport_ack|{e}"));
+                    } else {
+                        sh.event("move|worldport_ack");
+                    }
+                }
+            }
+        }
+
+        // Movement state machine: emit MSG_MOVE_START_* / STOP_* edges on
+        // input transitions, heartbeat every 500 ms while moving, and a
+        // zero-flags heartbeat if the body drifted at rest.
+        const MF_FORWARD: u32 = 0x1;
+        const MF_BACKWARD: u32 = 0x2;
+        const MF_STRAFE_LEFT: u32 = 0x4;
+        const MF_STRAFE_RIGHT: u32 = 0x8;
+        let input = {
+            let g = sh.last_input.lock().unwrap_or_else(|e| e.into_inner());
+            *g
+        };
+        let pose = {
+            let g = sh.last_pose.lock().unwrap_or_else(|e| e.into_inner());
+            *g
+        };
+
+        if let Some((pos, yaw)) = pose {
+            let forward = input.0;
+            let strafe = input.1;
+            let moving_fwd = forward > 0.1;
+            let moving_bwd = forward < -0.1;
+            let strafe_r = strafe > 0.1;
+            let strafe_l = strafe < -0.1;
+
+            let prev_fwd = prev_input.0 > 0.1;
+            let prev_bwd = prev_input.0 < -0.1;
+            let prev_sr = prev_input.1 > 0.1;
+            let prev_sl = prev_input.1 < -0.1;
+
+            // Compute current flags from input.
+            let cur_flags: u32 =
+                (if moving_fwd { MF_FORWARD } else { 0 })
+                | (if moving_bwd { MF_BACKWARD } else { 0 })
+                | (if strafe_r { MF_STRAFE_RIGHT } else { 0 })
+                | (if strafe_l { MF_STRAFE_LEFT } else { 0 });
+
+            // Helper to construct a MovementInfo and send it.
+            let mut send_move = |opcode: u16, flags: u32| -> bool {
+                let info = MovementInfo {
+                    flags,
+                    timestamp: uptime_ms(),
+                    position: benilla_protocol::wire::Vector3d {
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                    },
+                    orientation: yaw.rem_euclid(std::f32::consts::TAU),
+                    transport: None,
+                    pitch: 0.0,
+                    fall_time: 0,
+                    jump: None,
+                };
+                let body = build_movement(&info);
+                match session.send_body(opcode, &body) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        sh.event(format!("error|move|opcode={opcode:#x}|{e}"));
+                        false
+                    }
+                }
+            };
+
+            let mut sent_flags: u32 = 0;
+
+            // Forward edge: MSG_MOVE_START_FORWARD on rising edge, MSG_MOVE_STOP on both
+            // forward and backward falling (server clears all motion flags on STOP).
+            if moving_fwd && !prev_fwd && !prev_bwd {
+                send_move(MOVE_OP::MSG_MOVE_START_FORWARD, MF_FORWARD);
+                sent_flags |= MF_FORWARD;
+                sh.event(format!("move|StartForward|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+            if moving_bwd && !prev_bwd && !prev_fwd {
+                send_move(MOVE_OP::MSG_MOVE_START_BACKWARD, MF_BACKWARD);
+                sent_flags |= MF_BACKWARD;
+                sh.event(format!("move|StartBackward|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+            if !moving_fwd && !moving_bwd && (prev_fwd || prev_bwd) {
+                // STOP clears FORWARD/BACKWARD on the server.
+                send_move(MOVE_OP::MSG_MOVE_STOP, 0);
+                sh.event(format!("move|Stop|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+
+            // Strafe edges.
+            if strafe_r && !prev_sr && !prev_sl {
+                send_move(MOVE_OP::MSG_MOVE_START_STRAFE_RIGHT, MF_STRAFE_RIGHT);
+                sent_flags |= MF_STRAFE_RIGHT;
+                sh.event(format!("move|StartStrafeRight|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+            if strafe_l && !prev_sl && !prev_sr {
+                send_move(MOVE_OP::MSG_MOVE_START_STRAFE_LEFT, MF_STRAFE_LEFT);
+                sent_flags |= MF_STRAFE_LEFT;
+                sh.event(format!("move|StartStrafeLeft|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+            if !strafe_r && !strafe_l && (prev_sr || prev_sl) {
+                send_move(MOVE_OP::MSG_MOVE_STOP_STRAFE, 0);
+                sh.event(format!("move|StopStrafe|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+            }
+
+            // Heartbeat while moving (every 500 ms, carries all active flags).
+            let now = std::time::Instant::now();
+            if cur_flags != 0 && now >= next_hb {
+                let info = MovementInfo {
+                    flags: cur_flags,
+                    timestamp: uptime_ms(),
+                    position: benilla_protocol::wire::Vector3d {
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                    },
+                    orientation: yaw.rem_euclid(std::f32::consts::TAU),
+                    transport: None,
+                    pitch: 0.0,
+                    fall_time: 0,
+                    jump: None,
+                };
+                let _ = session.send_body(MOVE_OP::MSG_MOVE_HEARTBEAT, &build_movement(&info));
+                sh.event(format!(
+                    "move|heartbeat|flags={:#x}|{:.1},{:.1},{:.1}",
+                    cur_flags, pos[0], pos[1], pos[2]
+                ));
+                next_hb = now + HB_INTERVAL;
+            }
+
+            // Resting body drifted a fraction of a yard: server's exact compare
+            // would read it as motion on the next stream packet, so echo once.
+            if cur_flags == 0 {
+                let drifted = match last_pose_sent {
+                    Some((lp, _)) => {
+                        let dx = pos[0] - lp[0];
+                        let dy = pos[1] - lp[1];
+                        let dz = pos[2] - lp[2];
+                        (dx * dx + dy * dy + dz * dz) > 0.0001
+                    }
+                    None => true, // very first tick: nail down starting pose
+                };
+                if drifted {
+                    let info = MovementInfo {
+                        flags: 0,
+                        timestamp: uptime_ms(),
+                        position: benilla_protocol::wire::Vector3d {
+                            x: pos[0],
+                            y: pos[1],
+                            z: pos[2],
+                        },
+                        orientation: yaw.rem_euclid(std::f32::consts::TAU),
+                        transport: None,
+                        pitch: 0.0,
+                        fall_time: 0,
+                        jump: None,
+                    };
+                    let _ = session.send_body(MOVE_OP::MSG_MOVE_HEARTBEAT, &build_movement(&info));
+                    sh.event(format!("move|heartbeat@rest|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                    last_pose_sent = Some((pos, yaw));
+                }
+            }
+
+            prev_input = input;
+            last_move_flags = cur_flags;
         }
 
         match session.recv() {
@@ -1386,6 +1608,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
     let mut units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
     match obj {
         Object::Values { guid, mask } => {
+            let is_self = *guid == self_guid;
             if let Some(rec) = units.get_mut(guid) {
                 rec.fields.merge(mask.clone());
                 if rec.kind == 4 {
@@ -1395,20 +1618,30 @@ fn apply_object(obj: &Object, sh: &Shared) {
                 units.insert(
                     *guid,
                     UnitRec {
-                        kind: if *guid == self_guid { 4 } else { 0 },
+                        kind: if is_self { 4 } else { 0 },
                         fields: mask.clone(),
                         pos: [0.0; 3],
                         facing: 0.0,
                     },
                 );
             }
+            if is_self {
+                // Safe to claim mover ownership once our own object exists
+                // anywhere in the stream; vmangos drops mover claims for
+                // unknown guids.
+                sh.mover_ready.store(1, Ordering::SeqCst);
+            }
         }
         Object::Movement { guid, movement } => {
+            let is_self = *guid == self_guid;
             if let Some(rec) = units.get_mut(guid) {
                 if let Some((v, o)) = movement.position {
                     rec.pos = [v.x, v.y, v.z];
                     rec.facing = o;
                 }
+            }
+            if is_self {
+                sh.mover_ready.store(1, Ordering::SeqCst);
             }
         }
         Object::Create {
@@ -1432,6 +1665,9 @@ fn apply_object(obj: &Object, sh: &Shared) {
             );
             if *object_type == ObjectType::Player {
                 queue_visible_items(mask, sh);
+            }
+            if *guid == self_guid {
+                sh.mover_ready.store(1, Ordering::SeqCst);
             }
         }
         Object::OutOfRange { guids } => {
@@ -2397,6 +2633,34 @@ pub extern "C" fn bn_net_event(buf: *mut c_char, cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn bn_net_disconnect() -> u32 {
     send_cmd(Cmd::Logout) as u32
+}
+
+/// Feed the host's latest player pose so the world worker can echo it back to
+/// the server as a movement heartbeat. Positions are raw WoW world yards, yaw
+/// is radians (0 = +X, same convention `player.rs` uses). The server owns the
+/// authoritative position; this only keeps it in sync with the client's local
+/// simulation so rubber-banding stops.
+#[no_mangle]
+pub extern "C" fn bn_net_set_pose(x: f32, y: f32, z: f32, yaw: f32) -> u32 {
+    *shared()
+        .last_pose
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(([x, y, z], yaw));
+    1
+}
+
+/// Feed the host's latest directional input: (forward, strafe, turn) each -1..1.
+/// Positive forward = W, negative = S. Positive strafe = D, negative = A.
+/// Positive turn = right, negative = left. The world worker uses these to
+/// drive the MSG_MOVE_START/STOP opcode edges vmangos requires — only
+/// heartbeats would leave the server stuck with FORWARD set forever.
+#[no_mangle]
+pub extern "C" fn bn_net_set_input(forward: f32, strafe: f32, turn: f32) -> u32 {
+    *shared()
+        .last_input
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = (forward, strafe, turn);
+    1
 }
 
 /// Fill `out` with the logged-in player's descriptor state. Returns 1 when a
