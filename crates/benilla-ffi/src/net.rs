@@ -107,6 +107,12 @@ pub struct BnNetPlayer {
     pub quest_count: u32,
     pub quest_id: [u32; 20],
     pub quest_state: [u8; 20],
+    /// Live `UNIT_FIELD_AURA` slots (buffs 0-31, debuffs 32-47), ascending
+    /// slot: spell id, stack count and the descriptor slot the aura sits in.
+    pub aura_count: u32,
+    pub aura_slot: [u8; 48],
+    pub aura_spell: [u32; 48],
+    pub aura_stacks: [u8; 48],
     pub pos: [f32; 3],
     pub facing: f32,
 }
@@ -131,6 +137,10 @@ impl Default for BnNetPlayer {
             quest_count: 0,
             quest_id: [0; 20],
             quest_state: [0; 20],
+            aura_count: 0,
+            aura_slot: [0; 48],
+            aura_spell: [0; 48],
+            aura_stacks: [0; 48],
             pos: [0.0; 3],
             facing: 0.0,
         }
@@ -1148,6 +1158,19 @@ fn refresh_player(sh: &Shared) {
         slot += 1;
     }
     p.quest_count = slot as u32;
+    // Live buffs/debuffs, straight off the descriptor block: the host draws the
+    // buff bar from these, and the spell ids resolve to icons through Spell.dbc.
+    let mut auras = 0usize;
+    for a in f.unit_auras() {
+        if auras >= p.aura_slot.len() {
+            break;
+        }
+        p.aura_slot[auras] = a.slot;
+        p.aura_spell[auras] = a.spell_id;
+        p.aura_stacks[auras] = a.stacks;
+        auras += 1;
+    }
+    p.aura_count = auras as u32;
     // The item objects behind the pack/bag guids may have just arrived (or
     // changed); make sure their templates are asked for.
     queue_self_items(f, &units, sh);
