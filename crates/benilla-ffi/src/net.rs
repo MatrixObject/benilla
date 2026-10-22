@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 
-use benilla_protocol::messages::{Object, ObjectFields, ObjectType, ServerPacket};
+use benilla_protocol::messages::{AttackSwingError, Object, ObjectFields, ObjectType, ServerPacket};
 use benilla_protocol::WorldSession;
 
 /// Stage codes returned by `bn_net_status`.
@@ -708,8 +708,65 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     .insert(*entry, info.display_info_id);
             }
         }
-        ServerPacket::LevelUp(_)
-        | ServerPacket::LogoutComplete
+        // ---- combat feedback: the numbers the reference floats over units ----
+        ServerPacket::AttackerState(s) => {
+            // `displayed()` is the reference gate (0x625e40): a dodged or
+            // parried on-next-swing ability gets neither log line nor number.
+            if s.displayed() {
+                sh.event(format!(
+                    "dmg|melee|{}|{}|{}|{}|{}|{}|{}",
+                    s.victim, s.attacker, s.damage, s.victim_state, s.hit_info, s.absorb, s.resist
+                ));
+            }
+        }
+        ServerPacket::SpellDamageLog(s) => {
+            sh.event(format!(
+                "dmg|spell|{}|{}|{}|{}|{}|{}|{}|{}",
+                s.target,
+                s.attacker,
+                s.damage,
+                s.school,
+                u8::from(s.hit_info & 0x2 != 0), // crit bit, SpellDefines.h:179
+                s.absorb,
+                s.resist,
+                u8::from(s.periodic)
+            ));
+        }
+        ServerPacket::SpellHealLog(s) => {
+            sh.event(format!(
+                "heal|{}|{}|{}|{}",
+                s.target,
+                s.healer,
+                s.amount,
+                u8::from(s.critical)
+            ));
+        }
+        ServerPacket::SpellEnergizeLog(s) => {
+            sh.event(format!("power|{}|{}|{}", s.target, s.power, s.amount));
+        }
+        ServerPacket::AttackSwingError(e) => {
+            let code = match e {
+                AttackSwingError::NotInRange => 1,
+                AttackSwingError::BadFacing => 2,
+                AttackSwingError::DeadOrUnattackable => 3,
+            };
+            sh.event(format!("attack|error|{code}"));
+        }
+        ServerPacket::XpGain(x) => {
+            sh.event(format!(
+                "xp|{}|{}|{}",
+                x.total,
+                x.base,
+                u8::from(x.kill)
+            ));
+        }
+        ServerPacket::LevelUp(info) => {
+            sh.event(format!(
+                "levelup|{}|{}|{}",
+                info.level, info.health, info.powers[0]
+            ));
+        }
+        ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
         | ServerPacket::QuestUpdateComplete { .. }
         | ServerPacket::QuestUpdateAddKill { .. }
@@ -904,12 +961,33 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
         return 0;
     };
     let rec = units.get(&guid).expect("guid from the same map");
+    let row = unit_row(guid, rec);
+    unsafe { *out = row };
+    1
+}
+
+/// One tracked object by guid (the host's target lookup: no sort, one hit).
+#[no_mangle]
+pub extern "C" fn bn_net_unit_by_guid(guid: u64, out: *mut BnNetUnit) -> u32 {
+    if out.is_null() || guid == 0 {
+        return 0;
+    }
+    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rec) = units.get(&guid) else {
+        return 0;
+    };
+    let row = unit_row(guid, rec);
+    unsafe { *out = row };
+    1
+}
+
+fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
     let f = &rec.fields;
     // Player appearance bytes; creatures leave all of this zero.
     let bytes0 = f.unit_bytes_0().unwrap_or(0);
     let pb = f.player_bytes().unwrap_or(0);
     let pb2 = f.player_bytes_2().unwrap_or(0);
-    let row = BnNetUnit {
+    BnNetUnit {
         guid,
         kind: rec.kind,
         level: f.unit_level().unwrap_or(0),
@@ -945,9 +1023,7 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
                 displays.get(&entry).copied().unwrap_or(0)
             })
         },
-    };
-    unsafe { *out = row };
-    1
+    }
 }
 
 /// Drop the tracked objects, e.g. after leaving the world.
