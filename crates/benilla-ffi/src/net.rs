@@ -1143,11 +1143,8 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     } else {
                         sh.event(format!("move|set_active_mover|{guid}"));
                     }
-                    if let Err(e) = session.worldport_ack() {
-                        sh.event(format!("error|worldport_ack|{e}"));
-                    } else {
-                        sh.event("move|worldport_ack");
-                    }
+                    // Note: no worldport_ack here — MSG_MOVE_WORLDPORT_ACK is only
+                    // owed after SMSG_NEW_WORLD (map transfer), not at login.
                 }
             }
         }
@@ -1188,24 +1185,13 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 | (if strafe_r { MF_STRAFE_RIGHT } else { 0 })
                 | (if strafe_l { MF_STRAFE_LEFT } else { 0 });
 
-            // Helper to construct a MovementInfo and send it.
+            // Use session.send_movement so MovementInfo construction and serialization
+            // exactly match WorldWriter.send_movement (no manual struct build + send_body).
+            let now_orient = yaw.rem_euclid(std::f32::consts::TAU);
             let mut send_move = |opcode: u16, flags: u32| -> bool {
-                let info = MovementInfo {
-                    flags,
-                    timestamp: uptime_ms(),
-                    position: benilla_protocol::wire::Vector3d {
-                        x: pos[0],
-                        y: pos[1],
-                        z: pos[2],
-                    },
-                    orientation: yaw.rem_euclid(std::f32::consts::TAU),
-                    transport: None,
-                    pitch: 0.0,
-                    fall_time: 0,
-                    jump: None,
-                };
-                let body = build_movement(&info);
-                match session.send_body(opcode, &body) {
+                match session.send_movement(
+                    opcode, flags, pos, now_orient, 0.0, 0, None, None,
+                ) {
                     Ok(()) => true,
                     Err(e) => {
                         sh.event(format!("error|move|opcode={opcode:#x}|{e}"));
@@ -1253,21 +1239,9 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             // Heartbeat while moving (every 500 ms, carries all active flags).
             let now = std::time::Instant::now();
             if cur_flags != 0 && now >= next_hb {
-                let info = MovementInfo {
-                    flags: cur_flags,
-                    timestamp: uptime_ms(),
-                    position: benilla_protocol::wire::Vector3d {
-                        x: pos[0],
-                        y: pos[1],
-                        z: pos[2],
-                    },
-                    orientation: yaw.rem_euclid(std::f32::consts::TAU),
-                    transport: None,
-                    pitch: 0.0,
-                    fall_time: 0,
-                    jump: None,
-                };
-                let _ = session.send_body(MOVE_OP::MSG_MOVE_HEARTBEAT, &build_movement(&info));
+                let _ = session.send_movement(
+                    MOVE_OP::MSG_MOVE_HEARTBEAT, cur_flags, pos, now_orient, 0.0, 0, None, None,
+                );
                 sh.event(format!(
                     "move|heartbeat|flags={:#x}|{:.1},{:.1},{:.1}",
                     cur_flags, pos[0], pos[1], pos[2]
@@ -1288,21 +1262,9 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     None => true, // very first tick: nail down starting pose
                 };
                 if drifted {
-                    let info = MovementInfo {
-                        flags: 0,
-                        timestamp: uptime_ms(),
-                        position: benilla_protocol::wire::Vector3d {
-                            x: pos[0],
-                            y: pos[1],
-                            z: pos[2],
-                        },
-                        orientation: yaw.rem_euclid(std::f32::consts::TAU),
-                        transport: None,
-                        pitch: 0.0,
-                        fall_time: 0,
-                        jump: None,
-                    };
-                    let _ = session.send_body(MOVE_OP::MSG_MOVE_HEARTBEAT, &build_movement(&info));
+                    let _ = session.send_movement(
+                        MOVE_OP::MSG_MOVE_HEARTBEAT, 0, pos, now_orient, 0.0, 0, None, None,
+                    );
                     sh.event(format!("move|heartbeat@rest|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
                     last_pose_sent = Some((pos, yaw));
                 }
@@ -2660,6 +2622,13 @@ pub extern "C" fn bn_net_set_input(forward: f32, strafe: f32, turn: f32) -> u32 
         .last_input
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = (forward, strafe, turn);
+    // Log on any non-zero input so we can confirm the UE side is calling us.
+    if forward.abs() > 0.1 || strafe.abs() > 0.1 || turn.abs() > 0.1 {
+        shared().event(format!(
+            "input|fwd={:.2},str={:.2},trn={:.2}",
+            forward, strafe, turn
+        ));
+    }
     1
 }
 

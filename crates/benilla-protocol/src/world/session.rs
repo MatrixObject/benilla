@@ -381,6 +381,29 @@ impl WorldSession {
         )
     }
 
+    /// One `MSG_MOVE_*` packet with full MovementInfo — mirrors
+    /// `WorldWriter::send_movement` so the FFI middle layer can drive the
+    /// complete opcode/flag state machine without manually constructing or
+    /// serializing MovementInfo (those are `pub(super)` in the writer module).
+    pub fn send_movement(
+        &mut self,
+        opcode: u16,
+        flags: u32,
+        pos: [f32; 3],
+        orientation: f32,
+        pitch: f32,
+        fall_time: u32,
+        jump: Option<messages::JumpInfo>,
+        transport: Option<messages::TransportPose>,
+    ) -> Result<()> {
+        let mut info = movement_info(pos, orientation, flags);
+        info.pitch = pitch;
+        info.fall_time = fall_time;
+        info.jump = jump;
+        info.transport = transport;
+        self.send(opcode, &messages::movement(&info))
+    }
+
     /// Ack a `SMSG_FORCE_*_SPEED_CHANGE` at rest with the full guid, counter and exact speed.
     pub fn force_speed_ack(
         &mut self,
