@@ -170,6 +170,15 @@ pub struct BnNetUnit {
     /// `SMSG_CHAR_ENUM` equipment order (head..tabard); 0 = empty / unknown
     /// (`Item.dbc` maps `PLAYER_VISIBLE_ITEM_<slot>_0` entries to displays).
     pub visible_display: [u32; 19],
+    /// `OBJECT_FIELD_ENTRY`: the item entry or the creature template entry.
+    pub entry: u32,
+    /// Creature template rank: 0 normal, 1 elite, 2 rare-elite, 3 world boss,
+    /// 4 rare. Filled from the creature-query cache (0 until it answers).
+    pub rank: u32,
+    /// `CreatureType.dbc` id (0 until the template answers).
+    pub creature_type: u32,
+    /// NUL-terminated UTF-8 creature name; empty until the query answers.
+    pub name: [c_char; 64],
 }
 
 impl Default for BnNetUnit {
@@ -196,6 +205,10 @@ impl Default for BnNetUnit {
             hair_color: 0,
             facial: 0,
             visible_display: [0; 19],
+            entry: 0,
+            rank: 0,
+            creature_type: 0,
+            name: [0; 64],
         }
     }
 }
@@ -295,6 +308,16 @@ impl Default for BnNetInvItem {
             info: BnNetItemInfo::default(),
         }
     }
+}
+
+/// One creature template from `SMSG_CREATURE_QUERY_RESPONSE`: the name and rank
+/// the target frame needs (elite/boss styling), plus the type word.
+#[derive(Clone)]
+struct CreatureTemplateLite {
+    name: String,
+    subname: String,
+    creature_type: u32,
+    rank: u32,
 }
 
 /// One quest template from `SMSG_QUEST_QUERY_RESPONSE` (the quest log's detail
@@ -454,6 +477,11 @@ struct Shared {
     /// Casts in flight by caster guid (self included), from SPELL_START until
     /// SPELL_GO / SPELL_FAILED_OTHER.
     casts: Mutex<HashMap<u64, CastState>>,
+    /// Creature templates from `SMSG_CREATURE_QUERY_RESPONSE`, keyed by entry:
+    /// name, rank (elite/boss) and creature type - the target frame's data.
+    creatures: Mutex<HashMap<u32, CreatureTemplateLite>>,
+    /// Creature entries already asked for.
+    creature_asked: Mutex<HashSet<u32>>,
 }
 
 impl Shared {
@@ -507,6 +535,8 @@ fn shared() -> &'static Shared {
         spells: Mutex::new(Vec::new()),
         actions: Mutex::new(Vec::new()),
         casts: Mutex::new(HashMap::new()),
+        creatures: Mutex::new(HashMap::new()),
+        creature_asked: Mutex::new(HashSet::new()),
     })
 }
 
@@ -721,6 +751,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 handle_packet(&packet, sh);
                 flush_item_queries(session, sh);
                 queue_self_quests(session, sh);
+                queue_creature_names(session, sh);
             }
             Err(e) => {
                 // A read deadline is the normal quiet path; anything else ends
@@ -856,6 +887,42 @@ fn queue_self_quests(session: &mut WorldSession, sh: &Shared) {
         if id != 0 && asked.insert(id) {
             let _ = session.quest_query(id);
         }
+    }
+}
+
+/// Ask for the creature templates seen in the stream window: the target frame
+/// needs the name and rank (elite/boss). Two per packet keeps the burst small
+/// while a town full of NPCs streams in.
+fn queue_creature_names(session: &mut WorldSession, sh: &Shared) {
+    let mut asked: Vec<(u32, u64)> = Vec::new();
+    {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = sh
+            .creature_asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cache = sh.creatures.lock().unwrap_or_else(|e| e.into_inner());
+        for (guid, rec) in units.iter() {
+            if rec.kind != 3 {
+                continue;
+            }
+            let entry = rec
+                .fields
+                .raw_fields()
+                .find(|(index, _)| *index == 3)
+                .map(|(_, value)| value)
+                .unwrap_or(0);
+            if entry == 0 || cache.contains_key(&entry) || !seen.insert(entry) {
+                continue;
+            }
+            asked.push((entry, *guid));
+            if asked.len() >= 2 {
+                break;
+            }
+        }
+    }
+    for (entry, guid) in asked {
+        let _ = session.creature_query(entry, guid);
     }
 }
 
@@ -1142,6 +1209,29 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                         },
                     );
             }
+        }
+        // Creature templates: the target frame's name, rank (elite/boss) and
+        // creature type come from here; 1.12 answers with `info = None` for an
+        // unknown entry, cached as an empty row so it is not re-asked.
+        ServerPacket::CreatureQueryResponse { entry, info } => {
+            let row = match info {
+                Some(i) => CreatureTemplateLite {
+                    name: i.name.clone(),
+                    subname: i.subname.clone(),
+                    creature_type: i.creature_type,
+                    rank: i.rank,
+                },
+                None => CreatureTemplateLite {
+                    name: String::new(),
+                    subname: String::new(),
+                    creature_type: 0,
+                    rank: 0,
+                },
+            };
+            sh.creatures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*entry, row);
         }
         // The "You receive …" line; `bag`/`slot` locate the new row so the host
         // can refresh an inventory panel.
@@ -1582,6 +1672,19 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
     let bytes0 = f.unit_bytes_0().unwrap_or(0);
     let pb = f.player_bytes().unwrap_or(0);
     let pb2 = f.player_bytes_2().unwrap_or(0);
+    // `OBJECT_FIELD_ENTRY` = descriptor index 3. A creature's template answers
+    // the target frame's name/rank; a player has no such row.
+    let entry = f
+        .raw_fields()
+        .find(|(index, _)| *index == 3)
+        .map(|(_, value)| value)
+        .unwrap_or(0);
+    let template = shared()
+        .creatures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&entry)
+        .cloned();
     BnNetUnit {
         guid,
         kind: rec.kind,
@@ -1617,6 +1720,20 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
                 let entry = f.player_visible_item_entry(i as u8).unwrap_or(0);
                 displays.get(&entry).copied().unwrap_or(0)
             })
+        },
+        // Template entry (OBJECT_FIELD_ENTRY) plus the creature name/rank once
+        // the query answers; players have no creature template, so both stay 0.
+        entry,
+        rank: template.as_ref().map(|t| t.rank).unwrap_or(0),
+        creature_type: template.as_ref().map(|t| t.creature_type).unwrap_or(0),
+        name: {
+            let mut buf = [0 as c_char; 64];
+            if let Some(t) = &template {
+                for (dst, src) in buf.iter_mut().zip(t.name.as_bytes().iter().take(63)) {
+                    *dst = *src as c_char;
+                }
+            }
+            buf
         },
     }
 }
