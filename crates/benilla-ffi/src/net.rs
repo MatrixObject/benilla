@@ -337,6 +337,26 @@ impl Default for BnNetQuestInfo {
     }
 }
 
+/// One occupied action-bar slot (`SMSG_ACTION_BUTTONS`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetAction {
+    pub slot: u8,
+    /// `ActionButtonType`: 0x00 spell, 0x40 macro, 0x80 item.
+    pub kind: u8,
+    pub action: u32,
+}
+
+impl Default for BnNetAction {
+    fn default() -> Self {
+        Self {
+            slot: 0,
+            kind: 0,
+            action: 0,
+        }
+    }
+}
+
 /// One tracked object: its descriptor snapshot plus the last known position.
 struct UnitRec {
     kind: u8,
@@ -392,6 +412,10 @@ struct Shared {
     quests: Mutex<HashMap<u32, QuestTemplateLite>>,
     /// Quest ids already asked for (the log re-sends descriptors constantly).
     quest_asked: Mutex<HashSet<u32>>,
+    /// The spell book (learned ids, in `SMSG_INITIAL_SPELLS` order).
+    spells: Mutex<Vec<u32>>,
+    /// Occupied action-bar slots: (slot, kind, action).
+    actions: Mutex<Vec<(u8, u8, u32)>>,
 }
 
 impl Shared {
@@ -442,6 +466,8 @@ fn shared() -> &'static Shared {
         item_templates: Mutex::new(HashMap::new()),
         quests: Mutex::new(HashMap::new()),
         quest_asked: Mutex::new(HashSet::new()),
+        spells: Mutex::new(Vec::new()),
+        actions: Mutex::new(Vec::new()),
     })
 }
 
@@ -1190,6 +1216,50 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 t.title.replace('|', "/")
             ));
         }
+        // The spell book: learned ids in server order; rank-ups supersede the
+        // old id in place.
+        ServerPacket::InitialSpells { spell_ids, .. } => {
+            let mut book = sh.spells.lock().unwrap_or_else(|e| e.into_inner());
+            book.clear();
+            for id in spell_ids {
+                let id = *id as u32;
+                if !book.contains(&id) {
+                    book.push(id);
+                }
+            }
+        }
+        ServerPacket::LearnedSpell { spell_id } => {
+            let mut book = sh.spells.lock().unwrap_or_else(|e| e.into_inner());
+            let id = *spell_id as u32;
+            if !book.contains(&id) {
+                book.push(id);
+            }
+        }
+        ServerPacket::RemovedSpell { spell_id } => {
+            let id = *spell_id as u32;
+            sh.spells
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|s| *s != id);
+        }
+        ServerPacket::SupercededSpell {
+            old_spell_id,
+            new_spell_id,
+        } => {
+            let old = *old_spell_id as u32;
+            let new = *new_spell_id as u32;
+            let mut book = sh.spells.lock().unwrap_or_else(|e| e.into_inner());
+            book.retain(|s| *s != old);
+            if !book.contains(&new) {
+                book.push(new);
+            }
+        }
+        ServerPacket::ActionButtons { buttons } => {
+            let mut slots: Vec<(u8, u8, u32)> =
+                buttons.iter().map(|b| (b.slot, b.kind, b.action)).collect();
+            slots.sort_by_key(|s| s.0);
+            *sh.actions.lock().unwrap_or_else(|e| e.into_inner()) = slots;
+        }
         ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
         | ServerPacket::QuestUpdateComplete { .. }
@@ -1502,6 +1572,54 @@ pub extern "C" fn bn_net_quest_info(quest_id: u32, out: *mut BnNetQuestInfo) -> 
     copy_name(&mut row.title, &q.title);
     copy_name(&mut row.objectives, &q.objectives);
     copy_name(&mut row.details, &q.details);
+    unsafe { *out = row };
+    1
+}
+
+/// Learned spells in book order.
+#[no_mangle]
+pub extern "C" fn bn_net_spell_count() -> u32 {
+    shared()
+        .spells
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u32
+}
+
+/// The spell id at `index`; 0 when out of range.
+#[no_mangle]
+pub extern "C" fn bn_net_spell(index: u32) -> u32 {
+    let sh = shared();
+    let book = sh.spells.lock().unwrap_or_else(|e| e.into_inner());
+    book.get(index as usize).copied().unwrap_or(0)
+}
+
+/// Occupied action-bar slots, sorted by slot index.
+#[no_mangle]
+pub extern "C" fn bn_net_action_count() -> u32 {
+    shared()
+        .actions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u32
+}
+
+/// One action-bar slot (`slot`, `kind` 0 spell/0x40 macro/0x80 item, `action`).
+#[no_mangle]
+pub extern "C" fn bn_net_action(index: u32, out: *mut BnNetAction) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let sh = shared();
+    let slots = sh.actions.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((slot, kind, action)) = slots.get(index as usize) else {
+        return 0;
+    };
+    let row = BnNetAction {
+        slot: *slot,
+        kind: *kind,
+        action: *action,
+    };
     unsafe { *out = row };
     1
 }

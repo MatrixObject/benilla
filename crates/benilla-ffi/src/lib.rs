@@ -147,6 +147,10 @@ pub struct BnWorld {
     /// `bn_light_sample` and reused every query.
     lights: Option<benilla_formats::LightCatalog>,
 
+    /// Parsed `Spell.dbc`/`SpellIcon` rows for the spell book and cast bar,
+    /// loaded once on the first `bn_spell_info` and reused every query.
+    spells: Option<benilla_formats::SpellCatalog>,
+
     /// Parsed WMO geometry by root path, shared by every placement of a model.
     wmo_models: HashMap<String, std::sync::Arc<Vec<benilla_formats::RenderSubmesh>>>,
 
@@ -313,6 +317,8 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         chain: benilla_formats::Chain::open(data).ok(),
 
         lights: None,
+
+        spells: None,
 
         wmo_models: HashMap::new(),
 
@@ -7240,6 +7246,52 @@ pub extern "C" fn bn_light_sample(
     // SAFETY: `out` holds at least `cap >= N` floats.
     unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
     N
+}
+
+/// One `Spell.dbc` display row as a TSV line:
+///   `id|name|rank|icon|school|power_type|mana_cost|duration_index|range_index`
+/// (`icon` is the BLP path without extension; empty rank for unranked rows).
+/// Returns the byte count written, 0 when the row is missing.
+#[no_mangle]
+pub extern "C" fn bn_spell_info(world: *mut BnWorld, spell_id: u32, out: *mut c_char, cap: u32) -> u32 {
+    if world.is_null() || out.is_null() || cap == 0 || spell_id == 0 {
+        return 0;
+    }
+    // SAFETY: the caller passes the handle `bn_init` returned.
+    let w = unsafe { &mut *world };
+    if w.spells.is_none() {
+        w.spells = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::load_spell_catalog(c).ok());
+    }
+    let Some(cat) = w.spells.as_ref() else {
+        return 0;
+    };
+    let Some(s) = cat.get(spell_id) else {
+        return 0;
+    };
+    let line = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        s.id,
+        s.name,
+        s.rank.as_deref().unwrap_or(""),
+        s.icon.as_deref().unwrap_or(""),
+        s.school,
+        s.power_type,
+        s.mana_cost,
+        s.duration_index,
+        s.range_index
+    );
+    // SAFETY: `out` holds at least `cap` bytes; the copy is NUL-terminated.
+    let bytes = line.as_bytes();
+    let room = (cap as usize).saturating_sub(1);
+    let n = bytes.len().min(room);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
+        *out.add(n) = 0;
+    }
+    n as u32
 }
 
 /// The zone's water tint bands at a WoW-space position (`sRGB 0..1`): the same Light row
