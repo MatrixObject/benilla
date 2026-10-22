@@ -3256,11 +3256,9 @@ pub extern "C" fn bn_model_fill(
                         }
 
                         (tri, ts)
-
                     }
 
                     None => ((0..nv).map(|i| i as u16).collect(), vec![false; nv]),
-
                 };
 
                 let mut ti = 0u32;

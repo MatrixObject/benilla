@@ -267,9 +267,7 @@ fn char_model_slots(
             .get(b.texture_combo_index as usize)
             .and_then(|&ti| model.textures.get(ti as usize));
         let slot = char_slot_of(tex);
-        let hidden = visible
-            .as_ref()
-            .is_some_and(|v| !v.contains(&sec.id));
+        let hidden = visible.as_ref().is_some_and(|v| !v.contains(&sec.id));
         let byte = if hidden { slot | 0x80 } else { slot };
         flags[start..end].fill(byte);
     }
