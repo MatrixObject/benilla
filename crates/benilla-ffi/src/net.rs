@@ -84,6 +84,9 @@ impl Default for BnNetChar {
 #[derive(Clone, Copy)]
 pub struct BnNetPlayer {
     pub guid: u64,
+    /// The character's `SMSG_CHAR_ENUM` map id (0 Eastern Kingdoms, 1 Kalimdor,
+    /// other values are instanced maps the host cannot stream).
+    pub map: u32,
     pub level: u32,
     pub health: u32,
     pub max_health: u32,
@@ -109,6 +112,7 @@ impl Default for BnNetPlayer {
     fn default() -> Self {
         Self {
             guid: 0,
+            map: 0,
             level: 0,
             health: 0,
             max_health: 0,
@@ -545,8 +549,19 @@ fn refresh_player(sh: &Shared) {
     };
     let f = &rec.fields;
     let power_type = f.unit_power_type();
+    // The map id comes from the roster row (the world stream carries no map
+    // field); a manual `player_login` without a roster match stays 0.
+    let map = sh
+        .chars
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|c| c.guid == guid)
+        .map(|c| c.map)
+        .unwrap_or(0);
     let mut p = BnNetPlayer {
         guid,
+        map,
         level: f.unit_level().unwrap_or(0),
         health: f.unit_health().unwrap_or(0),
         max_health: f.unit_max_health().unwrap_or(0),

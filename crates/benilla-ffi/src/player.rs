@@ -696,6 +696,25 @@ impl Player {
         ((cx / 16) as i32, (cy / 16) as i32)
     }
 
+    /// The continent this body's tiles were resolved against.
+    fn map_of(&self) -> &str {
+        &self.map
+    }
+
+    /// Adopt a server-authoritative pose: feet, heading, and a clean predictor
+    /// (no carried velocity, no stale grounded/water latch).
+    fn set_server_pose(&mut self, pos: [f32; 3], yaw: f32) {
+        self.pos = pos;
+        self.yaw = yaw;
+        self.model_yaw = yaw;
+        self.vel = [0.0; 3];
+        self.grounded = false;
+        self.swimming = false;
+        self.snap_pending = false;
+        self.last_ground = pos;
+        self.void_time = 0.0;
+    }
+
     /// Load the tile under the player plus its neighbours, at most one new ADT
     /// per call (a full 3x3 would hitch on the first frame), then evict
     /// anything more than one tile away.
@@ -1698,6 +1717,37 @@ pub extern "C" fn bn_player_reset(
         p.grounded = true;
         p.last_ground = p.pos;
     }
+    w.player = Some(p);
+    1
+}
+
+/// Place the middle layer's body at a server position (feet, WoW yards) and
+/// heading. Unlike `bn_player_reset` the feet keep the server Z (the client's
+/// own `MSG_MOVE_TELEPORT_ACK` path does the same) and the local predictor's
+/// velocity is dropped so the next tick starts clean. The map is switched when
+/// it differs from the resident one (a login can land in another continent).
+#[no_mangle]
+pub extern "C" fn bn_player_teleport(
+    world: *mut BnWorld,
+    map: *const std::ffi::c_char,
+    x: f32,
+    y: f32,
+    z: f32,
+    yaw: f32,
+) -> u32 {
+    if world.is_null() {
+        return 0;
+    }
+    let Some(map) = crate::cstr_to_str(map) else {
+        return 0;
+    };
+    let w = unsafe { &mut *world };
+    let Some(mut p) = w.player.take() else { return 0 };
+    if p.map_of() != map {
+        p = Player::new(map, x, y);
+    }
+    p.set_server_pose([x, y, z], yaw);
+    p.ensure_tiles(&w.archives);
     w.player = Some(p);
     1
 }
