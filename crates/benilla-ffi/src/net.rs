@@ -16,7 +16,7 @@
 //!   bn_net_event(buf, cap) -> bytes popped (0 = empty)
 //!   bn_net_disconnect()
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
@@ -163,6 +163,10 @@ pub struct BnNetUnit {
     pub hair: u8,
     pub hair_color: u8,
     pub facial: u8,
+    /// Public worn equipment resolved to `ItemDisplayInfo` ids in
+    /// `SMSG_CHAR_ENUM` equipment order (head..tabard); 0 = empty / unknown
+    /// (`Item.dbc` maps `PLAYER_VISIBLE_ITEM_<slot>_0` entries to displays).
+    pub visible_display: [u32; 19],
 }
 
 impl Default for BnNetUnit {
@@ -188,6 +192,7 @@ impl Default for BnNetUnit {
             hair: 0,
             hair_color: 0,
             facial: 0,
+            visible_display: [0; 19],
         }
     }
 }
@@ -227,6 +232,14 @@ struct Shared {
     /// manager, reduced to what the FFI exposes).
     units: Mutex<HashMap<u64, UnitRec>>,
     player: Mutex<Option<BnNetPlayer>>,
+    /// Worn-item entry -> `ItemDisplayInfo` id, filled from the server's
+    /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` (1.12 ships no Item.dbc, so this
+    /// template cache is the only entry->display mapping the client has).
+    item_displays: Mutex<HashMap<u32, u32>>,
+    /// Entries already asked for, so a stream of updates never re-queries.
+    item_asked: Mutex<HashSet<u32>>,
+    /// Entries seen on a player but not yet sent as a query.
+    item_queue: Mutex<Vec<u32>>,
 }
 
 impl Shared {
@@ -271,6 +284,9 @@ fn shared() -> &'static Shared {
         chars: Mutex::new(Vec::new()),
         units: Mutex::new(HashMap::new()),
         player: Mutex::new(None),
+        item_displays: Mutex::new(HashMap::new()),
+        item_asked: Mutex::new(HashSet::new()),
+        item_queue: Mutex::new(Vec::new()),
     })
 }
 
@@ -466,7 +482,10 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
         }
 
         match session.recv() {
-            Ok(packet) => handle_packet(&packet, sh),
+            Ok(packet) => {
+                handle_packet(&packet, sh);
+                flush_item_queries(session, sh);
+            }
             Err(e) => {
                 // A read deadline is the normal quiet path; anything else ends
                 // the session (the server dropped us, or the link broke).
@@ -508,6 +527,31 @@ fn object_kind(t: ObjectType) -> u8 {
 /// only stops a pathological server from growing the map forever.
 const MAX_UNITS: usize = 4096;
 
+/// Queue `CMSG_ITEM_QUERY_SINGLE` for every worn item entry that has not been
+/// asked for yet. 1.12 has no Item.dbc, so the display id only arrives in the
+/// server's template response; the query is ask-once per entry.
+fn queue_visible_items(f: &ObjectFields, sh: &Shared) {
+    let mut asked = sh.item_asked.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
+    for i in 0..19u8 {
+        let entry = f.player_visible_item_entry(i).unwrap_or(0);
+        if entry != 0 && asked.insert(entry) {
+            queue.push(entry);
+        }
+    }
+}
+
+/// Send the queued item queries (one per player appearance change at most).
+fn flush_item_queries(session: &mut WorldSession, sh: &Shared) {
+    let pending: Vec<u32> = {
+        let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.drain(..).collect()
+    };
+    for entry in pending {
+        let _ = session.item_query(entry, 0);
+    }
+}
+
 /// Fold one `SMSG_UPDATE_OBJECT` entry into the tracked object table.
 fn apply_object(obj: &Object, sh: &Shared) {
     let self_guid = sh.self_guid.load(Ordering::SeqCst);
@@ -516,6 +560,9 @@ fn apply_object(obj: &Object, sh: &Shared) {
         Object::Values { guid, mask } => {
             if let Some(rec) = units.get_mut(guid) {
                 rec.fields.merge(mask.clone());
+                if rec.kind == 4 {
+                    queue_visible_items(mask, sh);
+                }
             } else if units.len() < MAX_UNITS {
                 units.insert(
                     *guid,
@@ -555,6 +602,9 @@ fn apply_object(obj: &Object, sh: &Shared) {
                     facing,
                 },
             );
+            if *object_type == ObjectType::Player {
+                queue_visible_items(mask, sh);
+            }
         }
         Object::OutOfRange { guids } => {
             for g in guids {
@@ -649,6 +699,14 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(guid);
             refresh_player(sh);
+        }
+        ServerPacket::ItemQueryResponse { entry, info } => {
+            if let Some(info) = info {
+                sh.item_displays
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(*entry, info.display_info_id);
+            }
         }
         ServerPacket::LevelUp(_)
         | ServerPacket::LogoutComplete
@@ -872,6 +930,21 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
         hair: ((pb >> 16) & 0xff) as u8,
         hair_color: ((pb >> 24) & 0xff) as u8,
         facial: (pb2 & 0xff) as u8,
+        // Equipment slots are only broadcast for players; each visible entry is
+        // an item template the server answers with its display id.
+        visible_display: {
+            let displays = shared()
+                .item_displays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::array::from_fn(|i| {
+                if rec.kind != 4 {
+                    return 0;
+                }
+                let entry = f.player_visible_item_entry(i as u8).unwrap_or(0);
+                displays.get(&entry).copied().unwrap_or(0)
+            })
+        },
     };
     unsafe { *out = row };
     1
