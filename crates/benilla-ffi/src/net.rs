@@ -493,6 +493,8 @@ enum Cmd {
     LootMoney,
     /// `CMSG_LOOT_RELEASE`: close the open loot window.
     LootRelease(u64),
+    /// `CMSG_REPOP_REQUEST`: release the spirit after death.
+    Repop,
     GameObjUse(u64),
     QuestAccept { npc: u64, quest: u32 },
     QuestComplete { npc: u64, quest: u32 },
@@ -772,6 +774,11 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::LootRelease(guid)) => {
                     let _ = session.loot_release(guid);
+                }
+                Ok(Cmd::Repop) => {
+                    if let Err(e) = session.repop_request() {
+                        sh.event(format!("error|repop|{e}"));
+                    }
                 }
                 Ok(Cmd::GameObjUse(guid)) => {
                     let _ = session.gameobj_use(guid);
@@ -1746,6 +1753,8 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         14 => Cmd::LootItem(a as u8),
         15 => Cmd::LootMoney,
         16 => Cmd::LootRelease(a),
+        // 17 = release the spirit (the dead screen's button).
+        17 => Cmd::Repop,
         _ => return 0,
     };
     send_cmd(cmd) as u32
