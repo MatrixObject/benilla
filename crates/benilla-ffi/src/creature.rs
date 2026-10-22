@@ -67,7 +67,10 @@ fn copy_out(text: &str, out: *mut c_char, cap: u32) -> u32 {
 }
 
 /// Write one display row as
-/// `id|model=<.m2>|scale=<f>|tex=<t0>,<t1>,<t2>|npc=<race>/<sex>|bake=<name>`.
+/// `id|model=<.m2>|scale=<f>|tex=<t0>,<t1>,<t2>|npc=<race>/<sex>|bake=<name>`
+/// plus, for a humanoid NPC, `|look=<skin>/<face>/<hair>/<haircolor>/<facial>`
+/// and `|equip=<e0>,...,<e9>` (CreatureDisplayInfoExtra equipment, ItemDisplayInfo
+/// ids in bodyslot order - e0 is the helm).
 ///
 /// `model` is what the host renders, `scale` is the client's combined
 /// `modelScale * creatureModelScale`, `npc` is 0/0 for a plain creature and
@@ -99,7 +102,7 @@ pub extern "C" fn bn_creature_display_info(
         Some(a) => (a.race as u32, a.sex as u32, a.bake_name.as_deref().unwrap_or("")),
         None => (0, 0, ""),
     };
-    let line = format!(
+    let mut line = format!(
         "{}|model={}|scale={:.3}|tex={},{},{}|npc={}/{}|bake={}",
         display_id,
         m2_path(&model.model_path),
@@ -111,6 +114,21 @@ pub extern "C" fn bn_creature_display_info(
         sex,
         bake
     );
+    if let Some(a) = model.npc_appearance.as_ref() {
+        line.push_str(&format!(
+            "|look={}/{}/{}/{}/{}|equip={}",
+            a.skin,
+            a.face,
+            a.hair_style,
+            a.hair_color,
+            a.facial_hair,
+            a.equipment
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     copy_out(&line, out, cap)
 }
 

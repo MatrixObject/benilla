@@ -150,6 +150,72 @@ pub extern "C" fn bn_char_model_slots(
         return 0;
     };
     let w = unsafe { &mut *world };
+    char_model_slots(w, p, race, sex, hair_style, facial_hair, None, out, cap)
+}
+
+/// Same contract as [`bn_char_model_slots`], but the wearer is dressed: `equip`
+/// is the 10 `CreatureDisplayInfoExtra` equipment columns in bodyslot order
+/// (e0 helm, e2..e10 body), i.e. exactly what a humanoid NPC wears. The
+/// visibility set then follows the reference's equipment branches (helm hides
+/// hair/ears, robes replace legs, tabard, ...) instead of the naked default.
+#[no_mangle]
+pub extern "C" fn bn_char_model_slots_gear(
+    world: *mut BnWorld,
+    model_path: *const u8,
+    race: u32,
+    sex: u32,
+    hair_style: u32,
+    facial_hair: u32,
+    equip: *const u32,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || model_path.is_null() || out.is_null() || cap == 0 || equip.is_null() {
+        return 0;
+    }
+    let Some(p) = cstr_to_str(model_path as *const std::os::raw::c_char) else {
+        return 0;
+    };
+    // SAFETY: the caller passes 10 readable u32s.
+    let ids: [u32; 10] = unsafe { std::array::from_fn(|i| *equip.add(i)) };
+    let w = unsafe { &mut *world };
+    // A failed ItemDisplayInfo pass must not hide the body: fall back to the
+    // naked geoset set rather than reporting zero visible triangles.
+    let eg = equipped_geosets(w, &ids);
+    char_model_slots(w, p, race, sex, hair_style, facial_hair, eg.as_ref(), out, cap)
+}
+
+/// The reference's worn-equipment geoset selectors for an NPC's 10 equipment
+/// columns (`EquipGeosets`), read off `ItemDisplayInfo`.
+fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 10]) -> Option<EquipGeosets> {
+    let chain = w.chain.as_mut()?;
+    let cat = benilla_formats::load_item_display_catalog(chain).ok()?;
+    let worn: [Option<&benilla_formats::ItemDisplay>; 8] =
+        std::array::from_fn(|i| cat.get(ids[2 + i]));
+    let mut eg = EquipGeosets::default();
+    for (i, d) in worn.iter().enumerate() {
+        if let Some(d) = d {
+            eg.bodyslots[i] = Some(d.geoset_groups);
+        }
+    }
+    // The head slot's HelmetGeosetVisData pair (split by sex in the selector).
+    eg.helm_vis = cat.get(ids[0]).and_then(|d| d.worn_helm_vis());
+    // Branch B3's gate: the shirt cuffs, as the reference reads it.
+    eg.forearm_dressed = benilla_formats::forearm_dressed(&worn);
+    Some(eg)
+}
+
+fn char_model_slots(
+    w: &mut BnWorld,
+    p: &str,
+    race: u32,
+    sex: u32,
+    hair_style: u32,
+    facial_hair: u32,
+    equip: Option<&EquipGeosets>,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
     let Some(bytes) = read_model(w, p) else {
         return 0;
     };
@@ -167,6 +233,7 @@ pub extern "C" fn bn_char_model_slots(
         return 0;
     }
 
+    let naked = EquipGeosets::default();
     let visible = w
         .chain
         .as_mut()
@@ -177,7 +244,7 @@ pub extern "C" fn bn_char_model_slots(
                 sex as u8,
                 hair_style as u8,
                 facial_hair as u8,
-                &EquipGeosets::default(),
+                equip.unwrap_or(&naked),
             )
         });
 

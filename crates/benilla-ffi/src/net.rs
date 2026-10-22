@@ -2622,13 +2622,6 @@ pub extern "C" fn bn_net_set_input(forward: f32, strafe: f32, turn: f32) -> u32 
         .last_input
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = (forward, strafe, turn);
-    // Log on any non-zero input so we can confirm the UE side is calling us.
-    if forward.abs() > 0.1 || strafe.abs() > 0.1 || turn.abs() > 0.1 {
-        shared().event(format!(
-            "input|fwd={:.2},str={:.2},trn={:.2}",
-            forward, strafe, turn
-        ));
-    }
     1
 }
 
