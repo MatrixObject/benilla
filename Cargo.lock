@@ -593,6 +593,7 @@ dependencies = [
  "benilla-formats",
  "benilla-m2",
  "benilla-mpq",
+ "benilla-protocol",
  "benilla-ui",
  "benilla-wmo",
 ]
