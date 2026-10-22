@@ -693,6 +693,12 @@ impl WorldSession {
         self.send(opcode::CMSG_GROUP_ACCEPT, &messages::group_accept())
     }
 
+    /// Decline the group invite we were just offered (`CMSG_GROUP_DECLINE`, empty body;
+    /// the inviter receives `SMSG_GROUP_DECLINE`).
+    pub fn group_decline(&mut self) -> Result<()> {
+        self.send(opcode::CMSG_GROUP_DECLINE, &messages::group_decline())
+    }
+
     /// Leave or disband our group (`CMSG_GROUP_DISBAND`, empty body).
     pub fn group_disband(&mut self) -> Result<()> {
         self.send(opcode::CMSG_GROUP_DISBAND, &messages::group_disband())

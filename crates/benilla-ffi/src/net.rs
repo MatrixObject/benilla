@@ -13,6 +13,7 @@
 //!   bn_net_char_count() / bn_net_char(i, out)
 //!   bn_net_enter(guid)
 //!   bn_net_send(kind, a, b, text)
+//!   bn_net_group(out) -> 1 while in a group / invite pending
 //!   bn_net_event(buf, cap) -> bytes popped (0 = empty)
 //!   bn_net_disconnect()
 
@@ -582,6 +583,80 @@ impl Default for BnNetCast {
     }
 }
 
+/// Party roster width the host lays out (self excluded: the HUD already draws
+/// the player's own frame).
+pub const BN_PARTY_SLOTS: usize = 4;
+
+/// One `SMSG_GROUP_LIST` row as the host draws it (`SMSG_PARTY_MEMBER_STATS`
+/// patches the live fields in place).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetPartyMember {
+    pub guid: u64,
+    /// NUL-terminated UTF-8; the client's roster names are ASCII.
+    pub name: [c_char; 64],
+    pub level: u32,
+    /// `AreaTable.dbc` zone id from the last full stats update.
+    pub zone: u32,
+    /// 0/1: the list row says the member is present (`listed_online`).
+    pub online: u32,
+    pub leader: u32,
+    pub dead: u32,
+    pub health: u32,
+    pub max_health: u32,
+    pub power: u32,
+    pub max_power: u32,
+    /// 0 mana, 1 rage, 2 focus, 3 energy.
+    pub power_type: u32,
+}
+
+impl Default for BnNetPartyMember {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            name: [0; 64],
+            level: 0,
+            zone: 0,
+            online: 0,
+            leader: 0,
+            dead: 0,
+            health: 0,
+            max_health: 0,
+            power: 0,
+            max_power: 0,
+            power_type: 0,
+        }
+    }
+}
+
+/// The live group: roster plus the pending-invite popup state.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetParty {
+    /// Listed members, self excluded (0..=4).
+    pub count: u32,
+    pub in_group: u32,
+    /// 0 none, 1 party, 2 raid (the wire's 0/1 plus one).
+    pub group_type: u32,
+    /// 1 while an invite popup is waiting for accept/decline.
+    pub invite: u32,
+    pub inviter: [c_char; 64],
+    pub members: [BnNetPartyMember; BN_PARTY_SLOTS],
+}
+
+impl Default for BnNetParty {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            in_group: 0,
+            group_type: 0,
+            invite: 0,
+            inviter: [0; 64],
+            members: [BnNetPartyMember::default(); BN_PARTY_SLOTS],
+        }
+    }
+}
+
 /// One tracked object: its descriptor snapshot plus the last known position.
 struct UnitRec {
     kind: u8,
@@ -626,6 +701,15 @@ enum Cmd {
     AutoEquip { bag: u8, slot: u8 },
     /// `CMSG_SWAP_INV_ITEM`: two slots of the player's own equipment/pack array.
     SwapInv { src: u8, dst: u8 },
+    /// `CMSG_GROUP_INVITE`: invite a player by name.
+    GroupInvite(String),
+    /// `CMSG_GROUP_ACCEPT`: take the pending invite.
+    GroupAccept,
+    /// `CMSG_GROUP_DECLINE`: refuse the pending invite (the host only closes
+    /// its popup; the server also notifies the inviter).
+    GroupDecline,
+    /// `CMSG_GROUP_DISBAND`: leave or disband our group.
+    GroupDisband,
     Logout,
 }
 
@@ -670,6 +754,8 @@ struct Shared {
     loot: Mutex<BnNetLoot>,
     /// The open questgiver window (gossip menu / details / reward).
     giver: Mutex<BnNetGiver>,
+    /// The live group roster plus the pending-invite popup state.
+    party: Mutex<BnNetParty>,
 }
 
 impl Shared {
@@ -727,6 +813,7 @@ fn shared() -> &'static Shared {
         creature_asked: Mutex::new(HashSet::new()),
         loot: Mutex::new(BnNetLoot::default()),
         giver: Mutex::new(BnNetGiver::default()),
+        party: Mutex::new(BnNetParty::default()),
     })
 }
 
@@ -750,6 +837,16 @@ fn copy_name<const N: usize>(dst: &mut [c_char; N], name: &str) {
         dst[i] = *b as c_char;
     }
     dst[n] = 0;
+}
+
+/// Read a fixed NUL-terminated name buffer back into a `String`.
+fn name_of<const N: usize>(src: &[c_char; N]) -> String {
+    let bytes: Vec<u8> = src
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 // ---- worker ----
@@ -949,6 +1046,36 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::SwapInv { src, dst }) => {
                     if let Err(e) = session.swap_inv_item(src, dst) {
                         sh.event(format!("error|swap|{e}"));
+                    }
+                }
+                Ok(Cmd::GroupInvite(name)) => {
+                    if let Err(e) = session.group_invite(&name) {
+                        sh.event(format!("error|group|{e}"));
+                    }
+                }
+                Ok(Cmd::GroupAccept) => {
+                    // Close the popup immediately: the roster follows on
+                    // SMSG_GROUP_LIST (and a party of one carries no rows).
+                    sh.party
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .invite = 0;
+                    if let Err(e) = session.group_accept() {
+                        sh.event(format!("error|group|{e}"));
+                    }
+                }
+                Ok(Cmd::GroupDecline) => {
+                    sh.party
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .invite = 0;
+                    if let Err(e) = session.group_decline() {
+                        sh.event(format!("error|group|{e}"));
+                    }
+                }
+                Ok(Cmd::GroupDisband) => {
+                    if let Err(e) = session.group_disband() {
+                        sh.event(format!("error|group|{e}"));
                     }
                 }
                 Ok(Cmd::Logout) | Err(TryRecvError::Disconnected) => {
@@ -1889,6 +2016,137 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         | ServerPacket::QuestLogFull => {
             sh.event(format!("pkt|{}", packet.name()));
         }
+        // ---- group / party ----
+        ServerPacket::GroupInvite { inviter } => {
+            {
+                let mut party = sh.party.lock().unwrap_or_else(|e| e.into_inner());
+                party.invite = 1;
+                copy_name(&mut party.inviter, inviter);
+            }
+            sh.event(format!("group_invite|{inviter}"));
+        }
+        ServerPacket::GroupDecline { name } => {
+            {
+                let mut party = sh.party.lock().unwrap_or_else(|e| e.into_inner());
+                // Only clear the popup when the decliner is the one who asked.
+                let inviter = name_of(&party.inviter);
+                if inviter.eq_ignore_ascii_case(name) {
+                    party.invite = 0;
+                }
+            }
+            sh.event(format!("group_decline|{name}"));
+        }
+        // Kick or leave: the roster is gone (an empty list follows too, the
+        // full reset here keeps the frames from lingering one packet).
+        ServerPacket::GroupUninvited => {
+            *sh.party.lock().unwrap_or_else(|e| e.into_inner()) = BnNetParty::default();
+            sh.event("group_leave");
+        }
+        ServerPacket::GroupDestroyed => {
+            *sh.party.lock().unwrap_or_else(|e| e.into_inner()) = BnNetParty::default();
+            sh.event("group_destroyed");
+        }
+        ServerPacket::GroupLeaderChanged { name } => {
+            {
+                let mut party = sh.party.lock().unwrap_or_else(|e| e.into_inner());
+                for row in party.members.iter_mut() {
+                    row.leader = (name_of(&row.name) == *name) as u32;
+                }
+            }
+            sh.event(format!("group_leader|{name}"));
+        }
+        // The full roster (the recipient has no row). An empty list is the
+        // client's own "you left the group" signal; live stats the server
+        // already sent are carried over by guid so the frame never flashes 0.
+        ServerPacket::GroupList {
+            group_type,
+            members,
+            leader,
+            ..
+        } => {
+            let mut party = sh.party.lock().unwrap_or_else(|e| e.into_inner());
+            if members.is_empty() {
+                *party = BnNetParty::default();
+            } else {
+                let old = party.members;
+                let mut next = BnNetParty::default();
+                next.in_group = 1;
+                next.group_type = u32::from(*group_type) + 1;
+                next.count = members.len().min(BN_PARTY_SLOTS) as u32;
+                for (i, m) in members.iter().take(BN_PARTY_SLOTS).enumerate() {
+                    let mut row = BnNetPartyMember::default();
+                    row.guid = m.guid;
+                    copy_name(&mut row.name, &m.name);
+                    row.online = m.listed_online() as u32;
+                    row.leader = (m.guid == *leader) as u32;
+                    if let Some(prev) = old.iter().find(|o| o.guid == m.guid) {
+                        row.level = prev.level;
+                        row.zone = prev.zone;
+                        row.dead = prev.dead;
+                        row.health = prev.health;
+                        row.max_health = prev.max_health;
+                        row.power = prev.power;
+                        row.max_power = prev.max_power;
+                        row.power_type = prev.power_type;
+                    }
+                    next.members[i] = row;
+                }
+                *party = next;
+            }
+            let n = party.count;
+            drop(party);
+            sh.event(format!("group|{n}"));
+        }
+        // A delta (or the asked-for _FULL form): patch only the present fields.
+        ServerPacket::PartyMemberStats { guid, info, .. } => {
+            let mut party = sh.party.lock().unwrap_or_else(|e| e.into_inner());
+            let count = party.count as usize;
+            let mut known = false;
+            for row in party.members.iter_mut().take(count) {
+                if row.guid != *guid {
+                    continue;
+                }
+                known = true;
+                if let Some(s) = info.status {
+                    // ONLINE 0x01; DEAD 0x04 / GHOST 0x08 both draw as dead.
+                    row.online = (s & 0x01 != 0) as u32;
+                    row.dead = (s & 0x0c != 0) as u32;
+                }
+                if let Some(v) = info.cur_hp {
+                    row.health = u32::from(v);
+                }
+                if let Some(v) = info.max_hp {
+                    row.max_health = u32::from(v);
+                }
+                if let Some(v) = info.cur_power {
+                    row.power = u32::from(v);
+                }
+                if let Some(v) = info.max_power {
+                    row.max_power = u32::from(v);
+                }
+                if let Some(v) = info.power_type {
+                    row.power_type = u32::from(v);
+                }
+                if let Some(v) = info.level {
+                    row.level = u32::from(v);
+                }
+                if let Some(v) = info.zone {
+                    row.zone = u32::from(v);
+                }
+                break;
+            }
+            drop(party);
+            if !known {
+                sh.event("pkt|PARTY_MEMBER_STATS".to_string());
+            }
+        }
+        ServerPacket::PartyCommandResult {
+            operation,
+            member,
+            result,
+        } => {
+            sh.event(format!("group_result|{operation}|{member}|{result}"));
+        }
         _ => {}
     }
 }
@@ -1973,7 +2231,9 @@ pub extern "C" fn bn_net_enter(guid: u64) -> u32 {
 ///   8 = quest query (b=quest), 9 = logout,
 ///   11 = use item (b = bag<<8 | slot, a = spell slot),
 ///   12 = auto-equip (b = bag<<8 | slot),
-///   13 = swap inventory slots (a = src, b = dst).
+///   13 = swap inventory slots (a = src, b = dst),
+///   24 = accept a group invite, 25 = leave/disband the group,
+///   26 = invite by name (text), 27 = decline the pending invite.
 /// A bag byte of 0xFF means the player's own equipment array
 /// ([`BAG_EQUIPPED`]). Returns 1 when the command was queued.
 #[no_mangle]
@@ -2040,6 +2300,15 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             npc: a,
             quest: b & 0xffff,
         },
+        // 24 = accept a group invite, 25 = leave/disband,
+        // 26 = invite by name (text), 27 = decline the pending invite.
+        24 => Cmd::GroupAccept,
+        25 => Cmd::GroupDisband,
+        26 => match cstr(text) {
+            Some(name) if !name.is_empty() => Cmd::GroupInvite(name),
+            _ => return 0,
+        },
+        27 => Cmd::GroupDecline,
         _ => return 0,
     };
     send_cmd(cmd) as u32
@@ -2058,6 +2327,21 @@ pub extern "C" fn bn_net_loot(out: *mut BnNetLoot) -> u32 {
         *out = window;
     }
     open as u32
+}
+
+/// The live group snapshot as the host draws it. Returns 1 while in a group
+/// or with a pending invite, 0 otherwise (the caller then skips the frames).
+#[no_mangle]
+pub extern "C" fn bn_net_group(out: *mut BnNetParty) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let party = *shared().party.lock().unwrap_or_else(|e| e.into_inner());
+    let active = party.in_group != 0 || party.invite != 0;
+    unsafe {
+        *out = party;
+    }
+    active as u32
 }
 
 /// The open questgiver window. Returns its mode (0 closed, 1 menu,
