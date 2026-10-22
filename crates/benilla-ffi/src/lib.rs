@@ -6360,6 +6360,60 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
+/// Visible lines of one message frame (chat / error text), one TSV row each:
+/// `left top right bottom r g b a font height text` (VM root units, y up).
+/// These live in the widget's ring, which the region-walking dump cannot see;
+/// the host paints them with `bn_ui_text_bitmap` at the given rect.
+/// Returns bytes written (0 = no session, unknown frame or no lines).
+#[no_mangle]
+pub extern "C" fn bn_ui_message_lines(frame: *const c_char, buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(frame_name) = cstr_to_str(frame) else {
+        return 0;
+    };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            let mut text = String::new();
+            for row in s.message_line_rows(frame_name) {
+                // The text is the last column: strip the delimiters it could carry.
+                let clean: String = row
+                    .text
+                    .chars()
+                    .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect();
+                text.push_str(&format!(
+                    "{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\n",
+                    row.left,
+                    row.top,
+                    row.right,
+                    row.bottom,
+                    row.color[0],
+                    row.color[1],
+                    row.color[2],
+                    row.color[3],
+                    row.font_path,
+                    row.font_height,
+                    clean
+                ));
+            }
+            Some(text)
+        })
+    }));
+    let Ok(Some(text)) = out else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
 /// Rasterize one FontString to RGBA8 for the UE HUD painter (see `ui_font`).
 ///
 /// `size_px` is the drawn pixel size (the host applies WoW's em cap and the

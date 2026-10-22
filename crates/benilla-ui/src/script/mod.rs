@@ -63,6 +63,7 @@ mod dressup;
 mod duel;
 pub(crate) mod event;
 mod extract;
+pub use extract::MessageLineRow;
 mod follow;
 pub(crate) mod font;
 mod font_block;

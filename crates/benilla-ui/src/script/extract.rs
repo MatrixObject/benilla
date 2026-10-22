@@ -515,3 +515,65 @@ fn bar_fill_uv(base: Option<TexCoords>, sb: &crate::widget::StatusBarState) -> T
         [l, l + (r - l) * f, t, b]
     })
 }
+
+/// One visible line of a [`ScrollingMessageFrame`] (chat) or `MessageFrame`
+/// (error text). These lines live in the widget's ring, not in FontString
+/// regions, so a region-walking host (a TSV dump) cannot see them; this is the
+/// extractor's placement, handed out for hosts that paint the text themselves.
+pub struct MessageLineRow {
+    /// VM root units, y up (the same space as a dump's F/R rects).
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    /// Line colour with its fade alpha (0..1).
+    pub color: [f32; 4],
+    pub text: String,
+    /// The frame's font and em height, for the host's rasterizer.
+    pub font_path: String,
+    pub font_height: f32,
+}
+
+impl UiScript {
+    /// Visible lines of the named message frame, oldest first. Call after a
+    /// tick: placement reads the last resolved layout.
+    pub fn message_line_rows(&self, frame: &str) -> Vec<MessageLineRow> {
+        let model = self.model_ref();
+        let Some(fh) = model.arena.lookup(frame) else {
+            return Vec::new();
+        };
+        let Some(&fr) = model.resolved.get(&fh) else {
+            return Vec::new();
+        };
+        let font = Self::message_frame_font(&model, fh);
+        let mut quads = Vec::new();
+        Self::emit_message_lines(
+            &model,
+            fh,
+            fr,
+            0,
+            super::layout::FramePaint {
+                alpha: 1.0,
+                scale: 1.0,
+            },
+            None,
+            &mut quads,
+        );
+        quads
+            .into_iter()
+            .filter_map(|q| match (q.rect, q.content) {
+                (Some(r), QuadContent::Text { text: Some(t), color, .. }) => Some(MessageLineRow {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                    color: color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                    text: t,
+                    font_path: font.path.clone().unwrap_or_default(),
+                    font_height: font.height.unwrap_or(14.0),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
