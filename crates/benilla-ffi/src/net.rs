@@ -153,6 +153,16 @@ pub struct BnNetUnit {
     pub y: f32,
     pub z: f32,
     pub facing: f32,
+    /// Player appearance (kind 4 only; zero for creatures): `UNIT_FIELD_BYTES_0`
+    /// race/gender and the `PLAYER_BYTES` skin/face/hair/color plus `PLAYER_BYTES_2`
+    /// facial hair, which drive the CharSections atlas.
+    pub race: u8,
+    pub sex: u8,
+    pub skin: u8,
+    pub face: u8,
+    pub hair: u8,
+    pub hair_color: u8,
+    pub facial: u8,
 }
 
 impl Default for BnNetUnit {
@@ -171,6 +181,13 @@ impl Default for BnNetUnit {
             y: 0.0,
             z: 0.0,
             facing: 0.0,
+            race: 0,
+            sex: 0,
+            skin: 0,
+            face: 0,
+            hair: 0,
+            hair_color: 0,
+            facial: 0,
         }
     }
 }
@@ -808,6 +825,10 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
     };
     let rec = units.get(&guid).expect("guid from the same map");
     let f = &rec.fields;
+    // Player appearance bytes; creatures leave all of this zero.
+    let bytes0 = f.unit_bytes_0().unwrap_or(0);
+    let pb = f.player_bytes().unwrap_or(0);
+    let pb2 = f.player_bytes_2().unwrap_or(0);
     let row = BnNetUnit {
         guid,
         kind: rec.kind,
@@ -822,6 +843,13 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
         y: rec.pos[1],
         z: rec.pos[2],
         facing: rec.facing,
+        race: (bytes0 & 0xff) as u8,
+        sex: ((bytes0 >> 16) & 0xff) as u8,
+        skin: (pb & 0xff) as u8,
+        face: ((pb >> 8) & 0xff) as u8,
+        hair: ((pb >> 16) & 0xff) as u8,
+        hair_color: ((pb >> 24) & 0xff) as u8,
+        facial: (pb2 & 0xff) as u8,
     };
     unsafe { *out = row };
     1
