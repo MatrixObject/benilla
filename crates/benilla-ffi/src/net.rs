@@ -197,6 +197,103 @@ impl Default for BnNetUnit {
     }
 }
 
+/// One item template, cached from `SMSG_ITEM_QUERY_SINGLE_RESPONSE` (1.12 ships
+/// no Item.dbc, so the server response is the only source of names/quality).
+struct ItemTemplate {
+    name: String,
+    display_id: u32,
+    quality: u32,
+    inventory_type: u32,
+    item_level: u32,
+    required_level: u32,
+    sell_price: u32,
+    buy_price: u32,
+    stackable: u32,
+    class: u32,
+    subclass: u32,
+    bag_family: u32,
+    max_durability: u32,
+}
+
+/// `Bag` sentinel of an equipped-slot row: inventory slot 0..18 is the player's
+/// own equipment array, the same 0xFF the client passes to `CMSG_USE_ITEM`.
+pub const BAG_EQUIPPED: u8 = 0xFF;
+
+/// One item template as the host reads it (`bn_net_item_info`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetItemInfo {
+    pub entry: u32,
+    pub display_id: u32,
+    pub quality: u32,
+    pub inventory_type: u32,
+    pub item_level: u32,
+    pub required_level: u32,
+    pub sell_price: u32,
+    pub buy_price: u32,
+    pub stackable: u32,
+    pub class: u32,
+    pub subclass: u32,
+    pub bag_family: u32,
+    pub max_durability: u32,
+    /// NUL-terminated UTF-8 template name; empty until the query answers.
+    pub name: [c_char; 96],
+}
+
+impl Default for BnNetItemInfo {
+    fn default() -> Self {
+        Self {
+            entry: 0,
+            display_id: 0,
+            quality: 0,
+            inventory_type: 0,
+            item_level: 0,
+            required_level: 0,
+            sell_price: 0,
+            buy_price: 0,
+            stackable: 0,
+            class: 0,
+            subclass: 0,
+            bag_family: 0,
+            max_durability: 0,
+            name: [0; 96],
+        }
+    }
+}
+
+/// One occupied inventory slot: where it sits, which item object fills it, and
+/// the template fields the host draws with.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetInvItem {
+    pub guid: u64,
+    pub entry: u32,
+    /// [`BAG_EQUIPPED`], 0 (backpack) or an equipped-bag slot 19..22. Feed this
+    /// straight back to `bn_net_send` kinds 11/12.
+    pub bag: u8,
+    /// Equipment index (0..18) or slot inside the bag.
+    pub slot: u8,
+    pub count: u32,
+    pub durability: u32,
+    pub max_durability: u32,
+    pub info: BnNetItemInfo,
+}
+
+impl Default for BnNetInvItem {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            entry: 0,
+            bag: 0,
+            slot: 0,
+            count: 0,
+            durability: 0,
+            max_durability: 0,
+            info: BnNetItemInfo::default(),
+        }
+    }
+}
+
 /// One tracked object: its descriptor snapshot plus the last known position.
 struct UnitRec {
     kind: u8,
@@ -218,6 +315,12 @@ enum Cmd {
     QuestQuery(u32),
     /// Cast `spell` at `target` (0 = self), answered by `SMSG_CAST_RESULT`.
     Cast { spell: u32, target: u64 },
+    /// `CMSG_USE_ITEM`: bag 0xFF = equipped slot; `spell` is the item spell slot.
+    UseItem { bag: u8, slot: u8, spell: u8 },
+    /// `CMSG_AUTOEQUIP_ITEM`: the server picks the destination equipment slot.
+    AutoEquip { bag: u8, slot: u8 },
+    /// `CMSG_SWAP_INV_ITEM`: two slots of the player's own equipment/pack array.
+    SwapInv { src: u8, dst: u8 },
     Logout,
 }
 
@@ -240,6 +343,8 @@ struct Shared {
     item_asked: Mutex<HashSet<u32>>,
     /// Entries seen on a player but not yet sent as a query.
     item_queue: Mutex<Vec<u32>>,
+    /// Full templates from the query answers, keyed by entry.
+    item_templates: Mutex<HashMap<u32, ItemTemplate>>,
 }
 
 impl Shared {
@@ -287,6 +392,7 @@ fn shared() -> &'static Shared {
         item_displays: Mutex::new(HashMap::new()),
         item_asked: Mutex::new(HashSet::new()),
         item_queue: Mutex::new(Vec::new()),
+        item_templates: Mutex::new(HashMap::new()),
     })
 }
 
@@ -303,7 +409,7 @@ fn send_cmd(cmd: Cmd) -> bool {
     }
 }
 
-fn copy_name(dst: &mut [c_char; 32], name: &str) {
+fn copy_name<const N: usize>(dst: &mut [c_char; N], name: &str) {
     let bytes = name.as_bytes();
     let n = bytes.len().min(dst.len() - 1);
     for (i, b) in bytes[..n].iter().enumerate() {
@@ -470,6 +576,21 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         Err(e) => sh.event(format!("error|cast|{e}")),
                     }
                 }
+                Ok(Cmd::UseItem { bag, slot, spell }) => {
+                    if let Err(e) = session.use_item(bag, slot, spell) {
+                        sh.event(format!("error|use_item|{e}"));
+                    }
+                }
+                Ok(Cmd::AutoEquip { bag, slot }) => {
+                    if let Err(e) = session.auto_equip_item(bag, slot) {
+                        sh.event(format!("error|equip|{e}"));
+                    }
+                }
+                Ok(Cmd::SwapInv { src, dst }) => {
+                    if let Err(e) = session.swap_inv_item(src, dst) {
+                        sh.event(format!("error|swap|{e}"));
+                    }
+                }
                 Ok(Cmd::Logout) | Err(TryRecvError::Disconnected) => {
                     let _ = session.logout(std::time::Duration::from_secs(2));
                     sh.event("closed|world");
@@ -550,6 +671,160 @@ fn flush_item_queries(session: &mut WorldSession, sh: &Shared) {
     for entry in pending {
         let _ = session.item_query(entry, 0);
     }
+}
+
+/// Ask for the template of every item object in the player's own equipment,
+/// backpack and equipped bags. The item guid -> entry lookup is the object
+/// table; the caller already holds `units`.
+fn queue_self_items(f: &ObjectFields, units: &HashMap<u64, UnitRec>, sh: &Shared) {
+    let mut asked = sh.item_asked.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ask = |guid: u64| {
+        let Some(rec) = units.get(&guid) else {
+            return;
+        };
+        let entry = rec.fields.object_entry().unwrap_or(0);
+        if entry != 0 && asked.insert(entry) {
+            queue.push(entry);
+        }
+    };
+    for i in 0..23u8 {
+        let Some(guid) = f.player_inv_slot(i) else {
+            continue;
+        };
+        if guid == 0 {
+            continue;
+        }
+        if i >= 19 {
+            // Equipped bag: the bag object carries its contents in
+            // `CONTAINER_FIELD_SLOT_1`, which the server streams in the update
+            // block rather than in the player's pack slots.
+            ask(guid);
+            if let Some(bag) = units.get(&guid) {
+                let n = bag.fields.container_num_slots().unwrap_or(0).min(36);
+                for s in 0..n {
+                    if let Some(item) = bag.fields.container_slot(s as u8) {
+                        if item != 0 {
+                            ask(item);
+                        }
+                    }
+                }
+            }
+        } else {
+            ask(guid);
+        }
+    }
+    for i in 0..16u8 {
+        if let Some(guid) = f.player_pack_slot(i) {
+            if guid != 0 {
+                ask(guid);
+            }
+        }
+    }
+}
+
+/// Build the item info row for one entry (empty when the query has not
+/// answered yet).
+fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetItemInfo {
+    let mut row = BnNetItemInfo {
+        entry,
+        ..Default::default()
+    };
+    if let Some(t) = templates.get(&entry) {
+        row.display_id = t.display_id;
+        row.quality = t.quality;
+        row.inventory_type = t.inventory_type;
+        row.item_level = t.item_level;
+        row.required_level = t.required_level;
+        row.sell_price = t.sell_price;
+        row.buy_price = t.buy_price;
+        row.stackable = t.stackable;
+        row.class = t.class;
+        row.subclass = t.subclass;
+        row.bag_family = t.bag_family;
+        row.max_durability = t.max_durability;
+        copy_name(&mut row.name, &t.name);
+    }
+    row
+}
+
+/// Every occupied slot of the player's own inventory, in client order:
+/// equipment 0..18, backpack, then the four equipped bags.
+fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let templates = sh
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<BnNetInvItem> = Vec::new();
+    if self_guid == 0 {
+        return out;
+    }
+    let Some(player) = units.get(&self_guid) else {
+        return out;
+    };
+    let f = &player.fields;
+
+    let mut push = |bag: u8, slot: u8, guid: u64| {
+        let Some(rec) = units.get(&guid) else {
+            return;
+        };
+        let entry = rec.fields.object_entry().unwrap_or(0);
+        if entry == 0 {
+            return;
+        }
+        let mut row = BnNetInvItem {
+            guid,
+            entry,
+            bag,
+            slot,
+            count: rec.fields.item_stack_count().unwrap_or(1),
+            durability: rec.fields.item_durability().unwrap_or(0),
+            max_durability: rec.fields.item_max_durability().unwrap_or(0),
+            ..Default::default()
+        };
+        row.max_durability = row
+            .max_durability
+            .max(templates.get(&entry).map(|t| t.max_durability).unwrap_or(0));
+        row.info = item_info_row(entry, &templates);
+        out.push(row);
+    };
+
+    for i in 0..19u8 {
+        if let Some(guid) = f.player_inv_slot(i) {
+            if guid != 0 {
+                push(BAG_EQUIPPED, i, guid);
+            }
+        }
+    }
+    for i in 0..16u8 {
+        if let Some(guid) = f.player_pack_slot(i) {
+            if guid != 0 {
+                push(0, i, guid);
+            }
+        }
+    }
+    for bag_slot in 19..23u8 {
+        let Some(bag_guid) = f.player_inv_slot(bag_slot) else {
+            continue;
+        };
+        if bag_guid == 0 {
+            continue;
+        }
+        let Some(bag) = units.get(&bag_guid) else {
+            continue;
+        };
+        let n = bag.fields.container_num_slots().unwrap_or(0).min(36);
+        for s in 0..n {
+            if let Some(item) = bag.fields.container_slot(s as u8) {
+                if item != 0 {
+                    push(bag_slot, s as u8, item);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Fold one `SMSG_UPDATE_OBJECT` entry into the tracked object table.
@@ -670,6 +945,9 @@ fn refresh_player(sh: &Shared) {
         slot += 1;
     }
     p.quest_count = slot as u32;
+    // The item objects behind the pack/bag guids may have just arrived (or
+    // changed); make sure their templates are asked for.
+    queue_self_items(f, &units, sh);
     drop(units);
     *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
 }
@@ -706,7 +984,55 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(*entry, info.display_info_id);
+                sh.item_templates
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        *entry,
+                        ItemTemplate {
+                            name: info.name.clone(),
+                            display_id: info.display_info_id,
+                            quality: info.quality,
+                            inventory_type: info.inventory_type,
+                            item_level: info.item_level,
+                            required_level: info.required_level,
+                            sell_price: info.sell_price,
+                            buy_price: info.buy_price,
+                            stackable: info.stackable,
+                            class: info.class,
+                            subclass: info.subclass,
+                            bag_family: info.bag_family,
+                            max_durability: info.max_durability,
+                        },
+                    );
             }
+        }
+        // The "You receive …" line; `bag`/`slot` locate the new row so the host
+        // can refresh an inventory panel.
+        ServerPacket::ItemPushResult(p) => {
+            sh.event(format!(
+                "item|push|{}|{}|{}|{}|{}|{}",
+                p.item_entry,
+                p.count,
+                p.bag_slot,
+                p.item_slot,
+                u8::from(p.from_npc),
+                u8::from(p.created)
+            ));
+        }
+        // A refused equip/use/swap; the host shows the client's own message.
+        ServerPacket::InventoryChangeFailure {
+            reason,
+            required_level,
+            item_guid,
+            ..
+        } => {
+            sh.event(format!(
+                "inv|fail|{}|{}|{}",
+                reason,
+                required_level.unwrap_or(0),
+                item_guid
+            ));
         }
         // ---- combat feedback: the numbers the reference floats over units ----
         ServerPacket::AttackerState(s) => {
@@ -855,8 +1181,12 @@ pub extern "C" fn bn_net_enter(guid: u64) -> u32 {
 ///   kind 1 = chat (text), 2 = attack (a=guid), 3 = target (a=guid),
 ///   4 = loot (a=guid), 5 = use gameobject (a=guid),
 ///   6 = accept quest (a=npc, b=quest), 7 = complete quest (a=npc, b=quest),
-///   8 = quest query (b=quest), 9 = logout.
-/// Returns 1 when the command was queued.
+///   8 = quest query (b=quest), 9 = logout,
+///   11 = use item (b = bag<<8 | slot, a = spell slot),
+///   12 = auto-equip (b = bag<<8 | slot),
+///   13 = swap inventory slots (a = src, b = dst).
+/// A bag byte of 0xFF means the player's own equipment array
+/// ([`BAG_EQUIPPED`]). Returns 1 when the command was queued.
 #[no_mangle]
 pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) -> u32 {
     let cmd = match kind {
@@ -875,6 +1205,19 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         // 10 = cast at self (a = spell id); targeted casts go through
         // `bn_net_cast`, which can carry the full 64-bit guid.
         10 => Cmd::Cast { spell: a as u32, target: 0 },
+        11 => Cmd::UseItem {
+            bag: ((b >> 8) & 0xff) as u8,
+            slot: (b & 0xff) as u8,
+            spell: (a & 0xff) as u8,
+        },
+        12 => Cmd::AutoEquip {
+            bag: ((b >> 8) & 0xff) as u8,
+            slot: (b & 0xff) as u8,
+        },
+        13 => Cmd::SwapInv {
+            src: (a & 0xff) as u8,
+            dst: (b & 0xff) as u8,
+        },
         _ => return 0,
     };
     send_cmd(cmd) as u32
@@ -1035,5 +1378,46 @@ pub extern "C" fn bn_net_units_clear() -> u32 {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    1
+}
+
+/// Occupied inventory slots (equipment 0..18, backpack, equipped bags).
+#[no_mangle]
+pub extern "C" fn bn_net_inv_count() -> u32 {
+    inventory_rows(shared()).len() as u32
+}
+
+/// Fill up to `cap` inventory rows; returns how many were written. The row's
+/// `bag`/`slot` feed `bn_net_send` kinds 11/12 unchanged.
+#[no_mangle]
+pub extern "C" fn bn_net_inv(out: *mut BnNetInvItem, cap: u32) -> u32 {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let rows = inventory_rows(shared());
+    let n = rows.len().min(cap as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(rows.as_ptr(), out, n);
+    }
+    n as u32
+}
+
+/// Fill `out` with one item template (name, quality, slot family). Returns 1
+/// once the server has answered the entry's query.
+#[no_mangle]
+pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
+    if out.is_null() || entry == 0 {
+        return 0;
+    }
+    let sh = shared();
+    let templates = sh
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(_) = templates.get(&entry) else {
+        return 0;
+    };
+    let row = item_info_row(entry, &templates);
+    unsafe { *out = row };
     1
 }
