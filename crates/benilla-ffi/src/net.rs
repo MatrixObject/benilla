@@ -294,6 +294,49 @@ impl Default for BnNetInvItem {
     }
 }
 
+/// One quest template from `SMSG_QUEST_QUERY_RESPONSE` (the quest log's detail
+/// view: the descriptors only carry ids and counters).
+struct QuestTemplateLite {
+    level: u32,
+    zone: i32,
+    money: i32,
+    flags: u32,
+    title: String,
+    objectives: String,
+    details: String,
+}
+
+/// One quest template as the host reads it (`bn_net_quest_info`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetQuestInfo {
+    pub quest_id: u32,
+    pub level: u32,
+    pub zone: i32,
+    pub money: i32,
+    pub flags: u32,
+    /// NUL-terminated UTF-8; pipe characters are flattened to '/' on the event
+    /// line, the struct itself keeps the original text.
+    pub title: [c_char; 96],
+    pub objectives: [c_char; 512],
+    pub details: [c_char; 512],
+}
+
+impl Default for BnNetQuestInfo {
+    fn default() -> Self {
+        Self {
+            quest_id: 0,
+            level: 0,
+            zone: 0,
+            money: 0,
+            flags: 0,
+            title: [0; 96],
+            objectives: [0; 512],
+            details: [0; 512],
+        }
+    }
+}
+
 /// One tracked object: its descriptor snapshot plus the last known position.
 struct UnitRec {
     kind: u8,
@@ -345,6 +388,10 @@ struct Shared {
     item_queue: Mutex<Vec<u32>>,
     /// Full templates from the query answers, keyed by entry.
     item_templates: Mutex<HashMap<u32, ItemTemplate>>,
+    /// Quest log templates, keyed by quest id.
+    quests: Mutex<HashMap<u32, QuestTemplateLite>>,
+    /// Quest ids already asked for (the log re-sends descriptors constantly).
+    quest_asked: Mutex<HashSet<u32>>,
 }
 
 impl Shared {
@@ -393,6 +440,8 @@ fn shared() -> &'static Shared {
         item_asked: Mutex::new(HashSet::new()),
         item_queue: Mutex::new(Vec::new()),
         item_templates: Mutex::new(HashMap::new()),
+        quests: Mutex::new(HashMap::new()),
+        quest_asked: Mutex::new(HashSet::new()),
     })
 }
 
@@ -606,6 +655,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             Ok(packet) => {
                 handle_packet(&packet, sh);
                 flush_item_queries(session, sh);
+                queue_self_quests(session, sh);
             }
             Err(e) => {
                 // A read deadline is the normal quiet path; anything else ends
@@ -719,6 +769,27 @@ fn queue_self_items(f: &ObjectFields, units: &HashMap<u64, UnitRec>, sh: &Shared
             if guid != 0 {
                 ask(guid);
             }
+        }
+    }
+}
+
+/// Ask the server for a template of every quest in the log we have not seen
+/// yet, so titles/objectives exist without opening the quest log.
+fn queue_self_quests(session: &mut WorldSession, sh: &Shared) {
+    let ids: Vec<u32> = {
+        let player = sh.player.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = player.as_ref() else {
+            return;
+        };
+        p.quest_id[..(p.quest_count as usize).min(20)].to_vec()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let mut asked = sh.quest_asked.lock().unwrap_or_else(|e| e.into_inner());
+    for id in ids {
+        if id != 0 && asked.insert(id) {
+            let _ = session.quest_query(id);
         }
     }
 }
@@ -1092,6 +1163,33 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 info.level, info.health, info.powers[0]
             ));
         }
+        // The quest log detail template; the log itself only carries ids, so
+        // this is the only source of titles/objectives.
+        ServerPacket::QuestQueryResponse(t) => {
+            sh.quests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    t.quest_id,
+                    QuestTemplateLite {
+                        level: t.level,
+                        zone: t.zone_or_sort,
+                        money: t.money,
+                        flags: t.flags,
+                        title: t.title.clone(),
+                        objectives: t.objectives_text.clone(),
+                        details: t.details.clone(),
+                    },
+                );
+            // Pipes would break the host's field split; quest titles have none
+            // in practice, but flatten defensively.
+            sh.event(format!(
+                "quest|info|{}|{}|{}",
+                t.quest_id,
+                t.level,
+                t.title.replace('|', "/")
+            ));
+        }
         ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
         | ServerPacket::QuestUpdateComplete { .. }
@@ -1378,6 +1476,33 @@ pub extern "C" fn bn_net_units_clear() -> u32 {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    1
+}
+
+/// Fill `out` with one quest template (title, objectives, details). Returns 0
+/// until the server answers the log's query.
+#[no_mangle]
+pub extern "C" fn bn_net_quest_info(quest_id: u32, out: *mut BnNetQuestInfo) -> u32 {
+    if out.is_null() || quest_id == 0 {
+        return 0;
+    }
+    let sh = shared();
+    let quests = sh.quests.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(q) = quests.get(&quest_id) else {
+        return 0;
+    };
+    let mut row = BnNetQuestInfo {
+        quest_id,
+        level: q.level,
+        zone: q.zone,
+        money: q.money,
+        flags: q.flags,
+        ..Default::default()
+    };
+    copy_name(&mut row.title, &q.title);
+    copy_name(&mut row.objectives, &q.objectives);
+    copy_name(&mut row.details, &q.details);
+    unsafe { *out = row };
     1
 }
 
