@@ -23,7 +23,9 @@ use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use benilla_protocol::messages::{AttackSwingError, Object, ObjectFields, ObjectType, ServerPacket};
+use benilla_protocol::messages::{
+    AttackSwingError, CastOutcome, Object, ObjectFields, ObjectType, ServerPacket,
+};
 use benilla_protocol::WorldSession;
 
 /// Stage codes returned by `bn_net_status`.
@@ -1297,6 +1299,18 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             slots.sort_by_key(|s| s.0);
             *sh.actions.lock().unwrap_or_else(|e| e.into_inner()) = slots;
         }
+        // The server's verdict on our own cast: failures are reported to the
+        // host as `castfail|spell|reason|arg` (reason = SpellCastResult), while
+        // a success needs no event (the SpellStart/SpellGo pair follows).
+        ServerPacket::CastResult { spell_id, outcome } => match outcome {
+            CastOutcome::Ok => {}
+            CastOutcome::Failed { reason, arg } => sh.event(format!(
+                "castfail|{}|{}|{}",
+                spell_id,
+                reason,
+                arg.unwrap_or(0)
+            )),
+        },
         // Cast bars: START opens one, GO / FAILED closes it; pushback moves the
         // start later, which is exactly how the client shrinks the fill.
         ServerPacket::SpellStart(s) => {
