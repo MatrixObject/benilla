@@ -393,6 +393,53 @@ impl Default for BnNetAction {
     }
 }
 
+/// One loot-window row (`SMSG_LOOT_RESPONSE` items).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetLootItem {
+    pub slot: u8,
+    /// `LootSlotType`: 0 lootable, 1 rolling, 2 master, 3 locked, 4 owner.
+    pub slot_type: u8,
+    pub item_id: u32,
+    pub count: u32,
+    /// `item_template.display_id`; the host resolves the icon through
+    /// `ItemDisplayInfo.dbc`.
+    pub display_info_id: u32,
+}
+
+impl Default for BnNetLootItem {
+    fn default() -> Self {
+        Self {
+            slot: 0,
+            slot_type: 0,
+            item_id: 0,
+            count: 0,
+            display_info_id: 0,
+        }
+    }
+}
+
+/// The open loot window (0 rows / guid 0 = closed).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetLoot {
+    pub guid: u64,
+    pub gold: u32,
+    pub count: u32,
+    pub items: [BnNetLootItem; 16],
+}
+
+impl Default for BnNetLoot {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            gold: 0,
+            count: 0,
+            items: [BnNetLootItem::default(); 16],
+        }
+    }
+}
+
 /// An observed cast in progress (`SMSG_SPELL_START` .. `SMSG_SPELL_GO`).
 struct CastState {
     spell_id: u32,
@@ -440,6 +487,12 @@ enum Cmd {
     Attack(u64),
     Target(u64),
     Loot(u64),
+    /// `CMSG_AUTOSTORE_LOOT_ITEM`: take one loot-window row by slot.
+    LootItem(u8),
+    /// `CMSG_LOOT_MONEY`: take the corpse's coin pile.
+    LootMoney,
+    /// `CMSG_LOOT_RELEASE`: close the open loot window.
+    LootRelease(u64),
     GameObjUse(u64),
     QuestAccept { npc: u64, quest: u32 },
     QuestComplete { npc: u64, quest: u32 },
@@ -492,6 +545,8 @@ struct Shared {
     creatures: Mutex<HashMap<u32, CreatureTemplateLite>>,
     /// Creature entries already asked for.
     creature_asked: Mutex<HashSet<u32>>,
+    /// The open loot window (`SMSG_LOOT_RESPONSE` .. release/error).
+    loot: Mutex<BnNetLoot>,
 }
 
 impl Shared {
@@ -547,6 +602,7 @@ fn shared() -> &'static Shared {
         casts: Mutex::new(HashMap::new()),
         creatures: Mutex::new(HashMap::new()),
         creature_asked: Mutex::new(HashSet::new()),
+        loot: Mutex::new(BnNetLoot::default()),
     })
 }
 
@@ -707,6 +763,15 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::Loot(guid)) => {
                     let _ = session.loot(guid);
+                }
+                Ok(Cmd::LootItem(slot)) => {
+                    let _ = session.autostore_loot_item(slot);
+                }
+                Ok(Cmd::LootMoney) => {
+                    let _ = session.loot_money();
+                }
+                Ok(Cmd::LootRelease(guid)) => {
+                    let _ = session.loot_release(guid);
                 }
                 Ok(Cmd::GameObjUse(guid)) => {
                     let _ = session.gameobj_use(guid);
@@ -1412,6 +1477,70 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             slots.sort_by_key(|s| s.0);
             *sh.actions.lock().unwrap_or_else(|e| e.into_inner()) = slots;
         }
+        // The loot window: RESPONSE opens it (gold + rows), RELEASE/ERROR close
+        // it, REMOVED drops a taken row. Names for the rows come from the same
+        // item-template cache as the bag panel, so the entries are queued here.
+        ServerPacket::LootResponse {
+            guid,
+            gold,
+            items,
+            ..
+        } => {
+            let mut window = BnNetLoot {
+                guid: *guid,
+                gold: *gold,
+                ..Default::default()
+            };
+            {
+                let mut asked = sh.item_asked.lock().unwrap_or_else(|e| e.into_inner());
+                let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
+                for it in items.iter().take(window.items.len()) {
+                    window.items[window.count as usize] = BnNetLootItem {
+                        slot: it.slot,
+                        slot_type: it.slot_type,
+                        item_id: it.item_id,
+                        count: it.count,
+                        display_info_id: it.display_info_id,
+                    };
+                    window.count += 1;
+                    if it.item_id != 0 && asked.insert(it.item_id) {
+                        queue.push(it.item_id);
+                    }
+                }
+            }
+            let count = window.count;
+            *sh.loot.lock().unwrap_or_else(|e| e.into_inner()) = window;
+            sh.event(format!("loot|open|{}|{}|{}", guid, gold, count));
+        }
+        ServerPacket::LootError { guid, error } => {
+            *sh.loot.lock().unwrap_or_else(|e| e.into_inner()) = BnNetLoot::default();
+            sh.event(format!("loot|error|{}|{}", guid, error));
+        }
+        ServerPacket::LootReleaseResponse { .. } => {
+            *sh.loot.lock().unwrap_or_else(|e| e.into_inner()) = BnNetLoot::default();
+            sh.event("loot|close".to_string());
+        }
+        ServerPacket::LootRemoved { slot } => {
+            let mut window = sh.loot.lock().unwrap_or_else(|e| e.into_inner());
+            let mut out = BnNetLoot {
+                guid: window.guid,
+                gold: window.gold,
+                ..Default::default()
+            };
+            for i in 0..window.count as usize {
+                if window.items[i].slot != *slot {
+                    out.items[out.count as usize] = window.items[i];
+                    out.count += 1;
+                }
+            }
+            *window = out;
+        }
+        ServerPacket::LootMoneyNotify { amount } => {
+            sh.event(format!("loot|money|{}", amount));
+        }
+        ServerPacket::LootClearMoney => {
+            sh.loot.lock().unwrap_or_else(|e| e.into_inner()).gold = 0;
+        }
         // The server's verdict on our own cast: failures are reported to the
         // host as `castfail|spell|reason|arg` (reason = SpellCastResult), while
         // a success needs no event (the SpellStart/SpellGo pair follows).
@@ -1613,9 +1742,28 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             src: (a & 0xff) as u8,
             dst: (b & 0xff) as u8,
         },
+        // 14 = autostore one loot row by slot, 15 = take the coins, 16 = close.
+        14 => Cmd::LootItem(a as u8),
+        15 => Cmd::LootMoney,
+        16 => Cmd::LootRelease(a),
         _ => return 0,
     };
     send_cmd(cmd) as u32
+}
+
+/// The open loot window as the host draws it. Returns 1 while a window is open
+/// (`guid` set), 0 otherwise.
+#[no_mangle]
+pub extern "C" fn bn_net_loot(out: *mut BnNetLoot) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let window = *shared().loot.lock().unwrap_or_else(|e| e.into_inner());
+    let open = window.guid != 0;
+    unsafe {
+        *out = window;
+    }
+    open as u32
 }
 
 /// Cast `spell` at `target` (0 = self). Answers arrive as `cast|spell|target`
