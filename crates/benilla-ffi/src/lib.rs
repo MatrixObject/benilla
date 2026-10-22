@@ -56,6 +56,10 @@ mod player;
 
 mod wdl_far;
 
+// ---- Network session (realm logon + world stream on a worker thread) ----
+
+mod net;
+
 use std::io::Cursor;
 
 use std::path::Path;
