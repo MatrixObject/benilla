@@ -440,6 +440,102 @@ impl Default for BnNetLoot {
     }
 }
 
+/// One questgiver menu row (`SMSG_GOSSIP_MESSAGE` quests / `SMSG_QUESTGIVER_QUEST_LIST`);
+/// `icon` is a `dialog_status` value (5 available, 3 incomplete, 4/6/7 reward).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetGiverQuest {
+    pub quest_id: u32,
+    pub icon: u32,
+    pub level: u32,
+    pub title: [c_char; 96],
+}
+
+impl Default for BnNetGiverQuest {
+    fn default() -> Self {
+        Self {
+            quest_id: 0,
+            icon: 0,
+            level: 0,
+            title: [0; 96],
+        }
+    }
+}
+
+/// One selectable reward on a questgiver panel (`ItemDisplayInfo` id included
+/// so the host can paint the icon).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetGiverReward {
+    pub item_id: u32,
+    pub count: u32,
+    pub display_id: u32,
+}
+
+impl Default for BnNetGiverReward {
+    fn default() -> Self {
+        Self {
+            item_id: 0,
+            count: 0,
+            display_id: 0,
+        }
+    }
+}
+
+/// The open questgiver window: mode 0 closed, 1 quest menu, 2 accept panel,
+/// 3 progress panel, 4 reward panel.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetGiver {
+    pub npc: u64,
+    pub mode: u32,
+    pub quest_id: u32,
+    pub auto_finish: u32,
+    /// Signed: negative when the quest costs money.
+    pub money: i32,
+    /// `SMSG_QUESTGIVER_REQUEST_ITEMS.is_complete`: the reward panel may be used.
+    pub can_complete: u32,
+    pub quest_count: u32,
+    pub quests: [BnNetGiverQuest; 24],
+    /// The reward choices (`QuestGiverChoices` / `QUEST_REWARD_CHOICES_COUNT` 6).
+    pub choice_count: u32,
+    pub choices: [BnNetGiverReward; 6],
+    pub title: [c_char; 96],
+    pub body: [c_char; 1024],
+    pub objectives: [c_char; 512],
+}
+
+impl Default for BnNetGiver {
+    fn default() -> Self {
+        Self {
+            npc: 0,
+            mode: 0,
+            quest_id: 0,
+            auto_finish: 0,
+            money: 0,
+            can_complete: 0,
+            quest_count: 0,
+            quests: [BnNetGiverQuest::default(); 24],
+            choice_count: 0,
+            choices: [BnNetGiverReward::default(); 6],
+            title: [0; 96],
+            body: [0; 1024],
+            objectives: [0; 512],
+        }
+    }
+}
+
+/// Copy `src` into a NUL-terminated fixed buffer (truncating on a char boundary).
+fn put_str<const N: usize>(dst: &mut [c_char; N], src: &str) {
+    let mut cut = src.len().min(N - 1);
+    while cut > 0 && !src.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    for (i, b) in src.as_bytes()[..cut].iter().enumerate() {
+        dst[i] = *b as c_char;
+    }
+}
+
 /// An observed cast in progress (`SMSG_SPELL_START` .. `SMSG_SPELL_GO`).
 struct CastState {
     spell_id: u32,
@@ -495,6 +591,15 @@ enum Cmd {
     LootRelease(u64),
     /// `CMSG_REPOP_REQUEST`: release the spirit after death.
     Repop,
+    /// `CMSG_GOSSIP_HELLO`: open the NPC's gossip/quest menu.
+    GiverHello(u64),
+    /// `CMSG_QUESTGIVER_QUERY_QUEST`: the accept panel for one quest.
+    QuestQueryGiver { npc: u64, quest: u32 },
+    /// `CMSG_QUESTGIVER_REQUEST_REWARD`: the progress panel's Continue, opens the
+    /// offer-reward panel.
+    QuestRequestReward { npc: u64, quest: u32 },
+    /// `CMSG_QUESTGIVER_CHOOSE_REWARD`: hand in and take reward `reward`.
+    QuestReward { npc: u64, quest: u32, reward: u32 },
     GameObjUse(u64),
     QuestAccept { npc: u64, quest: u32 },
     QuestComplete { npc: u64, quest: u32 },
@@ -549,6 +654,8 @@ struct Shared {
     creature_asked: Mutex<HashSet<u32>>,
     /// The open loot window (`SMSG_LOOT_RESPONSE` .. release/error).
     loot: Mutex<BnNetLoot>,
+    /// The open questgiver window (gossip menu / details / reward).
+    giver: Mutex<BnNetGiver>,
 }
 
 impl Shared {
@@ -605,6 +712,7 @@ fn shared() -> &'static Shared {
         creatures: Mutex::new(HashMap::new()),
         creature_asked: Mutex::new(HashSet::new()),
         loot: Mutex::new(BnNetLoot::default()),
+        giver: Mutex::new(BnNetGiver::default()),
     })
 }
 
@@ -779,6 +887,18 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     if let Err(e) = session.repop_request() {
                         sh.event(format!("error|repop|{e}"));
                     }
+                }
+                Ok(Cmd::GiverHello(npc)) => {
+                    let _ = session.questgiver_hello(npc);
+                }
+                Ok(Cmd::QuestQueryGiver { npc, quest }) => {
+                    let _ = session.questgiver_query_quest(npc, quest);
+                }
+                Ok(Cmd::QuestRequestReward { npc, quest }) => {
+                    let _ = session.questgiver_request_reward(npc, quest);
+                }
+                Ok(Cmd::QuestReward { npc, quest, reward }) => {
+                    let _ = session.questgiver_choose_reward(npc, quest, reward);
                 }
                 Ok(Cmd::GameObjUse(guid)) => {
                     let _ = session.gameobj_use(guid);
@@ -1548,6 +1668,124 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         ServerPacket::LootClearMoney => {
             sh.loot.lock().unwrap_or_else(|e| e.into_inner()).gold = 0;
         }
+        // Questgiver window. Gossip and the quest-list packet both open the
+        // menu; details/reward/progress replace it with a single quest, and a
+        // completed hand-in just closes it.
+        ServerPacket::GossipMessage { npc, quests, .. } => {
+            let mut giver = BnNetGiver {
+                npc: *npc,
+                mode: 1,
+                ..Default::default()
+            };
+            for (i, q) in quests.iter().take(giver.quests.len()).enumerate() {
+                giver.quests[i] = BnNetGiverQuest {
+                    quest_id: q.quest_id,
+                    icon: q.icon,
+                    level: q.level,
+                    title: [0; 96],
+                };
+                put_str(&mut giver.quests[i].title, &q.title);
+            }
+            giver.quest_count = quests.len().min(giver.quests.len()) as u32;
+            let count = giver.quest_count;
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            sh.event(format!("giver|open|{}|{}", npc, count));
+        }
+        ServerPacket::GossipComplete => {
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            sh.event("giver|close".to_string());
+        }
+        ServerPacket::QuestGiverQuestList(list) => {
+            let mut giver = BnNetGiver {
+                npc: list.npc,
+                mode: 1,
+                ..Default::default()
+            };
+            put_str(&mut giver.body, &list.greeting);
+            for (i, q) in list.quests.iter().take(giver.quests.len()).enumerate() {
+                giver.quests[i] = BnNetGiverQuest {
+                    quest_id: q.quest_id,
+                    icon: q.icon,
+                    level: q.level,
+                    title: [0; 96],
+                };
+                put_str(&mut giver.quests[i].title, &q.title);
+            }
+            giver.quest_count = list.quests.len().min(giver.quests.len()) as u32;
+            let count = giver.quest_count;
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            sh.event(format!("giver|open|{}|{}", list.npc, count));
+        }
+        ServerPacket::QuestGiverDetails(d) => {
+            let mut giver = BnNetGiver {
+                npc: d.npc,
+                mode: 2,
+                quest_id: d.quest_id,
+                auto_finish: d.auto_finish,
+                money: d.money,
+                ..Default::default()
+            };
+            put_str(&mut giver.title, &d.title);
+            put_str(&mut giver.body, &d.details);
+            put_str(&mut giver.objectives, &d.objectives);
+            giver.choice_count = d.choices.len().min(giver.choices.len()) as u32;
+            for (i, c) in d.choices.iter().take(giver.choices.len()).enumerate() {
+                giver.choices[i] = BnNetGiverReward {
+                    item_id: c.item_id,
+                    count: c.count,
+                    display_id: c.display_id,
+                };
+            }
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            sh.event(format!("giver|details|{}", d.quest_id));
+        }
+        ServerPacket::QuestGiverOfferReward(r) => {
+            let mut giver = BnNetGiver {
+                npc: r.npc,
+                mode: 4,
+                quest_id: r.quest_id,
+                auto_finish: r.auto_finish,
+                money: r.money,
+                can_complete: 1,
+                ..Default::default()
+            };
+            put_str(&mut giver.title, &r.title);
+            put_str(&mut giver.body, &r.offer_text);
+            giver.choice_count = r.choices.len().min(giver.choices.len()) as u32;
+            for (i, c) in r.choices.iter().take(giver.choices.len()).enumerate() {
+                giver.choices[i] = BnNetGiverReward {
+                    item_id: c.item_id,
+                    count: c.count,
+                    display_id: c.display_id,
+                };
+            }
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            sh.event(format!("giver|reward|{}", r.quest_id));
+        }
+        ServerPacket::QuestGiverRequestItems(r) => {
+            let mut giver = BnNetGiver {
+                npc: r.npc,
+                mode: 3,
+                quest_id: r.quest_id,
+                money: r.required_money as i32,
+                can_complete: u32::from(r.is_complete),
+                ..Default::default()
+            };
+            put_str(&mut giver.title, &r.title);
+            put_str(&mut giver.body, &r.request_text);
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            sh.event(format!("giver|progress|{}", r.quest_id));
+        }
+        ServerPacket::QuestGiverComplete(c) => {
+            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            sh.event(format!("giver|complete|{}|{}|{}", c.quest_id, c.xp, c.money));
+        }
+        ServerPacket::QuestGiverInvalid { .. } => {
+            sh.event("giver|invalid".to_string());
+        }
+        ServerPacket::QuestGiverFailed { .. } => {
+            sh.event("giver|failed".to_string());
+        }
         // The server's verdict on our own cast: failures are reported to the
         // host as `castfail|spell|reason|arg` (reason = SpellCastResult), while
         // a success needs no event (the SpellStart/SpellGo pair follows).
@@ -1755,6 +1993,33 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         16 => Cmd::LootRelease(a),
         // 17 = release the spirit (the dead screen's button).
         17 => Cmd::Repop,
+        // 18 = gossip hello (a = npc), 19 = query a quest's accept panel
+        // (a = npc, b = quest), 20 = accept (a = npc, b = quest),
+        // 21 = complete/hand-in (a = npc, b = quest), 22 = choose reward
+        // (a = npc, b = quest | reward << 16), 23 = request the reward panel
+        // (a = npc, b = quest).
+        18 => Cmd::GiverHello(a),
+        19 => Cmd::QuestQueryGiver {
+            npc: a,
+            quest: b & 0xffff,
+        },
+        20 => Cmd::QuestAccept {
+            npc: a,
+            quest: b & 0xffff,
+        },
+        21 => Cmd::QuestComplete {
+            npc: a,
+            quest: b & 0xffff,
+        },
+        22 => Cmd::QuestReward {
+            npc: a,
+            quest: b & 0xffff,
+            reward: b >> 16,
+        },
+        23 => Cmd::QuestRequestReward {
+            npc: a,
+            quest: b & 0xffff,
+        },
         _ => return 0,
     };
     send_cmd(cmd) as u32
@@ -1773,6 +2038,21 @@ pub extern "C" fn bn_net_loot(out: *mut BnNetLoot) -> u32 {
         *out = window;
     }
     open as u32
+}
+
+/// The open questgiver window. Returns its mode (0 closed, 1 menu,
+/// 2 accept panel, 3 reward/progress panel).
+#[no_mangle]
+pub extern "C" fn bn_net_giver(out: *mut BnNetGiver) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let giver = *shared().giver.lock().unwrap_or_else(|e| e.into_inner());
+    let mode = giver.mode;
+    unsafe {
+        *out = giver;
+    }
+    mode
 }
 
 /// Cast `spell` at `target` (0 = self). Answers arrive as `cast|spell|target`
