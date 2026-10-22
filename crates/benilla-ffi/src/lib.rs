@@ -60,6 +60,10 @@ mod wdl_far;
 
 mod net;
 
+// ---- CreatureDisplayInfo -> model path / scale / skins (host render inputs) ----
+
+mod creature;
+
 use std::io::Cursor;
 
 use std::path::Path;
