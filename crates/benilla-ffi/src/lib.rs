@@ -4818,11 +4818,31 @@ pub fn m2_skinned_positions(
 
     let fmt = benilla_m2::parse_m2(&mut std::io::Cursor::new(bytes)).ok()?;
 
-    let model = fmt.model();
-
     let global_seqs = parse_m2_global_sequences(bytes);
 
     let bones = parse_m2_bones(bytes)?;
+
+    Some(m2_skinned_positions_rig(fmt.model(), &global_seqs, &bones, anim, time_ms))
+
+}
+
+/// Skinning core shared by the byte path and the cached-rig path: bone
+
+/// matrices at one (anim, time) plus the 4-weight vertex blend.
+
+pub fn m2_skinned_positions_rig(
+
+    model: &benilla_m2::M2Model,
+
+    global_seqs: &[u32],
+
+    bones: &[BnBone],
+
+    anim: usize,
+
+    time_ms: u32,
+
+) -> Vec<[f32; 3]> {
 
     // global_time_ms: for gseq tracks, use global clock.
 
@@ -4834,7 +4854,7 @@ pub fn m2_skinned_positions(
 
     let mats: Vec<BnMat4> = (0..bones.len())
 
-        .map(|i| bone_matrix_at(&bones, anim, time_ms, global_time_ms, &global_seqs, i))
+        .map(|i| bone_matrix_at(bones, anim, time_ms, global_time_ms, global_seqs, i))
 
         .collect();
 
@@ -4934,7 +4954,97 @@ pub fn m2_skinned_positions(
 
     }
 
-    Some(out)
+    out
+
+}
+
+/// A parsed M2 rig kept for the duration of the session: the animation tick
+/// calls `bn_model_skinned_positions` every frame, and re-reading + re-parsing
+/// the model (plus its bone and global-sequence tables) cost ~10 ms per call.
+
+struct M2Rig {
+
+    format: benilla_m2::M2Format,
+
+    global_seqs: Vec<u32>,
+
+    bones: Vec<BnBone>,
+
+}
+
+fn m2_rig_cache() -> &'static Mutex<HashMap<String, Arc<M2Rig>>> {
+
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<M2Rig>>>> = OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+
+}
+
+/// The cached rig for `path`, parsed from the archives on first use.
+
+fn m2_rig_cached(archives: &[Archive], path: &str) -> Option<Arc<M2Rig>> {
+
+    {
+
+        let cache = m2_rig_cache().lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(rig) = cache.get(path) {
+
+            return Some(rig.clone());
+
+        }
+
+    }
+
+    let mut bytes = None;
+
+    for a in archives.iter().rev() {
+
+        if a.contains(path) {
+
+            if let Ok(b) = a.read_file(path) {
+
+                bytes = Some(b);
+
+                break;
+
+            }
+
+        }
+
+    }
+
+    let bytes = bytes?;
+
+    let format = benilla_m2::parse_m2(&mut std::io::Cursor::new(bytes.as_slice())).ok()?;
+
+    let global_seqs = parse_m2_global_sequences(&bytes);
+
+    let bones = parse_m2_bones(&bytes)?;
+
+    let rig = Arc::new(M2Rig {
+
+        format,
+
+        global_seqs,
+
+        bones,
+
+    });
+
+    let mut cache = m2_rig_cache().lock().unwrap_or_else(|e| e.into_inner());
+
+    // Bound the cache: a long tour visits every creature model in the world.
+
+    if cache.len() >= 512 {
+
+        cache.clear();
+
+    }
+
+    cache.insert(path.to_owned(), rig.clone());
+
+    Some(rig)
 
 }
 
@@ -5386,51 +5496,45 @@ pub extern "C" fn bn_model_skinned_positions(
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let rig = match m2_rig_cached(&w.archives, p) {
 
-        if !a.contains(p) {
+        Some(r) => r,
 
-            continue;
+        None => return 0,
 
-        }
+    };
 
-        if let Ok(bytes) = a.read_file(p) {
+    let verts = m2_skinned_positions_rig(
 
-            if let Some(verts) = m2_skinned_positions_ue(
+        rig.format.model(),
 
-                bytes.as_slice(),
+        &rig.global_seqs,
 
-                anim_idx as usize,
+        &rig.bones,
 
-                time_ms,
+        anim_idx as usize,
 
-            ) {
+        time_ms,
 
-                let n = verts.len().min(cap as usize);
+    );
 
-                for (i, v) in verts.iter().take(n).enumerate() {
+    let n = verts.len().min(cap as usize);
 
-                    unsafe {
+    for (i, v) in verts.iter().take(n).enumerate() {
 
-                        *out.add(i * 3) = v[0];
+        unsafe {
 
-                        *out.add(i * 3 + 1) = v[1];
+            *out.add(i * 3) = v[0];
 
-                        *out.add(i * 3 + 2) = v[2];
+            *out.add(i * 3 + 1) = v[1];
 
-                    }
-
-                }
-
-                return n as u32;
-
-            }
+            *out.add(i * 3 + 2) = v[2];
 
         }
 
     }
 
-    0
+    n as u32
 
 }
 

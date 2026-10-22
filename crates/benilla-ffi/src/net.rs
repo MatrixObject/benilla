@@ -768,13 +768,14 @@ impl Shared {
     }
 
     fn event(&self, line: impl Into<String>) {
+        let line = line.into();
         let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
         // The host drains this every frame; the cap only guards a host that
         // stopped polling while the server keeps talking.
         if q.len() >= 1024 {
             q.pop_front();
         }
-        q.push_back(line.into());
+        q.push_back(line);
     }
 
     fn drain_events(&self, cap: usize) -> String {
@@ -1099,15 +1100,21 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             Err(e) => {
                 // A read deadline is the normal quiet path; anything else ends
                 // the session (the server dropped us, or the link broke).
-                let quiet = e
-                    .downcast_ref::<std::io::Error>()
-                    .map(|io| {
-                        matches!(
-                            io.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        )
-                    })
-                    .unwrap_or(false);
+                // The IO error sits under benilla-protocol's context layer
+                // ("reading world header"), so walk the chain - a plain
+                // downcast only sees the outermost error. Windows reports a
+                // socket deadline as WSAETIMEDOUT (TimedOut), not WouldBlock.
+                let quiet = e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .map(|io| {
+                            matches!(
+                                io.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            )
+                        })
+                        .unwrap_or(false)
+                });
                 if quiet {
                     continue;
                 }

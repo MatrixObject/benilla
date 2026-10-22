@@ -34,7 +34,9 @@ pub(super) fn recv_packet(
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)
-        .map_err(|e| anyhow!("reading world header: {e}"))?;
+        // Keep the io::Error as the source: a socket deadline must stay
+        // recognisable (`TimedOut`/`WouldBlock`) instead of becoming a string.
+        .map_err(|e| anyhow::Error::new(e).context("reading world header"))?;
     if let Some(d) = decrypter {
         d.decrypt(&mut header);
     }
@@ -45,7 +47,11 @@ pub(super) fn recv_packet(
     let mut body = vec![0u8; body_len];
     stream
         .read_exact(&mut body)
-        .map_err(|e| anyhow!("reading world body (opcode {opcode:#x}, {body_len} bytes): {e}"))?;
+        .map_err(|e| {
+            anyhow::Error::new(e).context(format!(
+                "reading world body (opcode {opcode:#x}, {body_len} bytes)"
+            ))
+        })?;
     messages::parse_server(opcode, &body).map_err(|e| {
         Unparsed {
             opcode,
