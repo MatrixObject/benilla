@@ -113,6 +113,14 @@ pub struct BnNetPlayer {
     pub aura_slot: [u8; 48],
     pub aura_spell: [u32; 48],
     pub aura_stacks: [u8; 48],
+    /// Primary stats after buffs, 0 Str, 1 Agi, 2 Sta, 3 Int, 4 Spi; plus the
+    /// melee numbers the character sheet shows.
+    pub stat: [u32; 5],
+    pub armor: i32,
+    pub attack_power: i32,
+    pub damage_min: f32,
+    pub damage_max: f32,
+    pub attack_time: u32,
     pub pos: [f32; 3],
     pub facing: f32,
 }
@@ -141,6 +149,12 @@ impl Default for BnNetPlayer {
             aura_slot: [0; 48],
             aura_spell: [0; 48],
             aura_stacks: [0; 48],
+            stat: [0; 5],
+            armor: 0,
+            attack_power: 0,
+            damage_min: 0.0,
+            damage_max: 0.0,
+            attack_time: 0,
             pos: [0.0; 3],
             facing: 0.0,
         }
@@ -1333,6 +1347,12 @@ fn refresh_player(sh: &Shared) {
         mount: f.unit_mount_display_id(),
         combo: f.player_combo_points().unwrap_or(0),
         dead: f.unit_is_dead() as u8,
+        stat: std::array::from_fn(|i| f.unit_stat(i as u8).unwrap_or(0)),
+        armor: f.unit_resistance(0).unwrap_or(0),
+        attack_power: f.unit_attack_power().unwrap_or(0),
+        damage_min: f.unit_min_damage().unwrap_or(0.0),
+        damage_max: f.unit_max_damage().unwrap_or(0.0),
+        attack_time: f.unit_base_attack_time(0).unwrap_or(0),
         pos: rec.pos,
         facing: rec.facing,
         ..Default::default()
