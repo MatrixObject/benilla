@@ -1444,6 +1444,36 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&g.caster);
+            // A completed own cast starts the spell's recovery timer. The
+            // duration is a Spell.dbc column (recovery_ms / category recovery),
+            // so `0` tells the host to resolve it from the catalogue.
+            if g.caster == sh.self_guid.load(Ordering::SeqCst) {
+                sh.event(format!("cooldown|{}|0", g.spell_id));
+            }
+        }
+        // Server-pushed cooldowns (school lockout, pet, item procs, GM reset)
+        // carry explicit durations; 0 ms falls back to the DBC recovery.
+        ServerPacket::SpellCooldownList { caster, cooldowns } => {
+            if *caster == 0 || *caster == sh.self_guid.load(Ordering::SeqCst) {
+                for (spell_id, ms) in cooldowns {
+                    sh.event(format!("cooldown|{}|{}", spell_id, ms));
+                }
+            }
+        }
+        ServerPacket::CooldownEvent { spell_id, caster } => {
+            if *caster == sh.self_guid.load(Ordering::SeqCst) {
+                sh.event(format!("cooldown|{}|0", spell_id));
+            }
+        }
+        ServerPacket::ClearCooldown { spell_id, caster } => {
+            if *caster == sh.self_guid.load(Ordering::SeqCst) {
+                sh.event(format!("cooldownclear|{}", spell_id));
+            }
+        }
+        ServerPacket::CooldownCheat { caster } => {
+            if *caster == sh.self_guid.load(Ordering::SeqCst) {
+                sh.event("cooldownclear|0".to_string());
+            }
         }
         ServerPacket::SpellFailedOther { caster, .. } => {
             sh.casts

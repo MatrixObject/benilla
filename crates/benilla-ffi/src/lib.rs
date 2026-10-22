@@ -7249,7 +7249,8 @@ pub extern "C" fn bn_light_sample(
 }
 
 /// One `Spell.dbc` display row as a TSV line:
-///   `id|name|rank|icon|school|power_type|mana_cost|duration_index|range_index`
+///   `id|name|rank|icon|school|power_type|mana_cost|duration_index|range_index|`
+///   `recovery_ms|category|category_recovery_ms|start_recovery_ms`
 /// (`icon` is the BLP path without extension; empty rank for unranked rows).
 /// Returns the byte count written, 0 when the row is missing.
 #[no_mangle]
@@ -7272,7 +7273,7 @@ pub extern "C" fn bn_spell_info(world: *mut BnWorld, spell_id: u32, out: *mut c_
         return 0;
     };
     let line = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         s.id,
         s.name,
         s.rank.as_deref().unwrap_or(""),
@@ -7281,7 +7282,11 @@ pub extern "C" fn bn_spell_info(world: *mut BnWorld, spell_id: u32, out: *mut c_
         s.power_type,
         s.mana_cost,
         s.duration_index,
-        s.range_index
+        s.range_index,
+        s.recovery_ms,
+        s.category,
+        s.category_recovery_ms,
+        s.start_recovery_ms
     );
     // SAFETY: `out` holds at least `cap` bytes; the copy is NUL-terminated.
     let bytes = line.as_bytes();
