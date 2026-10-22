@@ -16,13 +16,14 @@
 //!   bn_net_event(buf, cap) -> bytes popped (0 = empty)
 //!   bn_net_disconnect()
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, CStr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 
-use benilla_protocol::{messages::ServerPacket, WorldSession};
+use benilla_protocol::messages::{Object, ObjectFields, ObjectType, ServerPacket};
+use benilla_protocol::WorldSession;
 
 /// Stage codes returned by `bn_net_status`.
 pub const ST_IDLE: u32 = 0;
@@ -75,6 +76,109 @@ impl Default for BnNetChar {
     }
 }
 
+/// The logged-in player's own descriptor state, rebuilt from the object stream.
+///
+/// Positions are raw WoW yards (X east, Y north, Z up); the host converts to
+/// its own axes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetPlayer {
+    pub guid: u64,
+    pub level: u32,
+    pub health: u32,
+    pub max_health: u32,
+    pub mana: u32,
+    pub max_mana: u32,
+    pub xp: u32,
+    pub next_xp: u32,
+    pub money: u32,
+    pub target: u64,
+    pub mount: u32,
+    pub combo: u8,
+    pub dead: u8,
+    /// Number of non-empty `PLAYER_QUEST_LOG` slots, and the slots themselves
+    /// (`quest_state` is `QUEST_STATE_COMPLETE`/`FAIL`, 0 in progress).
+    pub quest_count: u32,
+    pub quest_id: [u32; 20],
+    pub quest_state: [u8; 20],
+    pub pos: [f32; 3],
+    pub facing: f32,
+}
+
+impl Default for BnNetPlayer {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            level: 0,
+            health: 0,
+            max_health: 0,
+            mana: 0,
+            max_mana: 0,
+            xp: 0,
+            next_xp: 0,
+            money: 0,
+            target: 0,
+            mount: 0,
+            combo: 0,
+            dead: 0,
+            quest_count: 0,
+            quest_id: [0; 20],
+            quest_state: [0; 20],
+            pos: [0.0; 3],
+            facing: 0.0,
+        }
+    }
+}
+
+/// One object from the world stream, as the host may want to draw it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetUnit {
+    pub guid: u64,
+    /// [`ObjectType`] as a byte: 1 item, 2 container, 3 unit, 4 player,
+    /// 5 gameobject, 6 dynamicobject, 7 corpse, 0 plain object.
+    pub kind: u8,
+    pub level: u32,
+    pub display_id: i32,
+    pub health: u32,
+    pub max_health: u32,
+    pub target: u64,
+    pub mount: u32,
+    pub dead: u8,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub facing: f32,
+}
+
+impl Default for BnNetUnit {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            kind: 0,
+            level: 0,
+            display_id: 0,
+            health: 0,
+            max_health: 0,
+            target: 0,
+            mount: 0,
+            dead: 0,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            facing: 0.0,
+        }
+    }
+}
+
+/// One tracked object: its descriptor snapshot plus the last known position.
+struct UnitRec {
+    kind: u8,
+    fields: ObjectFields,
+    pos: [f32; 3],
+    facing: f32,
+}
+
 /// Commands the game thread hands to the session thread.
 enum Cmd {
     Enter(u64),
@@ -91,8 +195,15 @@ enum Cmd {
 
 struct Shared {
     status: AtomicU32,
+    /// The guid handed to `player_login`; `UpdateObject` entries for it feed
+    /// `player`.
+    self_guid: AtomicU64,
     events: Mutex<VecDeque<String>>,
     chars: Mutex<Vec<BnNetChar>>,
+    /// Every tracked object in the stream window (the client's own object
+    /// manager, reduced to what the FFI exposes).
+    units: Mutex<HashMap<u64, UnitRec>>,
+    player: Mutex<Option<BnNetPlayer>>,
 }
 
 impl Shared {
@@ -132,8 +243,11 @@ fn shared() -> &'static Shared {
     static SHARED: OnceLock<Shared> = OnceLock::new();
     SHARED.get_or_init(|| Shared {
         status: AtomicU32::new(ST_IDLE),
+        self_guid: AtomicU64::new(0),
         events: Mutex::new(VecDeque::new()),
         chars: Mutex::new(Vec::new()),
+        units: Mutex::new(HashMap::new()),
+        player: Mutex::new(None),
     })
 }
 
@@ -242,6 +356,12 @@ fn worker(host: String, user: String, pass: String, rx: std::sync::mpsc::Receive
     loop {
         match rx.recv() {
             Ok(Cmd::Enter(guid)) => {
+                sh.self_guid.store(guid, Ordering::SeqCst);
+                sh.units
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 sh.set(ST_ENTERING);
                 sh.event(format!("enter|{guid}"));
                 match session.player_login(guid) {
@@ -337,6 +457,129 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
     }
 }
 
+/// [`ObjectType`] as the byte the host sees in [`BnNetUnit::kind`].
+fn object_kind(t: ObjectType) -> u8 {
+    match t {
+        ObjectType::Object => 0,
+        ObjectType::Item => 1,
+        ObjectType::Container => 2,
+        ObjectType::Unit => 3,
+        ObjectType::Player => 4,
+        ObjectType::GameObject => 5,
+        ObjectType::DynamicObject => 6,
+        ObjectType::Corpse => 7,
+    }
+}
+
+/// Cap on tracked objects: the stream window is a few hundred at most, so this
+/// only stops a pathological server from growing the map forever.
+const MAX_UNITS: usize = 4096;
+
+/// Fold one `SMSG_UPDATE_OBJECT` entry into the tracked object table.
+fn apply_object(obj: &Object, sh: &Shared) {
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let mut units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    match obj {
+        Object::Values { guid, mask } => {
+            if let Some(rec) = units.get_mut(guid) {
+                rec.fields.merge(mask.clone());
+            } else if units.len() < MAX_UNITS {
+                units.insert(
+                    *guid,
+                    UnitRec {
+                        kind: if *guid == self_guid { 4 } else { 0 },
+                        fields: mask.clone(),
+                        pos: [0.0; 3],
+                        facing: 0.0,
+                    },
+                );
+            }
+        }
+        Object::Movement { guid, movement } => {
+            if let Some(rec) = units.get_mut(guid) {
+                if let Some((v, o)) = movement.position {
+                    rec.pos = [v.x, v.y, v.z];
+                    rec.facing = o;
+                }
+            }
+        }
+        Object::Create {
+            guid,
+            object_type,
+            movement,
+            mask,
+        } => {
+            let (pos, facing) = match movement.position {
+                Some((v, o)) => ([v.x, v.y, v.z], o),
+                None => ([0.0; 3], 0.0),
+            };
+            units.insert(
+                *guid,
+                UnitRec {
+                    kind: object_kind(*object_type),
+                    fields: mask.clone(),
+                    pos,
+                    facing,
+                },
+            );
+        }
+        Object::OutOfRange { guids } => {
+            for g in guids {
+                units.remove(g);
+            }
+        }
+        // Proximity hints only affect the client's update cadence.
+        Object::Near { .. } => {}
+    }
+}
+
+/// Rebuild the host's player snapshot after its descriptor changed.
+fn refresh_player(sh: &Shared) {
+    let guid = sh.self_guid.load(Ordering::SeqCst);
+    if guid == 0 {
+        return;
+    }
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rec) = units.get(&guid) else {
+        return;
+    };
+    let f = &rec.fields;
+    let power_type = f.unit_power_type();
+    let mut p = BnNetPlayer {
+        guid,
+        level: f.unit_level().unwrap_or(0),
+        health: f.unit_health().unwrap_or(0),
+        max_health: f.unit_max_health().unwrap_or(0),
+        mana: f.unit_power(power_type).unwrap_or(0),
+        max_mana: f.unit_max_power(power_type).unwrap_or(0),
+        xp: f.player_xp().unwrap_or(0),
+        next_xp: f.player_next_level_xp().unwrap_or(0),
+        money: f.player_money().unwrap_or(0),
+        target: f.unit_target().unwrap_or(0),
+        mount: f.unit_mount_display_id(),
+        combo: f.player_combo_points().unwrap_or(0),
+        dead: f.unit_is_dead() as u8,
+        pos: rec.pos,
+        facing: rec.facing,
+        ..Default::default()
+    };
+    let mut slot = 0usize;
+    for i in 0..20u8 {
+        let Some(q) = f.player_quest_log(i) else {
+            continue;
+        };
+        if q.quest_id == 0 {
+            continue;
+        }
+        p.quest_id[slot] = q.quest_id;
+        p.quest_state[slot] = q.state;
+        slot += 1;
+    }
+    p.quest_count = slot as u32;
+    drop(units);
+    *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+}
+
 fn handle_packet(packet: &ServerPacket, sh: &Shared) {
     match packet {
         ServerPacket::MessageChat(msg) => {
@@ -348,10 +591,21 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .unwrap_or_else(|| msg.sender_guid.to_string());
             sh.event(format!("chat|{}|{}|{}", msg.chat_type, who, msg.text));
         }
-        // The world stream is very chatty; only named packets go to the queue,
-        // and the host only drains what its UI needs. Object updates are the
-        // bulk (movement/health), so they are summarized rather than echoed.
-        ServerPacket::UpdateObject { .. } => {}
+        // The world stream is very chatty; object updates are the bulk, so they
+        // are folded into the tracked table rather than echoed as events.
+        ServerPacket::UpdateObject { objects } => {
+            for obj in objects {
+                apply_object(obj, sh);
+            }
+            refresh_player(sh);
+        }
+        ServerPacket::DestroyObject { guid } => {
+            sh.units
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(guid);
+            refresh_player(sh);
+        }
         ServerPacket::LevelUp(_)
         | ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
@@ -488,4 +742,84 @@ pub extern "C" fn bn_net_event(buf: *mut c_char, cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn bn_net_disconnect() -> u32 {
     send_cmd(Cmd::Logout) as u32
+}
+
+/// Fill `out` with the logged-in player's descriptor state. Returns 1 when a
+/// snapshot exists (i.e. the world stream has delivered the player object).
+#[no_mangle]
+pub extern "C" fn bn_net_player(out: *mut BnNetPlayer) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let sh = shared();
+    let player = sh.player.lock().unwrap_or_else(|e| e.into_inner());
+    match player.as_ref() {
+        Some(p) => {
+            unsafe { *out = *p };
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bn_net_self_guid() -> u64 {
+    shared().self_guid.load(Ordering::SeqCst)
+}
+
+/// Number of objects currently tracked from the world stream.
+#[no_mangle]
+pub extern "C" fn bn_net_unit_count() -> u32 {
+    shared()
+        .units
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u32
+}
+
+/// Fill `out` with one tracked object. Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    // Deterministic order: guids sorted, so the host can page through a stable
+    // view while its own hash order is irrelevant.
+    let mut guids: Vec<u64> = units.keys().copied().collect();
+    guids.sort_unstable();
+    let Some(guid) = guids.get(index as usize).copied() else {
+        return 0;
+    };
+    let rec = units.get(&guid).expect("guid from the same map");
+    let f = &rec.fields;
+    let row = BnNetUnit {
+        guid,
+        kind: rec.kind,
+        level: f.unit_level().unwrap_or(0),
+        display_id: f.unit_displayid().unwrap_or(0),
+        health: f.unit_health().unwrap_or(0),
+        max_health: f.unit_max_health().unwrap_or(0),
+        target: f.unit_target().unwrap_or(0),
+        mount: f.unit_mount_display_id(),
+        dead: f.unit_is_dead() as u8,
+        x: rec.pos[0],
+        y: rec.pos[1],
+        z: rec.pos[2],
+        facing: rec.facing,
+    };
+    unsafe { *out = row };
+    1
+}
+
+/// Drop the tracked objects, e.g. after leaving the world.
+#[no_mangle]
+pub extern "C" fn bn_net_units_clear() -> u32 {
+    let sh = shared();
+    sh.units
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    1
 }
