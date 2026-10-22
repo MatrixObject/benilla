@@ -21,6 +21,7 @@ use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use benilla_protocol::messages::{AttackSwingError, Object, ObjectFields, ObjectType, ServerPacket};
 use benilla_protocol::WorldSession;
@@ -357,6 +358,38 @@ impl Default for BnNetAction {
     }
 }
 
+/// An observed cast in progress (`SMSG_SPELL_START` .. `SMSG_SPELL_GO`).
+struct CastState {
+    spell_id: u32,
+    started: Instant,
+    duration_ms: u32,
+    target: u64,
+}
+
+/// One active cast bar as the host draws it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetCast {
+    pub caster: u64,
+    pub spell_id: u32,
+    pub duration_ms: u32,
+    /// Time already spent, clamped to `duration_ms`.
+    pub elapsed_ms: u32,
+    pub target: u64,
+}
+
+impl Default for BnNetCast {
+    fn default() -> Self {
+        Self {
+            caster: 0,
+            spell_id: 0,
+            duration_ms: 0,
+            elapsed_ms: 0,
+            target: 0,
+        }
+    }
+}
+
 /// One tracked object: its descriptor snapshot plus the last known position.
 struct UnitRec {
     kind: u8,
@@ -416,6 +449,9 @@ struct Shared {
     spells: Mutex<Vec<u32>>,
     /// Occupied action-bar slots: (slot, kind, action).
     actions: Mutex<Vec<(u8, u8, u32)>>,
+    /// Casts in flight by caster guid (self included), from SPELL_START until
+    /// SPELL_GO / SPELL_FAILED_OTHER.
+    casts: Mutex<HashMap<u64, CastState>>,
 }
 
 impl Shared {
@@ -468,6 +504,7 @@ fn shared() -> &'static Shared {
         quest_asked: Mutex::new(HashSet::new()),
         spells: Mutex::new(Vec::new()),
         actions: Mutex::new(Vec::new()),
+        casts: Mutex::new(HashMap::new()),
     })
 }
 
@@ -1260,6 +1297,39 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             slots.sort_by_key(|s| s.0);
             *sh.actions.lock().unwrap_or_else(|e| e.into_inner()) = slots;
         }
+        // Cast bars: START opens one, GO / FAILED closes it; pushback moves the
+        // start later, which is exactly how the client shrinks the fill.
+        ServerPacket::SpellStart(s) => {
+            if s.caster != 0 && s.cast_time_ms > 0 {
+                sh.casts.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    s.caster,
+                    CastState {
+                        spell_id: s.spell_id,
+                        started: Instant::now(),
+                        duration_ms: s.cast_time_ms,
+                        target: s.targets.unit_target.unwrap_or(0),
+                    },
+                );
+            }
+        }
+        ServerPacket::SpellGo(g) => {
+            sh.casts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&g.caster);
+        }
+        ServerPacket::SpellFailedOther { caster, .. } => {
+            sh.casts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(caster);
+        }
+        ServerPacket::SpellDelayed { caster, delay_ms } => {
+            let mut casts = sh.casts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = casts.get_mut(caster) {
+                c.started += Duration::from_millis(*delay_ms as u64);
+            }
+        }
         ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
         | ServerPacket::QuestUpdateComplete { .. }
@@ -1619,6 +1689,41 @@ pub extern "C" fn bn_net_action(index: u32, out: *mut BnNetAction) -> u32 {
         slot: *slot,
         kind: *kind,
         action: *action,
+    };
+    unsafe { *out = row };
+    1
+}
+
+/// An active cast by `caster` (0 = the local player). Returns 1 with the
+/// elapsed/duration split the host fills a cast bar with, 0 when idle. Stale
+/// entries (missed GO) expire after their duration plus a second.
+#[no_mangle]
+pub extern "C" fn bn_net_cast_state(caster: u64, out: *mut BnNetCast) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let sh = shared();
+    let guid = if caster != 0 {
+        caster
+    } else {
+        sh.self_guid.load(Ordering::SeqCst)
+    };
+    let mut casts = sh.casts.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = casts.get(&guid) else {
+        return 0;
+    };
+    let elapsed = c.started.elapsed();
+    let dur = c.duration_ms as u64;
+    if elapsed.as_millis() as u64 > dur + 1000 {
+        casts.remove(&guid);
+        return 0;
+    }
+    let row = BnNetCast {
+        caster: guid,
+        spell_id: c.spell_id,
+        duration_ms: c.duration_ms,
+        elapsed_ms: (elapsed.as_millis() as u64).min(dur) as u32,
+        target: c.target,
     };
     unsafe { *out = row };
     1
