@@ -26,10 +26,9 @@ use std::time::{Duration, Instant};
 
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
-    movement as build_movement, MovementInfo, AttackSwingError, CastOutcome, Object, ObjectFields,
-    ObjectType, ServerPacket,
+    AttackSwingError, CastOutcome, CharCreateReq, Object, ObjectFields, ObjectType, ServerPacket,
 };
-use benilla_protocol::wire::Vector3d;
+use benilla_protocol::RealmInfo;
 use benilla_protocol::WorldSession;
 
 /// Stage codes returned by `bn_net_status`.
@@ -64,6 +63,13 @@ pub struct BnNetChar {
     pub equip_display: [u32; 19],
     /// `InventoryType` per slot, same order.
     pub equip_inv: [u8; 19],
+    /// `PLAYER_BYTES`/`PLAYER_BYTES_2` customization: the CharSections
+    /// compositor's input, so a character-select preview can dress the body.
+    pub skin: u8,
+    pub face: u8,
+    pub hair_style: u8,
+    pub hair_color: u8,
+    pub facial_hair: u8,
 }
 
 impl Default for BnNetChar {
@@ -79,6 +85,11 @@ impl Default for BnNetChar {
             zone: 0,
             equip_display: [0; 19],
             equip_inv: [0; 19],
+            skin: 0,
+            face: 0,
+            hair_style: 0,
+            hair_color: 0,
+            facial_hair: 0,
         }
     }
 }
@@ -127,6 +138,35 @@ pub struct BnNetPlayer {
     pub attack_time: u32,
     pub pos: [f32; 3],
     pub facing: f32,
+}
+
+/// One `CMD_REALM_LIST` row as the host draws the server picker.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetRealm {
+    /// `host:port` of the world server, as the client would dial it.
+    pub address: [c_char; 128],
+    /// NUL-terminated UTF-8 realm name.
+    pub name: [c_char; 64],
+    /// This account's character count there, shown as `"(3)"`.
+    pub characters: u8,
+    /// The realm type (a `Cfg_Configs.dbc` row index, not a fixed enum).
+    pub realm_type: u32,
+    /// The realm flags the client holds (0x01 invalid, 0x02 offline, 0x04,
+    /// plus the 0x20/0x40/0x80 Recommended/New/Full bits).
+    pub flags: u8,
+}
+
+impl Default for BnNetRealm {
+    fn default() -> Self {
+        Self {
+            address: [0; 128],
+            name: [0; 64],
+            characters: 0,
+            realm_type: 0,
+            flags: 0,
+        }
+    }
 }
 
 impl Default for BnNetPlayer {
@@ -480,6 +520,55 @@ impl Default for BnNetGiverQuest {
     }
 }
 
+/// One row of a vendor's stock as the host draws it (`SMSG_LIST_INVENTORY`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetVendorRow {
+    /// 1-based list position on the wire (not a `CMSG_BUY_ITEM` argument).
+    pub slot: u32,
+    /// `item_template` entry; resolve the icon through `bn_net_item_info`.
+    pub entry: u32,
+    /// `item_template.display_id` as the server reports it (0 = unknown).
+    pub display_id: u32,
+    /// Remaining stock (0 = sold out); `u32::MAX` = unlimited.
+    pub count: u32,
+    /// Buy price in copper, reputation-discounted by the server.
+    pub price: u32,
+    /// Max durability of the item on purchase (0 = no durability).
+    pub max_durability: u32,
+    /// Copies one purchase grants (`item_template.buy_count`).
+    pub buy_count: u32,
+}
+
+impl Default for BnNetVendorRow {
+    fn default() -> Self {
+        Self {
+            slot: 0, entry: 0, display_id: 0, count: 0,
+            price: 0, max_durability: 0, buy_count: 0,
+        }
+    }
+}
+
+/// The open vendor/shop window (0 rows / guid 0 = closed).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BnNetVendor {
+    /// `guid != 0` = a stock list is showing for this vendor.
+    pub guid: u64,
+    pub count: u32,
+    pub rows: [BnNetVendorRow; 128],
+}
+
+impl Default for BnNetVendor {
+    fn default() -> Self {
+        Self {
+            guid: 0,
+            count: 0,
+            rows: [BnNetVendorRow::default(); 128],
+        }
+    }
+}
+
 /// One selectable reward on a questgiver panel (`ItemDisplayInfo` id included
 /// so the host can paint the icon).
 #[repr(C)]
@@ -713,6 +802,32 @@ enum Cmd {
     GroupDecline,
     /// `CMSG_GROUP_DISBAND`: leave or disband our group.
     GroupDisband,
+    /// `CMSG_LIST_INVENTORY`: open a vendor's stock list.
+    VendorList(u64),
+    /// `CMSG_BUY_ITEM`: buy `count` stacks of the template entry from the vendor.
+    VendorBuy { vendor: u64, entry: u32, count: u8 },
+    /// `CMSG_SELL_ITEM`: sell `count` (0 = whole stack) of our item to the vendor.
+    VendorSell { vendor: u64, item_guid: u64, count: u8 },
+    /// `CMSG_BUYBACK_ITEM`: buy back a previously sold item from the vendor.
+    VendorBuyback { vendor: u64, slot: u32 },
+    /// `CMSG_REPAIR_ITEM`: repair `item_guid` (0 = everything) at the vendor.
+    VendorRepair { vendor: u64, item_guid: u64 },
+    /// `CMSG_CHAR_CREATE` at the character park; the roster is re-asked on
+    /// success (the server streams a fresh `SMSG_CHAR_ENUM` first).
+    CharCreateReq(CharCreateReq),
+    /// `CMSG_CHAR_DELETE` at the character park.
+    CharDelete(u64),
+    /// `CMSG_CHAR_RENAME` for a character the server flagged for it.
+    CharRename { guid: u64, name: String },
+    /// Re-ask the roster (after a create/delete/rename, or on re-entry).
+    RefreshRoster,
+    /// Pick realm `index` and world-connect on its address, replacing the
+    /// default auto-pick; answers with a fresh roster at `ST_CHARS`.
+    RealmPick(u32),
+    /// Log out to the character park on the same link (`SMSG_LOGOUT_COMPLETE`);
+    /// the socket stays authenticated, so a roster ask re-enters without
+    /// re-authenticating.
+    LogoutToRoster,
     Logout,
 }
 
@@ -763,6 +878,30 @@ struct Shared {
     giver: Mutex<BnNetGiver>,
     /// The live group roster plus the pending-invite popup state.
     party: Mutex<BnNetParty>,
+    /// The open vendor/shop window (`SMSG_LIST_INVENTORY` .. closed).
+    vendor: Mutex<BnNetVendor>,
+    /// The account's `CMD_REALM_LIST` rows; the host's server picker reads
+    /// these, and `bn_net_realm_pick` world-connects on the chosen one.
+    realms: Mutex<Vec<RealmInfo>>,
+    /// Bumped whenever `realms` is replaced, so the glue host knows to re-read
+    /// its list (the rows themselves are fetched by index).
+    realms_epoch: AtomicU64,
+    /// Bumped whenever the roster in `chars` is replaced.
+    chars_epoch: AtomicU64,
+    /// The last menu-mode failure the glue host turns into a status dialog.
+    menu_error: Mutex<Option<String>>,
+    /// The last `CMSG_CHAR_CREATE` reply `(name, code)` for the glue host.
+    create_reply: Mutex<Option<(String, u8)>>,
+    /// The last `CMSG_CHAR_DELETE` reply `(guid, code)` for the glue host.
+    delete_reply: Mutex<Option<(u64, u8)>>,
+    /// The last `CMSG_CHAR_RENAME` reply `(guid, name, code)` for the glue host.
+    rename_reply: Mutex<Option<(u64, String, u8)>>,
+    /// The logon credentials `bn_net_connect` started with, kept so
+    /// `bn_net_reconnect` can re-log on without the host re-passing them.
+    creds: Mutex<Option<(String, String, String)>>,
+    /// The last logon's SRP6 session key, so `RealmPick`'s world connect
+    /// re-authenticates on the same key. All-zero when no logon completed.
+    session_key: Mutex<[u8; 40]>,
     /// Latest player pose fed by the host (UE pawn) so the world worker can
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
@@ -807,6 +946,14 @@ impl Shared {
     }
 }
 
+/// Read the shared roster under its lock: `f` maps the rows to its own shape.
+/// The shared state is created lazily, so this always yields `Some`.
+pub(crate) fn with_chars<R>(f: impl FnOnce(&[BnNetChar]) -> R) -> Option<R> {
+    let sh = shared();
+    let rows = sh.chars.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&rows))
+}
+
 fn shared() -> &'static Shared {
     static SHARED: OnceLock<Shared> = OnceLock::new();
     SHARED.get_or_init(|| Shared {
@@ -831,6 +978,16 @@ fn shared() -> &'static Shared {
         loot: Mutex::new(BnNetLoot::default()),
         giver: Mutex::new(BnNetGiver::default()),
         party: Mutex::new(BnNetParty::default()),
+        vendor: Mutex::new(BnNetVendor::default()),
+        realms: Mutex::new(Vec::new()),
+        realms_epoch: AtomicU64::new(0),
+        chars_epoch: AtomicU64::new(0),
+        menu_error: Mutex::new(None),
+        create_reply: Mutex::new(None),
+        delete_reply: Mutex::new(None),
+        rename_reply: Mutex::new(None),
+        creds: Mutex::new(None),
+        session_key: Mutex::new([0u8; 40]),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -870,81 +1027,143 @@ fn name_of<const N: usize>(src: &[c_char; N]) -> String {
 
 // ---- worker ----
 
-fn worker(host: String, user: String, pass: String, rx: std::sync::mpsc::Receiver<Cmd>) {
+/// How the worker treats the realm list. `Auto` is the headless host path: it
+/// world-connects the first realm with characters and stops at the roster.
+/// `Glue` is the in-game menu path: it publishes the realm list and waits for
+/// the UI's `RealmPick`, keeping the realmd link for refreshes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Auto,
+    Glue,
+}
+
+fn worker(
+    host: String,
+    user: String,
+    pass: String,
+    rx: std::sync::mpsc::Receiver<Cmd>,
+    mode: RunMode,
+) {
     let sh = shared();
     sh.set(ST_CONNECTING);
     sh.event(format!("connect|{host}"));
+    *sh.creds.lock().unwrap_or_else(|e| e.into_inner()) = Some((host.clone(), user.clone(), pass.clone()));
 
     let mut logon = match benilla_protocol::logon(&host, &user, &pass, 0) {
         Ok(l) => l,
         Err(e) => {
             sh.event(format!("error|logon|{e}"));
+            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("logon: {e}"));
             sh.set(ST_FAILED);
             return;
         }
     };
     sh.set(ST_LOGON_OK);
     sh.event(format!("logon|ok|{} realms", logon.realms.len()));
+    *sh.realms.lock().unwrap_or_else(|e| e.into_inner()) = logon.realms.clone();
+    sh.realms_epoch.fetch_add(1, Ordering::SeqCst);
+    *sh.session_key.lock().unwrap_or_else(|e| e.into_inner()) = logon.session_key;
 
-    // Pick the realm the player most likely means: the first with characters,
-    // else the first listed (the client's own RealmList picks by name).
-    let Some(realm) = logon
-        .realms
-        .iter()
-        .find(|r| r.characters > 0)
-        .or_else(|| logon.realms.first())
-        .cloned()
-    else {
-        sh.event("error|realms|no realms on this account");
-        sh.set(ST_FAILED);
-        return;
-    };
-    sh.event(format!("realm|{}|{}|{} chars", realm.name, realm.address, realm.characters));
-
-    sh.set(ST_WORLD_CONNECTING);
-    let mut session = match WorldSession::connect(&realm.address, &user, logon.session_key) {
-        Ok(s) => s,
-        Err(e) => {
-            sh.event(format!("error|world|{e}"));
+    let mut session: Option<WorldSession> = None;
+    if mode == RunMode::Auto {
+        // Pick the realm the player most likely means: the first with characters,
+        // else the first listed (the client's own RealmList picks by name).
+        let Some(realm) = logon
+            .realms
+            .iter()
+            .find(|r| r.characters > 0)
+            .or_else(|| logon.realms.first())
+            .cloned()
+        else {
+            sh.event("error|realms|no realms on this account");
+            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("no realms on this account".to_string());
             sh.set(ST_FAILED);
             return;
-        }
-    };
-    // The held realmd socket is only needed for realm-list refreshes; free it.
-    logon.close();
+        };
+        sh.event(format!("realm|{}|{}|{} chars", realm.name, realm.address, realm.characters));
 
-    let chars = match session.char_enum() {
-        Ok(c) => c,
-        Err(e) => {
-            sh.event(format!("error|char_enum|{e}"));
-            sh.set(ST_FAILED);
-            return;
-        }
-    };
-    {
-        let mut out = sh.chars.lock().unwrap_or_else(|e| e.into_inner());
-        out.clear();
-        for c in &chars {
-            let mut row = BnNetChar {
-                guid: c.guid,
-                race: c.race,
-                class: c.class,
-                gender: c.gender,
-                level: c.level,
-                map: c.map,
-                zone: c.zone,
-                ..Default::default()
-            };
-            copy_name(&mut row.name, &c.name);
-            for (i, item) in c.equipment.iter().enumerate().take(19) {
-                row.equip_display[i] = item.display_id;
-                row.equip_inv[i] = item.inventory_type;
+        sh.set(ST_WORLD_CONNECTING);
+        match WorldSession::connect(&realm.address, &user, logon.session_key) {
+            Ok(s) => {
+                session = Some(s);
+                // The held realmd socket is only needed for realm-list refreshes; free it.
+                logon.close();
             }
-            out.push(row);
+            Err(e) => {
+                sh.event(format!("error|world|{e}"));
+                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("world: {e}"));
+                sh.set(ST_FAILED);
+                return;
+            }
+        }
+        match roster(session.as_mut().expect("session"), sh) {
+            Ok(n) => sh.event(format!("chars|{n}")),
+            Err(e) => {
+                sh.event(format!("error|char_enum|{e}"));
+                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("char_enum: {e}"));
+                sh.set(ST_FAILED);
+                return;
+            }
+        }
+    } else {
+        // Glue: the UI's realm list reads `sh.realms`; hold the logon so a
+        // refresh stays possible, and wait for the picked realm.
+        sh.event("realms|ready");
+        loop {
+            match rx.recv() {
+                Ok(Cmd::RealmPick(index)) => {
+                    let realm = {
+                        let realms = sh.realms.lock().unwrap_or_else(|e| e.into_inner());
+                        realms.get(index as usize).cloned()
+                    };
+                    let Some(realm) = realm else {
+                        sh.event(format!("error|realm|{index} out of range"));
+                        continue;
+                    };
+                    sh.event(format!(
+                        "realm|{}|{}|{} chars",
+                        realm.name, realm.address, realm.characters
+                    ));
+                    sh.set(ST_WORLD_CONNECTING);
+                    let key = *sh.session_key.lock().unwrap_or_else(|e| e.into_inner());
+                    match WorldSession::connect(&realm.address, &user, key) {
+                        Ok(mut s) => match roster(&mut s, sh) {
+                            Ok(n) => {
+                                sh.event(format!("chars|{n}"));
+                                logon.close();
+                                session = Some(s);
+                                break;
+                            }
+                            Err(e) => {
+                                sh.event(format!("error|char_enum|{e}"));
+                                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(format!("char_enum: {e}"));
+                                sh.set(ST_LOGON_OK);
+                            }
+                        },
+                        Err(e) => {
+                            sh.event(format!("error|world|{e}"));
+                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("world: {e}"));
+                            sh.set(ST_LOGON_OK);
+                        }
+                    }
+                }
+                Ok(Cmd::Logout) | Err(_) => {
+                    sh.event("closed|roster");
+                    logon.close();
+                    sh.set(ST_IDLE);
+                    return;
+                }
+                Ok(_) => {}
+            }
         }
     }
-    sh.set(ST_CHARS);
-    sh.event(format!("chars|{}", chars.len()));
+    let mut session = session.expect("session");
+
 
     // Wait for the host to choose a character. The socket stays authenticated;
     // no read deadline is set, so an idle roster does not time out.
@@ -967,10 +1186,152 @@ fn worker(host: String, user: String, pass: String, rx: std::sync::mpsc::Receive
                     }
                     Err(e) => {
                         sh.event(format!("error|player_login|{e}"));
+                        if mode == RunMode::Glue {
+                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("player_login: {e}"));
+                            sh.set(ST_CHARS);
+                            continue;
+                        }
                         sh.set(ST_FAILED);
                     }
                 }
                 return;
+            }
+            Ok(Cmd::RefreshRoster) => {
+                match roster(&mut session, sh) {
+                    Ok(n) => sh.event(format!("chars|{n}")),
+                    Err(e) => {
+                        sh.event(format!("error|char_enum|{e}"));
+                        if mode == RunMode::Glue {
+                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("char_enum: {e}"));
+                            sh.set(ST_CHARS);
+                            continue;
+                        }
+                        sh.set(ST_FAILED);
+                        return;
+                    }
+                }
+            }
+            Ok(Cmd::CharCreateReq(req)) => {
+                match session.create_character(&req) {
+                    Ok(code) => {
+                        // A success streams a fresh roster; a refusal is the
+                        // name-in-use / limit byte the host's dialog shows.
+                        sh.event(format!("char_create|{}|{code}", req.name));
+                        *sh.create_reply.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((req.name.clone(), code));
+                        if code == 0x2E {
+                            if let Err(e) = roster(&mut session, sh) {
+                                sh.event(format!("error|char_enum|{e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        sh.event(format!("error|char_create|{e}"));
+                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("char_create: {e}"));
+                    }
+                }
+            }
+            Ok(Cmd::CharDelete(guid)) => {
+                match session.delete_character(guid) {
+                    Ok(code) => {
+                        sh.event(format!("char_delete|{guid}|{code}"));
+                        *sh.delete_reply.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((guid, code));
+                        // A success takes the row out of the roster the screen shows.
+                        if code == 0x39 {
+                            if let Err(e) = roster(&mut session, sh) {
+                                sh.event(format!("error|char_enum|{e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        sh.event(format!("error|char_delete|{e}"));
+                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("char_delete: {e}"));
+                    }
+                }
+            }
+            Ok(Cmd::CharRename { guid, name }) => {
+                match session.rename_character(guid, &name) {
+                    Ok((code, renamed)) => {
+                        if let Some((g, n)) = renamed {
+                            sh.event(format!("char_rename|{g}|{n}|{code}"));
+                        } else {
+                            sh.event(format!("char_rename|{guid}|{code}"));
+                        }
+                        *sh.rename_reply.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((guid, name.clone(), code));
+                        if code == 0x2E {
+                            if let Err(e) = roster(&mut session, sh) {
+                                sh.event(format!("error|char_enum|{e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        sh.event(format!("error|char_rename|{e}"));
+                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("char_rename: {e}"));
+                    }
+                }
+            }
+            Ok(Cmd::RealmPick(index)) => {
+                let realm = {
+                    let realms = sh.realms.lock().unwrap_or_else(|e| e.into_inner());
+                    realms.get(index as usize).cloned()
+                };
+                let Some(realm) = realm else {
+                    sh.event(format!("error|realm|{index} out of range"));
+                    continue;
+                };
+                sh.event(format!("realm|{}|{}|{} chars", realm.name, realm.address, realm.characters));
+                // World-connect on the chosen address; the old session's socket
+                // closes when `session` is replaced below.
+                sh.set(ST_WORLD_CONNECTING);
+                let key = *sh.session_key.lock().unwrap_or_else(|e| e.into_inner());
+                match WorldSession::connect(&realm.address, &user, key) {
+                    Ok(s) => {
+                        session = s;
+                        if let Err(e) = roster(&mut session, sh) {
+                            sh.event(format!("error|char_enum|{e}"));
+                            if mode == RunMode::Glue {
+                                sh.set(ST_LOGON_OK);
+                                continue;
+                            }
+                            sh.set(ST_FAILED);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        sh.event(format!("error|world|{e}"));
+                        if mode == RunMode::Glue {
+                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("world: {e}"));
+                            sh.set(ST_LOGON_OK);
+                            continue;
+                        }
+                        sh.set(ST_FAILED);
+                        return;
+                    }
+                }
+            }
+            Ok(Cmd::LogoutToRoster) => {
+                match session.logout(Duration::from_secs(2)) {
+                    Ok(()) => {
+                        // `SMSG_LOGOUT_COMPLETE`: the link is back at the park;
+                        // the roster is re-asked so the host's screen refreshes.
+                        sh.event("logout|roster");
+                        *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        if let Err(e) = roster(&mut session, sh) {
+                            sh.event(format!("error|char_enum|{e}"));
+                            sh.set(ST_FAILED);
+                            return;
+                        }
+                    }
+                    Err(e) => sh.event(format!("error|logout|{e}")),
+                }
             }
             Ok(Cmd::Logout) | Err(_) => {
                 sh.event("closed|roster");
@@ -980,6 +1341,44 @@ fn worker(host: String, user: String, pass: String, rx: std::sync::mpsc::Receive
             Ok(_) => {}   // world commands before entering are meaningless
         }
     }
+}
+
+/// Ask `CMSG_CHAR_ENUM` and fill the shared roster; returns its row count.
+fn roster(
+    session: &mut WorldSession,
+    sh: &Shared,
+) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let chars = session.char_enum()?;
+    {
+        let mut out = sh.chars.lock().unwrap_or_else(|e| e.into_inner());
+        out.clear();
+        for c in &chars {
+            let mut row = BnNetChar {
+                guid: c.guid,
+                race: c.race,
+                class: c.class,
+                gender: c.gender,
+                level: c.level,
+                map: c.map,
+                zone: c.zone,
+                skin: c.skin,
+                face: c.face,
+                hair_style: c.hair_style,
+                hair_color: c.hair_color,
+                facial_hair: c.facial_hair,
+                ..Default::default()
+            };
+            copy_name(&mut row.name, &c.name);
+            for (i, item) in c.equipment.iter().enumerate().take(19) {
+                row.equip_display[i] = item.display_id;
+                row.equip_inv[i] = item.inventory_type;
+            }
+            out.push(row);
+        }
+    }
+    sh.set(ST_CHARS);
+    sh.chars_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok(chars.len())
 }
 
 /// Pump the world stream: one `recv` with a short deadline per loop so queued
@@ -1116,13 +1515,47 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         sh.event(format!("error|group|{e}"));
                     }
                 }
+                Ok(Cmd::VendorList(vendor)) => {
+                    sh.vendor.lock().unwrap_or_else(|e| e.into_inner()).guid = 0;
+                    if let Err(e) = session.list_inventory(vendor) {
+                        sh.event(format!("error|vendor|list|{e}"));
+                    }
+                }
+                Ok(Cmd::VendorBuy { vendor, entry, count }) => {
+                    if let Err(e) = session.buy_item(vendor, entry, count) {
+                        sh.event(format!("error|vendor|buy|{e}"));
+                    }
+                }
+                Ok(Cmd::VendorSell { vendor, item_guid, count }) => {
+                    if let Err(e) = session.sell_item(vendor, item_guid, count) {
+                        sh.event(format!("error|vendor|sell|{e}"));
+                    }
+                }
+                Ok(Cmd::VendorBuyback { vendor, slot }) => {
+                    if let Err(e) = session.buyback_item(vendor, slot) {
+                        sh.event(format!("error|vendor|buyback|{e}"));
+                    }
+                }
+                Ok(Cmd::VendorRepair { vendor, item_guid }) => {
+                    if let Err(e) = session.repair_item(vendor, item_guid) {
+                        sh.event(format!("error|vendor|repair|{e}"));
+                    }
+                    sh.event(format!("vendor|repair|{vendor}|{item_guid}"));
+                }
                 Ok(Cmd::Logout) | Err(TryRecvError::Disconnected) => {
                     let _ = session.logout(std::time::Duration::from_secs(2));
                     sh.event("closed|world");
                     sh.set(ST_IDLE);
                     return;
                 }
-                Ok(Cmd::Enter(_)) => {}
+                // Park-only verbs: meaningless in-world, so no-ops here.
+                Ok(Cmd::CharCreateReq(_))
+                | Ok(Cmd::CharDelete(_))
+                | Ok(Cmd::CharRename { .. })
+                | Ok(Cmd::RefreshRoster)
+                | Ok(Cmd::RealmPick(_))
+                | Ok(Cmd::LogoutToRoster)
+                | Ok(Cmd::Enter(_)) => {}
                 Err(TryRecvError::Empty) => break,
             }
         }
@@ -1276,6 +1709,21 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
 
         match session.recv() {
             Ok(packet) => {
+                // NewWorld / TransferPending: the server has announced a map change.
+                // The 1.12 client must ack immediately with MSG_MOVE_WORLDPORT_ACK
+                // (empty body) so mangosd advances to PLAYER_STATE_LOGGED_IN;
+                // without it the socket is dropped after the next update tick.
+                match &packet {
+                    ServerPacket::NewWorld { .. }
+                    | ServerPacket::TransferPending { .. } => {
+                        if let Err(e) = session.worldport_ack() {
+                            sh.event(format!("error|worldport_ack|{e}"));
+                        } else {
+                            sh.event("worldport_ack");
+                        }
+                    }
+                    _ => {}
+                }
                 handle_packet(&packet, sh);
                 flush_item_queries(session, sh);
                 queue_self_quests(session, sh);
@@ -2138,6 +2586,49 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         ServerPacket::QuestGiverFailed { .. } => {
             sh.event("giver|failed".to_string());
         }
+        // ---- vendor / shop ----
+        ServerPacket::VendorList { vendor, items } => {
+            let mut win = BnNetVendor { guid: *vendor, ..Default::default() };
+            let n = items.len().min(win.rows.len());
+            for i in 0..n {
+                let it = &items[i];
+                win.rows[i] = BnNetVendorRow {
+                    slot: it.slot,
+                    entry: it.entry,
+                    display_id: it.display_id,
+                    count: it.current_count,
+                    price: it.price,
+                    max_durability: it.max_durability,
+                    buy_count: it.buy_count,
+                };
+                if it.entry != 0 {
+                    let mut asked = sh.item_asked.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    if asked.insert(it.entry) { queue.push(it.entry); }
+                }
+            }
+            win.count = n as u32;
+            *sh.vendor.lock().unwrap_or_else(|e| e.into_inner()) = win;
+            sh.event(format!("vendor|open|{vendor}|{n}"));
+        }
+        ServerPacket::BuyItem { vendor, slot, new_count, purchase_count } => {
+            // The purchase is applied through the next SMSG_UPDATE_OBJECT; the
+            // stock row refreshes in place so the host can redraw the price.
+            let mut win = sh.vendor.lock().unwrap_or_else(|e| e.into_inner());
+            let i = (*slot as usize).saturating_sub(1);
+            if i < win.rows.len() { win.rows[i].count = *new_count; }
+            sh.event(format!(
+                "vendor|bought|{vendor}|slot={slot}|new_stock={new_count}|count={purchase_count}"
+            ));
+        }
+        ServerPacket::SellItemResult { vendor, item_guid, reason } => {
+            // Successful sells are silent (the server only shows them in the
+            // player's own UPDATE_OBJECT), so a SELL packet means a refusal.
+            sh.event(format!("vendor|sellfail|{vendor}|{item_guid}|{reason}"));
+        }
+        ServerPacket::BuyFailed { vendor, item_entry, reason } => {
+            sh.event(format!("vendor|buyfail|{vendor}|{item_entry}|{reason}"));
+        }
         // The server's verdict on our own cast: failures are reported to the
         // host as `castfail|spell|reason|arg` (reason = SpellCastResult), while
         // a success needs no event (the SpellStart/SpellGo pair follows).
@@ -2365,15 +2856,26 @@ fn cstr(ptr: *const c_char) -> Option<String> {
     unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(|s| s.to_owned())
 }
 
+/// `std::env::var` as an `Option` (an empty value is `Some("")`).
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Start a login on a worker thread. `host` is the realmd address ("host" or
-/// "host:port"), `user`/`pass` the account. Returns 1 when the worker started.
+/// "host:port"), `user`/`pass` the account. Empty strings fall back to the
+/// `WOW_HOST` / `WOW_USER` / `WOW_PASS` environment variables, so the host can
+/// call `bn_net_connect("", "", "")` for an env-driven logon. Returns 1 when
+/// the worker started.
 #[no_mangle]
 pub extern "C" fn bn_net_connect(
     host: *const c_char,
     user: *const c_char,
     pass: *const c_char,
 ) -> u32 {
-    let (Some(host), Some(user), Some(pass)) = (cstr(host), cstr(user), cstr(pass)) else {
+    let host = cstr(host).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_HOST"));
+    let user = cstr(user).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_USER"));
+    let pass = cstr(pass).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_PASS"));
+    let (Some(host), Some(user), Some(pass)) = (host, user, pass) else {
         return 0;
     };
     {
@@ -2386,7 +2888,7 @@ pub extern "C" fn bn_net_connect(
         std::thread::Builder::new()
             .name("bn-net".into())
             .spawn(move || {
-                worker(host, user, pass, rx);
+                worker(host, user, pass, rx, RunMode::Auto);
                 let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
                 *guard = None;
             })
@@ -2394,6 +2896,151 @@ pub extern "C" fn bn_net_connect(
     }
     1
 }
+
+// ---- glue-menu helpers (the frame's host drives the login flow) ----
+
+/// One read of the worker's menu state for the glue host.
+pub(crate) struct MenuSnapshot {
+    pub status: u32,
+    pub realms_epoch: u64,
+    pub chars_epoch: u64,
+    /// 1 while the worker thread is alive (commands channel still open).
+    pub alive: bool,
+}
+
+pub(crate) fn menu_snapshot() -> MenuSnapshot {
+    let sh = shared();
+    let alive = commands()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    MenuSnapshot {
+        status: sh.status(),
+        realms_epoch: sh.realms_epoch.load(Ordering::SeqCst),
+        chars_epoch: sh.chars_epoch.load(Ordering::SeqCst),
+        alive,
+    }
+}
+
+pub(crate) fn menu_realms() -> Vec<RealmInfo> {
+    shared()
+        .realms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(crate) fn menu_chars() -> Vec<BnNetChar> {
+    shared()
+        .chars
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Index of `name` in the published realm list (the list rows are also read by
+/// index, so a picked realm maps straight back).
+pub(crate) fn menu_realm_index(name: &str) -> Option<u32> {
+    let realms = shared().realms.lock().unwrap_or_else(|e| e.into_inner());
+    realms
+        .iter()
+        .position(|r| r.name.eq_ignore_ascii_case(name))
+        .map(|i| i as u32)
+}
+
+/// Start a glue-mode login: publish the realmd realm list and wait for a
+/// `RealmPick` from the menu instead of auto-connecting. Fails when a session
+/// is already running.
+pub(crate) fn menu_login(host: &str, user: &str, pass: &str) -> bool {
+    let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_some() {
+        return false;   // a session is already running
+    }
+    let (tx, rx) = channel();
+    *guard = Some(tx);
+    let (host, user, pass) = (host.to_string(), user.to_string(), pass.to_string());
+    std::thread::Builder::new()
+        .name("bn-net".into())
+        .spawn(move || {
+            worker(host, user, pass, rx, RunMode::Glue);
+            let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        })
+        .ok();
+    true
+}
+
+/// 1 while a worker owns the session (login in flight or the menu's link up).
+pub(crate) fn menu_active() -> bool {
+    commands()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+pub(crate) fn menu_pick_realm(index: u32) -> bool {
+    send_cmd(Cmd::RealmPick(index))
+}
+
+/// Drop the menu's link at the worker (the logon or the held realmd socket).
+pub(crate) fn menu_logout() -> bool {
+    send_cmd(Cmd::Logout)
+}
+
+pub(crate) fn menu_enter(guid: u64) -> bool {
+    send_cmd(Cmd::Enter(guid))
+}
+
+pub(crate) fn menu_refresh_roster() -> bool {
+    send_cmd(Cmd::RefreshRoster)
+}
+
+pub(crate) fn menu_create_character(req: CharCreateReq) -> bool {
+    send_cmd(Cmd::CharCreateReq(req))
+}
+
+pub(crate) fn menu_delete_character(guid: u64) -> bool {
+    send_cmd(Cmd::CharDelete(guid))
+}
+
+pub(crate) fn menu_rename_character(guid: u64, name: String) -> bool {
+    send_cmd(Cmd::CharRename { guid, name })
+}
+
+pub(crate) fn menu_take_error() -> Option<String> {
+    shared()
+        .menu_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+pub(crate) fn menu_take_create_reply() -> Option<(String, u8)> {
+    shared()
+        .create_reply
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+pub(crate) fn menu_take_delete_reply() -> Option<(u64, u8)> {
+    shared()
+        .delete_reply
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+pub(crate) fn menu_take_rename_reply() -> Option<(u64, String, u8)> {
+    shared()
+        .rename_reply
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+#[allow(dead_code)]
+const _BN_NET_PATCH_V1: () = ();
 
 #[no_mangle]
 pub extern "C" fn bn_net_status() -> u32 {
@@ -2427,6 +3074,152 @@ pub extern "C" fn bn_net_char(index: u32, out: *mut BnNetChar) -> u32 {
 #[no_mangle]
 pub extern "C" fn bn_net_enter(guid: u64) -> u32 {
     send_cmd(Cmd::Enter(guid)) as u32
+}
+
+/// The account's realm list (the host's server picker). 0 when no logon has
+/// completed.
+#[no_mangle]
+pub extern "C" fn bn_net_realm_count() -> u32 {
+    shared()
+        .realms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u32
+}
+
+/// Fill `out` with the i-th realm row. Returns 1 on success.
+#[no_mangle]
+pub extern "C" fn bn_net_realm(index: u32, out: *mut BnNetRealm) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let realms = shared().realms.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = realms.get(index as usize) else {
+        return 0;
+    };
+    let mut row = BnNetRealm::default();
+    copy_name(&mut row.address, &r.address);
+    copy_name(&mut row.name, &r.name);
+    row.characters = r.characters;
+    row.realm_type = r.realm_type;
+    row.flags = r.flags;
+    unsafe {
+        *out = row;
+    }
+    1
+}
+
+/// World-connect on realm `index`'s address and re-read the roster. Returns 1
+/// when the pick was queued (the answer is a fresh `chars|N` event line at
+/// `ST_CHARS`).
+#[no_mangle]
+pub extern "C" fn bn_net_realm_pick(index: u32) -> u32 {
+    send_cmd(Cmd::RealmPick(index)) as u32
+}
+
+/// Create a character. `name` is NUL-terminated; the appearance bytes are the
+/// `CharSections` indices the host's char-create form collects. The result byte
+/// answers as `char_create|<name>|<code>` on the event queue; a 0x2E (success)
+/// is followed by a fresh `chars|N` roster.
+#[no_mangle]
+pub extern "C" fn bn_net_char_create(
+    name: *const c_char,
+    race: u8,
+    class: u8,
+    gender: u8,
+    skin: u8,
+    face: u8,
+    hair: u8,
+    hair_color: u8,
+    facial: u8,
+) -> u32 {
+    let Some(name) = cstr(name) else {
+        return 0;
+    };
+    if name.is_empty() {
+        return 0;
+    }
+    send_cmd(Cmd::CharCreateReq(CharCreateReq {
+        name,
+        race,
+        class,
+        gender,
+        skin,
+        face,
+        hair_style: hair,
+        hair_color,
+        facial_hair: facial,
+    })) as u32
+}
+
+/// Delete a roster character. Answers as `char_delete|<guid>|<code>`.
+#[no_mangle]
+pub extern "C" fn bn_net_char_delete(guid: u64) -> u32 {
+    if guid == 0 {
+        return 0;
+    }
+    send_cmd(Cmd::CharDelete(guid)) as u32
+}
+
+/// Rename a character the server flagged for it. Answers as
+/// `char_rename|<guid>|<code>`, and a success re-reads the roster.
+#[no_mangle]
+pub extern "C" fn bn_net_char_rename(guid: u64, name: *const c_char) -> u32 {
+    let Some(name) = cstr(name) else {
+        return 0;
+    };
+    if name.is_empty() {
+        return 0;
+    }
+    send_cmd(Cmd::CharRename { guid, name }) as u32
+}
+
+/// Re-ask the roster (after the host's own refresh, or re-entry to the park).
+#[no_mangle]
+pub extern "C" fn bn_net_refresh_roster() -> u32 {
+    send_cmd(Cmd::RefreshRoster) as u32
+}
+
+/// Log out to the character park on the same link (a `bn_net_send` kind 9 in
+/// the world does the in-world logout; this one is the park's own back
+/// button). Answers as `logout|roster` plus a fresh roster at `ST_CHARS`.
+#[no_mangle]
+pub extern "C" fn bn_net_logout_to_roster() -> u32 {
+    send_cmd(Cmd::LogoutToRoster) as u32
+}
+
+/// Re-login with the cached `bn_net_connect` credentials: drops any session
+/// (roster or world) and starts a fresh worker on the same host/account.
+/// The answer is the usual `logon|ok` / `chars|N` event cascade. 0 when there
+/// is nothing cached yet.
+#[no_mangle]
+pub extern "C" fn bn_net_reconnect() -> u32 {
+    let creds = shared().creds.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some((host, user, pass)) = creds else {
+        return 0;
+    };
+    // Close whatever link is running first, so only one worker owns the state.
+    let _ = send_cmd(Cmd::Logout);
+    let _ = send_cmd(Cmd::LogoutToRoster);
+    // Give the running worker a beat to notice its close before we restart.
+    std::thread::sleep(Duration::from_millis(50));
+    {
+        let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return 0;
+        }
+        let (tx, rx) = channel();
+        *guard = Some(tx);
+        std::thread::Builder::new()
+            .name("bn-net".into())
+            .spawn(move || {
+                worker(host, user, pass, rx, RunMode::Auto);
+                let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+            })
+            .ok();
+    }
+    1
 }
 
 /// Kernel for every in-world action:
@@ -2514,6 +3307,27 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             _ => return 0,
         },
         27 => Cmd::GroupDecline,
+        // 28 = open the vendor's stock list (a = vendor guid); answers as
+        // `vendor|open|...` on the event queue.
+        // 29 = buy (a = vendor guid, b = entry | ((count-1) << 16), 1..256).
+        // 30 = sell whole stack (a = our item guid, b = vendor guid).
+        // 31 = buyback (a = vendor guid, b = absolute buyback slot 69..80).
+        // 32 = repair one item (a = item guid, b = vendor guid).
+        // 33 = repair everything (a = vendor guid, b = 0).
+        28 => Cmd::VendorList(a),
+        29 => Cmd::VendorBuy {
+            vendor: a,
+            entry: (b & 0xFFFF) as u32,
+            count: (((b >> 16) & 0xFF) as u8).max(1),
+        },
+        30 => Cmd::VendorSell {
+            vendor: b as u64,
+            item_guid: a,
+            count: 0,
+        },
+        31 => Cmd::VendorBuyback { vendor: a, slot: b },
+        32 => Cmd::VendorRepair { vendor: b as u64, item_guid: a },
+        33 => Cmd::VendorRepair { vendor: a, item_guid: 0 },
         _ => return 0,
     };
     send_cmd(cmd) as u32
@@ -2547,6 +3361,20 @@ pub extern "C" fn bn_net_group(out: *mut BnNetParty) -> u32 {
         *out = party;
     }
     active as u32
+}
+
+/// The open vendor/shop window; returns the number of stock rows (0 = closed).
+#[no_mangle]
+pub extern "C" fn bn_net_vendor(out: *mut BnNetVendor) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let window = *shared().vendor.lock().unwrap_or_else(|e| e.into_inner());
+    let count = window.count;
+    unsafe {
+        *out = window;
+    }
+    count
 }
 
 /// The open questgiver window. Returns its mode (0 closed, 1 menu,

@@ -20,6 +20,11 @@ use std::collections::HashMap;
 
 use std::ffi::c_char;
 
+use benilla_ui::script::{
+    GossipMenu, GossipOptionView, GossipQuestRow, MerchantItem, MerchantState,
+    QuestPanel, QuestState,
+};
+
 // ---- WoW <-> UE5 coordinate-system converter (single source of truth) ----
 
 mod coords;
@@ -6468,6 +6473,159 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
+/// Dump the visible 3D model panes (character-select / character-create
+/// previews) as TSV, one row per pane:
+/// `P handle kind name left top right bottom alpha guid display facing model
+/// looksrc race sex skin face hair hair_color facial g0..g7 ffx`.
+/// Coordinates are the VM's own (root 1365.3x768, y up); the host converts.
+/// `looksrc` is `char` (roster subject), `create` (the glue create screen's
+/// dress-up state), `file` (`SetModel`) or `none`. Returns bytes written
+/// (0 = no session or no visible model pane).
+#[no_mangle]
+pub extern "C" fn bn_ui_panes(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let text = {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BN_UI.with(|slot| {
+                let mut held = slot.borrow_mut();
+                let s = held.as_mut()?;
+                s.resolve();
+                let panes = s.character_panes();
+                let mut subjects = std::collections::HashMap::new();
+                for p in &panes {
+                    subjects.insert(p.handle, (p.guid, p.display, p.kind));
+                }
+                let create = s.glue_create_look();
+                let roster: std::collections::HashMap<u64, net::BnNetChar> =
+                    net::with_chars(|rows| rows.iter().map(|r| (r.guid, *r)).collect())
+                        .unwrap_or_default();
+                let mut text = String::new();
+                for q in s.extract() {
+                    let benilla_ui::script::QuadContent::ModelPane {
+                        handle,
+                        name,
+                        model,
+                        facing,
+                        ffx,
+                        ..
+                    } = q.content
+                    else {
+                        continue;
+                    };
+                    let Some(rect) = q.rect else {
+                        continue;
+                    };
+                    let (guid, display, kind) =
+                        subjects.get(&handle).copied().unwrap_or((0, 0, benilla_ui::widget::FrameKind::Model));
+                    let (mut race, mut sex, mut skin, mut face) = (0u32, 0u32, 0u32, 0u32);
+                    let (mut hair, mut hair_color, mut facial) = (0u32, 0u32, 0u32);
+                    let mut gear = [0u32; 8];
+                    let mut looks = "none";
+                    if guid != 0 {
+                        if let Some(row) = roster.get(&guid) {
+                            race = row.race as u32;
+                            sex = row.gender as u32;
+                            skin = row.skin as u32;
+                            face = row.face as u32;
+                            hair = row.hair_style as u32;
+                            hair_color = row.hair_color as u32;
+                            facial = row.facial_hair as u32;
+                            // Body slots in the enum's equipment order:
+                            // shirt, chest, belt, pants, boots, wrist, gloves, tabard.
+                            gear = [
+                                row.equip_display[3],
+                                row.equip_display[4],
+                                row.equip_display[5],
+                                row.equip_display[6],
+                                row.equip_display[7],
+                                row.equip_display[8],
+                                row.equip_display[9],
+                                row.equip_display[18],
+                            ];
+                            looks = "char";
+                        }
+                    } else if display == 0 {
+                        if let Some(c) = create {
+                            race = c.race as u32;
+                            sex = c.sex as u32;
+                            skin = c.skin as u32;
+                            face = c.face as u32;
+                            hair = c.hair_style as u32;
+                            hair_color = c.hair_color as u32;
+                            facial = c.facial_hair as u32;
+                            looks = "create";
+                        }
+                    }
+                    if model.is_some() && guid == 0 {
+                        looks = "file";
+                    }
+                    let kind_no = match kind {
+                        benilla_ui::widget::FrameKind::Model => 0,
+                        benilla_ui::widget::FrameKind::PlayerModel => 1,
+                        benilla_ui::widget::FrameKind::DressUpModel => 2,
+                        benilla_ui::widget::FrameKind::TabardModel => 3,
+                        _ => 0,
+                    };
+                    let clean = |v: &str| -> String {
+                        v.chars()
+                            .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
+                            .collect()
+                    };
+                    text.push_str(&format!(
+                        "P\t{:?}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{},{},{},{},{}\t{}\n",
+                        handle,
+                        kind_no,
+                        name.as_deref().map(clean).unwrap_or_default(),
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                        q.alpha,
+                        guid,
+                        display,
+                        facing,
+                        model.as_deref().map(clean).unwrap_or_default(),
+                        looks,
+                        race,
+                        sex,
+                        skin,
+                        face,
+                        hair,
+                        hair_color,
+                        facial,
+                        gear[0],
+                        gear[1],
+                        gear[2],
+                        gear[3],
+                        gear[4],
+                        gear[5],
+                        gear[6],
+                        gear[7],
+                        if ffx { 1 } else { 0 },
+                    ));
+                }
+                Some(text)
+            })
+        }));
+        match out {
+            Ok(Some(t)) => t,
+            _ => return 0,
+        }
+    };
+    if text.is_empty() {
+        return 0;
+    }
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(cap as usize - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
 /// Visible lines of one message frame (chat / error text), one TSV row each:
 /// `left top right bottom r g b a font height text` (VM root units, y up).
 /// These live in the widget's ring, which the region-walking dump cannot see;
@@ -6615,98 +6773,391 @@ pub extern "C" fn bn_ui_text_bitmap(
 // through the same `bn_ui_dump` as the in-game UI.
 
 use benilla_ui::script::{
-    GlueCall, GlueCharacter, GlueHost, GlueNotice, GlueSignal, GlueText, NoticeState, ScriptValue,
-    UiScript,
+    GlueCall, GlueCharacter, GlueCreateCatalog, GlueCreateClass, GlueCreateCounts, GlueCreateRace,
+    GlueHost, GlueNameRow, GlueNotice, GlueRealm, GlueRealmCategory, GlueRealmType, GlueSignal,
+    GlueText, NoticeState, ScriptValue, UiScript,
 };
 
-/// Side-channel ops the stub host queues while a verb's call fan-out holds the
-/// script: the fake roster (loaded by the next `bn_ui_tick`) and the events the
-/// render host polls.
+/// The DBC catalogs the glue screens read: the create screen's races/classes/
+/// customization counts and the roster's race/class/zone/model strings. Loaded
+/// once with the glue VM.
 #[derive(Default)]
-struct MenuPending {
-    roster: Option<Vec<GlueCharacter>>,
+struct GlueCatalogs {
+    create: Option<benilla_formats::CharCreateCatalog>,
+    classes: Option<benilla_formats::ChrClasses>,
+    factions: Option<benilla_formats::FactionCatalog>,
+    areas: Option<benilla_formats::AreaTableCatalog>,
+    creatures: Option<benilla_formats::CreatureCatalog>,
+}
+
+/// The menu's bridge between the network worker and the glue VM: the worker
+/// state already applied, the pending roster fetch, the realm the screen picked
+/// and the status dialog the host raised.
+struct MenuSync {
+    last_status: u32,
+    last_realms_epoch: u64,
+    last_chars_epoch: u64,
+    pending_roster: bool,
+    roster_epoch_at_request: u64,
+    realm_index: Option<u32>,
+    dialog: Option<&'static str>,
+    realms_refresh: bool,
     events: Vec<String>,
+    realm_address: String,
+    catalogs: GlueCatalogs,
+}
+
+impl Default for MenuSync {
+    fn default() -> Self {
+        MenuSync {
+            last_status: u32::MAX,
+            last_realms_epoch: 0,
+            last_chars_epoch: 0,
+            pending_roster: false,
+            roster_epoch_at_request: 0,
+            realm_index: None,
+            dialog: None,
+            realms_refresh: false,
+            events: Vec::new(),
+            realm_address: String::new(),
+            catalogs: GlueCatalogs::default(),
+        }
+    }
 }
 
 thread_local! {
-    static BN_MENU: RefCell<MenuPending> =
-        const { RefCell::new(MenuPending { roster: None, events: Vec::new() }) };
+    static BN_MENU: RefCell<MenuSync> = RefCell::new(MenuSync::default());
 }
 
-/// The menu's `CGlueMgr` host, offline: every screen transition the reference
-/// would reach through the login server happens in place, and the one step that
-/// needs a world server (entering the world) becomes a queued event instead.
+fn open_key(which: &'static str, key: &'static str) -> GlueSignal {
+    GlueSignal::Open {
+        which,
+        text: Some(GlueText::Key(key)),
+        data: None,
+    }
+}
+
+fn open_raw(which: &'static str, text: String) -> GlueSignal {
+    GlueSignal::Open {
+        which,
+        text: Some(GlueText::Raw(text)),
+        data: None,
+    }
+}
+
+fn set_dialog(which: Option<&'static str>) {
+    BN_MENU.with(|m| m.borrow_mut().dialog = which);
+}
+
+/// The `FactionGroup` rows whose bit the race template's mask holds.
+fn faction_groups<'a>(
+    factions: &'a benilla_formats::FactionCatalog,
+    template: &'a benilla_formats::FactionTemplate,
+) -> impl Iterator<Item = &'a benilla_formats::FactionGroupRow> {
+    factions
+        .faction_groups()
+        .iter()
+        .filter(|g| g.mask_id != 0 && template.group_mask & 1u32.wrapping_shl(g.mask_id) != 0)
+}
+
+/// `0x5ec480`: the race's body display for a sex, then that display's model row.
+fn display_resolves(cats: &GlueCatalogs, display: u32) -> bool {
+    let Some(creatures) = cats.creatures.as_ref() else {
+        return false;
+    };
+    let models: std::collections::HashSet<u32> =
+        creatures.sized_models().map(|(id, _, _)| id).collect();
+    creatures
+        .display_models()
+        .any(|(d, m)| d == display && models.contains(&m))
+}
+
+/// The create screen's catalog, assembled the way the glue build walks it
+/// (`0x470430`, `create_catalog` in benilla-app).
+fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
+    let mut catalog = GlueCreateCatalog::default();
+    let Some(create) = cats.create.as_ref() else {
+        return catalog;
+    };
+    let Some(factions) = cats.factions.as_ref() else {
+        return catalog;
+    };
+    for side in ["Alliance", "Horde"] {
+        for row in create.race_rows() {
+            if row.flags & 0x1 != 0 {
+                continue;
+            }
+            let Some(template) = factions.template(row.faction) else {
+                continue;
+            };
+            for _ in faction_groups(factions, template)
+                .filter(|g| g.internal.eq_ignore_ascii_case(side))
+            {
+                let id = row.id;
+                let token = |t: Option<&str>| t.unwrap_or_default().to_string();
+                catalog.races.push(GlueCreateRace {
+                    id,
+                    name: token(create.race_name(id)),
+                    file: token(create.race_file(id)),
+                    faction: faction_groups(factions, template)
+                        .next()
+                        .map(|g| (g.name.clone(), g.internal.clone())),
+                    tokens: [
+                        token(create.facial_hair_customization(id, 0)),
+                        token(create.facial_hair_customization(id, 1)),
+                        token(create.hair_customization(id)),
+                    ],
+                });
+            }
+        }
+    }
+    for race in catalog.races.iter().map(|r| r.id).collect::<Vec<_>>() {
+        let list = create.class_list(race);
+        for &class in &list {
+            if let Some(table) = cats.classes.as_ref().filter(|t| t.has_row(u32::from(class))) {
+                catalog.classes.insert(
+                    class,
+                    GlueCreateClass {
+                        name: table.name(u32::from(class)).unwrap_or_default().into(),
+                        file: table.file(u32::from(class)).unwrap_or_default().into(),
+                    },
+                );
+            }
+        }
+        catalog.class_lists.insert(race, list);
+        for sex in 0..=2u8 {
+            if let Some(r) = create.ranges(race, sex) {
+                catalog.counts.insert(
+                    (race, sex),
+                    GlueCreateCounts {
+                        skin: i32::from(r.skin),
+                        face: i32::from(r.face),
+                        hair_styles: i32::from(r.hair_style),
+                        hair_colors: (0..r.hair_style)
+                            .map(|style| i32::from(create.hair_colors(race, sex, style)))
+                            .collect(),
+                        facial_hair: i32::from(r.facial_hair),
+                    },
+                );
+            }
+            if create
+                .body_display(race, sex)
+                .is_some_and(|d| display_resolves(cats, d))
+            {
+                catalog.models.insert((race, sex));
+            }
+        }
+    }
+    catalog.names = create
+        .name_gen()
+        .iter()
+        .map(|r| GlueNameRow {
+            race: r.race,
+            sex: r.sex,
+            name: r.name.clone(),
+        })
+        .collect();
+    catalog
+}
+
+/// The menu's `CGlueMgr` host over the network worker: the verbs' dialogs and
+/// state land in the call; the replies arrive on later ticks.
 struct MenuHost;
 
 impl MenuHost {
-    fn queue_roster() {
-        BN_MENU.with(|p| {
-            p.borrow_mut().roster = Some(vec![GlueCharacter {
-                guid: 1,
-                name: "Nezha".to_string(),
-                race: "人类".to_string(),
-                class: "战士".to_string(),
-                level: 1,
-                zone: None,
-                file_string: String::new(),
-                gender: 0,
+    /// The roster rows as the character screen's records take them (`0x4732a0`).
+    fn map_chars(sync: &MenuSync) -> Vec<GlueCharacter> {
+        let text = |s: Option<&str>| s.unwrap_or_default().to_string();
+        let mut out = Vec::new();
+        for row in net::menu_chars() {
+            let bytes: Vec<u8> = row
+                .name
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            out.push(GlueCharacter {
+                guid: row.guid,
+                name: String::from_utf8_lossy(&bytes).into_owned(),
+                race: text(sync.catalogs.create.as_ref().and_then(|r| r.race_name(row.race))),
+                class: text(
+                    sync.catalogs
+                        .classes
+                        .as_ref()
+                        .and_then(|c| c.name(u32::from(row.class))),
+                ),
+                level: row.level,
+                zone: sync
+                    .catalogs
+                    .areas
+                    .as_ref()
+                    .and_then(|a| a.name(row.zone))
+                    .map(str::to_string),
+                file_string: text(sync.catalogs.create.as_ref().and_then(|r| r.race_file(row.race))),
+                gender: row.gender,
                 flags: 0,
-                // No M2 build: the render host draws no glue scene pane anyway.
-                model: false,
-            }]);
-        });
+                model: sync
+                    .catalogs
+                    .create
+                    .as_ref()
+                    .and_then(|r| r.body_display(row.race, row.gender))
+                    .is_some_and(|d| display_resolves(&sync.catalogs, d)),
+            });
+        }
+        out
     }
 }
 
 impl GlueHost for MenuHost {
     fn call(&self, call: GlueCall) -> Vec<GlueSignal> {
+        eprintln!("bn_menu: call {call:?}");
         match call {
-            // `CGlueMgr::Login`'s own dialog half; auth "succeeds" at once:
-            // drop the status dialog, tear any roster down and put character
-            // select up, whose OnShow asks for the character list.
+            // `CGlueMgr::Login`'s own dialog half: empty boxes open an `OKAY`,
+            // else state 1 with the `CANCEL` dialog and the logon.
             GlueCall::Login(c) => {
                 if c.account.is_empty() {
-                    return vec![GlueSignal::Open {
-                        which: "OKAY",
-                        text: Some(GlueText::Key("LOGIN_ENTER_NAME")),
-                        data: None,
-                    }];
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "LOGIN_ENTER_NAME")];
                 }
                 if c.password.is_empty() {
-                    return vec![GlueSignal::Open {
-                        which: "OKAY",
-                        text: Some(GlueText::Key("LOGIN_ENTER_PASSWORD")),
-                        data: None,
-                    }];
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "LOGIN_ENTER_PASSWORD")];
                 }
-                vec![
-                    GlueSignal::Close,
-                    GlueSignal::Teardown,
-                    GlueSignal::Screen("charselect"),
-                ]
+                let addr = BN_MENU.with(|m| m.borrow().realm_address.clone());
+                BN_MENU.with(|m| {
+                    let mut s = m.borrow_mut();
+                    s.last_status = u32::MAX;
+                    s.last_realms_epoch = 0;
+                    s.last_chars_epoch = 0;
+                    s.pending_roster = false;
+                    s.realm_index = None;
+                    s.dialog = Some("CANCEL");
+                });
+                let _ = net::menu_login(&addr, &c.account, &c.password);
+                vec![GlueSignal::Open {
+                    which: "CANCEL",
+                    text: None,
+                    data: None,
+                }]
             }
-            // The reference's reply lands a frame later and loads the roster
-            // with the script free; queue it for `bn_ui_tick`.
+            // The dialog button at the logon cancels the link, then closes.
+            GlueCall::StatusDialogClick => {
+                if net::menu_snapshot().status == net::ST_CONNECTING {
+                    let _ = net::menu_logout();
+                }
+                set_dialog(None);
+                vec![GlueSignal::Close]
+            }
+            GlueCall::DisconnectFromServer => {
+                let _ = net::menu_logout();
+                set_dialog(None);
+                BN_MENU.with(|m| m.borrow_mut().last_status = u32::MAX);
+                vec![GlueSignal::Close, GlueSignal::Disconnected]
+            }
+            GlueCall::QuitGame => vec![],
+            // State 4: the `REALM_LIST_IN_PROGRESS` dialog when asked, and the
+            // rebuild of the list the worker already holds.
+            GlueCall::RequestRealmList { dialog } => {
+                BN_MENU.with(|m| m.borrow_mut().realms_refresh = true);
+                if dialog {
+                    set_dialog(Some("CANCEL"));
+                    vec![open_key("CANCEL", "REALM_LIST_IN_PROGRESS")]
+                } else {
+                    vec![]
+                }
+            }
+            GlueCall::CancelRealmListQuery => {
+                set_dialog(None);
+                vec![GlueSignal::Close]
+            }
+            GlueCall::CancelLogon => {
+                let _ = net::menu_logout();
+                set_dialog(None);
+                vec![GlueSignal::Close]
+            }
+            // `ConnectToRealm`: the realm is picked by name, then the world link.
+            GlueCall::ChangeRealm(name) => match net::menu_realm_index(&name) {
+                Some(index) => {
+                    BN_MENU.with(|m| {
+                        let mut s = m.borrow_mut();
+                        s.realm_index = Some(index);
+                        s.dialog = Some("CANCEL");
+                    });
+                    let _ = net::menu_pick_realm(index);
+                    vec![open_key("CANCEL", "GAME_SERVER_LOGIN")]
+                }
+                None => {
+                    set_dialog(Some("OKAY"));
+                    vec![open_key("OKAY", "REALM_LIST_REALM_NOT_FOUND")]
+                }
+            },
+            // State 3: the dialog and the `CMSG_CHAR_ENUM`; the roster reply is
+            // loaded by the tick, with the script free.
             GlueCall::GetCharacterList => {
-                Self::queue_roster();
+                let now = net::menu_snapshot().chars_epoch;
+                if !net::menu_refresh_roster() {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "CHAR_LIST_FAILED")];
+                }
+                BN_MENU.with(|m| {
+                    let mut s = m.borrow_mut();
+                    s.pending_roster = true;
+                    s.roster_epoch_at_request = now;
+                    s.dialog = Some("CANCEL");
+                });
+                vec![open_key("CANCEL", "CHAR_LIST_RETRIEVING")]
+            }
+            GlueCall::DeleteCharacter(guid) => {
+                if !net::menu_delete_character(guid) {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                }
+                set_dialog(Some("CANCEL"));
+                vec![open_key("CANCEL", "CHAR_DELETE_IN_PROGRESS")]
+            }
+            GlueCall::RenameCharacter { guid, name } => {
+                if !net::menu_rename_character(guid, name) {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                }
+                set_dialog(Some("CANCEL"));
+                vec![open_key("CANCEL", "CHAR_RENAME_IN_PROGRESS")]
+            }
+            GlueCall::CreateCharacter(request) => {
+                let req = benilla_protocol::CharCreateReq {
+                    name: request.name.clone(),
+                    race: request.race,
+                    class: request.class,
+                    gender: request.sex,
+                    skin: request.skin,
+                    face: request.face,
+                    hair_style: request.hair_style,
+                    hair_color: request.hair_color,
+                    facial_hair: request.facial_hair,
+                };
+                if !net::menu_create_character(req) {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                }
+                set_dialog(Some("CANCEL"));
+                vec![open_key("CANCEL", "CHAR_CREATE_IN_PROGRESS")]
+            }
+            // The world entry's guards and the pick. The render host sees the
+            // world through `bn_net_status() == ST_IN_WORLD`.
+            GlueCall::EnterWorld { guid, flags, .. } => {
+                if flags & 0x4 != 0 {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "CHAR_LOGIN_LOCKED_FOR_TRANSFER")];
+                }
+                if flags & 0x4000 != 0 {
+                    return vec![GlueSignal::ForceRename("CHAR_RENAME_DESCRIPTION")];
+                }
+                if !net::menu_enter(guid) {
+                    set_dialog(Some("OKAY"));
+                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                }
                 vec![]
             }
-            // The one flow a world server owns: report it to the render host.
-            GlueCall::EnterWorld { .. } => {
-                BN_MENU.with(|p| p.borrow_mut().events.push("enter_world".to_string()));
-                vec![]
-            }
-            GlueCall::StatusDialogClick => vec![GlueSignal::Close],
-            // No servers to list or dial in the offline menu.
-            GlueCall::RequestRealmList { .. }
-            | GlueCall::CancelRealmListQuery
-            | GlueCall::CancelLogon
-            | GlueCall::ChangeRealm(_)
-            | GlueCall::DisconnectFromServer
-            | GlueCall::QuitGame
-            | GlueCall::DeleteCharacter(_)
-            | GlueCall::RenameCharacter { .. }
-            | GlueCall::CreateCharacter(_) => vec![],
         }
     }
 
@@ -6714,14 +7165,19 @@ impl GlueHost for MenuHost {
         Vec::new()
     }
 
-    /// The offline menu is always "connected": the EnterWorld guards are the
-    /// host's half and must not open a disconnect dialog.
+    /// The world link's flag: up from the character roster to the world.
     fn connected(&self) -> bool {
-        true
+        matches!(
+            net::menu_snapshot().status,
+            net::ST_CHARS | net::ST_ENTERING | net::ST_IN_WORLD
+        )
     }
 
     fn selected_realm_type(&self) -> Option<u32> {
-        Some(0)
+        let index = BN_MENU.with(|m| m.borrow().realm_index)?;
+        net::menu_realms()
+            .get(index as usize)
+            .map(|r| r.realm_type)
     }
 }
 
@@ -6737,8 +7193,11 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         return 0;
     }
     // SAFETY: caller guarantees a valid exclusive handle for the call's span.
-    let w = unsafe { &*world };
-    let Some(chain) = w.chain.as_ref() else {
+    // The host owns the world exclusively while a load runs; the FFI keeps the
+    // const pointer for the read-only entry points, so the chain's mutable
+    // catalogs are reached through this single-threaded cast.
+    let w = unsafe { &mut *(world as *mut BnWorld) };
+    let Some(chain) = w.chain.as_mut() else {
         return 0;
     };
     // Warm the FONTS cache now: bn_ui_dump's EditBox advance measurement runs
@@ -6750,7 +7209,6 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         let Ok(mut script) = UiScript::new_glue() else {
             return 0u32;
         };
-        BN_MENU.with(|p| *p.borrow_mut() = MenuPending::default());
         // The agreements the login's first tests read; a returning player's
         // flags, so the menu is not parked on the ToU screen.
         for notice in GlueNotice::ALL {
@@ -6806,6 +7264,50 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
                     ),
             );
         }
+        // The glue screens' DBC catalogs: the create screen's races/classes and
+        // the roster's race/class/zone/model strings, loaded once with the VM.
+        let mut catalogs = GlueCatalogs::default();
+        catalogs.create = benilla_formats::CharCreateCatalog::load(chain).ok();
+        catalogs.classes = benilla_formats::load_chr_classes(chain).ok();
+        catalogs.factions = benilla_formats::load_faction_catalog(chain).ok();
+        catalogs.areas = benilla_formats::load_area_table_catalog(chain).ok();
+        catalogs.creatures = benilla_formats::load_creature_catalog(chain).ok();
+        let create_catalog = build_create_catalog(&catalogs);
+        script.set_glue_create_catalog(std::rc::Rc::new(create_catalog));
+        let categories = benilla_formats::load_realm_categories(chain, 1)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| GlueRealmCategory {
+                id: c.id,
+                name: c.name,
+            })
+            .collect();
+        let types = benilla_formats::load_realm_configs(chain)
+            .map(|configs| {
+                configs
+                    .rows()
+                    .iter()
+                    .map(|r| GlueRealmType {
+                        realm_type: r.realm_type,
+                        pvp: r.pvp,
+                        rp: r.rp,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        script.set_glue_realm_setup(categories, types);
+        let realm_address = std::env::var("BN_REALMD")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| script.cvar("realmlist").filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "127.0.0.1:3724".to_string());
+        BN_MENU.with(|m| {
+            *m.borrow_mut() = MenuSync {
+                realm_address,
+                catalogs,
+                ..MenuSync::default()
+            };
+        });
         // `GetBillingPlan` is one of benilla's NOT_YET glue verbs (upstream's own
         // list), but zhCN's `CharacterSelect_OnShow` calls it and aborts on the
         // nil, skipping its tail (`GlueFrameFadeIn`). Stand it in only while
@@ -6861,9 +7363,197 @@ pub extern "C" fn bn_ui_set_screen_size(w: f32, h: f32) -> u32 {
     out.unwrap_or(0)
 }
 
+/// Fire a batch of host signals into the VM, in order.
+fn fire(script: &mut UiScript, signals: Vec<GlueSignal>) {
+    for signal in signals {
+        script.fire_glue_signal(signal);
+    }
+}
+
+/// Publish the worker's realm list and run the glue rebuild (whose tail fires
+/// `OPEN_REALM_LIST` or `GET_PREFERRED_REALM_INFO`). The account's character
+/// count comes from the realm records so a roster-bearing account gets the
+/// list rather than the new-account wizard.
+fn publish_realms(script: &mut UiScript) {
+    let realms: Vec<GlueRealm> = net::menu_realms()
+        .iter()
+        .map(|r| GlueRealm {
+            name: r.name.clone(),
+            realm_type: r.realm_type,
+            flags: r.flags,
+            population: r.population,
+            characters: r.characters,
+            category: r.category,
+        })
+        .collect();
+    let count: u16 = realms
+        .iter()
+        .map(|r| u16::from(r.characters))
+        .sum::<u16>();
+    eprintln!(
+        "bn_menu: publish realms={} chars={count} {:?}",
+        realms.len(),
+        realms
+            .iter()
+            .map(|r| (&r.name, r.category, r.flags, r.characters))
+            .collect::<Vec<_>>()
+    );
+    // The reference's realm-list reply frame (`0x46c0d2`-`0x46c0e2`): the
+    // status dialog closed first, then the holder and the rebuild.
+    fire(script, vec![GlueSignal::Close]);
+    script.set_glue_realms(realms);
+    script.set_glue_realm_characters(count);
+    script.rebuild_glue_realms();
+    let n = script.eval::<f64>("return GetNumRealms(1)").unwrap_or(-1.0);
+    let cats = script
+        .eval::<f64>("local t = GetRealmCategories(); return t.n or #t")
+        .unwrap_or(-1.0);
+    eprintln!("bn_menu: after rebuild screen={:?} realms(1)={n} categories={cats}", script.glue_screen());
+}
+
+/// The `GetCharacterListUpdate` tail, called from the tick for the screen's
+/// `OnShow` and after a delete or rename.
+fn begin_char_list(script: &mut UiScript) {
+    for signal in MenuHost.call(GlueCall::GetCharacterList) {
+        script.fire_glue_signal(signal);
+    }
+}
+
+/// Apply the worker's replies to the glue VM: the realm list, screen
+/// transitions, the roster and the status dialogs. Runs outside a verb's call
+/// fan-out, which is why the replies wait for a tick.
+fn sync_menu(script: &mut UiScript) {
+    let snap = net::menu_snapshot();
+    let last_status = BN_MENU.with(|m| m.borrow().last_status);
+    let last_realms = BN_MENU.with(|m| m.borrow().last_realms_epoch);
+    let refresh_realms = BN_MENU.with(|m| std::mem::take(&mut m.borrow_mut().realms_refresh));
+
+    if snap.realms_epoch != last_realms {
+        BN_MENU.with(|m| m.borrow_mut().last_realms_epoch = snap.realms_epoch);
+        publish_realms(script);
+    } else if refresh_realms {
+        publish_realms(script);
+    }
+
+    if snap.status != last_status {
+        BN_MENU.with(|m| m.borrow_mut().last_status = snap.status);
+        eprintln!("bn_menu: status {last_status} -> {} (screen={:?})", snap.status, script.glue_screen());
+        match snap.status {
+            // Auth OK: the roster is up, and its OnShow asks for the list.
+            net::ST_CHARS => {
+                set_dialog(None);
+                fire(
+                    script,
+                    vec![
+                        GlueSignal::Close,
+                        GlueSignal::Teardown,
+                        GlueSignal::Screen("charselect"),
+                    ],
+                );
+            }
+            net::ST_FAILED => {
+                set_dialog(None);
+                let msg = net::menu_take_error().unwrap_or_else(|| "login failed".to_string());
+                fire(script, vec![GlueSignal::Close, open_raw("OKAY", msg)]);
+            }
+            // The world is up; the render host polls this through
+            // `bn_ui_poll_event` (it also reads `bn_net_status`).
+            net::ST_IN_WORLD => {
+                BN_MENU.with(|m| m.borrow_mut().events.push("enter_world".to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    // The `SMSG_CHAR_ENUM` reply the pending query waited for.
+    let (pending, at) = BN_MENU.with(|m| {
+        let s = m.borrow();
+        (s.pending_roster, s.roster_epoch_at_request)
+    });
+    if pending && snap.chars_epoch != at {
+        BN_MENU.with(|m| {
+            let mut s = m.borrow_mut();
+            s.pending_roster = false;
+            s.last_chars_epoch = snap.chars_epoch;
+            s.dialog = None;
+        });
+        fire(script, vec![GlueSignal::Close]);
+        let chars = BN_MENU.with(|m| MenuHost::map_chars(&m.borrow()));
+        script.load_glue_roster(chars);
+    }
+
+    if let Some((_name, code)) = net::menu_take_create_reply() {
+        set_dialog(None);
+        if code == 0x2E {
+            fire(
+                script,
+                vec![
+                    GlueSignal::Close,
+                    GlueSignal::SelectLast,
+                    GlueSignal::Screen("charselect"),
+                ],
+            );
+        } else {
+            fire(
+                script,
+                vec![
+                    GlueSignal::Close,
+                    open_key("OKAY", benilla_ui::script::glue_status_key(i32::from(code))),
+                ],
+            );
+        }
+    }
+
+    if let Some((_guid, code)) = net::menu_take_delete_reply() {
+        if code == 0x39 {
+            fire(script, vec![GlueSignal::Close, GlueSignal::SelectFirst]);
+            begin_char_list(script);
+        } else {
+            set_dialog(None);
+            fire(
+                script,
+                vec![
+                    GlueSignal::Close,
+                    open_key("OKAY", benilla_ui::script::glue_status_key(i32::from(code))),
+                ],
+            );
+        }
+    }
+
+    if let Some((_guid, _name, code)) = net::menu_take_rename_reply() {
+        set_dialog(None);
+        if code == 0x2E {
+            fire(script, vec![GlueSignal::Close]);
+            begin_char_list(script);
+        } else if code == 0x31 {
+            fire(
+                script,
+                vec![
+                    GlueSignal::Close,
+                    GlueSignal::ForceRename("CHAR_CREATE_NAME_IN_USE"),
+                ],
+            );
+        } else {
+            fire(
+                script,
+                vec![
+                    GlueSignal::Close,
+                    open_key("OKAY", benilla_ui::script::glue_status_key(i32::from(code))),
+                ],
+            );
+        }
+    }
+
+    if let Some(msg) = net::menu_take_error() {
+        set_dialog(None);
+        fire(script, vec![GlueSignal::Close, open_raw("OKAY", msg)]);
+    }
+}
+
 /// Advance the loaded UI (OnUpdate handlers, hover re-pick, queued events) and
-/// apply the menu host's pending ops (the fake roster load). `elapsed` is
-/// seconds since the last call. Returns 1 with a session, 0 without.
+/// apply the menu host's pending ops (realm list, screen transitions, roster).
+/// `elapsed` is seconds since the last call. Returns 1 with a session, 0
+/// without.
 #[no_mangle]
 pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6872,9 +7562,8 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
             let Some(script) = slot.as_mut() else {
                 return 0u32;
             };
-            let roster = BN_MENU.with(|p| p.borrow_mut().roster.take());
-            if let Some(roster) = roster {
-                script.load_glue_roster(roster);
+            if script.vm_kind() == benilla_ui::script::VmKind::Glue {
+                sync_menu(script);
             }
             script.tick(elapsed);
             for e in script.take_errors() {
@@ -7134,6 +7823,204 @@ pub extern "C" fn bn_ui_eval(code: *const c_char, buf: *mut c_char, cap: u32) ->
         *buf.add(n) = 0;
     }
     n as u32
+}
+
+// ---- VM state push: feed wire snapshots into benilla's own FrameXML dialogs ----
+
+/// Push the open gossip menu into the VM's `UiScript` so benilla's stock
+/// `GossipFrame` shows and populates (the host then paints it via `bn_ui_dump`
+/// as it already does). `greeting` is the NPC's text; `quest_titles`/`quest_levels`
+/// are parallel arrays of quest rows from `SMSG_GOSSIP_MESSAGE`; `opt_labels`/`opt_icons`
+/// are the gossip option pairs. All NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub extern "C" fn bn_ui_push_gossip(
+    greeting: *const c_char,
+    quest_titles: *const *const c_char,
+    quest_levels: *const u32,
+    n_quests: u32,
+    opt_labels: *const *const c_char,
+    opt_icons: *const *const c_char,
+    n_opts: u32,
+) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let cs = |p: *const c_char| {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            let greeting_s = cs(greeting);
+            // An all-empty push clears the open menu (the host's close signal).
+            if greeting_s.is_empty() && n_quests == 0 && n_opts == 0 {
+                script.set_gossip(None);
+                return 1;
+            }
+            let mut quests = Vec::new();
+            for i in 0..n_quests as usize {
+                let title = unsafe { cs(*quest_titles.add(i)) };
+                let level = unsafe { *quest_levels.add(i) };
+                quests.push(GossipQuestRow {
+                    title,
+                    level,
+                    active: false,
+                });
+            }
+            let mut options = Vec::new();
+            for i in 0..n_opts as usize {
+                let label = unsafe { cs(*opt_labels.add(i)) };
+                let icon = unsafe { cs(*opt_icons.add(i)) };
+                options.push(GossipOptionView {
+                    label,
+                    icon_type: icon,
+                });
+            }
+            let menu = GossipMenu {
+                greeting: greeting_s,
+                quests,
+                options,
+            };
+            script.set_gossip(Some(menu));
+            script.fire_event("GOSSIP_SHOW", Vec::new());
+            1
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Push the open questgiver panel into the VM's `UiScript` so benilla's stock
+/// `QuestFrame` shows. `panel` is 0=greeting, 1=detail, 2=progress, 3=reward.
+/// All text fields are NUL-terminated UTF-8.
+#[no_mangle]
+pub extern "C" fn bn_ui_push_quest(
+    panel: u32,
+    title: *const c_char,
+    body: *const c_char,
+    objectives: *const c_char,
+    money: i32,
+    can_complete: u32,
+) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let cs = |p: *const c_char| {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(p) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            let p = match panel {
+                0 => QuestPanel::Greeting,
+                1 => QuestPanel::Detail,
+                2 => QuestPanel::Progress,
+                _ => QuestPanel::Reward,
+            };
+            let title_s = cs(title);
+            let body_s = cs(body);
+            let objectives_s = cs(objectives);
+            // An all-empty push clears the open panel.
+            if title_s.is_empty() && body_s.is_empty() && objectives_s.is_empty() {
+                script.set_quest(None);
+                return 1;
+            }
+            let state = QuestState {
+                panel: p,
+                title: title_s,
+                body: body_s,
+                objectives: objectives_s,
+                reward_money: money as u32,
+                completable: can_complete != 0,
+                ..QuestState::default()
+            };
+            script.set_quest(Some(state));
+            let event = match p {
+                QuestPanel::Greeting => "QUEST_GREETING",
+                QuestPanel::Detail => "QUEST_DETAIL",
+                QuestPanel::Progress => "QUEST_PROGRESS",
+                QuestPanel::Reward => "QUEST_COMPLETE",
+            };
+            script.fire_event(event, Vec::new());
+            1
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Push the open merchant window into the VM's `UiScript` so benilla's stock
+/// `MerchantFrame` shows. `item_names`/`item_textures`/`item_prices`/
+/// `item_quantities`/`item_num_avail`/`item_ids` are parallel arrays.
+#[no_mangle]
+pub extern "C" fn bn_ui_push_merchant(
+    item_names: *const *const c_char,
+    item_textures: *const *const c_char,
+    item_prices: *const u32,
+    item_quantities: *const u32,
+    item_num_avail: *const i32,
+    item_ids: *const u32,
+    n_items: u32,
+    can_repair: u32,
+) -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let cs = |p: *const c_char| {
+                if p.is_null() {
+                    None
+                } else {
+                    Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                }
+            };
+            // A zero-item push clears the open vendor.
+            if n_items == 0 {
+                script.set_merchant(None);
+                return 1;
+            }
+            let mut items = Vec::new();
+            for i in 0..n_items as usize {
+                let name = unsafe { cs(*item_names.add(i)) };
+                let texture = unsafe { cs(*item_textures.add(i)) };
+                let price = unsafe { *item_prices.add(i) };
+                let quantity = unsafe { *item_quantities.add(i) };
+                let num_available = unsafe { *item_num_avail.add(i) };
+                let item_id = unsafe { *item_ids.add(i) };
+                items.push(MerchantItem {
+                    name,
+                    texture,
+                    price,
+                    quantity,
+                    num_available,
+                    item_id,
+                    stats: None,
+                    link: None,
+                    max_stack: None,
+                });
+            }
+            let state = MerchantState {
+                items,
+                buyback: Vec::new(),
+                can_repair: can_repair != 0,
+            };
+            script.set_merchant(Some(state));
+            1
+        })
+    }));
+    out.unwrap_or(0)
 }
 
 // ---- glue booth ----
