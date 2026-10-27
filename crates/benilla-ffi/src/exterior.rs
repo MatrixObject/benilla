@@ -38,6 +38,10 @@ pub struct NavModel {
     prefs: Vec<WmoPortalRef>,
     tris: Vec<Vec<[[f32; 3]; 3]>>,
     dtris: Vec<Vec<[[f32; 3]; 3]>>,
+    /// Per MODD index, the groups whose MODR names it: the client creates
+    /// one doodad per (index, group) (`0x695aa0`) and draws a group's
+    /// copy with the group.
+    doodad_groups: Vec<Vec<u16>>,
     has_portals: bool,
 }
 
@@ -46,6 +50,9 @@ pub struct Placement {
     pos: [f32; 3],
     q: [f32; 4],
     aabb: ([f32; 3], [f32; 3]),
+    /// A WMO-internal doodad's owning placement and MODD index; `None` is an
+    /// ADT placement, which the exterior-window gate culls.
+    owner: Option<(u32, u32)>,
 }
 
 struct Gate {
@@ -108,6 +115,7 @@ pub fn load_nav(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Ar
         prefs: portals.refs.clone(),
         tris: Vec::new(),
         dtris: Vec::new(),
+        doodad_groups: vec![Vec::new(); root.doodads().len()],
         has_portals,
     };
     if !has_portals {
@@ -125,6 +133,11 @@ pub fn load_nav(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Ar
             nav.flags = h.flags;
             nav.ref_start = h.portal_ref_start;
             nav.ref_count = h.portal_ref_count;
+        }
+        for di in benilla_formats::wmo_group_doodad_refs(&gb) {
+            if let Some(slot) = m.doodad_groups.get_mut(di as usize) {
+                slot.push(gi as u16);
+            }
         }
         let mut gp: Vec<[f32; 3]> = Vec::new();
         let mut gx: Vec<u32> = Vec::new();
@@ -180,12 +193,19 @@ pub fn register_wmo(
                 pos: position,
                 q,
                 aabb,
+                owner: None,
             },
         );
     }
 }
 
-pub fn register_doodad(uid: u32, pos: [f32; 3], q: [f32; 4], aabb: ([f32; 3], [f32; 3])) {
+pub fn register_doodad(
+    uid: u32,
+    pos: [f32; 3],
+    q: [f32; 4],
+    aabb: ([f32; 3], [f32; 3]),
+    owner: Option<(u32, u32)>,
+) {
     if let Ok(mut s) = state().lock() {
         s.dd.insert(
             uid,
@@ -194,6 +214,7 @@ pub fn register_doodad(uid: u32, pos: [f32; 3], q: [f32; 4], aabb: ([f32; 3], [f
                 pos,
                 q,
                 aabb,
+                owner,
             },
         );
     }
@@ -913,16 +934,80 @@ pub extern "C" fn bn_exterior_update(eye: *const f32, fwd: *const f32, aspect: f
     ok
 }
 
-fn verdict(placements: &HashMap<u32, Placement>, gate: &Option<Gate>, uid: u32) -> u32 {
-    let Some(g) = gate else {
+fn wmo_verdict(s: &ExtState, uid: u32) -> u32 {
+    let Some(g) = &s.gate else {
         return 1;
     };
     if g.own_uid == uid {
         return 1;
     }
-    placements
+    s.wmo
         .get(&uid)
         .map_or(1, |p| admits_aabb(g, &p.aabb) as u32)
+}
+
+/// One naming group's chain for a WMO-internal prop: the portal flood's bit,
+/// and the window gate on an exterior group of another building — the same
+/// terms `group_ok` applies to the group's own geometry.
+fn doodad_group_ok(s: &ExtState, owner_uid: u32, group: usize) -> bool {
+    let Some(pl) = s.wmo.get(&owner_uid) else {
+        return true;
+    };
+    let Some(Some(m)) = s.models.get(&pl.key) else {
+        return true;
+    };
+    if s.pvs
+        .get(&owner_uid)
+        .is_some_and(|v| !v.get(group).copied().unwrap_or(true))
+    {
+        return false;
+    }
+    if let Some(g) = &s.gate {
+        let exterior = m
+            .nav
+            .get(group)
+            .is_some_and(|n| n.flags & GROUP_EXTERIOR != 0);
+        if exterior && g.own_uid != owner_uid {
+            let Some(o) = group_obb(m, &pl.pos, &pl.q, group) else {
+                return true;
+            };
+            if !admits(g, &o) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The client creates one doodad per (MODD index, MODR group) and draws it with
+/// that group (`0x695aa0`), so a WMO-internal prop draws iff any naming group
+/// is in this frame's portal flood: from outside only through a doorway the
+/// walk reaches, from inside the camera's own room regardless of where it looks.
+/// An ADT placement has no room and keeps the exterior-window gate.
+fn doodad_verdict(s: &ExtState, uid: u32) -> u32 {
+    let Some(p) = s.dd.get(&uid) else {
+        return 1;
+    };
+    let Some((owner_uid, di)) = p.owner else {
+        return s
+            .gate
+            .as_ref()
+            .map_or(1, |g| admits_aabb(g, &p.aabb) as u32);
+    };
+    let Some(Some(m)) = s.wmo.get(&owner_uid).and_then(|w| s.models.get(&w.key)) else {
+        return 1;
+    };
+    if !m.has_portals {
+        return 1;
+    }
+    let Some(groups) = m.doodad_groups.get(di as usize) else {
+        return 1;
+    };
+    u32::from(
+        groups
+            .iter()
+            .any(|&g| doodad_group_ok(s, owner_uid, g as usize)),
+    )
 }
 
 #[no_mangle]
@@ -931,7 +1016,7 @@ pub extern "C" fn bn_exterior_wmo_ok(uid: u32, out: *mut u32) -> u32 {
         return 0;
     }
     if let Ok(s) = state().lock() {
-        unsafe { *out = verdict(&s.wmo, &s.gate, uid) };
+        unsafe { *out = wmo_verdict(&s, uid) };
         return 1;
     }
     unsafe { *out = 1 };
@@ -944,9 +1029,209 @@ pub extern "C" fn bn_exterior_doodad_ok(uid: u32, out: *mut u32) -> u32 {
         return 0;
     }
     if let Ok(s) = state().lock() {
-        unsafe { *out = verdict(&s.dd, &s.gate, uid) };
+        unsafe { *out = doodad_verdict(&s, uid) };
         return 1;
     }
     unsafe { *out = 1 };
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nav(flags: &[u32], doodad_groups: Vec<Vec<u16>>) -> Option<Arc<NavModel>> {
+        Some(Arc::new(NavModel {
+            nav: flags
+                .iter()
+                .map(|&flags| GroupNav {
+                    flags,
+                    bbox_min: [0.0; 3],
+                    bbox_max: [10.0; 3],
+                    ref_start: 0,
+                    ref_count: 0,
+                })
+                .collect(),
+            pverts: Vec::new(),
+            pinfos: Vec::new(),
+            prefs: Vec::new(),
+            tris: Vec::new(),
+            dtris: Vec::new(),
+            doodad_groups,
+            has_portals: true,
+        }))
+    }
+
+    fn placement(owner: Option<(u32, u32)>, aabb: ([f32; 3], [f32; 3])) -> Placement {
+        Placement {
+            key: String::new(),
+            pos: [0.0; 3],
+            q: [0.0, 0.0, 0.0, 1.0],
+            aabb,
+            owner,
+        }
+    }
+
+    /// A prop draws with the MODR groups that name it and nothing else: the
+    /// camera's own room lit keeps it up wherever the camera turns, a dark room
+    /// takes it down, and an ADT placement still answers the window gate.
+    #[test]
+    fn a_wmo_prop_follows_its_rooms_portal_bit() {
+        let mut s = ExtState {
+            wmo: HashMap::new(),
+            dd: HashMap::new(),
+            models: HashMap::new(),
+            gate: None,
+            pvs: HashMap::new(),
+        };
+        // Rooms 0 and 1, then the exterior porch group 2.
+        s.models.insert(
+            "inn".into(),
+            nav(&[0, 0, EXTERIOR], vec![vec![0], vec![1], vec![2]]),
+        );
+        s.models
+            .insert("twin".into(), nav(&[0, 0], vec![vec![0, 1]]));
+        s.wmo.insert(
+            7,
+            Placement {
+                key: "inn".into(),
+                ..placement(None, ([0.0; 3], [10.0; 3]))
+            },
+        );
+        let unit = ([0.0, 0.0, 1.0], [2.0, 2.0, 3.0]);
+        s.dd.insert(100, placement(Some((7, 0)), unit)); // a room-0 prop
+        s.dd.insert(101, placement(Some((7, 1)), unit)); // a room-1 prop
+        s.dd.insert(102, placement(Some((9, 0)), unit)); // owner never registered
+        s.dd.insert(103, placement(None, unit)); // an MDDF placement
+
+        // Inside room 0: its prop and the lit porch stay; the dark room 1's
+        // prop goes; an unknown owner or uid fails open.
+        s.pvs.insert(7, Arc::new(vec![true, false, true]));
+        assert_eq!(doodad_verdict(&s, 100), 1);
+        assert_eq!(doodad_verdict(&s, 101), 0);
+        assert_eq!(doodad_verdict(&s, 102), 1);
+        assert_eq!(doodad_verdict(&s, 103), 1);
+        assert_eq!(doodad_verdict(&s, 4242), 1);
+
+        // A prop named by two groups draws while either is lit, and goes when
+        // both are dark — the reference's any-naming-group rule.
+        s.wmo.insert(
+            8,
+            Placement {
+                key: "twin".into(),
+                ..placement(None, ([0.0; 3], [10.0; 3]))
+            },
+        );
+        s.dd.insert(104, placement(Some((8, 0)), unit));
+        s.pvs.insert(8, Arc::new(vec![false, true]));
+        assert_eq!(doodad_verdict(&s, 104), 1);
+        s.pvs.insert(8, Arc::new(vec![false, false]));
+        assert_eq!(doodad_verdict(&s, 104), 0);
+
+        // Outside the building the flood lights only the exterior groups: the
+        // room's props cull even with no window gate at all.
+        s.pvs.insert(7, Arc::new(vec![false, false, true]));
+        assert_eq!(doodad_verdict(&s, 100), 0);
+        assert_eq!(doodad_verdict(&s, 101), 0);
+        assert_eq!(doodad_verdict(&s, 102), 1, "unknown owner fails open");
+
+        // A model with no portal graph is never culled by the client.
+        s.models.insert("shed".into(), None);
+        s.wmo.insert(
+            9,
+            Placement {
+                key: "shed".into(),
+                ..placement(None, ([0.0; 3], [10.0; 3]))
+            },
+        );
+        s.dd.insert(105, placement(Some((9, 0)), unit));
+        assert_eq!(doodad_verdict(&s, 105), 1);
+
+        // Inside another building: an ADT prop outside every window culls, and
+        // so does a prop of another building's exterior group; the camera's own
+        // building and interior groups never consult the window gate.
+        s.gate = Some(Gate {
+            frusta: vec![[[0.0, 0.0, -1.0, 0.0]; 4]],
+            own_uid: 7,
+        });
+        assert_eq!(doodad_verdict(&s, 103), 0);
+        assert_eq!(
+            doodad_verdict(&s, 100),
+            0,
+            "pvs still decides its own rooms"
+        );
+        s.pvs.insert(7, Arc::new(vec![true, false, true]));
+        assert_eq!(doodad_verdict(&s, 100), 1, "own room, gate ignores it");
+        s.dd.insert(106, placement(Some((7, 2)), unit)); // the own porch
+        assert_eq!(doodad_verdict(&s, 106), 1, "own building is exempt");
+        s.dd.insert(107, placement(Some((8, 0)), unit)); // another building
+        s.pvs.insert(8, Arc::new(vec![true, true]));
+        s.dd.insert(108, placement(Some((8, 0)), unit));
+        assert_eq!(doodad_verdict(&s, 107), 1, "interior group: no window test");
+        s.models
+            .insert("hall".into(), nav(&[EXTERIOR], vec![vec![0]]));
+        s.wmo.insert(
+            10,
+            Placement {
+                key: "hall".into(),
+                ..placement(None, ([0.0; 3], [10.0; 3]))
+            },
+        );
+        s.pvs.insert(10, Arc::new(vec![true]));
+        s.dd.insert(109, placement(Some((10, 0)), unit));
+        assert_eq!(
+            doodad_verdict(&s, 109),
+            0,
+            "exterior group follows the gate"
+        );
+    }
+
+    /// The MODD ownership comes from each group file's MODR, read through the
+    /// `{stem}_{gi:03}.wmo` path `load_nav` builds: a wrong path or a missed
+    /// RDOM would leave every prop unowned, which fails open to always-drawn.
+    #[test]
+    fn a_goldshire_building_names_its_props_from_its_group_files() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let mut checked = 0;
+        // Goldshire's tiles: the ADT names are `(x from world y, y from world x)`.
+        for (tx, ty) in [(31, 49), (32, 49), (31, 48)] {
+            let Ok(bytes) =
+                chain.read_file(&format!("world\\maps\\azeroth\\azeroth_{tx}_{ty}.adt"))
+            else {
+                continue;
+            };
+            let Ok(tile) = benilla_formats::adt_to_tile_mesh(&bytes) else {
+                continue;
+            };
+            for w in tile
+                .wmos
+                .iter()
+                .filter(|w| w.model.to_ascii_lowercase().contains("goldshire"))
+            {
+                let Some(m) = load_nav(&mut chain, &w.model) else {
+                    continue;
+                };
+                if !m.has_portals {
+                    continue;
+                }
+                let named: usize = m.doodad_groups.iter().filter(|g| !g.is_empty()).count();
+                assert!(
+                    named > 0,
+                    "{}: no group names a MODD — the group path or the MODR read is wrong",
+                    w.model
+                );
+                assert!(
+                    m.nav.iter().any(|n| n.flags & EXTERIOR == 0),
+                    "{}: a building with portals and props has a room",
+                    w.model
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no Goldshire building with portals on the probed tiles"
+        );
+    }
 }

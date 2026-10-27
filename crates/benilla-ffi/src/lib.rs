@@ -3238,6 +3238,10 @@ struct WmoDoodadInst {
     quat: [f32; 4],
     scale: f32,
     uid: u32,
+    /// The MODF placement that owns this prop and its MODD index: the prop
+    /// draws with the MODR groups that name it, so the cull needs both.
+    wmo_uid: u32,
+    di: u32,
 }
 
 /// A root's MODD/MODS tables, WMO model space, cached by root path: the
@@ -3343,6 +3347,8 @@ fn resolve_wmo_doodads(
                     quat: q_mul(q_place, *q_local),
                     scale: *scale,
                     uid: wmo_doodad_uid(&inst.model, inst.unique_id, di as u32),
+                    wmo_uid: inst.unique_id,
+                    di: di as u32,
                 });
             }
         }
@@ -3482,6 +3488,7 @@ pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
     };
     // The far-clip cull addresses the placement by uid after the tile drops
     // its flats, so the baked sphere rides the uid-keyed table.
+    let owner = wmo_doodad_at(w, i).map(|d| (d.wmo_uid, d.di));
     if let Some(uid) = w
         .tile
         .as_ref()
@@ -3496,6 +3503,7 @@ pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
             pos,
             quat.unwrap_or_else(|| placement_quat(rot)),
             flat.aabb,
+            owner,
         );
     }
     let n = flat.subs.len() as u32;
