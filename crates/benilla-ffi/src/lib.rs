@@ -816,7 +816,7 @@ fn tile_worker() {
                             }
 
                             // The tile's prop models, for the parse cache and
-                            // the body's footprint parking (under the raw ADT
+                            // the body's hull parking (under the raw ADT
                             // path, which is what the collision tile asks for).
                             let mut model_seen = std::collections::HashSet::new();
                             for d in &t.doodads {
@@ -2788,10 +2788,7 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     let n = flat.subs.len() as u32;
     wmo_sphere_store(uid, Some(&flat));
     if !exterior::nav_known(&key) {
-        let nav = w
-            .chain
-            .as_mut()
-            .and_then(|c| exterior::load_nav(c, &key));
+        let nav = w.chain.as_mut().and_then(|c| exterior::load_nav(c, &key));
         exterior::store_nav(&key, nav);
     }
     exterior::register_wmo(uid, &key, pos, rot, flat.aabb);
@@ -3048,7 +3045,12 @@ pub extern "C" fn bn_wmo_drawable(
         return 0;
     };
     // SAFETY: caller guarantees two valid three-float arrays.
-    let (e, f) = unsafe { ([*eye, *eye.add(1), *eye.add(2)], [*fwd, *fwd.add(1), *fwd.add(2)]) };
+    let (e, f) = unsafe {
+        (
+            [*eye, *eye.add(1), *eye.add(2)],
+            [*fwd, *fwd.add(1), *fwd.add(2)],
+        )
+    };
     let depth = (c[0] - e[0]) * f[0] + (c[1] - e[1]) * f[1] + (c[2] - e[2]) * f[2] - r;
     // The client's `farclip` range: 177 to 777.
     let wall = farclip.clamp(177.0, 777.0);
@@ -3081,7 +3083,12 @@ pub extern "C" fn bn_doodad_drawable(
         return 0;
     };
     // SAFETY: caller guarantees two valid three-float arrays.
-    let (e, f) = unsafe { ([*eye, *eye.add(1), *eye.add(2)], [*fwd, *fwd.add(1), *fwd.add(2)]) };
+    let (e, f) = unsafe {
+        (
+            [*eye, *eye.add(1), *eye.add(2)],
+            [*fwd, *fwd.add(1), *fwd.add(2)],
+        )
+    };
     let depth = (c[0] - e[0]) * f[0] + (c[1] - e[1]) * f[1] + (c[2] - e[2]) * f[2] - r;
     let wall = farclip.clamp(177.0, 777.0);
     unsafe { *out = (depth <= wall) as u32 };
@@ -3344,9 +3351,9 @@ fn resolve_wmo_doodads(
 }
 
 /// Parse a prepared tile's prop models on the worker: the mesh (shared with
-/// `bn_doodad_load`), its rig (shared with `bn_doodad_rig_info`) and the base
-/// footprint the body walks against. `models` pairs the raw ADT path (the
-/// footprint's key) with its normalized form (the cache key).
+/// `bn_doodad_load`), its rig (shared with `bn_doodad_rig_info`) and the
+/// collision hull the body walks against. `models` pairs the raw ADT path (the
+/// hull's key) with its normalized form (the cache key).
 fn prefetch_doodad_models(chain: &mut benilla_formats::Chain, models: &[(String, String)]) {
     for (raw, path) in models {
         let Some(bytes) = read_m2_bytes_chain(chain, path) else {
@@ -3362,7 +3369,12 @@ fn prefetch_doodad_models(chain: &mut benilla_formats::Chain, models: &[(String,
                 }
             }
         };
-        player::footprint_park(raw, player::footprint_of(subs.as_slice()));
+        player::doodad_hull_park(
+            raw,
+            benilla_formats::parse_m2_collision_hull(&bytes)
+                .ok()
+                .filter(|h| !h.is_empty()),
+        );
         doodad_rig::rig_ensure_from_bytes(path, &bytes, subs);
     }
 }

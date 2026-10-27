@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -122,10 +121,7 @@ pub fn load_nav(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Ar
         let Ok(gb) = chain.read_file(&format!("{stem}_{gi:03}.wmo")) else {
             continue;
         };
-        if let (Some(h), Some(nav)) = (
-            benilla_formats::wmo_group_header(&gb),
-            m.nav.get_mut(gi)
-        ) {
+        if let (Some(h), Some(nav)) = (benilla_formats::wmo_group_header(&gb), m.nav.get_mut(gi)) {
             nav.flags = h.flags;
             nav.ref_start = h.portal_ref_start;
             nav.ref_count = h.portal_ref_count;
@@ -135,9 +131,11 @@ pub fn load_nav(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Ar
         benilla_formats::accumulate_wmo_group_collision(&gb, &mut gp, &mut gx);
         if let Some(slot) = m.tris.get_mut(gi) {
             for t in gx.as_chunks::<3>().0 {
-                if let (Some(&a), Some(&b), Some(&c)) =
-                    (gp.get(t[0] as usize), gp.get(t[1] as usize), gp.get(t[2] as usize))
-                {
+                if let (Some(&a), Some(&b), Some(&c)) = (
+                    gp.get(t[0] as usize),
+                    gp.get(t[1] as usize),
+                    gp.get(t[2] as usize),
+                ) {
                     slot.push([a, b, c]);
                 }
             }
@@ -147,9 +145,11 @@ pub fn load_nav(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Ar
         benilla_formats::accumulate_wmo_group_camera_only_collision(&gb, &mut dp, &mut dx);
         if let Some(slot) = m.dtris.get_mut(gi) {
             for t in dx.as_chunks::<3>().0 {
-                if let (Some(&a), Some(&b), Some(&c)) =
-                    (dp.get(t[0] as usize), dp.get(t[1] as usize), dp.get(t[2] as usize))
-                {
+                if let (Some(&a), Some(&b), Some(&c)) = (
+                    dp.get(t[0] as usize),
+                    dp.get(t[1] as usize),
+                    dp.get(t[2] as usize),
+                ) {
                     slot.push([a, b, c]);
                 }
             }
@@ -347,8 +347,8 @@ fn down_ray(m: &NavModel, eye: [f32; 3]) -> Seeds {
                 }
             }
         }
-        let named = fb
-            .filter(|&g| eye[2] - fb_z <= MAX_FLOOR_DROP && m.nav[g].flags & EXTERIOR == 0);
+        let named =
+            fb.filter(|&g| eye[2] - fb_z <= MAX_FLOOR_DROP && m.nav[g].flags & EXTERIOR == 0);
         return Seeds {
             in_group: named,
             across: None,
@@ -377,7 +377,11 @@ fn clip_rows(eye: [f32; 3], fwd: [f32; 3], aspect: f32) -> Option<[[f32; 4]; 4]>
         return None;
     }
     let f = [fwd[0] / fl, fwd[1] / fl, fwd[2] / fl];
-    let up0 = if f[2].abs() > 0.99 { [0.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let up0 = if f[2].abs() > 0.99 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
     let mut r = [
         f[1] * up0[2] - f[2] * up0[1],
         f[2] * up0[0] - f[0] * up0[2],
@@ -396,13 +400,15 @@ fn clip_rows(eye: [f32; 3], fwd: [f32; 3], aspect: f32) -> Option<[[f32; 4]; 4]>
     let half = (CAM_FOVY * 0.5).tan();
     let kx = 1.0 / (aspect.max(1.0e-3) * half);
     let ky = 1.0 / half;
-    let row = |a: [f32; 3], k: f32| [k * a[0], k * a[1], k * a[2], -k * (a[0] * eye[0] + a[1] * eye[1] + a[2] * eye[2])];
-    Some([
-        row(r, kx),
-        row(u, ky),
-        row(f, 1.0),
-        row(f, 1.0),
-    ])
+    let row = |a: [f32; 3], k: f32| {
+        [
+            k * a[0],
+            k * a[1],
+            k * a[2],
+            -k * (a[0] * eye[0] + a[1] * eye[1] + a[2] * eye[2]),
+        ]
+    };
+    Some([row(r, kx), row(u, ky), row(f, 1.0), row(f, 1.0)])
 }
 
 fn clip_point(rows: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 4] {
@@ -622,10 +628,8 @@ impl Flood<'_> {
                     continue;
                 };
                 let [nx, ny, nz, d] = info.plane;
-                let mut dd = nx * self.eye_local[0]
-                    + ny * self.eye_local[1]
-                    + nz * self.eye_local[2]
-                    + d;
+                let mut dd =
+                    nx * self.eye_local[0] + ny * self.eye_local[1] + nz * self.eye_local[2] + d;
                 if r.side < 0 {
                     dd = -dd;
                 }
@@ -745,7 +749,6 @@ fn flood_windows(
     (windows, visible)
 }
 
-
 fn admits(gate: &Gate, o: &Obb) -> bool {
     gate.frusta.iter().any(|f| obb_in_frustum(o, f))
 }
@@ -795,7 +798,10 @@ fn group_ok(
     let Some(o) = group_obb(m, &pl.pos, &pl.q, group) else {
         return true;
     };
-    if s.pvs.get(&uid).is_some_and(|v| !v.get(group).copied().unwrap_or(true)) {
+    if s.pvs
+        .get(&uid)
+        .is_some_and(|v| !v.get(group).copied().unwrap_or(true))
+    {
         return false;
     }
     let fl = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt();
@@ -804,8 +810,7 @@ fn group_ok(
         let c = o.c;
         let h = o.h;
         let rad = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
-        let depth =
-            (c[0] - eye[0]) * f[0] + (c[1] - eye[1]) * f[1] + (c[2] - eye[2]) * f[2] - rad;
+        let depth = (c[0] - eye[0]) * f[0] + (c[1] - eye[1]) * f[1] + (c[2] - eye[2]) * f[2] - rad;
         if depth > farclip.clamp(177.0, 777.0) {
             return false;
         }
@@ -850,11 +855,7 @@ pub extern "C" fn bn_exterior_group_ok(
 }
 
 #[no_mangle]
-pub extern "C" fn bn_exterior_update(
-    eye: *const f32,
-    fwd: *const f32,
-    aspect: f32,
-) -> u32 {
+pub extern "C" fn bn_exterior_update(eye: *const f32, fwd: *const f32, aspect: f32) -> u32 {
     if eye.is_null() || fwd.is_null() {
         return 0;
     }

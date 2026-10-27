@@ -256,92 +256,20 @@ const WMO_MARGIN: i32 = 1;
 /// One map cell is half a chunk (16.67 yd); the map corner is -17066.67.
 const WMO_CELL: f32 = 33.333_336 / 2.0;
 
-// ---- doodad footprints ----
-/// The slice of a model that counts as its base (yd above the model origin):
-/// knee height keeps trunks, crates, fences and sign posts, and leaves out
-/// canopies and awnings the body walks under.
-const DOODAD_SLICE: f32 = 1.0;
-/// Below this base extent (yd) a doodad is scenery, not an obstacle.
-const DOODAD_MIN_EXTENT: f32 = 0.15;
+// ---- doodad collision hulls ----
+// A map doodad collides by its M2 collision hull (the header's coarse
+// `bounding_vertices`/`bounding_triangles`), never by its render mesh:
+// `benilla-world`'s `placement_collider_data` traces exactly this gather. A
+// grass tuft or a canopy ships no hull and is walked through; a trunk's hull is
+// a handful of triangles the mover can certify a step onto. The old base-slice
+// box stood in for every model alike - grass became solid, a trunk became a
+// wall its canopy's footprint wide, and nothing could be stepped on.
 
-/// A doodad's standing obstacle: an oriented box over its base slice (a
-/// cylinder would turn a fence into a blob). `ux`/`uy` are the model's local
-/// axes projected to the world.
-#[derive(Clone, Copy)]
-struct DoodadCollider {
-    /// Base centre (x, y) and the lowest point of the model, world yards.
-    c: [f32; 3],
-    ux: [f32; 2],
-    uy: [f32; 2],
-    hx: f32,
-    hy: f32,
-    /// Top of the model; a footprint floating above the body does not block.
-    top: f32,
-}
-
-/// An M2's base footprint in model-local yards.
-#[derive(Clone, Copy)]
-pub(crate) struct Footprint {
-    cx: f32,
-    cy: f32,
-    hx: f32,
-    hy: f32,
-    zmin: f32,
-    zmax: f32,
-}
-
-/// The base footprint of a parsed M2 render mesh: the vertices within knee
-/// height of the model origin decide the box, so a crate's sides or a trunk
-/// are solid while its canopy is not.
-pub(crate) fn footprint_of(subs: &[benilla_formats::RenderSubmesh]) -> Option<Footprint> {
-    let mut lo = [f32::INFINITY; 2];
-    let mut hi = [f32::NEG_INFINITY; 2];
-    let mut zmin = f32::INFINITY;
-    let mut zmax = f32::NEG_INFINITY;
-    let mut any = false;
-    for s in subs {
-        for p in &s.positions {
-            zmin = zmin.min(p[2]);
-            zmax = zmax.max(p[2]);
-            if p[2] >= -0.5 && p[2] <= DOODAD_SLICE {
-                any = true;
-                lo[0] = lo[0].min(p[0]);
-                lo[1] = lo[1].min(p[1]);
-                hi[0] = hi[0].max(p[0]);
-                hi[1] = hi[1].max(p[1]);
-            }
-        }
-    }
-    if !any || zmax <= zmin {
-        return None;
-    }
-    let hx = (hi[0] - lo[0]) * 0.5;
-    let hy = (hi[1] - lo[1]) * 0.5;
-    if hx.max(hy) < DOODAD_MIN_EXTENT {
-        return None;
-    }
-    Some(Footprint {
-        cx: (lo[0] + hi[0]) * 0.5,
-        cy: (lo[1] + hi[1]) * 0.5,
-        hx,
-        hy,
-        zmin,
-        zmax,
-    })
-}
-
-/// The base footprint of an M2 doodad from its render mesh, parsed here.
-fn m2_footprint(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Footprint> {
-    footprint_of(&benilla_formats::load_m2_mesh(chain, raw_path).ok()?)
-}
-
-/// Footprints and WMO collision meshes parked by the tile worker, which
-/// already holds the MPQ chain. The tick that adopts a new tile looks them up
-/// instead of parsing a model on the game thread, where one stormwind wall
-/// parse was a 40-60 ms frame.
-fn parked_footprints() -> &'static std::sync::Mutex<HashMap<String, Option<Footprint>>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Footprint>>>> =
-        std::sync::OnceLock::new();
+fn parked_doodad_hulls(
+) -> &'static std::sync::Mutex<HashMap<String, Option<benilla_formats::CollisionMesh>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Option<benilla_formats::CollisionMesh>>>,
+    > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -352,15 +280,24 @@ fn parked_wmo_cols() -> &'static std::sync::Mutex<HashMap<String, benilla_format
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Park one model's footprint (`None` = it has no base obstacle).
-pub(crate) fn footprint_park(path: &str, fp: Option<Footprint>) {
-    if let Ok(mut m) = parked_footprints().lock() {
-        m.insert(path.to_string(), fp);
+/// Park one model's collision hull (`None` = the model ships none).
+pub(crate) fn doodad_hull_park(path: &str, hull: Option<benilla_formats::CollisionMesh>) {
+    if let Ok(mut m) = parked_doodad_hulls().lock() {
+        m.insert(path.to_string(), hull);
     }
 }
 
-fn footprint_parked(path: &str) -> Option<Option<Footprint>> {
-    parked_footprints().lock().ok()?.get(path).copied()
+fn doodad_hull_parked(path: &str) -> Option<Option<benilla_formats::CollisionMesh>> {
+    parked_doodad_hulls().lock().ok()?.get(path).cloned()
+}
+
+/// A doodad's hull, parsed here when the tile worker never parked it.
+fn m2_collision_hull(
+    chain: &mut benilla_formats::Chain,
+    raw_path: &str,
+) -> Option<benilla_formats::CollisionMesh> {
+    let hull = benilla_formats::load_m2_collision_hull(chain, raw_path).ok()?;
+    (!hull.is_empty()).then_some(hull)
 }
 
 /// Park one WMO's collision mesh for the body tile that lists it.
@@ -390,12 +327,12 @@ pub(crate) struct TileCol {
     /// lands in every cell its XY bounds overlap, so the huge city floors
     /// answer from any point instead of a full-scan every frame.
     wmo_cells: Vec<Vec<Tri>>,
-    /// Doodad base footprints on the same grid (the 1.12 M2s ship no collision
-    /// hull: a crate's sides or a trunk are their own base slice).
-    doodad_cells: Vec<Vec<DoodadCollider>>,
+    /// Doodad collision-hull triangles on the same grid: each placement's M2
+    /// hull, placed and scaled (`load_m2_collision_hull`).
+    doodad_cells: Vec<Vec<Tri>>,
     /// MODF placements, kept from the ADT so the WMO floors can be built once.
     wmos: Vec<benilla_formats::WmoInstance>,
-    /// MDDF placements, whose base footprints become collision cylinders.
+    /// MDDF placements, whose M2 collision hulls become world triangles.
     doodads: Vec<benilla_formats::Doodad>,
     /// MCLQ surfaces, sampled for the swim latch and the floating resolver.
     liquids: Vec<benilla_formats::LiquidMesh>,
@@ -414,7 +351,7 @@ pub(crate) struct TileCol {
     /// WMO MLIQ cursor: one model's water groups per slice (each is an MPQ
     /// read and parse; a city tile holds a dozen).
     wmo_mliq: usize,
-    /// Doodad cursor: footprints are built a few models at a time (the first
+    /// Doodad cursor: hulls are folded in a few models at a time (the first
     /// cold parse of ~200 unique M2 meshes costs half a second), so the frame
     /// never stalls on a tile load.
     doodad_next: usize,
@@ -715,56 +652,6 @@ fn keep_nearest(best: &mut Option<f32>, d: Option<f32>, max: f32) {
     }
 }
 
-/// Ray against a doodad's base box (an oriented, vertical slab): the ray
-/// length to the entry face, if it enters within the slab.
-fn ray_box(o: [f32; 3], d: [f32; 3], b: &DoodadCollider) -> Option<f32> {
-    let dx = o[0] - b.c[0];
-    let dy = o[1] - b.c[1];
-    let mut tmin = 0.0f32;
-    let mut tmax = f32::INFINITY;
-    let slab = |o: f32, d: f32, lo: f32, hi: f32, tmin: &mut f32, tmax: &mut f32| -> bool {
-        if d.abs() < 1.0e-6 {
-            return o >= lo && o <= hi;
-        }
-        let a = (lo - o) / d;
-        let c = (hi - o) / d;
-        *tmin = tmin.max(a.min(c));
-        *tmax = tmax.min(a.max(c));
-        *tmin <= *tmax
-    };
-    if !slab(
-        dx * b.ux[0] + dy * b.ux[1],
-        d[0] * b.ux[0] + d[1] * b.ux[1],
-        -b.hx,
-        b.hx,
-        &mut tmin,
-        &mut tmax,
-    ) {
-        return None;
-    }
-    if !slab(
-        dx * b.uy[0] + dy * b.uy[1],
-        d[0] * b.uy[0] + d[1] * b.uy[1],
-        -b.hy,
-        b.hy,
-        &mut tmin,
-        &mut tmax,
-    ) {
-        return None;
-    }
-    if !slab(
-        o[2] - b.c[2],
-        d[2],
-        0.0,
-        (b.top - b.c[2]).max(1.0e-4),
-        &mut tmin,
-        &mut tmax,
-    ) {
-        return None;
-    }
-    (tmin > 1.0e-4).then_some(tmin)
-}
-
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
 fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
     let [a, b, c] = t.v;
@@ -867,9 +754,9 @@ pub struct Player {
     mounted: bool,
     attack_left: f32,
     tiles: HashMap<(i32, i32), TileCol>,
-    /// Doodad model footprints, parsed once per model path (`None` = nothing
-    /// at body height).
-    footprints: HashMap<String, Option<Footprint>>,
+    /// Doodad collision hulls, parsed once per model path (`None` = the model
+    /// ships no hull, like grass or a canopy).
+    hulls: HashMap<String, Option<benilla_formats::CollisionMesh>>,
     /// Tiles already asked for and found missing in the archives.
     missing: Vec<(i32, i32)>,
     /// Set when a tile's WMO floors are built: the spawn sits on the terrain
@@ -914,7 +801,7 @@ impl Player {
             mounted: false,
             attack_left: 0.0,
             tiles: HashMap::new(),
-            footprints: HashMap::new(),
+            hulls: HashMap::new(),
             missing: Vec::new(),
             snap_pending: false,
             last_ground: [x, y, 0.0],
@@ -1031,70 +918,59 @@ impl Player {
                 self.snap_pending = true;
             }
         }
-        // Doodad footprints: the 1.12 M2s ship no collision hull (all 5,115
-        // doodads around Stormwind have an empty one), so the base slice of
-        // the render mesh stands in - a crate's sides, a trunk, a fence post -
-        // but not the canopy, which would wall off a forest. The first tile
-        // cold-parses ~200 unique models, so this runs on a 2ms budget per
-        // tick instead of all at once.
+        // Doodad hulls: each placement folds its model's M2 collision hull in
+        // as world triangles, the gather `placement_collider_data` builds. A
+        // model with no hull (grass, a canopy) is walked through and stepped
+        // under; a trunk's hull is solid and its sloped faces can be climbed.
+        // The first tile cold-parses ~200 unique models, so this runs on a 2ms
+        // budget per tick instead of all at once.
         let start = std::time::Instant::now();
         while t.doodad_next < t.doodads.len() {
             let i = t.doodad_next;
-            if !self.footprints.contains_key(&t.doodads[i].model) {
-                let parked = footprint_parked(&t.doodads[i].model);
+            if !self.hulls.contains_key(&t.doodads[i].model) {
+                let parked = doodad_hull_parked(&t.doodads[i].model);
                 if parked.is_none() && start.elapsed().as_millis() >= 2 {
                     // A cold model with nothing parked: leave the cursor on it
                     // for the next tick instead of parsing mid-frame.
                     break;
                 }
                 let model = t.doodads[i].model.clone();
-                let fp = parked.unwrap_or_else(|| m2_footprint(chain, &model));
-                self.footprints.insert(model, fp);
+                let hull = parked.unwrap_or_else(|| m2_collision_hull(chain, &model));
+                self.hulls.insert(model, hull);
             }
             t.doodad_next = i + 1;
             let d = &t.doodads[i];
-            let Some(Some(fp)) = self.footprints.get(&d.model) else {
+            let Some(Some(hull)) = self.hulls.get(&d.model) else {
                 continue;
             };
             let q = placement_quat(d.rotation);
-            let off = q_rot(q, [fp.cx * d.scale, fp.cy * d.scale, 0.0]);
-            let ax = q_rot(q, [1.0, 0.0, 0.0]);
-            let ay = q_rot(q, [0.0, 1.0, 0.0]);
-            let (ax, ay) = ([ax[0], ax[1]], [ay[0], ay[1]]);
-            let (lx, ly) = (
-                (ax[0] * ax[0] + ax[1] * ax[1]).sqrt(),
-                (ay[0] * ay[0] + ay[1] * ay[1]).sqrt(),
-            );
-            if lx < 1.0e-4 || ly < 1.0e-4 {
-                continue;
-            }
-            let (hx, hy) = (fp.hx * d.scale, fp.hy * d.scale);
-            let reach = (hx * hx + hy * hy).sqrt();
-            let col = DoodadCollider {
-                c: [
-                    d.position[0] + off[0],
-                    d.position[1] + off[1],
-                    d.position[2] + fp.zmin * d.scale,
-                ],
-                ux: [ax[0] / lx, ax[1] / lx],
-                uy: [ay[0] / ly, ay[1] / ly],
-                hx,
-                hy,
-                top: d.position[2] + fp.zmax * d.scale,
-            };
-            let (ax0, ay0) = TileCol::wmo_local(tx, ty, col.c[0] - reach, col.c[1] - reach);
-            let (bx0, by0) = TileCol::wmo_local(tx, ty, col.c[0] + reach, col.c[1] + reach);
-            let (x0, x1) = (
-                ax0.min(bx0).clamp(0, WMO_GRID - 1),
-                ax0.max(bx0).clamp(0, WMO_GRID - 1),
-            );
-            let (y0, y1) = (
-                ay0.min(by0).clamp(0, WMO_GRID - 1),
-                ay0.max(by0).clamp(0, WMO_GRID - 1),
-            );
-            for ly in y0..=y1 {
-                for lx in x0..=x1 {
-                    t.doodad_cells[(ly * WMO_GRID + lx) as usize].push(col);
+            let s = d.scale;
+            let world: Vec<[f32; 3]> = hull
+                .positions
+                .iter()
+                .map(|p| {
+                    let r = q_rot(q, [p[0] * s, p[1] * s, p[2] * s]);
+                    [
+                        r[0] + d.position[0],
+                        r[1] + d.position[1],
+                        r[2] + d.position[2],
+                    ]
+                })
+                .collect();
+            for tri in hull.indices.as_chunks::<3>().0 {
+                let (Some(&va), Some(&vb), Some(&vc)) = (
+                    world.get(tri[0] as usize),
+                    world.get(tri[1] as usize),
+                    world.get(tri[2] as usize),
+                ) else {
+                    continue;
+                };
+                let tri_c = Tri::new(va, vb, vc);
+                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
+                for ly in y0..=y1 {
+                    for lx in x0..=x1 {
+                        t.doodad_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                    }
                 }
             }
             if start.elapsed().as_millis() >= 2 {
@@ -1124,6 +1000,9 @@ impl Player {
                 for t in &tile.wmo_cells[i] {
                     consider(t);
                 }
+                for t in &tile.doodad_cells[i] {
+                    consider(t);
+                }
             }
         } else {
             // Crossing a border before the neighbour finished loading: any
@@ -1131,6 +1010,9 @@ impl Player {
             for (&(k0, k1), tile) in &self.tiles {
                 if let Some(i) = TileCol::wmo_cell(k0, k1, x, y) {
                     for t in &tile.wmo_cells[i] {
+                        consider(t);
+                    }
+                    for t in &tile.doodad_cells[i] {
                         consider(t);
                     }
                 }
@@ -1195,12 +1077,28 @@ impl Player {
         best
     }
 
-    /// A steep WMO face within `radius` of `p` (a wall; floors are excluded).
-    /// Faces entirely below `step_base + STEP_UP_HEIGHT` are steps, not walls:
-    /// the client's mover climbs them, so its wall test must not see them.
-    /// Pass `f32::NEG_INFINITY` to keep every face (the camera's probe).
+    /// A steep solid face within `radius` of `p` (a wall; floors are excluded).
+    /// Every face the reference's body trace meets is here: terrain (and the
+    /// impassable chunks' fences), WMO walk faces and doodad hulls, one
+    /// audience. Faces entirely below `step_base + STEP_UP_HEIGHT` are steps,
+    /// not walls: the client's mover climbs them, so its wall test must not
+    /// see them. Pass `f32::NEG_INFINITY` to keep every face (the camera's
+    /// probe).
     fn hit_steep(&self, p: [f32; 3], radius: f32, step_base: f32) -> bool {
         let (tx, ty) = Self::tile_of(p[0], p[1]);
+        let r2 = radius * radius;
+        let steep = |t: &Tri| -> bool {
+            if t.n[2].abs() >= GROUND_COS {
+                return false;
+            }
+            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            if top <= step_base + STEP_UP_HEIGHT {
+                return false; // a curb the mover steps over
+            }
+            let q = closest_on_tri(p, t);
+            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < r2
+        };
         let probe = |ktx: i32, kty: i32, tile: &TileCol| -> bool {
             let Some(i) = TileCol::wmo_cell(ktx, kty, p[0], p[1]) else {
                 return false;
@@ -1209,25 +1107,34 @@ impl Player {
                 (i % WMO_GRID as usize) as i32,
                 (i / WMO_GRID as usize) as i32,
             );
-            let r2 = radius * radius;
             for gy in (ly - 1)..=(ly + 1) {
                 for gx in (lx - 1)..=(lx + 1) {
                     if !(0..WMO_GRID).contains(&gx) || !(0..WMO_GRID).contains(&gy) {
                         continue;
                     }
-                    for t in &tile.wmo_cells[(gy * WMO_GRID + gx) as usize] {
-                        if t.n[2].abs() >= GROUND_COS {
-                            continue;
-                        }
-                        let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
-                        if top <= step_base + STEP_UP_HEIGHT {
-                            continue; // a curb the mover steps over
-                        }
-                        let q = closest_on_tri(p, t);
-                        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-                        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < r2 {
-                            return true;
-                        }
+                    let cell = (gy * WMO_GRID + gx) as usize;
+                    if tile.wmo_cells[cell].iter().any(steep)
+                        || tile.doodad_cells[cell].iter().any(steep)
+                    {
+                        return true;
+                    }
+                }
+            }
+            // Terrain, and the fences of its impassable chunks, live in the
+            // chunk buckets: the three-by-three chunks around the body.
+            let (cx, cy) =
+                world_to_chunk(p[0].clamp(-17066.0, 17066.0), p[1].clamp(-17066.0, 17066.0));
+            let (cx, cy) = (cx as i32, cy as i32);
+            for y in (cy - 1)..=(cy + 1) {
+                for x in (cx - 1)..=(cx + 1) {
+                    // The west/south map edge has no neighbour chunk, and the
+                    // neighbour tile answers for its own chunks.
+                    if x < 0 || y < 0 || x / 16 != ktx || y / 16 != kty {
+                        continue;
+                    }
+                    let b = ((y % 16) * 16 + (x % 16)) as usize;
+                    if tile.buckets[b].iter().any(steep) {
+                        return true;
                     }
                 }
             }
@@ -1242,7 +1149,7 @@ impl Player {
             .any(|(&(k0, k1), tile)| probe(k0, k1, tile))
     }
 
-    /// Horizontal blocking by a steep WMO face: the client's capsule (a
+    /// Horizontal blocking by a steep solid face: the client's capsule (a
     /// radius `CAPSULE_RADIUS` sweep between the feet and the head) against
     /// walls. Floors (`|n.z| >= GROUND_COS`) are left to [`Self::ground`].
     fn wall_hit(&self, x: f32, y: f32, feet: f32) -> bool {
@@ -1254,47 +1161,7 @@ impl Player {
                 CAPSULE_RADIUS,
                 feet,
             )
-        }) || self.doodad_hit(x, y, feet)
-    }
-
-    /// True when a doodad's base cylinder overlaps the body at (`x`, `y`).
-    fn doodad_hit(&self, x: f32, y: f32, feet: f32) -> bool {
-        let (tx, ty) = Self::tile_of(x, y);
-        let Some(tile) = self.tiles.get(&(tx, ty)) else {
-            return false;
-        };
-        let Some(ci) = TileCol::wmo_cell(tx, ty, x, y) else {
-            return false;
-        };
-        let (gx, gy) = (
-            (ci % WMO_GRID as usize) as i32,
-            (ci / WMO_GRID as usize) as i32,
-        );
-        let lo = feet + 0.1;
-        let hi = feet + CAPSULE_HEIGHT;
-        for ly in (gy - 1)..=(gy + 1) {
-            for lx in (gx - 1)..=(gx + 1) {
-                if !(0..WMO_GRID).contains(&lx) || !(0..WMO_GRID).contains(&ly) {
-                    continue;
-                }
-                for d in &tile.doodad_cells[(ly * WMO_GRID + lx) as usize] {
-                    if d.top <= lo || d.c[2] >= hi {
-                        continue;
-                    }
-                    let dx = x - d.c[0];
-                    let dy = y - d.c[1];
-                    // Closest point on the oriented base box to the body axis.
-                    let lx = dx * d.ux[0] + dy * d.ux[1];
-                    let ly = dx * d.uy[0] + dy * d.uy[1];
-                    let ex = lx - lx.clamp(-d.hx, d.hx);
-                    let ey = ly - ly.clamp(-d.hy, d.hy);
-                    if ex * ex + ey * ey < CAPSULE_RADIUS * CAPSULE_RADIUS {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        })
     }
 
     /// The framing pivot for this frame: the standing/swimming preset above
@@ -1322,8 +1189,8 @@ impl Player {
     /// face counts, a roof exactly like a wall: leaving ceilings to a floor
     /// probe let the eye rise through a roof (and through the city wall's
     /// arch stones) instead of stopping under it. The terrain buckets and the
-    /// doodads' base boxes are solid the same way, so the camera's ray sweeps
-    /// one world, not just the building the player stands in.
+    /// doodads' hulls are solid the same way, so the camera's ray sweeps one
+    /// world, not just the building the player stands in.
     fn boom_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
         let end = [
             pivot[0] + dir[0] * max,
@@ -1343,7 +1210,7 @@ impl Player {
                         keep_nearest(&mut best, ray_tri(pivot, dir, t), max);
                     }
                     for d in &tile.doodad_cells[(gy * WMO_GRID + gx) as usize] {
-                        keep_nearest(&mut best, ray_box(pivot, dir, d), max);
+                        keep_nearest(&mut best, ray_tri(pivot, dir, d), max);
                     }
                 }
             }
@@ -2002,6 +1869,9 @@ pub(crate) fn tile_col_from_mesh(mesh: &benilla_formats::TileMesh) -> TileCol {
     col.doodads = mesh.doodads.clone();
     for c in &mesh.chunks {
         col.liquids.extend(c.liquids.iter().cloned());
+        if c.impassable {
+            add_impassable_fences(c, &mut col);
+        }
         if c.positions.len() < 3 || c.indices.len() < 3 {
             continue;
         }
@@ -2024,6 +1894,51 @@ pub(crate) fn tile_col_from_mesh(mesh: &benilla_formats::TileMesh) -> TileCol {
         }
     }
     col
+}
+
+/// How far an impassable chunk's fence rises from the chunk AABB's min z
+/// (`chunk+0x4c`): the reference's `(0, 0, 32000.0)` (`0x46fa0000` at
+/// `0x6ab599`, emitter `0x6ab530`). Nothing extends below, so a mover under the
+/// chunk floor (a mine, the sea bed) passes beneath.
+const FENCE_REACH: f32 = 32000.0;
+
+/// The four side quads of an impassable chunk (`MCNK` header bit 1, read at
+/// `0x6aae2a`): without them the mover walks straight into a mountain chunk,
+/// sinks under its surface and is left inside the world. Built from the 9x9
+/// outer grid's corners (row `r` starts at `r·17`) from the chunk's min z up
+/// [`FENCE_REACH`]; vertical, so they never answer as a floor.
+fn add_impassable_fences(c: &benilla_formats::ChunkMesh, col: &mut TileCol) {
+    let Some(floor) = c.positions.iter().map(|p| p[2]).reduce(f32::min) else {
+        return; // a chunk with no vertices has no AABB to stand a fence on
+    };
+    const SIDES: [[usize; 2]; 4] = [
+        [8, 0],     // north (row 0), walked east → west
+        [136, 144], // south (row 8), walked west → east
+        [0, 136],   // west (col 0), walked north → south
+        [144, 8],   // east (col 8), walked south → north
+    ];
+    // The chunk's own bucket, from its centre vertex (row 4, col 4).
+    let Some(centre) = c.positions.get(72) else {
+        return;
+    };
+    let (cx, cy) = world_to_chunk(centre[0], centre[1]);
+    let bucket = ((cy % 16) * 16 + (cx % 16)) as usize;
+    let top = floor + FENCE_REACH;
+    for [from, to] in SIDES {
+        let (Some(a), Some(b)) = (c.positions.get(from), c.positions.get(to)) else {
+            continue;
+        };
+        col.buckets[bucket].push(Tri::new(
+            [a[0], a[1], floor],
+            [b[0], b[1], floor],
+            [b[0], b[1], top],
+        ));
+        col.buckets[bucket].push(Tri::new(
+            [a[0], a[1], floor],
+            [b[0], b[1], top],
+            [a[0], a[1], top],
+        ));
+    }
 }
 
 // ---- C ABI ----
@@ -2540,31 +2455,50 @@ mod tests {
     }
 
     #[test]
-    fn a_doodad_footprint_blocks_the_body() {
+    fn a_doodad_hull_is_a_wall_and_its_cap_is_a_floor() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
         let (cx, cy) = (p.pos[0] + 2.0, p.pos[1]);
         let mut tile = TileCol::new();
         let ci = TileCol::wmo_cell(tx, ty, cx, cy).unwrap();
-        let boxed = DoodadCollider {
-            c: [cx, cy, 0.0],
-            ux: [1.0, 0.0],
-            uy: [0.0, 1.0],
-            hx: 0.5,
-            hy: 0.5,
-            top: 3.0,
+        // A trunk's hull quad, standing on the ground: the vertical faces of a
+        // placed `bounding_triangles` mesh land in the doodad grid exactly so.
+        let wall = |y0: f32, y1: f32, z0: f32, z1: f32| {
+            [
+                Tri::new([cx, y0, z0], [cx, y1, z0], [cx, y1, z1]),
+                Tri::new([cx, y0, z0], [cx, y1, z1], [cx, y0, z1]),
+            ]
         };
-        tile.doodad_cells[ci].push(boxed);
-        // A footprint floating over the head does not block the feet.
-        tile.doodad_cells[ci].push(DoodadCollider {
-            c: [cx, cy + 4.0, 4.0],
-            top: 6.0,
-            ..boxed
-        });
+        tile.doodad_cells[ci].extend(wall(cy - 1.0, cy + 1.0, 0.0, 3.0));
         p.tiles.insert((tx, ty), tile);
-        assert!(p.wall_hit(cx, cy, 0.0), "inside the base cylinder");
+        assert!(p.wall_hit(cx, cy, 0.0), "the trunk face stops the capsule");
         assert!(!p.wall_hit(cx + 2.0, cy, 0.0), "clear of it");
-        assert!(!p.wall_hit(cx, cy + 4.0, 0.0), "canopy is above the body");
+        assert!(!p.wall_hit(cx, cy + 4.0, 0.0), "past its end");
+
+        // A stump cap half a yard up is a step the mover certifies, not a
+        // wall: the reference walks a short way onto a trunk's hull.
+        let (sx, sy) = (cx + 6.0, cy);
+        let si = TileCol::wmo_cell(tx, ty, sx, sy).unwrap();
+        let tile = p.tiles.get_mut(&(tx, ty)).unwrap();
+        tile.doodad_cells[si].push(Tri::new(
+            [sx - 0.5, sy - 0.5, 0.5],
+            [sx + 0.5, sy - 0.5, 0.5],
+            [sx + 0.5, sy + 0.5, 0.5],
+        ));
+        tile.doodad_cells[si].push(Tri::new(
+            [sx - 0.5, sy - 0.5, 0.5],
+            [sx + 0.5, sy + 0.5, 0.5],
+            [sx - 0.5, sy + 0.5, 0.5],
+        ));
+        let (z, nz) = p.ground(sx, sy, 5.0).expect("the cap answers as a floor");
+        assert!(
+            (z - 0.5).abs() < 1.0e-5 && nz >= GROUND_COS,
+            "caps are floors"
+        );
+        assert!(
+            !p.wall_hit(sx, sy, 0.0),
+            "a half-yard cap is climbed, not blocked"
+        );
     }
 
     #[test]
@@ -2876,7 +2810,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs the installed 1.12.1 data"]
-    fn doodad_footprints_on_city_tiles() {
+    fn doodad_hulls_on_city_tiles() {
         use crate::{bn_doodad_count, bn_doodad_model_path, bn_init, bn_load_tile};
         let dir =
             std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
@@ -2905,48 +2839,253 @@ mod tests {
                 }
             }
         }
+        // The body traces exactly the M2 collision hull (`0x6bc9f0` gathers
+        // `bounding_vertices`/`bounding_triangles`); a model that ships none -
+        // grass, a canopy, a hanging lamp - is walked through.
         let start = std::time::Instant::now();
-        let (mut solid, mut skipped) = (0, 0);
-        let (mut rsum, mut rmax) = (0.0f32, 0.0f32);
-        let mut buckets = [0usize; 6];
-        let mut biggest: Vec<(f32, String)> = Vec::new();
+        let (mut solid, mut bare, mut tris) = (0usize, 0usize, 0usize);
+        let mut biggest: Vec<(usize, String)> = Vec::new();
         for path in &paths {
             let chain = unsafe { (*w).chain.as_mut().unwrap() };
-            match m2_footprint(chain, path) {
-                Some(f) => {
-                    let r = f.hx.max(f.hy);
+            let hull = benilla_formats::load_m2_collision_hull(chain, path).ok();
+            match hull.filter(|h| !h.is_empty()) {
+                Some(h) => {
                     solid += 1;
-                    rsum += r;
-                    rmax = rmax.max(r);
-                    let b = if r < 0.3 {
-                        1
-                    } else if r < 0.6 {
-                        2
-                    } else if r < 1.0 {
-                        3
-                    } else if r < 2.0 {
-                        4
-                    } else {
-                        5
-                    };
-                    buckets[b] += 1;
-                    biggest.push((r, path.clone()));
+                    let n = h.indices.len() / 3;
+                    tris += n;
+                    biggest.push((n, path.clone()));
                 }
-                _ => skipped += 1,
+                None => bare += 1,
             }
         }
-        biggest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        biggest.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         println!(
-            "placed {placed}, unique models {}, solid {solid}, skipped {skipped}, \
-             avg r {:.2} max r {:.2}, buckets {buckets:?}, parsed in {:?}",
+            "placed {placed}, unique models {}, with hull {solid}, without {bare}, \
+             {tris} hull triangles, parsed in {:?}",
             paths.len(),
-            if solid > 0 { rsum / solid as f32 } else { 0.0 },
-            rmax,
             start.elapsed()
         );
-        for (r, p) in biggest.iter().take(5) {
-            println!("  r {r:.2} {p}");
+        for (n, p) in biggest.iter().take(5) {
+            println!("  {n} tris {p}");
         }
+        assert!(solid > 0, "a city tile's props must carry hulls");
+        assert!(bare > 0, "and hull-less props (grass) must appear too");
+        crate::bn_shutdown(w);
+    }
+
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn terrain_buckets_answer_like_a_full_scan() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (x0, y0) = (-9463.0f32, 63.0f32);
+        let (tx, ty) = Player::tile_of(x0, y0);
+        let mut p = Player::new("Azeroth", x0, y0);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(c) = load_tile(&w.archives, "Azeroth", tx + dx, ty + dy) {
+                    p.tiles.insert((tx + dx, ty + dy), c);
+                }
+            }
+        }
+        let (mut total, mut mism) = (0, 0);
+        for iy in -8..=8 {
+            for ix in -8..=8 {
+                let (x, y) = (x0 + ix as f32 * 5.0, y0 + iy as f32 * 5.0);
+                let (tx, ty) = Player::tile_of(x, y);
+                let Some(tile) = p.tiles.get(&(tx, ty)) else {
+                    continue;
+                };
+                let mut best: Option<f32> = None;
+                for b in &tile.buckets {
+                    for t in b {
+                        if let Some(z) = t.height_at(x, y, f32::INFINITY) {
+                            best = Some(best.map_or(z, |bz: f32| bz.max(z)));
+                        }
+                    }
+                }
+                for c in &tile.wmo_cells {
+                    for t in c {
+                        if let Some(z) = t.height_at(x, y, f32::INFINITY) {
+                            best = Some(best.map_or(z, |bz: f32| bz.max(z)));
+                        }
+                    }
+                }
+                let via = p.ground(x, y, f32::INFINITY).map(|(z, _)| z);
+                total += 1;
+                let bad = match (best, via) {
+                    (Some(a), Some(b)) => (a - b).abs() > 0.05,
+                    (None, None) => false,
+                    _ => true,
+                };
+                if bad {
+                    mism += 1;
+                    if mism <= 20 {
+                        println!("MISMATCH ({x:.1},{y:.1}) scan={best:?} ground={via:?}");
+                    }
+                }
+            }
+        }
+        println!("samples {total} mismatched {mism}");
+        assert!(total > 0, "the probe must land on loaded tiles");
+        assert_eq!(mism, 0, "the bucketed ground probe must match a full scan");
+        crate::bn_shutdown(w);
+    }
+
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn goldshire_walk_stays_on_the_terrain() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (x0, y0) = (-9463.0f32, 63.0f32);
+        let mut p = Player::new("Azeroth", x0, y0);
+        p.pos = [x0, y0, 200.0];
+        p.snap_pending = true;
+        for _ in 0..120 {
+            p.ensure_tiles(&w.archives);
+            p.tick(1.0 / 60.0);
+        }
+        println!(
+            "settled ({:.1},{:.1},{:.2}) grounded={} floor={:?}",
+            p.pos[0],
+            p.pos[1],
+            p.pos[2],
+            p.grounded,
+            p.ground(p.pos[0], p.pos[1], f32::INFINITY)
+        );
+        for leg in 0..8 {
+            p.yaw = leg as f32 * std::f32::consts::PI / 4.0;
+            p.input.forward = 1.0;
+            for i in 0..300 {
+                p.ensure_tiles(&w.archives);
+                p.tick(1.0 / 60.0);
+                if p.grounded {
+                    // Grounded means the feet are on the floor: the terrain
+                    // and the hulls answer the same probe the mover rides.
+                    if let Some((z, _)) = p.ground(p.pos[0], p.pos[1], p.pos[2] + 2.0) {
+                        assert!(
+                            (z - p.pos[2]).abs() < 0.1,
+                            "leg {leg} tick {i}: feet {:.2} vs floor {z:.2}",
+                            p.pos[2]
+                        );
+                    }
+                }
+                if i % 60 == 0 || i == 299 {
+                    println!(
+                        "leg {leg} t={:.1}s ({:.1},{:.1},{:.2}) grounded={} floor={:?} vel={:.2}",
+                        i as f32 / 60.0,
+                        p.pos[0],
+                        p.pos[1],
+                        p.pos[2],
+                        p.grounded,
+                        p.ground(p.pos[0], p.pos[1], p.pos[2] + 60.0)
+                            .map(|(z, _)| (z, (z - p.pos[2]).round())),
+                        p.vel[2]
+                    );
+                }
+            }
+            p.input.forward = 0.0;
+        }
+        crate::bn_shutdown(w);
+    }
+
+    /// At Goldshire: a hull-bearing prop's own spot is solid to the body, and a
+    /// hull-less one (grass, a canopy) stands in no body's way. Both are read
+    /// off the installed tile's own placements, not a synthetic quad.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn goldshire_props_collide_by_their_hulls() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (x0, y0) = (-9463.0f32, 63.0f32);
+        let mut p = Player::new("Azeroth", x0, y0);
+        p.pos = [x0, y0, 200.0];
+        p.ensure_tiles(&w.archives);
+        // Fold every resident tile's doodad hulls and WMO floors: `ensure_wmo`
+        // works on the tile the body stands in, so the body visits each one.
+        let keys: Vec<(i32, i32)> = p.tiles.keys().copied().collect();
+        let mut cache = HashMap::new();
+        for k in keys {
+            let Some(t) = p.tiles.get(&k) else { continue };
+            let Some(d) = t
+                .doodads
+                .iter()
+                .find(|d| Player::tile_of(d.position[0], d.position[1]) == k)
+            else {
+                continue;
+            };
+            p.pos[0] = d.position[0];
+            p.pos[1] = d.position[1];
+            for _ in 0..2000 {
+                p.ensure_wmo(&mut w.chain, &mut cache);
+                let done = p
+                    .tiles
+                    .get(&k)
+                    .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len());
+                if done {
+                    break;
+                }
+            }
+        }
+        let (tx, ty) = Player::tile_of(x0, y0);
+        let tile = p.tiles.get(&(tx, ty)).expect("Goldshire tile resident");
+        let (mut solid, mut bare) = (0usize, 0usize);
+        let mut blocked_rings = 0usize;
+        let mut blocked_props = 0usize;
+        let mut bare_wrong = 0usize;
+        for d in &tile.doodads {
+            match p.hulls.get(&d.model) {
+                Some(Some(_)) => {
+                    solid += 1;
+                    // The body approaches at ground level from eight sides: a
+                    // trunk's hull has to answer from at least one of them.
+                    let Some((feet, _)) = p.ground(d.position[0], d.position[1], f32::INFINITY)
+                    else {
+                        continue;
+                    };
+                    let mut hit = false;
+                    for k in 0..8 {
+                        let a = k as f32 * std::f32::consts::PI / 4.0;
+                        for r in [0.4, 1.0, 2.0, 3.0] {
+                            let (hx, hy) =
+                                (d.position[0] + a.cos() * r, d.position[1] + a.sin() * r);
+                            if p.wall_hit(hx, hy, feet) {
+                                blocked_rings += 1;
+                                hit = true;
+                            }
+                        }
+                    }
+                    if hit {
+                        blocked_props += 1;
+                    }
+                }
+                // No hull in the model: nothing is folded, so the body walks
+                // its spot. A model the hull table missed would be a parsing
+                // bug, and every one here would show up in `bare_wrong`.
+                None | Some(None) => {
+                    bare += 1;
+                    if p.hulls.get(&d.model).is_some_and(|h| h.is_some()) {
+                        bare_wrong += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "goldshire: {solid} hulled placements ({blocked_props} stop the body, \
+             {blocked_rings} blocked probes), {bare} hull-less ({bare_wrong} wrongly hulled)"
+        );
+        assert!(solid > 0 && bare > 0, "both kinds must be placed here");
+        assert!(blocked_props > 0, "a hulled prop must stop the body");
+        assert_eq!(bare_wrong, 0, "a hull-less prop is never solid");
         crate::bn_shutdown(w);
     }
 }
