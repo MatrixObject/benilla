@@ -1,5 +1,5 @@
 // Probe the actual path casing inside base.MPQ (1.12.1 stores names in a hash
-// table; contains() is case-sensitive here, so find what the real paths are).
+// table; contains is case-sensitive here, so find what the real paths are).
 fn main() {
     let base = "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data\\base.MPQ";
     let a = match benilla_mpq::Archive::open(base) {
@@ -23,7 +23,10 @@ fn main() {
     ];
     for p in probes {
         let c = a.contains(p);
-        let sz = a.file_size(p).map(|s| format!(" size={s}")).unwrap_or_default();
+        let sz = a
+            .file_size(p)
+            .map(|s| format!(" size={s}"))
+            .unwrap_or_default();
         println!("{p}: contains={c}{sz}");
     }
 }

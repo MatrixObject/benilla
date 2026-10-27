@@ -69,10 +69,7 @@ fn main() {
     }
 
     // FFI roundtrip: bn_init -> bn_load_tile -> counts/fills.
-    let dir = std::ffi::CString::new(
-        "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data",
-    )
-    .unwrap();
+    let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());
     if w.is_null() {
         println!("FFI: bn_init failed");
@@ -97,17 +94,19 @@ fn main() {
         "FFI: range_ok={ok} range={r:?} tex_ok={ok2} tex={texs} h(0,0)={}",
         benilla::bn_terrain_height_at(w, 0.0, 0.0)
     );
-    let mut verts = vec![benilla::BnVertex {
-        x: 0.0,
-        y: 0.0,
-        z: 0.0,
-        nx: 0.0,
-        ny: 0.0,
-        nz: 0.0,
-        u: 0.0,
-        v: 0.0,
-    };
-    nv as usize];
+    let mut verts = vec![
+        benilla::BnVertex {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            nx: 0.0,
+            ny: 0.0,
+            nz: 0.0,
+            u: 0.0,
+            v: 0.0,
+        };
+        nv as usize
+    ];
     let written = benilla::bn_terrain_fill_vertices(w, verts.as_mut_ptr(), nv);
     let mut idx = vec![0u16; ni as usize];
     let written_i = benilla::bn_terrain_fill_indices(w, idx.as_mut_ptr(), ni);
@@ -123,4 +122,3 @@ fn main() {
     );
     benilla::bn_shutdown(w);
 }
-

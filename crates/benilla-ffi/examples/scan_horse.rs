@@ -2,7 +2,9 @@
 // (listfile) each MPQ ships).
 fn main() {
     let data = "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data";
-    let needle = std::env::args().nth(1).unwrap_or_else(|| "ridinghorse".to_string());
+    let needle = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "ridinghorse".to_string());
     let needle = needle.to_lowercase();
 
     let files: Vec<String> = std::fs::read_dir(data)
@@ -18,7 +20,9 @@ fn main() {
             Ok(a) => a,
             Err(_) => continue,
         };
-        let Ok(list_bytes) = a.read_file("(listfile)") else { continue };
+        let Ok(list_bytes) = a.read_file("(listfile)") else {
+            continue;
+        };
         let text = String::from_utf8_lossy(&list_bytes);
         let mut hits = Vec::new();
         for line in text.lines() {
@@ -30,7 +34,9 @@ fn main() {
         }
         if !hits.is_empty() {
             println!("{f}:");
-            for h in hits { println!("   {h}"); }
+            for h in hits {
+                println!("   {h}");
+            }
         }
     }
 }

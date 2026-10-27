@@ -12,10 +12,7 @@ fn cstr(buf: &[i8]) -> String {
 }
 
 fn main() {
-    let dir = std::ffi::CString::new(
-        "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data",
-    )
-    .unwrap();
+    let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());
     if w.is_null() {
         eprintln!("bn_init failed");
@@ -71,9 +68,19 @@ fn main() {
             let (b0, b1) = bufs.split_at_mut(1);
             for s in 0..8u32 {
                 let t = t0a + (t1a - t0a) * s / 7;
-                let (cur, prev): (&mut [f32], &[f32]) =
-                    if s % 2 == 0 { (&mut b0[0], &b1[0]) } else { (&mut b1[0], &b0[0]) };
-                let n = benilla::bn_model_skinned_positions(w, cp.as_ptr(), 0, t, cur.as_mut_ptr(), cap);
+                let (cur, prev): (&mut [f32], &[f32]) = if s % 2 == 0 {
+                    (&mut b0[0], &b1[0])
+                } else {
+                    (&mut b1[0], &b0[0])
+                };
+                let n = benilla::bn_model_skinned_positions(
+                    w,
+                    cp.as_ptr(),
+                    0,
+                    t,
+                    cur.as_mut_ptr(),
+                    cap,
+                );
                 skin_calls += 1;
                 if n == 0 {
                     continue;
@@ -81,7 +88,9 @@ fn main() {
                 if s > 0 && n == nref {
                     for v in 0..n as usize {
                         let (p, q) = (&cur[v * 3..v * 3 + 3], &prev[v * 3..v * 3 + 3]);
-                        let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                        let d =
+                            ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
+                                .sqrt();
                         if d > maxd {
                             maxd = d;
                         }
@@ -97,7 +106,10 @@ fn main() {
             } else {
                 "static"
             };
-            println!("  [{flag}] max_delta={maxd:.3} anims={anims} dur={} {path}", t1a - t0a);
+            println!(
+                "  [{flag}] max_delta={maxd:.3} anims={anims} dur={} {path}",
+                t1a - t0a
+            );
         }
     }
 

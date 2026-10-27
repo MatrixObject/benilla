@@ -1,10 +1,10 @@
 // Quantify the two u16 truncation risks before touching the render path:
-//   1. doodad texture groups: UE's WMO/doodad builder remaps each texture
-//      group into a u16 index space and `break`s at 65535 - a group summing
-//      more verts across its placements silently loses geometry.
-//   2. WMO instances: BnTriangle carries u16 vertex indices per instance, so
-//      a single instance over 65535 verts truncates at the FFI itself.
-// Part 1 walks EVERY .wmo in the MPQ chain (group vertex totals). Part 2
+// 1. doodad texture groups: UE's WMO/doodad builder remaps each texture
+// group into a u16 index space and `break`s at 65535 - a group summing
+// more verts across its placements silently loses geometry.
+// 2. WMO instances: BnTriangle carries u16 vertex indices per instance, so
+// a single instance over 65535 verts truncates at the FFI itself.
+// Part 1 walks EVERY.wmo in the MPQ chain (group vertex totals). Part 2
 // finds doodad-bearing tiles near Stormwind (both filename orders, as
 // doodad_probe does) and sums each tile's doodad groups by the UE key
 // (texture + blend class + wrap; the anim split only makes real groups
@@ -40,7 +40,9 @@ fn part1_wmo_files(data_dir: &str) {
     let mut roots: HashMap<String, u32> = HashMap::new();
     for mpq in &files {
         let Ok(a) = Archive::open(mpq) else { continue };
-        let Ok(listfile) = a.read_file("(listfile)") else { continue };
+        let Ok(listfile) = a.read_file("(listfile)") else {
+            continue;
+        };
         let listing = String::from_utf8_lossy(&listfile).into_owned();
         for name in listing.split(|c| c == '\n' || c == '\r') {
             let name = name.trim();
@@ -60,7 +62,9 @@ fn part1_wmo_files(data_dir: &str) {
                 }
                 _ => stem.to_string(),
             };
-            let Ok(bytes) = a.read_file(name) else { continue };
+            let Ok(bytes) = a.read_file(name) else {
+                continue;
+            };
             let verts: u32 = match benilla_wmo::parse_wmo(&mut Cursor::new(bytes.as_slice())) {
                 Ok(ParsedWmo::Group(g)) => g.vertex_positions.len() as u32,
                 _ => 0,
@@ -137,8 +141,7 @@ fn part2_doodad_groups(w: *mut BnWorld) {
                     continue;
                 }
                 let mut tbuf = [0i8; 512];
-                let tex = if bn_doodad_texture(w, i, j, tbuf.as_mut_ptr(), tbuf.len() as u32) == 1
-                {
+                let tex = if bn_doodad_texture(w, i, j, tbuf.as_mut_ptr(), tbuf.len() as u32) == 1 {
                     cstr(&tbuf)
                 } else {
                     String::new()
@@ -148,7 +151,7 @@ fn part2_doodad_groups(w: *mut BnWorld) {
                 let mut wrap = 0u32;
                 bn_doodad_wrap(w, i, j, &mut wrap);
                 let key = format!("{tex}#c{}#w{}", blend & 0xff, wrap);
-                *groups.entry(key).or_default() += r[1] as u64;   // vtx_n
+                *groups.entry(key).or_default() += r[1] as u64; // vtx_n
             }
         }
         let mut sorted: Vec<_> = groups.into_iter().collect();
@@ -208,9 +211,9 @@ fn part2_doodad_groups(w: *mut BnWorld) {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     part1_wmo_files(&data_dir);
 
     let dir = std::ffi::CString::new(data_dir).unwrap();

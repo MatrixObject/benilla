@@ -1,10 +1,10 @@
 // Stage A feasibility probe for the login-screen glue booth (the missing
 // background): prove the four links the UE host will need hold before any FFI
 // is written.
-//   1. Lua: the shown Model frame exposes GetModel() -> the booth MDX path.
-//   2. MPQ: the path is readable (both .mdx and .m2 spellings checked).
-//   3. M2 : camera table index 0 parses (eye/target/roll/fov/near/far).
-//   4. FFI: bn_model_fill's loader returns vertices for the same path.
+// 1. Lua: the shown Model frame exposes GetModel -> the booth MDX path.
+// 2. MPQ: the path is readable (both.mdx and.m2 spellings checked).
+// 3. M2 : camera table index 0 parses (eye/target/roll/fov/near/far).
+// 4. FFI: bn_model_fill's loader returns vertices for the same path.
 use benilla::*;
 use benilla_mpq::Archive;
 use std::io::Cursor;
@@ -19,9 +19,9 @@ fn eval_str(code: &str) -> String {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir.clone()).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -37,13 +37,11 @@ fn main() {
     }
     println!(
         "== glue screen: {}",
-        eval_str(
-            "return tostring(GetCurrentGlueScreenName and GetCurrentGlueScreenName() or '?')"
-        )
+        eval_str("return tostring(GetCurrentGlueScreenName and GetCurrentGlueScreenName() or '?')")
     );
 
     // 1. Model frames the login screen shows (1.12 GlueXML names a Model
-    //    frame and pushes the MDX through SetModel / the file= attribute).
+    // frame and pushes the MDX through SetModel / the file= attribute).
     println!("== model frames:");
     println!(
         "{}",
@@ -77,7 +75,7 @@ fn main() {
         )
     );
 
-    // The path the booth builder uses (glue_booth.rs: token -> UI_<token> MDX).
+    // The path the booth builder uses (glue_booth: token -> UI_<token> MDX).
     let path_mdx = r"Interface\Glues\Models\UI_MainMenu\UI_MainMenu.mdx";
     let path_m2 = r"Interface\Glues\Models\UI_MainMenu\UI_MainMenu.m2";
 
@@ -119,14 +117,22 @@ fn main() {
     };
 
     // 3. Camera table record 0 = the glue pane's camera (glue_booth: scene.cam
-    //    = model.camera0). Values are WoW/model space, radians.
+    // = model.camera0). Values are WoW/model space, radians.
     match benilla_formats::parse_m2_camera(&bytes, 0) {
         Some(c) => println!(
             "== camera0: eye=({:.3},{:.3},{:.3}) target=({:.3},{:.3},{:.3}) \
              roll={:.4} fov={:.4} rad ({} deg) near={:.3} far={:.1}",
-            c.position[0], c.position[1], c.position[2],
-            c.target[0], c.target[1], c.target[2],
-            c.roll, c.fov, c.fov.to_degrees(), c.near_clip, c.far_clip
+            c.position[0],
+            c.position[1],
+            c.position[2],
+            c.target[0],
+            c.target[1],
+            c.target[2],
+            c.roll,
+            c.fov,
+            c.fov.to_degrees(),
+            c.near_clip,
+            c.far_clip
         ),
         None => println!("== camera0: PARSE FAILED (no camera table)"),
     }
@@ -136,10 +142,14 @@ fn main() {
         println!(
             "== bounds: min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2}) verts={} bones={} \
              camera1={}",
-            m.header.bounding_box_min[0], m.header.bounding_box_min[1],
-            m.header.bounding_box_min[2], m.header.bounding_box_max[0],
-            m.header.bounding_box_max[1], m.header.bounding_box_max[2],
-            m.vertices.len(), m.bones.len(),
+            m.header.bounding_box_min[0],
+            m.header.bounding_box_min[1],
+            m.header.bounding_box_min[2],
+            m.header.bounding_box_max[0],
+            m.header.bounding_box_max[1],
+            m.header.bounding_box_max[2],
+            m.vertices.len(),
+            m.bones.len(),
             benilla_formats::parse_m2_camera(&bytes, 1).is_some()
         );
     }
@@ -153,7 +163,7 @@ fn main() {
     }
 
     // 5. The FFI itself: one call must hand back the whole booth payload
-    //    (path normalized, camera raw-WoW, stock fog) the UE host consumes.
+    // (path normalized, camera raw-WoW, stock fog) the UE host consumes.
     let mut booth: BnBooth = unsafe { std::mem::zeroed() };
     let has = bn_ui_booth(cworld, &mut booth);
     let path = booth
@@ -170,8 +180,12 @@ fn main() {
         );
         println!(
             "   cam eye={:?} target={:?} roll={:.4} fov={:.4} near={:.3} far={:.1}",
-            booth.cam_eye, booth.cam_target, booth.cam_roll, booth.cam_fov,
-            booth.cam_near, booth.cam_far
+            booth.cam_eye,
+            booth.cam_target,
+            booth.cam_roll,
+            booth.cam_fov,
+            booth.cam_near,
+            booth.cam_far
         );
         println!(
             "   fog rgb={:?} near={} far={:.1}",

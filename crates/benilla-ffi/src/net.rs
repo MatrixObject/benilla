@@ -1,6 +1,6 @@
 //! Network middle layer: realmd logon + world session on a worker thread.
 //!
-//! The reference client's networking lives in `benilla-app` (Bevy); this
+//! The client's networking lives in the app crate; this
 //! module carries the same `benilla-protocol` session over a plain TCP socket
 //! so the UE host can log in, list characters and enter the world without
 //! linking the app. Everything below is blocking socket work on its own
@@ -8,14 +8,14 @@
 //! keeps frame times flat.
 //!
 //! The UE side declares these as `extern "C"`:
-//!   bn_net_connect(host, user, pass) -> 1 when the worker started
-//!   bn_net_status() -> stage code (see ST_*)
-//!   bn_net_char_count() / bn_net_char(i, out)
-//!   bn_net_enter(guid)
-//!   bn_net_send(kind, a, b, text)
-//!   bn_net_group(out) -> 1 while in a group / invite pending
-//!   bn_net_event(buf, cap) -> bytes popped (0 = empty)
-//!   bn_net_disconnect()
+//! bn_net_connect(host, user, pass) -> 1 when the worker started
+//! bn_net_status -> stage code (see ST_*)
+//! bn_net_char_count / bn_net_char(i, out)
+//! bn_net_enter(guid)
+//! bn_net_send(kind, a, b, text)
+//! bn_net_group(out) -> 1 while in a group / invite pending
+//! bn_net_event(buf, cap) -> bytes popped (0 = empty)
+//! bn_net_disconnect
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr};
@@ -26,8 +26,11 @@ use std::time::{Duration, Instant};
 
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
-    AttackSwingError, CastOutcome, CharCreateReq, Object, ObjectFields, ObjectType, ServerPacket,
+    AttackSwingError, CastOutcome, CharCreateReq, MonsterMoveFacing, Object, ObjectFields,
+    ObjectType, ServerPacket,
 };
+// The server-authored path walk: benilla's own sampler, shared with the Bevy client.
+use benilla_protocol::motion::{monster_move_spline, Spline};
 use benilla_protocol::RealmInfo;
 use benilla_protocol::WorldSession;
 
@@ -57,7 +60,7 @@ pub struct BnNetChar {
     /// `AreaTable.dbc` zone id and the map id the character logged out on.
     pub map: u32,
     pub zone: u32,
-    /// `ItemDisplayInfo.dbc` ids in the enum's equipment order (head .. tabard);
+    /// `ItemDisplayInfo.dbc` ids in the enum's equipment order (head.. tabard);
     /// 0 = empty slot. This is what the dress-up pass needs to show the gear
     /// on the character-select model.
     pub equip_display: [u32; 19],
@@ -247,6 +250,11 @@ pub struct BnNetUnit {
     pub creature_type: u32,
     /// NUL-terminated UTF-8 creature name; empty until the query answers.
     pub name: [c_char; 64],
+    /// The unit's own gait, as the native client picks it from the server's
+    /// `SMSG_MONSTER_MOVE`: AnimationData id 0 Stand, 4 Walk, 5 Run. `run_mode`
+    /// is `SPLINEFLAG_RUNMODE` (clear = `MOVEFLAG_WALK_MODE`), and only the
+    /// spline's live window plays a gait; once it ends the unit stands.
+    pub anim: u32,
 }
 
 impl Default for BnNetUnit {
@@ -277,6 +285,7 @@ impl Default for BnNetUnit {
             rank: 0,
             creature_type: 0,
             name: [0; 64],
+            anim: 0,
         }
     }
 }
@@ -543,8 +552,13 @@ pub struct BnNetVendorRow {
 impl Default for BnNetVendorRow {
     fn default() -> Self {
         Self {
-            slot: 0, entry: 0, display_id: 0, count: 0,
-            price: 0, max_durability: 0, buy_count: 0,
+            slot: 0,
+            entry: 0,
+            display_id: 0,
+            count: 0,
+            price: 0,
+            max_durability: 0,
+            buy_count: 0,
         }
     }
 }
@@ -643,7 +657,7 @@ fn put_str<const N: usize>(dst: &mut [c_char; N], src: &str) {
     }
 }
 
-/// An observed cast in progress (`SMSG_SPELL_START` .. `SMSG_SPELL_GO`).
+/// An observed cast in progress (`SMSG_SPELL_START`.. `SMSG_SPELL_GO`).
 struct CastState {
     spell_id: u32,
     started: Instant,
@@ -755,6 +769,89 @@ struct UnitRec {
     fields: ObjectFields,
     pos: [f32; 3],
     facing: f32,
+    /// The live `SMSG_MONSTER_MOVE` spline this unit is walking, evaluated by benilla's own
+    /// [`Spline`] (the same sampler the Bevy client uses); `None` at rest.
+    spline: Option<Spline>,
+}
+
+/// The unit's present pose: benilla's spline sample while one exists, else the
+/// last streamed position.
+///
+/// Sampling even after the walk's duration has run is deliberate: `sample` clamps
+/// its fraction to 1.0, so a finished spline reports its ENDPOINT and the unit
+/// stays there. Gating on `running` instead fell back to `rec.pos`, which
+/// `apply_monster_move` had set to the spline's START - so every creature snapped
+/// back to where it began the moment it stopped (the "回到原点"/stutter report).
+fn effective_pose(rec: &UnitRec) -> ([f32; 3], f32) {
+    let now = std::time::Instant::now();
+    match &rec.spline {
+        Some(s) => {
+            let (pos, facing, _pitch) = s.sample(now);
+            (pos, facing.unwrap_or(rec.facing))
+        }
+        None => (rec.pos, rec.facing),
+    }
+}
+
+/// Begin a [`Spline`] on `guid` from a `SMSG_MONSTER_MOVE`, through benilla's own
+/// [`monster_move_spline`]; a stop or a degenerate path settles the unit on `start`.
+#[allow(clippy::too_many_arguments)]
+fn apply_monster_move(
+    guid: u64,
+    start: [f32; 3],
+    path: &[[f32; 3]],
+    facing: &MonsterMoveFacing,
+    stop: bool,
+    spline_id: u32,
+    duration_ms: u32,
+    flying: bool,
+    run_mode: bool,
+    sh: &Shared,
+) {
+    let mut units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    // Resolve the final facing first (immutable borrows end before get_mut).
+    let face = match facing {
+        MonsterMoveFacing::Angle(a) => Some(*a),
+        MonsterMoveFacing::Spot(p) => Some((p[1] - start[1]).atan2(p[0] - start[0])),
+        MonsterMoveFacing::Target(g) => units.get(g).map(|t| {
+            let (tp, _) = effective_pose(t);
+            (tp[1] - start[1]).atan2(tp[0] - start[0])
+        }),
+        MonsterMoveFacing::None => None,
+    };
+    let Some(rec) = units.get_mut(&guid) else {
+        return;
+    };
+    let path: Vec<[f32; 3]> = if path.is_empty() {
+        vec![start]
+    } else {
+        path.to_vec()
+    };
+    match monster_move_spline(path, spline_id, stop, duration_ms, flying, run_mode, None) {
+        Some(spline) => {
+            rec.pos = spline.points[0];
+            if let Some(f) = face {
+                rec.facing = f;
+            }
+            rec.spline = Some(spline);
+        }
+        None => {
+            // A stop / zero duration / one-point path: no walk. Keep where the last
+            // walk ENDED - a stop normally carries the final point, but a zeroed
+            // `start` (seen on stop packets) used to slam the unit to the world
+            // origin, which read as "creatures teleport back the moment they halt".
+            let ended = rec.spline.as_ref().and_then(|s| s.points.last().copied());
+            rec.pos = if start == [0.0, 0.0, 0.0] {
+                ended.unwrap_or(rec.pos)
+            } else {
+                start
+            };
+            rec.spline = None;
+            if let Some(f) = face {
+                rec.facing = f;
+            }
+        }
+    }
 }
 
 /// Commands the game thread hands to the session thread.
@@ -775,24 +872,53 @@ enum Cmd {
     /// `CMSG_GOSSIP_HELLO`: open the NPC's gossip/quest menu.
     GiverHello(u64),
     /// `CMSG_QUESTGIVER_QUERY_QUEST`: the accept panel for one quest.
-    QuestQueryGiver { npc: u64, quest: u32 },
+    QuestQueryGiver {
+        npc: u64,
+        quest: u32,
+    },
     /// `CMSG_QUESTGIVER_REQUEST_REWARD`: the progress panel's Continue, opens the
     /// offer-reward panel.
-    QuestRequestReward { npc: u64, quest: u32 },
+    QuestRequestReward {
+        npc: u64,
+        quest: u32,
+    },
     /// `CMSG_QUESTGIVER_CHOOSE_REWARD`: hand in and take reward `reward`.
-    QuestReward { npc: u64, quest: u32, reward: u32 },
+    QuestReward {
+        npc: u64,
+        quest: u32,
+        reward: u32,
+    },
     GameObjUse(u64),
-    QuestAccept { npc: u64, quest: u32 },
-    QuestComplete { npc: u64, quest: u32 },
+    QuestAccept {
+        npc: u64,
+        quest: u32,
+    },
+    QuestComplete {
+        npc: u64,
+        quest: u32,
+    },
     QuestQuery(u32),
     /// Cast `spell` at `target` (0 = self), answered by `SMSG_CAST_RESULT`.
-    Cast { spell: u32, target: u64 },
+    Cast {
+        spell: u32,
+        target: u64,
+    },
     /// `CMSG_USE_ITEM`: bag 0xFF = equipped slot; `spell` is the item spell slot.
-    UseItem { bag: u8, slot: u8, spell: u8 },
+    UseItem {
+        bag: u8,
+        slot: u8,
+        spell: u8,
+    },
     /// `CMSG_AUTOEQUIP_ITEM`: the server picks the destination equipment slot.
-    AutoEquip { bag: u8, slot: u8 },
+    AutoEquip {
+        bag: u8,
+        slot: u8,
+    },
     /// `CMSG_SWAP_INV_ITEM`: two slots of the player's own equipment/pack array.
-    SwapInv { src: u8, dst: u8 },
+    SwapInv {
+        src: u8,
+        dst: u8,
+    },
     /// `CMSG_GROUP_INVITE`: invite a player by name.
     GroupInvite(String),
     /// `CMSG_GROUP_ACCEPT`: take the pending invite.
@@ -805,20 +931,37 @@ enum Cmd {
     /// `CMSG_LIST_INVENTORY`: open a vendor's stock list.
     VendorList(u64),
     /// `CMSG_BUY_ITEM`: buy `count` stacks of the template entry from the vendor.
-    VendorBuy { vendor: u64, entry: u32, count: u8 },
+    VendorBuy {
+        vendor: u64,
+        entry: u32,
+        count: u8,
+    },
     /// `CMSG_SELL_ITEM`: sell `count` (0 = whole stack) of our item to the vendor.
-    VendorSell { vendor: u64, item_guid: u64, count: u8 },
+    VendorSell {
+        vendor: u64,
+        item_guid: u64,
+        count: u8,
+    },
     /// `CMSG_BUYBACK_ITEM`: buy back a previously sold item from the vendor.
-    VendorBuyback { vendor: u64, slot: u32 },
+    VendorBuyback {
+        vendor: u64,
+        slot: u32,
+    },
     /// `CMSG_REPAIR_ITEM`: repair `item_guid` (0 = everything) at the vendor.
-    VendorRepair { vendor: u64, item_guid: u64 },
+    VendorRepair {
+        vendor: u64,
+        item_guid: u64,
+    },
     /// `CMSG_CHAR_CREATE` at the character park; the roster is re-asked on
     /// success (the server streams a fresh `SMSG_CHAR_ENUM` first).
     CharCreateReq(CharCreateReq),
     /// `CMSG_CHAR_DELETE` at the character park.
     CharDelete(u64),
     /// `CMSG_CHAR_RENAME` for a character the server flagged for it.
-    CharRename { guid: u64, name: String },
+    CharRename {
+        guid: u64,
+        name: String,
+    },
     /// Re-ask the roster (after a create/delete/rename, or on re-entry).
     RefreshRoster,
     /// Pick realm `index` and world-connect on its address, replacing the
@@ -872,13 +1015,13 @@ struct Shared {
     creatures: Mutex<HashMap<u32, CreatureTemplateLite>>,
     /// Creature entries already asked for.
     creature_asked: Mutex<HashSet<u32>>,
-    /// The open loot window (`SMSG_LOOT_RESPONSE` .. release/error).
+    /// The open loot window (`SMSG_LOOT_RESPONSE`.. release/error).
     loot: Mutex<BnNetLoot>,
     /// The open questgiver window (gossip menu / details / reward).
     giver: Mutex<BnNetGiver>,
     /// The live group roster plus the pending-invite popup state.
     party: Mutex<BnNetParty>,
-    /// The open vendor/shop window (`SMSG_LIST_INVENTORY` .. closed).
+    /// The open vendor/shop window (`SMSG_LIST_INVENTORY`.. closed).
     vendor: Mutex<BnNetVendor>,
     /// The account's `CMD_REALM_LIST` rows; the host's server picker reads
     /// these, and `bn_net_realm_pick` world-connects on the chosen one.
@@ -1047,7 +1190,8 @@ fn worker(
     let sh = shared();
     sh.set(ST_CONNECTING);
     sh.event(format!("connect|{host}"));
-    *sh.creds.lock().unwrap_or_else(|e| e.into_inner()) = Some((host.clone(), user.clone(), pass.clone()));
+    *sh.creds.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((host.clone(), user.clone(), pass.clone()));
 
     let mut logon = match benilla_protocol::logon(&host, &user, &pass, 0) {
         Ok(l) => l,
@@ -1081,7 +1225,10 @@ fn worker(
             sh.set(ST_FAILED);
             return;
         };
-        sh.event(format!("realm|{}|{}|{} chars", realm.name, realm.address, realm.characters));
+        sh.event(format!(
+            "realm|{}|{}|{} chars",
+            realm.name, realm.address, realm.characters
+        ));
 
         sh.set(ST_WORLD_CONNECTING);
         match WorldSession::connect(&realm.address, &user, logon.session_key) {
@@ -1164,17 +1311,13 @@ fn worker(
     }
     let mut session = session.expect("session");
 
-
     // Wait for the host to choose a character. The socket stays authenticated;
     // no read deadline is set, so an idle roster does not time out.
     loop {
         match rx.recv() {
             Ok(Cmd::Enter(guid)) => {
                 sh.self_guid.store(guid, Ordering::SeqCst);
-                sh.units
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
+                sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 sh.set(ST_ENTERING);
                 sh.event(format!("enter|{guid}"));
@@ -1197,22 +1340,20 @@ fn worker(
                 }
                 return;
             }
-            Ok(Cmd::RefreshRoster) => {
-                match roster(&mut session, sh) {
-                    Ok(n) => sh.event(format!("chars|{n}")),
-                    Err(e) => {
-                        sh.event(format!("error|char_enum|{e}"));
-                        if mode == RunMode::Glue {
-                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("char_enum: {e}"));
-                            sh.set(ST_CHARS);
-                            continue;
-                        }
-                        sh.set(ST_FAILED);
-                        return;
+            Ok(Cmd::RefreshRoster) => match roster(&mut session, sh) {
+                Ok(n) => sh.event(format!("chars|{n}")),
+                Err(e) => {
+                    sh.event(format!("error|char_enum|{e}"));
+                    if mode == RunMode::Glue {
+                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("char_enum: {e}"));
+                        sh.set(ST_CHARS);
+                        continue;
                     }
+                    sh.set(ST_FAILED);
+                    return;
                 }
-            }
+            },
             Ok(Cmd::CharCreateReq(req)) => {
                 match session.create_character(&req) {
                     Ok(code) => {
@@ -1254,29 +1395,27 @@ fn worker(
                     }
                 }
             }
-            Ok(Cmd::CharRename { guid, name }) => {
-                match session.rename_character(guid, &name) {
-                    Ok((code, renamed)) => {
-                        if let Some((g, n)) = renamed {
-                            sh.event(format!("char_rename|{g}|{n}|{code}"));
-                        } else {
-                            sh.event(format!("char_rename|{guid}|{code}"));
-                        }
-                        *sh.rename_reply.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some((guid, name.clone(), code));
-                        if code == 0x2E {
-                            if let Err(e) = roster(&mut session, sh) {
-                                sh.event(format!("error|char_enum|{e}"));
-                            }
-                        }
+            Ok(Cmd::CharRename { guid, name }) => match session.rename_character(guid, &name) {
+                Ok((code, renamed)) => {
+                    if let Some((g, n)) = renamed {
+                        sh.event(format!("char_rename|{g}|{n}|{code}"));
+                    } else {
+                        sh.event(format!("char_rename|{guid}|{code}"));
                     }
-                    Err(e) => {
-                        sh.event(format!("error|char_rename|{e}"));
-                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("char_rename: {e}"));
+                    *sh.rename_reply.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((guid, name.clone(), code));
+                    if code == 0x2E {
+                        if let Err(e) = roster(&mut session, sh) {
+                            sh.event(format!("error|char_enum|{e}"));
+                        }
                     }
                 }
-            }
+                Err(e) => {
+                    sh.event(format!("error|char_rename|{e}"));
+                    *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("char_rename: {e}"));
+                }
+            },
             Ok(Cmd::RealmPick(index)) => {
                 let realm = {
                     let realms = sh.realms.lock().unwrap_or_else(|e| e.into_inner());
@@ -1286,7 +1425,10 @@ fn worker(
                     sh.event(format!("error|realm|{index} out of range"));
                     continue;
                 };
-                sh.event(format!("realm|{}|{}|{} chars", realm.name, realm.address, realm.characters));
+                sh.event(format!(
+                    "realm|{}|{}|{} chars",
+                    realm.name, realm.address, realm.characters
+                ));
                 // World-connect on the chosen address; the old session's socket
                 // closes when `session` is replaced below.
                 sh.set(ST_WORLD_CONNECTING);
@@ -1338,7 +1480,7 @@ fn worker(
                 sh.set(ST_IDLE);
                 return;
             }
-            Ok(_) => {}   // world commands before entering are meaningless
+            Ok(_) => {} // world commands before entering are meaningless
         }
     }
 }
@@ -1493,19 +1635,13 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::GroupAccept) => {
                     // Close the popup immediately: the roster follows on
                     // SMSG_GROUP_LIST (and a party of one carries no rows).
-                    sh.party
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .invite = 0;
+                    sh.party.lock().unwrap_or_else(|e| e.into_inner()).invite = 0;
                     if let Err(e) = session.group_accept() {
                         sh.event(format!("error|group|{e}"));
                     }
                 }
                 Ok(Cmd::GroupDecline) => {
-                    sh.party
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .invite = 0;
+                    sh.party.lock().unwrap_or_else(|e| e.into_inner()).invite = 0;
                     if let Err(e) = session.group_decline() {
                         sh.event(format!("error|group|{e}"));
                     }
@@ -1521,12 +1657,20 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         sh.event(format!("error|vendor|list|{e}"));
                     }
                 }
-                Ok(Cmd::VendorBuy { vendor, entry, count }) => {
+                Ok(Cmd::VendorBuy {
+                    vendor,
+                    entry,
+                    count,
+                }) => {
                     if let Err(e) = session.buy_item(vendor, entry, count) {
                         sh.event(format!("error|vendor|buy|{e}"));
                     }
                 }
-                Ok(Cmd::VendorSell { vendor, item_guid, count }) => {
+                Ok(Cmd::VendorSell {
+                    vendor,
+                    item_guid,
+                    count,
+                }) => {
                     if let Err(e) = session.sell_item(vendor, item_guid, count) {
                         sh.event(format!("error|vendor|sell|{e}"));
                     }
@@ -1569,7 +1713,8 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             if guid != 0 {
                 // Use compare_exchange_weak so only the first tick flips it.
                 let claimed =
-                    sh.mover_ready.compare_exchange_weak(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+                    sh.mover_ready
+                        .compare_exchange_weak(1, 2, Ordering::SeqCst, Ordering::SeqCst);
                 if claimed.is_ok() {
                     if let Err(e) = session.set_active_mover(guid) {
                         sh.event(format!("error|set_active_mover|{e}"));
@@ -1612,8 +1757,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             let prev_sl = prev_input.1 < -0.1;
 
             // Compute current flags from input.
-            let cur_flags: u32 =
-                (if moving_fwd { MF_FORWARD } else { 0 })
+            let cur_flags: u32 = (if moving_fwd { MF_FORWARD } else { 0 })
                 | (if moving_bwd { MF_BACKWARD } else { 0 })
                 | (if strafe_r { MF_STRAFE_RIGHT } else { 0 })
                 | (if strafe_l { MF_STRAFE_LEFT } else { 0 });
@@ -1622,9 +1766,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             // exactly match WorldWriter.send_movement (no manual struct build + send_body).
             let now_orient = yaw.rem_euclid(std::f32::consts::TAU);
             let mut send_move = |opcode: u16, flags: u32| -> bool {
-                match session.send_movement(
-                    opcode, flags, pos, now_orient, 0.0, 0, None, None,
-                ) {
+                match session.send_movement(opcode, flags, pos, now_orient, 0.0, 0, None, None) {
                     Ok(()) => true,
                     Err(e) => {
                         sh.event(format!("error|move|opcode={opcode:#x}|{e}"));
@@ -1640,40 +1782,65 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             if moving_fwd && !prev_fwd && !prev_bwd {
                 send_move(MOVE_OP::MSG_MOVE_START_FORWARD, MF_FORWARD);
                 sent_flags |= MF_FORWARD;
-                sh.event(format!("move|StartForward|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|StartForward|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
             if moving_bwd && !prev_bwd && !prev_fwd {
                 send_move(MOVE_OP::MSG_MOVE_START_BACKWARD, MF_BACKWARD);
                 sent_flags |= MF_BACKWARD;
-                sh.event(format!("move|StartBackward|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|StartBackward|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
             if !moving_fwd && !moving_bwd && (prev_fwd || prev_bwd) {
                 // STOP clears FORWARD/BACKWARD on the server.
                 send_move(MOVE_OP::MSG_MOVE_STOP, 0);
-                sh.event(format!("move|Stop|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|Stop|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
 
             // Strafe edges.
             if strafe_r && !prev_sr && !prev_sl {
                 send_move(MOVE_OP::MSG_MOVE_START_STRAFE_RIGHT, MF_STRAFE_RIGHT);
                 sent_flags |= MF_STRAFE_RIGHT;
-                sh.event(format!("move|StartStrafeRight|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|StartStrafeRight|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
             if strafe_l && !prev_sl && !prev_sr {
                 send_move(MOVE_OP::MSG_MOVE_START_STRAFE_LEFT, MF_STRAFE_LEFT);
                 sent_flags |= MF_STRAFE_LEFT;
-                sh.event(format!("move|StartStrafeLeft|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|StartStrafeLeft|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
             if !strafe_r && !strafe_l && (prev_sr || prev_sl) {
                 send_move(MOVE_OP::MSG_MOVE_STOP_STRAFE, 0);
-                sh.event(format!("move|StopStrafe|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                sh.event(format!(
+                    "move|StopStrafe|{:.1},{:.1},{:.1}",
+                    pos[0], pos[1], pos[2]
+                ));
             }
 
             // Heartbeat while moving (every 500 ms, carries all active flags).
             let now = std::time::Instant::now();
             if cur_flags != 0 && now >= next_hb {
                 let _ = session.send_movement(
-                    MOVE_OP::MSG_MOVE_HEARTBEAT, cur_flags, pos, now_orient, 0.0, 0, None, None,
+                    MOVE_OP::MSG_MOVE_HEARTBEAT,
+                    cur_flags,
+                    pos,
+                    now_orient,
+                    0.0,
+                    0,
+                    None,
+                    None,
                 );
                 sh.event(format!(
                     "move|heartbeat|flags={:#x}|{:.1},{:.1},{:.1}",
@@ -1696,9 +1863,19 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 };
                 if drifted {
                     let _ = session.send_movement(
-                        MOVE_OP::MSG_MOVE_HEARTBEAT, 0, pos, now_orient, 0.0, 0, None, None,
+                        MOVE_OP::MSG_MOVE_HEARTBEAT,
+                        0,
+                        pos,
+                        now_orient,
+                        0.0,
+                        0,
+                        None,
+                        None,
                     );
-                    sh.event(format!("move|heartbeat@rest|{:.1},{:.1},{:.1}", pos[0], pos[1], pos[2]));
+                    sh.event(format!(
+                        "move|heartbeat@rest|{:.1},{:.1},{:.1}",
+                        pos[0], pos[1], pos[2]
+                    ));
                     last_pose_sent = Some((pos, yaw));
                 }
             }
@@ -1714,8 +1891,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 // (empty body) so mangosd advances to PLAYER_STATE_LOGGED_IN;
                 // without it the socket is dropped after the next update tick.
                 match &packet {
-                    ServerPacket::NewWorld { .. }
-                    | ServerPacket::TransferPending { .. } => {
+                    ServerPacket::NewWorld { .. } | ServerPacket::TransferPending { .. } => {
                         if let Err(e) = session.worldport_ack() {
                             sh.event(format!("error|worldport_ack|{e}"));
                         } else {
@@ -1879,10 +2055,7 @@ fn queue_creature_names(session: &mut WorldSession, sh: &Shared) {
     let mut asked: Vec<(u32, u64)> = Vec::new();
     {
         let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
-        let mut seen = sh
-            .creature_asked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut seen = sh.creature_asked.lock().unwrap_or_else(|e| e.into_inner());
         let cache = sh.creatures.lock().unwrap_or_else(|e| e.into_inner());
         for (guid, rec) in units.iter() {
             if rec.kind != 3 {
@@ -1938,10 +2111,7 @@ fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetIte
 fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
     let self_guid = sh.self_guid.load(Ordering::SeqCst);
     let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
-    let templates = sh
-        .item_templates
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<BnNetInvItem> = Vec::new();
     if self_guid == 0 {
         return out;
@@ -2032,6 +2202,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                         fields: mask.clone(),
                         pos: [0.0; 3],
                         facing: 0.0,
+                        spline: None,
                     },
                 );
             }
@@ -2048,6 +2219,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                 if let Some((v, o)) = movement.position {
                     rec.pos = [v.x, v.y, v.z];
                     rec.facing = o;
+                    rec.spline = None;
                 }
             }
             if is_self {
@@ -2071,6 +2243,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                     fields: mask.clone(),
                     pos,
                     facing,
+                    spline: None,
                 },
             );
             if *object_type == ObjectType::Player {
@@ -2189,6 +2362,56 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             }
             refresh_player(sh);
         }
+        // Creature/self splines: MaNGOS moves everything except free players
+        // with `SMSG_MONSTER_MOVE`, so without this every npc stands still.
+        ServerPacket::MonsterMove {
+            guid,
+            start,
+            path,
+            facing,
+            stop,
+            spline_id,
+            duration_ms,
+            flying,
+            run_mode,
+            ..
+        } => {
+            let start = [start.x, start.y, start.z];
+            let path: Vec<[f32; 3]> = path.iter().map(|p| [p.x, p.y, p.z]).collect();
+            apply_monster_move(
+                *guid,
+                start,
+                &path,
+                facing,
+                *stop,
+                *spline_id,
+                *duration_ms,
+                *flying,
+                *run_mode,
+                sh,
+            );
+        }
+        // A relayed player `MSG_MOVE_*`: an authoritative snap of another body.
+        ServerPacket::PlayerMove {
+            guid,
+            position,
+            orientation,
+            ..
+        } => {
+            let mut units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rec) = units.get_mut(guid) {
+                rec.pos = [position.x, position.y, position.z];
+                rec.facing = *orientation;
+                rec.spline = None;
+            }
+        }
+        // The normal carrier past vmangos's 300-packet/10s threshold: a deflated
+        // batch of the same movement packets, folded in by recursion.
+        ServerPacket::CompressedMoves { packets } => {
+            for p in packets {
+                handle_packet(p, sh);
+            }
+        }
         ServerPacket::DestroyObject { guid } => {
             sh.units
                 .lock()
@@ -2275,9 +2498,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 item_guid
             ));
         }
-        // ---- combat feedback: the numbers the reference floats over units ----
+        // ---- combat feedback: the numbers the client floats over units ----
         ServerPacket::AttackerState(s) => {
-            // `displayed()` is the reference gate (0x625e40): a dodged or
+            // `displayed` is the client gate: a dodged or
             // parried on-next-swing ability gets neither log line nor number.
             if s.displayed() {
                 sh.event(format!(
@@ -2320,12 +2543,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             sh.event(format!("attack|error|{code}"));
         }
         ServerPacket::XpGain(x) => {
-            sh.event(format!(
-                "xp|{}|{}|{}",
-                x.total,
-                x.base,
-                u8::from(x.kill)
-            ));
+            sh.event(format!("xp|{}|{}|{}", x.total, x.base, u8::from(x.kill)));
         }
         ServerPacket::LevelUp(info) => {
             sh.event(format!(
@@ -2336,21 +2554,18 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         // The quest log detail template; the log itself only carries ids, so
         // this is the only source of titles/objectives.
         ServerPacket::QuestQueryResponse(t) => {
-            sh.quests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    t.quest_id,
-                    QuestTemplateLite {
-                        level: t.level,
-                        zone: t.zone_or_sort,
-                        money: t.money,
-                        flags: t.flags,
-                        title: t.title.clone(),
-                        objectives: t.objectives_text.clone(),
-                        details: t.details.clone(),
-                    },
-                );
+            sh.quests.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                t.quest_id,
+                QuestTemplateLite {
+                    level: t.level,
+                    zone: t.zone_or_sort,
+                    money: t.money,
+                    flags: t.flags,
+                    title: t.title.clone(),
+                    objectives: t.objectives_text.clone(),
+                    details: t.details.clone(),
+                },
+            );
             // Pipes would break the host's field split; quest titles have none
             // in practice, but flatten defensively.
             sh.event(format!(
@@ -2408,10 +2623,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         // it, REMOVED drops a taken row. Names for the rows come from the same
         // item-template cache as the bag panel, so the entries are queued here.
         ServerPacket::LootResponse {
-            guid,
-            gold,
-            items,
-            ..
+            guid, gold, items, ..
         } => {
             let mut window = BnNetLoot {
                 guid: *guid,
@@ -2578,7 +2790,10 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         ServerPacket::QuestGiverComplete(c) => {
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
-            sh.event(format!("giver|complete|{}|{}|{}", c.quest_id, c.xp, c.money));
+            sh.event(format!(
+                "giver|complete|{}|{}|{}",
+                c.quest_id, c.xp, c.money
+            ));
         }
         ServerPacket::QuestGiverInvalid { .. } => {
             sh.event("giver|invalid".to_string());
@@ -2588,7 +2803,10 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         // ---- vendor / shop ----
         ServerPacket::VendorList { vendor, items } => {
-            let mut win = BnNetVendor { guid: *vendor, ..Default::default() };
+            let mut win = BnNetVendor {
+                guid: *vendor,
+                ..Default::default()
+            };
             let n = items.len().min(win.rows.len());
             for i in 0..n {
                 let it = &items[i];
@@ -2604,29 +2822,46 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 if it.entry != 0 {
                     let mut asked = sh.item_asked.lock().unwrap_or_else(|e| e.into_inner());
                     let mut queue = sh.item_queue.lock().unwrap_or_else(|e| e.into_inner());
-                    if asked.insert(it.entry) { queue.push(it.entry); }
+                    if asked.insert(it.entry) {
+                        queue.push(it.entry);
+                    }
                 }
             }
             win.count = n as u32;
             *sh.vendor.lock().unwrap_or_else(|e| e.into_inner()) = win;
             sh.event(format!("vendor|open|{vendor}|{n}"));
         }
-        ServerPacket::BuyItem { vendor, slot, new_count, purchase_count } => {
+        ServerPacket::BuyItem {
+            vendor,
+            slot,
+            new_count,
+            purchase_count,
+        } => {
             // The purchase is applied through the next SMSG_UPDATE_OBJECT; the
             // stock row refreshes in place so the host can redraw the price.
             let mut win = sh.vendor.lock().unwrap_or_else(|e| e.into_inner());
             let i = (*slot as usize).saturating_sub(1);
-            if i < win.rows.len() { win.rows[i].count = *new_count; }
+            if i < win.rows.len() {
+                win.rows[i].count = *new_count;
+            }
             sh.event(format!(
                 "vendor|bought|{vendor}|slot={slot}|new_stock={new_count}|count={purchase_count}"
             ));
         }
-        ServerPacket::SellItemResult { vendor, item_guid, reason } => {
+        ServerPacket::SellItemResult {
+            vendor,
+            item_guid,
+            reason,
+        } => {
             // Successful sells are silent (the server only shows them in the
             // player's own UPDATE_OBJECT), so a SELL packet means a refusal.
             sh.event(format!("vendor|sellfail|{vendor}|{item_guid}|{reason}"));
         }
-        ServerPacket::BuyFailed { vendor, item_entry, reason } => {
+        ServerPacket::BuyFailed {
+            vendor,
+            item_entry,
+            reason,
+        } => {
             sh.event(format!("vendor|buyfail|{vendor}|{item_entry}|{reason}"));
         }
         // The server's verdict on our own cast: failures are reported to the
@@ -2853,7 +3088,10 @@ fn cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok().map(|s| s.to_owned())
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_owned())
 }
 
 /// `std::env::var` as an `Option` (an empty value is `Some("")`).
@@ -2872,16 +3110,22 @@ pub extern "C" fn bn_net_connect(
     user: *const c_char,
     pass: *const c_char,
 ) -> u32 {
-    let host = cstr(host).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_HOST"));
-    let user = cstr(user).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_USER"));
-    let pass = cstr(pass).filter(|s| !s.is_empty()).or_else(|| env_var("WOW_PASS"));
+    let host = cstr(host)
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_var("WOW_HOST"));
+    let user = cstr(user)
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_var("WOW_USER"));
+    let pass = cstr(pass)
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_var("WOW_PASS"));
     let (Some(host), Some(user), Some(pass)) = (host, user, pass) else {
         return 0;
     };
     {
         let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
-            return 0;   // a session is already running
+            return 0; // a session is already running
         }
         let (tx, rx) = channel();
         *guard = Some(tx);
@@ -2954,7 +3198,7 @@ pub(crate) fn menu_realm_index(name: &str) -> Option<u32> {
 pub(crate) fn menu_login(host: &str, user: &str, pass: &str) -> bool {
     let mut guard = commands().lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_some() {
-        return false;   // a session is already running
+        return false; // a session is already running
     }
     let (tx, rx) = channel();
     *guard = Some(tx);
@@ -3194,7 +3438,11 @@ pub extern "C" fn bn_net_logout_to_roster() -> u32 {
 /// is nothing cached yet.
 #[no_mangle]
 pub extern "C" fn bn_net_reconnect() -> u32 {
-    let creds = shared().creds.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let creds = shared()
+        .creds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let Some((host, user, pass)) = creds else {
         return 0;
     };
@@ -3223,15 +3471,15 @@ pub extern "C" fn bn_net_reconnect() -> u32 {
 }
 
 /// Kernel for every in-world action:
-///   kind 1 = chat (text), 2 = attack (a=guid), 3 = target (a=guid),
-///   4 = loot (a=guid), 5 = use gameobject (a=guid),
-///   6 = accept quest (a=npc, b=quest), 7 = complete quest (a=npc, b=quest),
-///   8 = quest query (b=quest), 9 = logout,
-///   11 = use item (b = bag<<8 | slot, a = spell slot),
-///   12 = auto-equip (b = bag<<8 | slot),
-///   13 = swap inventory slots (a = src, b = dst),
-///   24 = accept a group invite, 25 = leave/disband the group,
-///   26 = invite by name (text), 27 = decline the pending invite.
+/// kind 1 = chat (text), 2 = attack (a=guid), 3 = target (a=guid),
+/// 4 = loot (a=guid), 5 = use gameobject (a=guid),
+/// 6 = accept quest (a=npc, b=quest), 7 = complete quest (a=npc, b=quest),
+/// 8 = quest query (b=quest), 9 = logout,
+/// 11 = use item (b = bag<<8 | slot, a = spell slot),
+/// 12 = auto-equip (b = bag<<8 | slot),
+/// 13 = swap inventory slots (a = src, b = dst),
+/// 24 = accept a group invite, 25 = leave/disband the group,
+/// 26 = invite by name (text), 27 = decline the pending invite.
 /// A bag byte of 0xFF means the player's own equipment array
 /// ([`BAG_EQUIPPED`]). Returns 1 when the command was queued.
 #[no_mangle]
@@ -3251,7 +3499,10 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         9 => Cmd::Logout,
         // 10 = cast at self (a = spell id); targeted casts go through
         // `bn_net_cast`, which can carry the full 64-bit guid.
-        10 => Cmd::Cast { spell: a as u32, target: 0 },
+        10 => Cmd::Cast {
+            spell: a as u32,
+            target: 0,
+        },
         11 => Cmd::UseItem {
             bag: ((b >> 8) & 0xff) as u8,
             slot: (b & 0xff) as u8,
@@ -3326,8 +3577,14 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             count: 0,
         },
         31 => Cmd::VendorBuyback { vendor: a, slot: b },
-        32 => Cmd::VendorRepair { vendor: b as u64, item_guid: a },
-        33 => Cmd::VendorRepair { vendor: a, item_guid: 0 },
+        32 => Cmd::VendorRepair {
+            vendor: b as u64,
+            item_guid: a,
+        },
+        33 => Cmd::VendorRepair {
+            vendor: a,
+            item_guid: 0,
+        },
         _ => return 0,
     };
     send_cmd(cmd) as u32
@@ -3427,15 +3684,12 @@ pub extern "C" fn bn_net_disconnect() -> u32 {
 
 /// Feed the host's latest player pose so the world worker can echo it back to
 /// the server as a movement heartbeat. Positions are raw WoW world yards, yaw
-/// is radians (0 = +X, same convention `player.rs` uses). The server owns the
+/// is radians (0 = +X, same convention `player` uses). The server owns the
 /// authoritative position; this only keeps it in sync with the client's local
 /// simulation so rubber-banding stops.
 #[no_mangle]
 pub extern "C" fn bn_net_set_pose(x: f32, y: f32, z: f32, yaw: f32) -> u32 {
-    *shared()
-        .last_pose
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(([x, y, z], yaw));
+    *shared().last_pose.lock().unwrap_or_else(|e| e.into_inner()) = Some(([x, y, z], yaw));
     1
 }
 
@@ -3506,6 +3760,45 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
     1
 }
 
+/// One tracked unit's three virtual weapon slots: the `UNIT_VIRTUAL_ITEM_SLOT_DISPLAY`
+/// id, its `(class, subclass, material, inventory_type)` from `UNIT_VIRTUAL_ITEM_INFO`,
+/// and the sheath type. This is where a vanilla creature's weapons/offhand come from;
+/// benilla's own rule (`resolveplacement`) turns these into an
+/// attachment slot. Always writes 3 entries (a 0 display means "nothing there").
+#[no_mangle]
+pub extern "C" fn bn_net_unit_virtual_items(
+    guid: u64,
+    out_displays: *mut u32,
+    out_info: *mut u8,
+    out_sheath: *mut u8,
+) -> u32 {
+    if out_displays.is_null() || out_info.is_null() || out_sheath.is_null() {
+        return 0;
+    }
+    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rec) = units.get(&guid) else {
+        return 0;
+    };
+    for slot in 0..3u8 {
+        let s = slot as usize;
+        let disp = rec.fields.unit_virtual_item_display(slot).unwrap_or(0);
+        let (c, sc, m, it) = rec
+            .fields
+            .unit_virtual_item_info(slot)
+            .unwrap_or((0, 0, 0, 0));
+        let sheath = rec.fields.unit_virtual_item_sheath(slot).unwrap_or(0);
+        unsafe {
+            *out_displays.add(s) = disp;
+            *out_info.add(s * 4) = c;
+            *out_info.add(s * 4 + 1) = sc;
+            *out_info.add(s * 4 + 2) = m;
+            *out_info.add(s * 4 + 3) = it;
+            *out_sheath.add(s) = sheath;
+        }
+    }
+    3
+}
+
 /// One tracked object by guid (the host's target lookup: no sort, one hit).
 #[no_mangle]
 pub extern "C" fn bn_net_unit_by_guid(guid: u64, out: *mut BnNetUnit) -> u32 {
@@ -3523,6 +3816,7 @@ pub extern "C" fn bn_net_unit_by_guid(guid: u64, out: *mut BnNetUnit) -> u32 {
 
 fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
     let f = &rec.fields;
+    let (pos, facing) = effective_pose(rec);
     // Player appearance bytes; creatures leave all of this zero.
     let bytes0 = f.unit_bytes_0().unwrap_or(0);
     let pb = f.player_bytes().unwrap_or(0);
@@ -3550,10 +3844,10 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
         target: f.unit_target().unwrap_or(0),
         mount: f.unit_mount_display_id(),
         dead: f.unit_is_dead() as u8,
-        x: rec.pos[0],
-        y: rec.pos[1],
-        z: rec.pos[2],
-        facing: rec.facing,
+        x: pos[0],
+        y: pos[1],
+        z: pos[2],
+        facing,
         race: (bytes0 & 0xff) as u8,
         sex: ((bytes0 >> 16) & 0xff) as u8,
         skin: (pb & 0xff) as u8,
@@ -3590,6 +3884,21 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
             }
             buf
         },
+        // Gait straight off the server's spline: a live spline plays Run when it
+        // carried `SPLINEFLAG_RUNMODE`, else Walk (`MOVEFLAG_WALK_MODE`); once
+        // the spline's duration is over the unit has arrived and stands. This is
+        // the same source the Bevy client's gait picker reads (`Spline::speed`
+        // exists for it), so the host only mirrors an id, it never guesses one.
+        anim: match rec.spline.as_ref() {
+            Some(s) if s.running(std::time::Instant::now()) => {
+                if s.run_mode {
+                    5
+                } else {
+                    4
+                }
+            }
+            _ => 0,
+        },
     }
 }
 
@@ -3597,10 +3906,7 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
 #[no_mangle]
 pub extern "C" fn bn_net_units_clear() -> u32 {
     let sh = shared();
-    sh.units
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
     *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
     1
 }
@@ -3744,10 +4050,7 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
         return 0;
     }
     let sh = shared();
-    let templates = sh
-        .item_templates
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
     let Some(_) = templates.get(&entry) else {
         return 0;
     };

@@ -1,16 +1,13 @@
 // Verify the cross-tile straddle dedup premise: a doodad/WMO that spans a
 // tile edge appears in BOTH adjacent tiles' MDDF/MODF under the SAME
-// unique_id (the reference dedups by it at 0x694bc0). Prints the uid
+// unique_id. Prints the uid
 // intersection of two adjacent tiles; non-empty means the duplicates the
 // host-side claim registry suppresses are real.
 
 use std::collections::HashSet;
 
 fn main() {
-    let dir = std::ffi::CString::new(
-        "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data",
-    )
-    .unwrap();
+    let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());
     if w.is_null() {
         eprintln!("bn_init failed");

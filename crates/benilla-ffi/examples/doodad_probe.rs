@@ -15,10 +15,7 @@ fn tex_of(w: *mut benilla::BnWorld, i: u32, j: u32) -> String {
 }
 
 fn main() {
-    let dir = std::ffi::CString::new(
-        "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data",
-    )
-    .unwrap();
+    let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());
     if w.is_null() {
         println!("bn_init failed");
@@ -74,34 +71,37 @@ fn main() {
             continue;
         }
         ok += 1;
-        println!("doodad {i}: submeshes={subs} verts={nv} idx={ni} tris={}", ni / 3);
-        let mut verts = vec![benilla::BnVertex {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            nx: 0.0,
-            ny: 0.0,
-            nz: 0.0,
-            u: 0.0,
-            v: 0.0,
-        }; nv as usize];
-        let written = benilla::bn_doodad_fill_vertices(w, i, verts.as_mut_ptr(), nv);
-        let mut tris = vec![benilla::BnTriangle {
-            a: 0,
-            b: 0,
-            c: 0,
-            material: 0,
-            flags: 0,
-        }; ni as usize];
-        let written_t = benilla::bn_doodad_fill_triangles(w, i, tris.as_mut_ptr(), ni);
-        let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz, mut mxz) = (
-            f32::MAX,
-            f32::MIN,
-            f32::MAX,
-            f32::MIN,
-            f32::MAX,
-            f32::MIN,
+        println!(
+            "doodad {i}: submeshes={subs} verts={nv} idx={ni} tris={}",
+            ni / 3
         );
+        let mut verts = vec![
+            benilla::BnVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                nx: 0.0,
+                ny: 0.0,
+                nz: 0.0,
+                u: 0.0,
+                v: 0.0,
+            };
+            nv as usize
+        ];
+        let written = benilla::bn_doodad_fill_vertices(w, i, verts.as_mut_ptr(), nv);
+        let mut tris = vec![
+            benilla::BnTriangle {
+                a: 0,
+                b: 0,
+                c: 0,
+                material: 0,
+                flags: 0,
+            };
+            ni as usize
+        ];
+        let written_t = benilla::bn_doodad_fill_triangles(w, i, tris.as_mut_ptr(), ni);
+        let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz, mut mxz) =
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for v in &verts[..written as usize] {
             mnx = mnx.min(v.x);
             mxx = mxx.max(v.x);

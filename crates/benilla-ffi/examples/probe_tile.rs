@@ -2,7 +2,13 @@
 // so probe that range with Map.dbc casing ("Durotar", not "durotar").
 fn main() {
     let data = "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data";
-    let maps = ["Durotar", "Stranglethorn", "Stormwind", "Alterac", "Azshara"];
+    let maps = [
+        "Durotar",
+        "Stranglethorn",
+        "Stormwind",
+        "Alterac",
+        "Azshara",
+    ];
     let files: Vec<String> = std::fs::read_dir(data)
         .expect("read Data dir")
         .filter_map(|e| e.ok())

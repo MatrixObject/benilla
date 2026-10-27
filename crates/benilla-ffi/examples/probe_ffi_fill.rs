@@ -34,8 +34,12 @@ fn main() {
         let (mut minx, mut miny, mut minz) = (f32::MAX, f32::MAX, f32::MAX);
         let (mut maxx, mut maxy, mut maxz) = (f32::MIN, f32::MIN, f32::MIN);
         for v in &vb {
-            minx = minx.min(v.x); miny = miny.min(v.y); minz = minz.min(v.z);
-            maxx = maxx.max(v.x); maxy = maxy.max(v.y); maxz = maxz.max(v.z);
+            minx = minx.min(v.x);
+            miny = miny.min(v.y);
+            minz = minz.min(v.z);
+            maxx = maxx.max(v.x);
+            maxy = maxy.max(v.y);
+            maxz = maxz.max(v.z);
         }
         println!(
             "{m}: verts={vc} tris={nt}\n  bbox min=({minx:.1},{miny:.1},{minz:.1}) max=({maxx:.1},{maxy:.1},{maxz:.1})\n  span=({:.1},{:.1},{:.1})",

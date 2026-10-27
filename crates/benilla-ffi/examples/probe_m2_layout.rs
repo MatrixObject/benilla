@@ -34,7 +34,10 @@ fn main() {
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
         for v in &m.vertices {
-            for (i, c) in [v.position.x, v.position.y, v.position.z].iter().enumerate() {
+            for (i, c) in [v.position.x, v.position.y, v.position.z]
+                .iter()
+                .enumerate()
+            {
                 if *c < min[i] {
                     min[i] = *c;
                 }
@@ -43,11 +46,18 @@ fn main() {
                 }
             }
         }
-        println!("vertex range: ({:.1},{:.1},{:.1}) - ({:.1},{:.1},{:.1})", min[0], min[1], min[2], max[0], max[1], max[2]);
+        println!(
+            "vertex range: ({:.1},{:.1},{:.1}) - ({:.1},{:.1},{:.1})",
+            min[0], min[1], min[2], max[0], max[1], max[2]
+        );
         println!(
             "authored bounds : ({:.1},{:.1},{:.1}) - ({:.1},{:.1},{:.1}) radius={:.1}",
-            m.header.bounding_box_min[0], m.header.bounding_box_min[1], m.header.bounding_box_min[2],
-            m.header.bounding_box_max[0], m.header.bounding_box_max[1], m.header.bounding_box_max[2],
+            m.header.bounding_box_min[0],
+            m.header.bounding_box_min[1],
+            m.header.bounding_box_min[2],
+            m.header.bounding_box_max[0],
+            m.header.bounding_box_max[1],
+            m.header.bounding_box_max[2],
             m.header.bounding_sphere_radius
         );
         // Dump first 5 vertices: position, bound bones, and that bone's pivot.
@@ -58,7 +68,11 @@ fn main() {
             let piv = if b0 < m.bones.len() {
                 &m.bones[b0].pivot
             } else {
-                &C3 { x: 0.0, y: 0.0, z: 0.0 }
+                &C3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }
             };
             println!(
                 "  v{i:3} pos=({:7.1},{:7.1},{:7.1}) w0={:3.0} bone0={:2} bone0pivot=({:7.1},{:7.1},{:7.1})",

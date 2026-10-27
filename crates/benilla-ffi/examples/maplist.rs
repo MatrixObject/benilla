@@ -8,9 +8,19 @@ fn main() {
         .filter(|n| n.to_lowercase().ends_with(".mpq"))
         .collect::<Vec<String>>();
     let maps = [
-        "Durotar", "Stonardel", "Stranglethorn", "Westplains", "Deadwind",
-        "Arathor", "Elwynn", "Lothetown", "Lakewater", "Alterac",
-        "Barrens", "Tirisfal", "Mulgore",
+        "Durotar",
+        "Stonardel",
+        "Stranglethorn",
+        "Westplains",
+        "Deadwind",
+        "Arathor",
+        "Elwynn",
+        "Lothetown",
+        "Lakewater",
+        "Alterac",
+        "Barrens",
+        "Tirisfal",
+        "Mulgore",
     ];
     let mut found = 0u32;
     for f in &files {

@@ -76,7 +76,11 @@ fn main() {
     for (i, b) in m.bones.iter().enumerate() {
         println!(
             "  bone {i} parent={} pivot=({:.3},{:.3},{:.3}) flags={:#x}",
-            b.parent, b.pivot.x, b.pivot.y, b.pivot.z, b.flags.bits()
+            b.parent,
+            b.pivot.x,
+            b.pivot.y,
+            b.pivot.z,
+            b.flags.bits()
         );
     }
     // Skin: which bones influence which vertices.

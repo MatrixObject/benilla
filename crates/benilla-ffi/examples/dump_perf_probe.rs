@@ -3,9 +3,9 @@
 // time goes so the optimisation targets the real hotspot instead of a guess.
 //
 // Variants (same helpers/rows as UI_DUMP_LUA, only the walk differs):
-//   V0 walk  : EnumerateFrames + IsVisible only (frame walk floor)
-//   V2 visreg: all F rows, regions only under visible frames
-//   V3 visall: rows only for visible frames (F + R)
+// V0 walk : EnumerateFrames + IsVisible only (frame walk floor)
+// V2 visreg: all F rows, regions only under visible frames
+// V3 visall: rows only for visible frames (F + R)
 // Plus bn_ui_dump (the shipped baseline) and region/frame counts.
 use benilla::*;
 
@@ -148,9 +148,9 @@ const SCRIPT: &str = r#"
 "#;
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -191,7 +191,9 @@ fn main() {
     "#;
     let (ms, _) = eval_ms(counts);
     let out = {
-        let Ok(c) = std::ffi::CString::new(counts) else { return };
+        let Ok(c) = std::ffi::CString::new(counts) else {
+            return;
+        };
         let mut buf = vec![0u8; 4096];
         let n = bn_ui_eval(c.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len() as u32);
         String::from_utf8_lossy(&buf[..n as usize]).into_owned()

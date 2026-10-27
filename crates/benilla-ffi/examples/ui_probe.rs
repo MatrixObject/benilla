@@ -2,10 +2,7 @@
 // the widget tree through the FFI, and summarize it.
 
 fn main() {
-    let dir = std::ffi::CString::new(
-        "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data",
-    )
-    .unwrap();
+    let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());
     if w.is_null() {
         println!("bn_init failed");
@@ -79,8 +76,10 @@ fn main() {
                 }
                 if f.len() >= 14 {
                     r_colour += 1;
-                    let non_default = get(9) != "1.00" || get(10) != "1.00"
-                        || get(11) != "1.00" || get(12) != "1.00"
+                    let non_default = get(9) != "1.00"
+                        || get(10) != "1.00"
+                        || get(11) != "1.00"
+                        || get(12) != "1.00"
                         || get(13) != "1.00";
                     if non_default {
                         nonwhite += 1;

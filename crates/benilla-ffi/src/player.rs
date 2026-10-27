@@ -1,7 +1,7 @@
 //! Middle-layer player: benilla's locomotion, collision probe and camera.
 //!
-//! The reference client owns movement (`player/state.rs`, `player/mover.rs`)
-//! and the third-person camera (`player/camera.rs`) inside the Bevy app, which
+//! The client owns movement (`state`, `mover`)
+//! and the third-person camera (`camera`) inside the Bevy app, which
 //! cannot be called from here (it pulls the whole engine). This module keeps
 //! the same constants, units (WoW yards) and laws - run 7 yd/s, backpedal
 //! 4.5/7, walk 2.5/7, gravity 19.29, jump 7.96, terminal 60.15, 50 deg ground
@@ -18,7 +18,7 @@ use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
 
 use crate::{placement_quat, q_rot, BnWorld};
 
-// ---- benilla-app/src/player/state.rs constants (read-only port) ----
+// ---- state constants (read-only port) ----
 const RUN_SPEED: f32 = 7.0;
 const WALK_RATIO: f32 = 2.5 / 7.0;
 const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
@@ -31,7 +31,7 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 const VOID_GUARD_DEPTH: f32 = 100.0;
 const GROUND_COS: f32 = 0.642_788;
 const STEP_UP_HEIGHT: f32 = 1.0;
-// The capsule the reference traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
+// The capsule the client traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
 // the probe below is a point at the feet plus the step window, which is the
 // same corridor for a walker on the floors this data ships.
 #[allow(dead_code)]
@@ -39,62 +39,61 @@ const CAPSULE_RADIUS: f32 = 1.0 / 3.0;
 #[allow(dead_code)]
 const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
-// ---- benilla-app/src/player/camera.rs ----
+// ---- camera ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
 const LOOK_SENSITIVITY: f32 = 0.028;
-const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom.rs's deviation, for a wider view
+const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
-/// sits inside the body (the reference's first-person cut is not modelled).
+/// sits inside the body (the client's first-person cut is not modelled).
 const CAM_BOOM_MIN: f32 = 1.0;
 /// `cameraYawSmoothSpeed` default 180°/s: the smart follow's return rate.
 const FOLLOW_RATE: f32 = std::f32::consts::PI;
 /// `creature_anim::select::STRAFE_BLEND_RATE`: the body heading eases to the
 /// strafe offset at this rate (/s).
 const STRAFE_BLEND_RATE: f32 = 17.26;
-/// `state.rs::TURN_RATE`: the keyboard turn rate, π rad/s (the server's own
+/// `TURN_RATE`: the keyboard turn rate, π rad/s (the server's own
 /// value; the client ships no default).
 const TURN_RATE: f32 = std::f32::consts::PI;
-/// `state.rs::TURN_RATE_MOVING`: the scale while translating or falling.
+/// `TURN_RATE_MOVING`: the scale while translating or falling.
 const TURN_RATE_MOVING: f32 = 0.75;
 /// Roam-mode flight speed (yd/s): a zone tour without waiting on terrain.
 const FLY_SPEED: f32 = 30.0;
 
-// ---- benilla-app/src/player/camera.rs pivot presets ----
+// ---- camera pivot presets ----
 /// A scale-1 Human Male's framing pivot: standing 1.9002692, swimming
 /// 0.3882572 lower (`model_pivot_height`, `cam+0x124`).
 const CAM_PIVOT_STAND: f32 = 1.900_269_2;
 const CAM_PIVOT_SWIM: f32 = 1.512_012;
-/// The pivot channel eases at 1.2 yd/s (the reference's `|Δh| / 1.2` s).
+/// The pivot channel eases at 1.2 yd/s (the client's `|Δh| / 1.2` s).
 const CAM_PIVOT_SMOOTH: f32 = 1.2;
 /// `model_pivot_height`'s `[5/6, 15]` band.
 const CAM_PIVOT_FLOOR: f32 = 5.0 / 6.0;
 const CAM_PIVOT_CEIL: f32 = 15.0;
 
-// ---- benilla-app/src/player/camera_water.rs ----
+// ---- camera_water ----
 /// The resting corridor floor, and the pivot's depth under the surface while
-/// submerged (`[0x8089cc]`).
+/// submerged.
 const WATER_REST: f32 = 5.0 / 6.0;
 /// The surface band's width, and the pivot's lift above the waterline in it
-/// (`[0x8089d0]`).
 const WATER_SURFACE_BAND: f32 = 2.0 / 9.0;
-/// The submerge band's outer edge (`[0x8089d4]`).
+/// The submerge band's outer edge.
 const WATER_SUBMERGE_EDGE: f32 = 5.0 / 9.0;
-/// The least head-room the pivot keeps above the corridor floor (`[0x808a04]`).
+/// The least head-room the pivot keeps above the corridor floor.
 const WATER_MIN_HEADROOM: f32 = 1.0 / 9.0;
 
 /// Mount speed bonus in 1.12: +60% (the client's riding speed).
 const MOUNT_SPEED_RATIO: f32 = 1.6;
 
-// ---- benilla-app/src/player/swim.rs (read-only port) ----
+// ---- swim (read-only port) ----
 /// Stock `MOVE_SWIM` (yd/s), vmangos `Unit.cpp:71`.
 const SWIM_SPEED: f32 = 4.722_222;
 /// Stock `MOVE_SWIM_BACK` (yd/s), vmangos `Unit.cpp:72`.
 const SWIM_BACK_SPEED: f32 = 2.5;
 /// The swim jump's seed (yd/s), about 14 % over the land jump.
 const SWIM_JUMP_SPEED: f32 = 9.096_748;
-/// The share of the collision height the water must cover to swim (`0x8012cc`).
+/// The share of the collision height the water must cover to swim.
 const SWIM_DEPTH_FRAC: f32 = 0.75;
-/// The enter/leave band (yd, `0x7ff9d0`): hold between `0.75·h - 1/36` and `0.75·h`.
+/// The enter/leave band: hold between `0.75·h - 1/36` and `0.75·h`.
 const SWIM_HYSTERESIS: f32 = 1.0 / 36.0;
 
 /// The state the host applies (plain C; yaw/pitch radians, positions yards).
@@ -136,7 +135,7 @@ fn wrap_pi(a: f32) -> f32 {
 
 /// The water corridor's pivot height (`camera_water::classify` + `corridor` +
 /// `pivot_height`), in yards above the feet. `target` is the model preset, `live`
-/// the eased channel value; the reference's head-room probe is not built, so the
+/// the eased channel value; the client's head-room probe is not built, so the
 /// reach is full. A surface swimmer's pivot rises to `surface + 2/9` and a diver's
 /// sits `5/6` under the surface, which is what keeps the boom out of the water.
 fn camera_pivot_height(target: f32, live: f32, surface: Option<f32>, feet: f32) -> f32 {
@@ -146,7 +145,7 @@ fn camera_pivot_height(target: f32, live: f32, surface: Option<f32>, feet: f32) 
             let d = s - feet;
             let excess = d - target;
             // A tie at 2/9 lands in the submerge band and one at 5/9 in clear,
-            // the reference's own tie-breaks.
+            // the client's own tie-breaks.
             if excess < WATER_SURFACE_BAND {
                 let floor = d + WATER_SURFACE_BAND;
                 (floor, live.max(floor))
@@ -158,7 +157,9 @@ fn camera_pivot_height(target: f32, live: f32, surface: Option<f32>, feet: f32) 
         }
     };
     let reach = (target.max(live) - floor).max(WATER_MIN_HEADROOM);
-    (floor + reach).min(cap).clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
+    (floor + reach)
+        .min(cap)
+        .clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
 }
 
 /// The strafe body offset from the aim (`creature_anim::select::strafe_body_offset`):
@@ -259,7 +260,7 @@ struct DoodadCollider {
 
 /// An M2's base footprint in model-local yards.
 #[derive(Clone, Copy)]
-struct Footprint {
+pub(crate) struct Footprint {
     cx: f32,
     cy: f32,
     hx: f32,
@@ -268,17 +269,16 @@ struct Footprint {
     zmax: f32,
 }
 
-/// The base footprint of an M2 doodad from its render mesh: the vertices
-/// within knee height of the model origin decide the box, so a crate's sides
-/// or a trunk are solid while its canopy is not.
-fn m2_footprint(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Footprint> {
-    let subs = benilla_formats::load_m2_mesh(chain, raw_path).ok()?;
+/// The base footprint of a parsed M2 render mesh: the vertices within knee
+/// height of the model origin decide the box, so a crate's sides or a trunk
+/// are solid while its canopy is not.
+pub(crate) fn footprint_of(subs: &[benilla_formats::RenderSubmesh]) -> Option<Footprint> {
     let mut lo = [f32::INFINITY; 2];
     let mut hi = [f32::NEG_INFINITY; 2];
     let mut zmin = f32::INFINITY;
     let mut zmax = f32::NEG_INFINITY;
     let mut any = false;
-    for s in &subs {
+    for s in subs {
         for p in &s.positions {
             zmin = zmin.min(p[2]);
             zmax = zmax.max(p[2]);
@@ -309,11 +309,62 @@ fn m2_footprint(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Fo
     })
 }
 
+/// The base footprint of an M2 doodad from its render mesh, parsed here.
+fn m2_footprint(chain: &mut benilla_formats::Chain, raw_path: &str) -> Option<Footprint> {
+    footprint_of(&benilla_formats::load_m2_mesh(chain, raw_path).ok()?)
+}
+
+/// Footprints and WMO collision meshes parked by the tile worker, which
+/// already holds the MPQ chain. The tick that adopts a new tile looks them up
+/// instead of parsing a model on the game thread, where one stormwind wall
+/// parse was a 40-60 ms frame.
+fn parked_footprints() -> &'static std::sync::Mutex<HashMap<String, Option<Footprint>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Footprint>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn parked_wmo_cols() -> &'static std::sync::Mutex<HashMap<String, benilla_formats::CollisionMesh>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, benilla_formats::CollisionMesh>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Park one model's footprint (`None` = it has no base obstacle).
+pub(crate) fn footprint_park(path: &str, fp: Option<Footprint>) {
+    if let Ok(mut m) = parked_footprints().lock() {
+        m.insert(path.to_string(), fp);
+    }
+}
+
+fn footprint_parked(path: &str) -> Option<Option<Footprint>> {
+    parked_footprints().lock().ok()?.get(path).copied()
+}
+
+/// Park one WMO's collision mesh for the body tile that lists it.
+pub(crate) fn wmo_collision_park(path: &str, mesh: benilla_formats::CollisionMesh) {
+    if let Ok(mut m) = parked_wmo_cols().lock() {
+        m.insert(path.to_string(), mesh);
+    }
+}
+
+pub(crate) fn wmo_collision_parked(path: &str) -> bool {
+    parked_wmo_cols()
+        .lock()
+        .map(|m| m.contains_key(path))
+        .unwrap_or(false)
+}
+
+fn wmo_collision_take(path: &str) -> Option<benilla_formats::CollisionMesh> {
+    parked_wmo_cols().lock().ok()?.remove(path)
+}
+
 /// One ADT tile's collision: terrain triangles bucketed by the chunk they
 /// came from (16x16 buckets = the chunks), plus the WMO floors once built.
-struct TileCol {
+pub(crate) struct TileCol {
     buckets: Vec<Vec<Tri>>,
-    /// Terrain triangles by chunk bucket - `buckets.len() == 256`.
+    /// Terrain triangles by chunk bucket - `buckets.len == 256`.
     /// WMO triangles bucketed on a [`WMO_GRID`] grid of the tile; a triangle
     /// lands in every cell its XY bounds overlap, so the huge city floors
     /// answer from any point instead of a full-scan every frame.
@@ -331,6 +382,17 @@ struct TileCol {
     /// model space: a query is mirrored into model space instead of baking.
     wmo_liquids: Vec<(benilla_formats::WmoInstance, benilla_formats::LiquidMesh)>,
     wmo_ready: bool,
+    /// WMO fold cursor: instances are baked into the grid a budgeted slice at
+    /// a time, so adopting a city tile never spends 40 ms in one tick. The
+    /// vertex transform is sliced by `wmo_vtx` for the same reason (a city
+    /// WMO's collision mesh runs to tens of thousands of vertices).
+    wmo_inst: usize,
+    wmo_tri: usize,
+    wmo_vtx: usize,
+    wmo_world: Vec<[f32; 3]>,
+    /// WMO MLIQ cursor: one model's water groups per slice (each is an MPQ
+    /// read and parse; a city tile holds a dozen).
+    wmo_mliq: usize,
     /// Doodad cursor: footprints are built a few models at a time (the first
     /// cold parse of ~200 unique M2 meshes costs half a second), so the frame
     /// never stalls on a tile load.
@@ -341,13 +403,22 @@ impl TileCol {
     fn new() -> Self {
         Self {
             buckets: (0..256).map(|_| Vec::new()).collect(),
-            wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
-            doodad_cells: (0..(WMO_GRID * WMO_GRID) as usize).map(|_| Vec::new()).collect(),
+            wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize)
+                .map(|_| Vec::new())
+                .collect(),
+            doodad_cells: (0..(WMO_GRID * WMO_GRID) as usize)
+                .map(|_| Vec::new())
+                .collect(),
             wmos: Vec::new(),
             doodads: Vec::new(),
             liquids: Vec::new(),
             wmo_liquids: Vec::new(),
             wmo_ready: false,
+            wmo_inst: 0,
+            wmo_tri: 0,
+            wmo_vtx: 0,
+            wmo_world: Vec::new(),
+            wmo_mliq: 0,
             doodad_next: 0,
         }
     }
@@ -387,71 +458,155 @@ impl TileCol {
     }
 }
 
-/// Bake one tile's WMO walking triangles + MLIQ surfaces into its grid.
-/// Returns true when at least one model contributed geometry (the caller
-/// then re-snaps the body so it does not start under a floor).
-fn build_wmo_collision(
+/// Bake WMO walking triangles + MLIQ surfaces into the tile's grid, one
+/// budgeted slice per tick. A city tile's floors are tens of thousands of
+/// triangles and folding them all in one tick was a 38-47 ms frame on the
+/// tick the body adopted the tile; the cursor resumes next tick.
+/// Returns true when this step contributed geometry (the caller then re-snaps
+/// the body so it does not start under a floor).
+fn build_wmo_collision_step(
     t: &mut TileCol,
     tx: i32,
     ty: i32,
     chain: &mut benilla_formats::Chain,
     cache: &mut HashMap<String, benilla_formats::CollisionMesh>,
+    budget: std::time::Duration,
 ) -> bool {
+    let start = std::time::Instant::now();
     let mut built = false;
-    for inst in &t.wmos {
-        if !cache.contains_key(&inst.model) {
-            let Ok(mesh) = benilla_formats::load_wmo_collision_tris(chain, &inst.model) else {
-                continue;
+    while t.wmo_inst < t.wmos.len() {
+        let model = t.wmos[t.wmo_inst].model.clone();
+        if !cache.contains_key(&model) {
+            // The tile worker parks this model's collision mesh beside the
+            // tile; a parse here runs on the tick that adopts the tile, so it
+            // waits for a fresh slice instead of overrunning the budget.
+            let mesh = match wmo_collision_take(&model) {
+                Some(m) => m,
+                None => {
+                    if start.elapsed() >= budget {
+                        break;
+                    }
+                    match benilla_formats::load_wmo_collision_tris(chain, &model) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            t.wmo_inst += 1;
+                            t.wmo_tri = 0;
+                            t.wmo_vtx = 0;
+                            continue;
+                        }
+                    }
+                }
             };
-            cache.insert(inst.model.clone(), mesh);
+            cache.insert(model.clone(), mesh);
         }
-        let Some(mesh) = cache.get(&inst.model) else { continue };
-        if mesh.is_empty() {
+        let total = cache[&model].indices.len() / 3;
+        if total == 0 || cache[&model].positions.is_empty() {
+            t.wmo_inst += 1;
+            t.wmo_tri = 0;
+            t.wmo_vtx = 0;
+            t.wmo_world.clear();
             continue;
         }
-        built = true;
-        let q = placement_quat(inst.rotation);
-        let mut world = Vec::with_capacity(mesh.positions.len());
-        for p in &mesh.positions {
-            let r = q_rot(q, *p);
-            world.push([
-                r[0] + inst.position[0],
-                r[1] + inst.position[1],
-                r[2] + inst.position[2],
-            ]);
-        }
-        for tri in mesh.indices.chunks_exact(3) {
-            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-            let (Some(&va), Some(&vb), Some(&vc)) = (world.get(a), world.get(b), world.get(c)) else {
-                continue;
+        // Start the instance: transform its vertices once, in slices (a city
+        // WMO runs to tens of thousands), then fold its triangles in chunks.
+        if t.wmo_tri == 0 {
+            let mesh = &cache[&model];
+            if t.wmo_vtx == 0 {
+                t.wmo_world.clear();
+                t.wmo_world.reserve(mesh.positions.len());
+            }
+            let (q, base) = {
+                let inst = &t.wmos[t.wmo_inst];
+                (placement_quat(inst.rotation), inst.position)
             };
-            let tri_c = Tri::new(va, vb, vc);
-            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
-            for ly in y0..=y1 {
-                for lx in x0..=x1 {
-                    t.wmo_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+            let end = (t.wmo_vtx + 4096).min(mesh.positions.len());
+            for p in &mesh.positions[t.wmo_vtx..end] {
+                let r = q_rot(q, *p);
+                t.wmo_world
+                    .push([r[0] + base[0], r[1] + base[1], r[2] + base[2]]);
+            }
+            t.wmo_vtx = end;
+            if t.wmo_vtx < mesh.positions.len() {
+                break; // more vertices next tick
+            }
+        }
+        let mut i = t.wmo_tri;
+        {
+            let world = &t.wmo_world;
+            let mesh = &cache[&model];
+            let cells = &mut t.wmo_cells;
+            while i < total {
+                let mesh_i = &mesh.indices[i * 3..i * 3 + 3];
+                let (a, b, c) = (mesh_i[0] as usize, mesh_i[1] as usize, mesh_i[2] as usize);
+                let (Some(&va), Some(&vb), Some(&vc)) = (world.get(a), world.get(b), world.get(c))
+                else {
+                    i += 1;
+                    continue;
+                };
+                let tri_c = Tri::new(va, vb, vc);
+                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
+                for ly in y0..=y1 {
+                    for lx in x0..=x1 {
+                        cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                    }
+                }
+                built = true;
+                i += 1;
+                if i % 128 == 0 && start.elapsed() >= budget {
+                    break;
                 }
             }
         }
-    }
-    // WMO MLIQ: the canals' and fountains' water, model space + placement
-    // (a rotation-safe query, so an arbitrary yaw still samples).
-    let mut liquid_cache: HashMap<String, Vec<benilla_formats::LiquidMesh>> = HashMap::new();
-    for inst in &t.wmos {
-        if !liquid_cache.contains_key(&inst.model) {
-            let meshes = crate::read_wmo_group_liquids(Some(&mut *chain), &inst.model);
-            liquid_cache.insert(inst.model.clone(), meshes);
+        t.wmo_tri = i;
+        if i < total {
+            break; // budget spent mid-instance
         }
-        let Some(meshes) = liquid_cache.get(&inst.model) else { continue };
-        for m in meshes {
-            t.wmo_liquids.push((inst.clone(), m.clone()));
+        t.wmo_inst += 1;
+        t.wmo_tri = 0;
+        t.wmo_vtx = 0;
+        t.wmo_world.clear();
+        if start.elapsed() >= budget {
+            break;
+        }
+    }
+    if t.wmo_inst >= t.wmos.len() && !t.wmo_ready {
+        // WMO MLIQ: the canals' and fountains' water, model space + placement
+        // (a rotation-safe query, so an arbitrary yaw still samples). The
+        // worker parks each model's groups, so this is a cache hit in the
+        // normal path; a tile nobody prefetched reads one model here.
+        let mliq = std::time::Instant::now();
+        while t.wmo_mliq < t.wmos.len() {
+            if mliq.elapsed() >= budget {
+                break;
+            }
+            let inst = t.wmos[t.wmo_mliq].clone();
+            let key = crate::wmo_key(&inst.model);
+            let meshes = match crate::wmo_liquid_lookup(&key) {
+                Some(m) => m,
+                None => {
+                    let meshes = std::sync::Arc::new(crate::read_wmo_group_liquids(
+                        Some(&mut *chain),
+                        &inst.model,
+                    ));
+                    crate::wmo_liquid_store(&key, meshes.clone());
+                    meshes
+                }
+            };
+            for m in meshes.iter() {
+                t.wmo_liquids.push((inst.clone(), m.clone()));
+            }
+            t.wmo_mliq += 1;
+        }
+        if t.wmo_mliq >= t.wmos.len() {
+            t.wmo_ready = true;
+            t.wmo_world = Vec::new();
         }
     }
     built
 }
 
 /// The liquid surface height under (x, y) in one liquid mesh, sampled
-/// bilinearly over the containing cell as the reference does (`0x6b7500`).
+/// bilinearly over the containing cell as the client does.
 /// `None` outside the mesh or over a dry cell.
 ///
 /// The cell axes are taken from the vertex grid itself (vertex 0 to vertex 1
@@ -493,10 +648,7 @@ fn liquid_height(m: &benilla_formats::LiquidMesh, x: f32, y: f32) -> Option<f32>
     let tr = m.positions[row * cols + col + 1][2];
     let bl = m.positions[(row + 1) * cols + col][2];
     let br = m.positions[(row + 1) * cols + col + 1][2];
-    Some(tl * (1.0 - u) * (1.0 - v)
-        + tr * (1.0 - u) * v
-        + bl * u * (1.0 - v)
-        + br * u * v)
+    Some(tl * (1.0 - u) * (1.0 - v) + tr * (1.0 - u) * v + bl * u * (1.0 - v) + br * u * v)
 }
 
 /// Ray/triangle intersection (Möller-Trumbore, both faces): the ray length to
@@ -506,9 +658,11 @@ fn ray_tri(o: [f32; 3], d: [f32; 3], t: &Tri) -> Option<f32> {
     let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
     let cross = |u: [f32; 3], v: [f32; 3]| {
-        [u[1] * v[2] - u[2] * v[1],
-         u[2] * v[0] - u[0] * v[2],
-         u[0] * v[1] - u[1] * v[0]]
+        [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ]
     };
     let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
     let pv = cross(d, e2);
@@ -592,7 +746,7 @@ struct Input {
     strafe: f32,
     /// The keyboard turn axis, left-positive (`TURN_LEFT` keys); the host sends
     /// it only while the right mouse button is up, when A/D turn instead of
-    /// strafing (`0x7c5360`).
+    /// strafing.
     turn: f32,
     jump: bool,
     walk: bool,
@@ -611,7 +765,7 @@ pub struct Player {
     model_yaw: f32,
     vel: [f32; 3],
     grounded: bool,
-    /// Latched by the water depth over the feet (`0x6030c0`); gravity is
+    /// Latched by the water depth over the feet; gravity is
     /// bypassed while set and the feet float at `0.75·h` under the surface.
     swimming: bool,
     input: Input,
@@ -736,16 +890,40 @@ impl Player {
         // Closest first.
         wanted.sort_by_key(|k| (k.0 - tx).abs() + (k.1 - ty).abs());
         if let Some(&k) = wanted.first() {
-            match load_tile(archives, &self.map, k.0, k.1) {
+            // The tile worker parks the collision tile beside the render one;
+            // only a tile it never saw (spawn, teleport) is parsed here.
+            let t0 = std::time::Instant::now();
+            match crate::collision_tile_take(&self.map, k.0, k.1) {
                 Some(t) => {
+                    eprintln!("bn_player: collision tile ({},{}) parked", k.0, k.1);
                     self.tiles.insert(k, t);
                 }
-                None => self.missing.push(k),
+                None => match load_tile(archives, &self.map, k.0, k.1) {
+                    Some(t) => {
+                        eprintln!(
+                            "bn_player: collision tile ({},{}) SYNC {:.1}ms",
+                            k.0,
+                            k.1,
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                        self.tiles.insert(k, t);
+                    }
+                    None => self.missing.push(k),
+                },
             }
         }
-        self.tiles.retain(|k, _| {
-            (k.0 - tx).abs() <= 1 && (k.1 - ty).abs() <= 1
-        });
+        let evicted: Vec<(i32, i32)> = self
+            .tiles
+            .keys()
+            .copied()
+            .filter(|k| (k.0 - tx).abs() > 1 || (k.1 - ty).abs() > 1)
+            .collect();
+        for k in evicted {
+            // Parked again for a walk back across the border.
+            if let Some(t) = self.tiles.remove(&k) {
+                crate::collision_tile_put(&self.map, k.0, k.1, t);
+            }
+        }
     }
 
     /// Fill the player tile's WMO floor/wall triangles once, from the same
@@ -762,8 +940,14 @@ impl Player {
         };
         let Some(chain) = chain.as_mut() else { return };
         if !t.wmo_ready {
-            t.wmo_ready = true;
-            if build_wmo_collision(t, tx, ty, chain, cache) {
+            if build_wmo_collision_step(
+                t,
+                tx,
+                ty,
+                chain,
+                cache,
+                std::time::Duration::from_millis(2),
+            ) {
                 self.snap_pending = true;
             }
         }
@@ -776,13 +960,22 @@ impl Player {
         let start = std::time::Instant::now();
         while t.doodad_next < t.doodads.len() {
             let i = t.doodad_next;
-            t.doodad_next += 1;
-            let d = &t.doodads[i];
-            if !self.footprints.contains_key(&d.model) {
-                let fp = m2_footprint(chain, &d.model);
-                self.footprints.insert(d.model.clone(), fp);
+            if !self.footprints.contains_key(&t.doodads[i].model) {
+                let parked = footprint_parked(&t.doodads[i].model);
+                if parked.is_none() && start.elapsed().as_millis() >= 2 {
+                    // A cold model with nothing parked: leave the cursor on it
+                    // for the next tick instead of parsing mid-frame.
+                    break;
+                }
+                let model = t.doodads[i].model.clone();
+                let fp = parked.unwrap_or_else(|| m2_footprint(chain, &model));
+                self.footprints.insert(model, fp);
             }
-            let Some(Some(fp)) = self.footprints.get(&d.model) else { continue };
+            t.doodad_next = i + 1;
+            let d = &t.doodads[i];
+            let Some(Some(fp)) = self.footprints.get(&d.model) else {
+                continue;
+            };
             let q = placement_quat(d.rotation);
             let off = q_rot(q, [fp.cx * d.scale, fp.cy * d.scale, 0.0]);
             let ax = q_rot(q, [1.0, 0.0, 0.0]);
@@ -872,7 +1065,7 @@ impl Player {
     }
 
     /// The liquid surface over (x, y), the lowest of any stacked blocks
-    /// (`benilla_world`'s `liquid_at`, so a stream over the sea reads as the
+    /// so a stream over the sea reads as the
     /// stream). Magma and slime are swum in like water.
     fn water(&self, x: f32, y: f32) -> Option<f32> {
         let (tx, ty) = Self::tile_of(x, y);
@@ -908,7 +1101,7 @@ impl Player {
 
     /// A steep WMO face within `radius` of `p` (a wall; floors are excluded).
     /// Faces entirely below `step_base + STEP_UP_HEIGHT` are steps, not walls:
-    /// the reference's mover climbs them, so its wall test must not see them.
+    /// the client's mover climbs them, so its wall test must not see them.
     /// Pass `f32::NEG_INFINITY` to keep every face (the camera's probe).
     fn hit_steep(&self, p: [f32; 3], radius: f32, step_base: f32) -> bool {
         let (tx, ty) = Self::tile_of(p[0], p[1]);
@@ -916,8 +1109,10 @@ impl Player {
             let Some(i) = TileCol::wmo_cell(ktx, kty, p[0], p[1]) else {
                 return false;
             };
-            let (lx, ly) = ((i % WMO_GRID as usize) as i32,
-                            (i / WMO_GRID as usize) as i32);
+            let (lx, ly) = (
+                (i % WMO_GRID as usize) as i32,
+                (i / WMO_GRID as usize) as i32,
+            );
             let r2 = radius * radius;
             for gy in (ly - 1)..=(ly + 1) {
                 for gx in (lx - 1)..=(lx + 1) {
@@ -951,7 +1146,7 @@ impl Player {
             .any(|(&(k0, k1), tile)| probe(k0, k1, tile))
     }
 
-    /// Horizontal blocking by a steep WMO face: the reference's capsule (a
+    /// Horizontal blocking by a steep WMO face: the client's capsule (a
     /// radius `CAPSULE_RADIUS` sweep between the feet and the head) against
     /// walls. Floors (`|n.z| >= GROUND_COS`) are left to [`Self::ground`].
     fn wall_hit(&self, x: f32, y: f32, feet: f32) -> bool {
@@ -969,9 +1164,16 @@ impl Player {
     /// True when a doodad's base cylinder overlaps the body at (`x`, `y`).
     fn doodad_hit(&self, x: f32, y: f32, feet: f32) -> bool {
         let (tx, ty) = Self::tile_of(x, y);
-        let Some(tile) = self.tiles.get(&(tx, ty)) else { return false };
-        let Some(ci) = TileCol::wmo_cell(tx, ty, x, y) else { return false };
-        let (gx, gy) = ((ci % WMO_GRID as usize) as i32, (ci / WMO_GRID as usize) as i32);
+        let Some(tile) = self.tiles.get(&(tx, ty)) else {
+            return false;
+        };
+        let Some(ci) = TileCol::wmo_cell(tx, ty, x, y) else {
+            return false;
+        };
+        let (gx, gy) = (
+            (ci % WMO_GRID as usize) as i32,
+            (ci / WMO_GRID as usize) as i32,
+        );
         let lo = feet + 0.1;
         let hi = feet + CAPSULE_HEIGHT;
         for ly in (gy - 1)..=(gy + 1) {
@@ -1032,8 +1234,11 @@ impl Player {
     /// miss walls seen edge-on (a wall joining two samples falls between
     /// them), so the segment is tested against the triangles itself.
     fn boom_wall_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
-        let end = [pivot[0] + dir[0] * max, pivot[1] + dir[1] * max,
-                   pivot[2] + dir[2] * max];
+        let end = [
+            pivot[0] + dir[0] * max,
+            pivot[1] + dir[1] * max,
+            pivot[2] + dir[2] * max,
+        ];
         let mut best: Option<f32> = None;
         let mut scan = |tx: i32, ty: i32, tile: &TileCol| {
             let (ax, ay) = TileCol::wmo_local(tx, ty, pivot[0], pivot[1]);
@@ -1091,7 +1296,11 @@ impl Player {
             limit = (t - 0.3).max(0.0);
         }
         let at = |f: f32| {
-            [pivot[0] + dir[0] * f, pivot[1] + dir[1] * f, pivot[2] + dir[2] * f]
+            [
+                pivot[0] + dir[0] * f,
+                pivot[1] + dir[1] * f,
+                pivot[2] + dir[2] * f,
+            ]
         };
         let mut prev = 0.0;
         for i in 1..=8 {
@@ -1184,8 +1393,7 @@ impl Player {
         self.pivot_height += (CAM_PIVOT_STAND - self.pivot_height).clamp(-glide, glide);
         self.attack_left = (self.attack_left - dt).max(0.0);
         let step_d = 8.33 * dt;
-        self.cam_distance +=
-            (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
+        self.cam_distance += (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
         self.cam_live = self.cam_distance;
     }
 
@@ -1206,8 +1414,7 @@ impl Player {
         }
         if self.snap_pending {
             self.snap_pending = false;
-            if let Some(z) = self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0)
-            {
+            if let Some(z) = self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0) {
                 self.pos[2] = z;
                 self.vel[2] = 0.0;
                 self.grounded = true;
@@ -1218,7 +1425,7 @@ impl Player {
         let forward = self.input.forward.clamp(-1.0, 1.0);
         let strafe = self.input.strafe.clamp(-1.0, 1.0);
 
-        // The swim latch (`0x6030c0`): the depth over the feet against
+        // The swim latch: the depth over the feet against
         // `0.75·h`, held in a 1/36-yd band. A rising launch is not caught, so
         // a swim jump can leave the water.
         let surface = self.water(self.pos[0], self.pos[1]);
@@ -1238,7 +1445,7 @@ impl Player {
             // The client dismounts on entering deep water.
             self.mounted = false;
         }
-        // The pivot channel (`0x50f160`): the standing preset, the swim drop in
+        // The pivot channel: the standing preset, the swim drop in
         // water, eased at 1.2 yd/s.
         let pivot_target = if self.swimming {
             CAM_PIVOT_SWIM
@@ -1251,10 +1458,10 @@ impl Player {
         self.surface = surface;
         let backpedal = forward < 0.0 && strafe.abs() < 0.01;
 
-        // The 1.12 control model (`0x7c5360`): A/D turn the character unless the
+        // The 1.12 control model: A/D turn the character unless the
         // right mouse button is held, when the host reports them as strafe. A
         // keyboard turn is left-positive and carries the body and the camera
-        // rigidly (`camera.rs`); translating or falling scales it by 0.75.
+        // rigidly (`camera`); translating or falling scales it by 0.75.
         let turn = self.input.turn.clamp(-1.0, 1.0);
         if turn != 0.0 {
             let rate = TURN_RATE
@@ -1269,8 +1476,8 @@ impl Player {
             self.cam_yaw = wrap_pi(self.cam_yaw - d);
         }
 
-        // WASD moves in the aim's basis, as the reference does (`state.rs`:
-        // "the facing ... is the basis WASD move in"); orbiting the camera
+        // WASD moves in the aim's basis, as the client does (`state`:
+        // "the facing... is the basis WASD move in"); orbiting the camera
         // does not steer the body. WoW axes: +X north, +Y west, so facing
         // yaw gives forward (cos, sin) and the player's right (sin, -cos).
         let (sy, cy) = self.yaw.sin_cos();
@@ -1278,12 +1485,14 @@ impl Player {
         let right = [sy, -cy];
         let mag;
         if self.swimming {
-            // The travel basis (`0x7c5880`): forward is the facing pitched by
+            // The travel basis: forward is the facing pitched by
             // the aim, strafe stays level, and there is no vertical input.
             let (sp, cp) = self.cam_pitch.sin_cos();
-            let mut v = [fwd[0] * cp * forward + right[0] * strafe,
-                         fwd[1] * cp * forward + right[1] * strafe,
-                         sp * forward];
+            let mut v = [
+                fwd[0] * cp * forward + right[0] * strafe,
+                fwd[1] * cp * forward + right[1] * strafe,
+                sp * forward,
+            ];
             let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             if len > 1.0 {
                 for c in &mut v {
@@ -1291,16 +1500,22 @@ impl Player {
                 }
             }
             mag = len.min(1.0);
-            let speed = if forward < -0.01 { SWIM_BACK_SPEED } else { SWIM_SPEED };
+            let speed = if forward < -0.01 {
+                SWIM_BACK_SPEED
+            } else {
+                SWIM_SPEED
+            };
             self.vel = [v[0] * speed, v[1] * speed, v[2] * speed];
-            // The rise cap (`0x632ba0`): the stroke's upward speed is clamped
+            // The rise cap: the stroke's upward speed is clamped
             // to what reaches the rest line this frame; the surplus turns into
             // level travel at the same speed.
             if let Some(s) = surface {
                 let cap = ((s - enter - self.pos[2]) / dt).max(0.0);
                 if self.vel[2] > cap {
-                    let speed = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]
-                        + self.vel[2] * self.vel[2]).sqrt();
+                    let speed = (self.vel[0] * self.vel[0]
+                        + self.vel[1] * self.vel[1]
+                        + self.vel[2] * self.vel[2])
+                        .sqrt();
                     let hl = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
                     let level = (speed * speed - cap * cap).max(0.0).sqrt();
                     if hl > 1.0e-6 {
@@ -1314,8 +1529,10 @@ impl Player {
                 }
             }
         } else {
-            let mut dir = [fwd[0] * forward + right[0] * strafe,
-                           fwd[1] * forward + right[1] * strafe];
+            let mut dir = [
+                fwd[0] * forward + right[0] * strafe,
+                fwd[1] * forward + right[1] * strafe,
+            ];
             let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
             if len > 1.0 {
                 dir[0] /= len;
@@ -1351,7 +1568,7 @@ impl Player {
             self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
         }
 
-        // Jump: an edge. In water Space is the swim jump (`0x7c6230`), which
+        // Jump: an edge. In water Space is the swim jump, which
         // clears the latch with a stronger seed at any depth.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
@@ -1368,7 +1585,7 @@ impl Player {
             }
         }
 
-        // Horizontal step with the reference's wall response: a floor more
+        // Horizontal step with the client's wall response: a floor more
         // than a step above the feet blocks the axis; the other one slides.
         let step = [self.vel[0] * dt, self.vel[1] * dt];
         if step[0] != 0.0 || step[1] != 0.0 {
@@ -1396,7 +1613,7 @@ impl Player {
         }
 
         if self.swimming {
-            // The floating resolver (`0x634640`): no gravity, the vertical only
+            // The floating resolver: no gravity, the vertical only
             // from the stroke. The feet sink to the rest line
             // `surface - 0.75·h` when the surface falls, and a shallow bottom
             // still holds them higher.
@@ -1417,7 +1634,6 @@ impl Player {
             self.vel[2] = 0.0;
         } else {
             // Vertical: gravity then the floor probe (benilla's order).
-            //
             // The probe's ceiling has to cover the whole step, not just the
             // new feet: at terminal velocity a hitched 0.1s frame drops 6 yd,
             // so probing from `pos.z + STEP_UP_HEIGHT` lets the feet pass a
@@ -1460,7 +1676,10 @@ impl Player {
                         eprintln!(
                             "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
                              {state} resident={}",
-                            self.pos[0], self.pos[1], self.pos[2], self.tiles.len()
+                            self.pos[0],
+                            self.pos[1],
+                            self.pos[2],
+                            self.tiles.len()
                         );
                     }
                     if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH {
@@ -1484,7 +1703,11 @@ impl Player {
             // never fires. Log the trajectory (with the tile's WMO cell count)
             // every half second instead, so a "fell through here" report has
             // coordinates and tells us whether the cell held any geometry.
-            self.fall_time = if self.grounded { 0.0 } else { self.fall_time + dt };
+            self.fall_time = if self.grounded {
+                0.0
+            } else {
+                self.fall_time + dt
+            };
             if !self.grounded && self.vel[2] < -10.0 && self.fall_time >= 0.5 {
                 self.fall_time = 0.0;
                 let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
@@ -1510,10 +1733,9 @@ impl Player {
 
         self.attack_left = (self.attack_left - dt).max(0.0);
 
-        // Zoom glide (`camera_zoom.rs`: constant 8.33 yd/s toward the target).
+        // Zoom glide (`camera_zoom`: constant 8.33 yd/s toward the target).
         let step_d = 8.33 * dt;
-        self.cam_distance += (self.cam_target_distance - self.cam_distance)
-            .clamp(-step_d, step_d);
+        self.cam_distance += (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
 
         // Boom collision: snap in at once when geometry intrudes (a wall the
         // player turns into), ease back out at the zoom glide's 8.33 yd/s.
@@ -1533,16 +1755,22 @@ impl Player {
         let pivot = self.camera_pivot();
         let fwd = self.camera_fwd();
         let mut dist = self.cam_live.min(self.cam_distance);
-        let mut eye = [pivot[0] - fwd[0] * dist, pivot[1] - fwd[1] * dist,
-                       pivot[2] - fwd[2] * dist];
+        let mut eye = [
+            pivot[0] - fwd[0] * dist,
+            pivot[1] - fwd[1] * dist,
+            pivot[2] - fwd[2] * dist,
+        ];
         // `cameraWaterCollision`'s ray: the waterline is solid, so a boom that
-        // would put the eye under the surface stops at it instead (`0x50e5ec`).
+        // would put the eye under the surface stops at it instead.
         if let Some(s) = self.surface {
             if eye[2] < s && pivot[2] > s {
                 let t = (pivot[2] - s) / (pivot[2] - eye[2]);
                 dist *= t.max(0.0);
-                eye = [pivot[0] - fwd[0] * dist, pivot[1] - fwd[1] * dist,
-                       pivot[2] - fwd[2] * dist];
+                eye = [
+                    pivot[0] - fwd[0] * dist,
+                    pivot[1] - fwd[1] * dist,
+                    pivot[2] - fwd[2] * dist,
+                ];
             }
         }
         (eye, pivot)
@@ -1552,7 +1780,7 @@ impl Player {
     /// each). Called every frame a button is held, so a still drag latches
     /// `look_active`. With
     /// `turn_body` the aim and the rendered body turn with the camera, as
-    /// `camera.rs` does on the right button; otherwise only the orbit moves.
+    /// `camera` does on the right button; otherwise only the orbit moves.
     fn look(&mut self, dx: f32, dy: f32, turn_body: bool) {
         // The button is held this frame (the host calls even for a zero
         // delta), so the smart follow yields to the drag.
@@ -1641,9 +1869,7 @@ impl Player {
 }
 
 /// Parse one ADT into collision triangles (world coords), bucketed by chunk.
-fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32)
-    -> Option<TileCol>
-{
+fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32) -> Option<TileCol> {
     let path = format!("World\\Maps\\{map}\\{map}_{tx}_{ty}.adt");
     let bytes = archives.iter().rev().find_map(|a| {
         if a.contains(&path) {
@@ -1652,7 +1878,11 @@ fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32)
             None
         }
     })?;
-    let mesh = adt_to_tile_mesh(&bytes).ok()?;
+    Some(tile_col_from_mesh(&adt_to_tile_mesh(&bytes).ok()?))
+}
+
+/// The collision half of an ADT, from the mesh the tile worker already parsed.
+pub(crate) fn tile_col_from_mesh(mesh: &benilla_formats::TileMesh) -> TileCol {
     let mut col = TileCol::new();
     col.wmos = mesh.wmos.clone();
     col.doodads = mesh.doodads.clone();
@@ -1679,7 +1909,7 @@ fn load_tile(archives: &[benilla_mpq::Archive], map: &str, tx: i32, ty: i32)
             col.buckets[((cy % 16) * 16 + (cx % 16)) as usize].push(t);
         }
     }
-    Some(col)
+    col
 }
 
 // ---- C ABI ----
@@ -1742,7 +1972,9 @@ pub extern "C" fn bn_player_teleport(
         return 0;
     };
     let w = unsafe { &mut *world };
-    let Some(mut p) = w.player.take() else { return 0 };
+    let Some(mut p) = w.player.take() else {
+        return 0;
+    };
     if p.map_of() != map {
         p = Player::new(map, x, y);
     }
@@ -1791,18 +2023,13 @@ pub extern "C" fn bn_player_fly(world: *mut BnWorld, on: u32) -> u32 {
     1
 }
 
-/// Mouse look: raw pointer delta in pixels. The reference's law is 0.003 rad
+/// Mouse look: raw pointer delta in pixels. The client's law is 0.003 rad
 /// per unit on both axes (`LOOK_SENSITIVITY`), pitch clamped to ±89°.
-/// `turn_body` != 0 is the right button: `camera.rs` turns the character with
+/// `turn_body` != 0 is the right button: `camera` turns the character with
 /// the camera, so the aim and the rendered body turn too. The left button
 /// only orbits, leaving the aim (and WASD's basis) where it was.
 #[no_mangle]
-pub extern "C" fn bn_player_mouse(
-    world: *mut BnWorld,
-    dx: f32,
-    dy: f32,
-    turn_body: u32,
-) -> u32 {
+pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32, turn_body: u32) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
     p.look(dx, dy, turn_body != 0);
     1
@@ -1816,7 +2043,7 @@ pub extern "C" fn bn_player_zoom(world: *mut BnWorld, notches: f32) -> u32 {
     1
 }
 
-/// Unarmed attack edge. Ignored in the air or mounted, like the reference.
+/// Unarmed attack edge. Ignored in the air or mounted, like the client.
 #[no_mangle]
 pub extern "C" fn bn_player_attack(world: *mut BnWorld) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
@@ -1848,12 +2075,30 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
         return 0;
     }
     let w = unsafe { &mut *world };
+    // Ask the tile worker for the body's own 3x3 window before touching the
+    // player: the host's stream window can lag the tile the body walks into,
+    // and a sync ADT parse in the tick that adopts it is the border hitch.
+    if let Some(p) = w.player.as_ref() {
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let map = p.map.clone();
+        crate::player_prefetch_window(w, &map, tx, ty);
+    }
     let Some(p) = w.player.as_mut() else { return 0 };
     // Split borrows: the tile load reads the archives, the WMO build the chain
     // and its shared model cache.
+    let t0 = std::time::Instant::now();
     p.ensure_tiles(&w.archives);
+    let t1 = std::time::Instant::now();
     p.ensure_wmo(&mut w.chain, &mut w.wmo_collision);
+    let t2 = std::time::Instant::now();
     p.tick(dt);
+    let t3 = std::time::Instant::now();
+    let tiles_ms = (t1 - t0).as_secs_f64() * 1000.0;
+    let wmo_ms = (t2 - t1).as_secs_f64() * 1000.0;
+    let tick_ms = (t3 - t2).as_secs_f64() * 1000.0;
+    if tiles_ms + wmo_ms + tick_ms > 8.0 {
+        eprintln!("bn_player_tick: tiles={tiles_ms:.1} wmo={wmo_ms:.1} tick={tick_ms:.1}");
+    }
     let s = p.state();
     unsafe {
         *out = s;
@@ -1903,7 +2148,10 @@ mod tests {
     #[test]
     fn the_capsule_stops_at_a_wall() {
         let p = player_with_wall();
-        assert!(p.wall_hit(-8799.7, -800.0, 0.0), "within the capsule radius");
+        assert!(
+            p.wall_hit(-8799.7, -800.0, 0.0),
+            "within the capsule radius"
+        );
         assert!(!p.wall_hit(-8798.0, -800.0, 0.0), "clear of the wall");
         assert!(!p.wall_hit(-8799.7, -800.0, 5.0), "above the wall top");
     }
@@ -1940,7 +2188,11 @@ mod tests {
         let mut restored = false;
         for _ in 0..400 {
             p.tick(0.1);
-            assert!(p.pos[2] > -100.0, "never falls out of the world: {}", p.pos[2]);
+            assert!(
+                p.pos[2] > -100.0,
+                "never falls out of the world: {}",
+                p.pos[2]
+            );
             if p.grounded && (p.pos[2] - 10.0).abs() < 1.0e-3 {
                 restored = true;
             }
@@ -2040,9 +2292,18 @@ mod tests {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         p.look(100.0, 0.0, true);
         let turn = 100.0 * LOOK_SENSITIVITY;
-        assert!((p.cam_yaw - turn).abs() < 1.0e-5, "cam_yaw follows the drag");
-        assert!((p.yaw + turn).abs() < 1.0e-5, "the aim is the mirror of cam_yaw");
-        assert!((p.model_yaw + turn).abs() < 1.0e-5, "the body turns at once");
+        assert!(
+            (p.cam_yaw - turn).abs() < 1.0e-5,
+            "cam_yaw follows the drag"
+        );
+        assert!(
+            (p.yaw + turn).abs() < 1.0e-5,
+            "the aim is the mirror of cam_yaw"
+        );
+        assert!(
+            (p.model_yaw + turn).abs() < 1.0e-5,
+            "the body turns at once"
+        );
         // The Smart follow sees the camera already behind, so it does not move.
         let target = wrap_pi(-p.yaw);
         assert!(wrap_pi(target - p.cam_yaw).abs() < 1.0e-5);
@@ -2123,8 +2384,10 @@ mod tests {
         }
         assert!(p.yaw.abs() < 1.0e-6, "the aim never follows WASD");
         let offset = wrap_pi(p.model_yaw - p.yaw);
-        assert!((offset + std::f32::consts::FRAC_PI_2).abs() < 0.05,
-                "a pure right strafe turns the body a quarter left in WoW yaw");
+        assert!(
+            (offset + std::f32::consts::FRAC_PI_2).abs() < 0.05,
+            "a pure right strafe turns the body a quarter left in WoW yaw"
+        );
     }
 
     /// One wet 2×2 liquid block at `z`, over the world's north-west corner.
@@ -2170,7 +2433,11 @@ mod tests {
         let x = 17066.666 - 0.5 * LIQUID_UNIT;
         let y = 17066.666 - 0.5 * LIQUID_UNIT;
         assert!((liquid_height(&m, x, y).unwrap() - 12.0).abs() < 1.0e-4);
-        assert_eq!(liquid_height(&m, 17066.666 + LIQUID_UNIT, y), None, "dry corner");
+        assert_eq!(
+            liquid_height(&m, 17066.666 + LIQUID_UNIT, y),
+            None,
+            "dry corner"
+        );
     }
 
     #[test]
@@ -2180,7 +2447,10 @@ mod tests {
         p.tick(0.1);
         assert!(p.swimming);
         assert!(!p.grounded);
-        assert!((p.pos[2] + 1.6).abs() < 1.0e-4, "an idle swimmer keeps its depth");
+        assert!(
+            (p.pos[2] + 1.6).abs() < 1.0e-4,
+            "an idle swimmer keeps its depth"
+        );
         assert_eq!(p.anim(), 41, "SwimIdle");
     }
 
@@ -2201,7 +2471,11 @@ mod tests {
         }
         assert!(p.swimming);
         let rest = -(SWIM_DEPTH_FRAC * CAPSULE_HEIGHT);
-        assert!((p.pos[2] - rest).abs() < 0.02, "held just under the surface: {}", p.pos[2]);
+        assert!(
+            (p.pos[2] - rest).abs() < 0.02,
+            "held just under the surface: {}",
+            p.pos[2]
+        );
     }
 
     #[test]
@@ -2229,10 +2503,8 @@ mod tests {
     #[ignore = "needs the installed 1.12.1 data"]
     fn probe_city_fall_spot() {
         use crate::bn_init;
-        let dir = std::ffi::CString::new(
-            r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data",
-        )
-        .unwrap();
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
         let w = bn_init(dir.as_ptr());
         assert!(!w.is_null());
         let w = unsafe { &mut *w };
@@ -2319,10 +2591,8 @@ mod tests {
     #[ignore = "needs the installed 1.12.1 data"]
     fn doodad_footprints_on_city_tiles() {
         use crate::{bn_doodad_count, bn_doodad_model_path, bn_init, bn_load_tile};
-        let dir = std::ffi::CString::new(
-            r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data",
-        )
-        .unwrap();
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
         let w = bn_init(dir.as_ptr());
         assert!(!w.is_null());
         let map = std::ffi::CString::new("Azeroth").unwrap();
@@ -2341,9 +2611,7 @@ mod tests {
                         continue;
                     }
                     placed += 1;
-                    let path = unsafe {
-                        std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap()
-                    };
+                    let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap() };
                     if seen.insert(path.to_string()) {
                         paths.push(path.to_string());
                     }
@@ -2363,7 +2631,17 @@ mod tests {
                     solid += 1;
                     rsum += r;
                     rmax = rmax.max(r);
-                    let b = if r < 0.3 { 1 } else if r < 0.6 { 2 } else if r < 1.0 { 3 } else if r < 2.0 { 4 } else { 5 };
+                    let b = if r < 0.3 {
+                        1
+                    } else if r < 0.6 {
+                        2
+                    } else if r < 1.0 {
+                        3
+                    } else if r < 2.0 {
+                        4
+                    } else {
+                        5
+                    };
                     buckets[b] += 1;
                     biggest.push((r, path.clone()));
                 }
@@ -2385,4 +2663,3 @@ mod tests {
         crate::bn_shutdown(w);
     }
 }
-

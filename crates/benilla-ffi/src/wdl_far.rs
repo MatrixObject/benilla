@@ -1,8 +1,8 @@
 //! Middle-layer FFI: the WDL far-terrain band (benilla's "distant low-detail
-//! terrain"), the coarse horizon the reference draws beyond the ADT ring.
+//! terrain"), the coarse horizon the client draws beyond the ADT ring.
 //!
 //! The parse and the 545-vertex centre-fan mesh are `benilla_formats::wdl`.
-//! Streaming policy mirrors `benilla-world::wdl` without Bevy: a Chebyshev ring
+//! Streaming policy: a Chebyshev ring
 //! of radius 5 around the view, each tile one mesh section, drawn unlit in the
 //! scene fog colour.
 
@@ -38,7 +38,7 @@ fn ensure_wdl(w: &mut BnWorld, map: &str) -> bool {
     }
 }
 
-/// `present_count()` of the map's WDL, loading/caching it first. 0 = no file.
+/// `present_count` of the map's WDL, loading/caching it first. 0 = no file.
 #[no_mangle]
 pub extern "C" fn bn_wdl_present(world: *mut BnWorld, map: *const c_char) -> u32 {
     let (Some(w), Some(map)) = (unsafe { world.as_mut() }, cstr(map)) else {

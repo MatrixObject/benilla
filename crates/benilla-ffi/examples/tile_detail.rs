@@ -48,7 +48,12 @@ fn main() {
             "  mcnk={chunks} verts={nv} idx={ni} chunks={nc} filled={written}\n  z=[{mn:.1},{mx:.1}] x=[{xmn:.1},{xmx:.1}] y=[{ymn:.1},{ymx:.1}]"
         );
         // Terrain height at the tile centre (0,0) and a few offsets.
-        for (qx, qy) in [(0.0f32, 0.0f32), (-100.0, 100.0), (100.0, -100.0), (-250.0, 250.0)] {
+        for (qx, qy) in [
+            (0.0f32, 0.0f32),
+            (-100.0, 100.0),
+            (100.0, -100.0),
+            (-250.0, 250.0),
+        ] {
             println!(
                 "  h({qx:.0},{qy:.0}) = {:.1}",
                 benilla::bn_terrain_height_at(w, qx, qy)

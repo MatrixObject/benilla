@@ -10,7 +10,7 @@ fn main() {
         .filter(|n| n.to_lowercase().ends_with(".mpq"))
         .collect();
 
-    // 1. First prove the reader finds a known texture (Texture.MPQ holds .blp).
+    // 1. First prove the reader finds a known texture (Texture.MPQ holds.blp).
     let tex = format!("{data}\\texture.MPQ");
     if let Ok(a) = benilla_mpq::Archive::open(&tex) {
         for probe in [

@@ -2,7 +2,7 @@
 //!
 //! The M2 of a player character carries *empty* texture-slot names: the body
 //! skin is composited at runtime from `CharSections.dbc` plus the character
-//! BLPs. The official compositor lives in `benilla-app` (Bevy), which the FFI
+//! BLPs. The full client's compositor lives in a crate the FFI
 //! boundary deliberately excludes, so this file runs the formats-level
 //! compositor (`benilla_formats::CharSections::composite_body`) directly over
 //! the checked-out `Chain`.
@@ -39,11 +39,17 @@ pub extern "C" fn bn_char_skin_rgba(
     }
     // SAFETY: caller guarantees a valid, exclusive handle.
     let w = unsafe { &mut *world };
+    if w.chain.is_none() {
+        return 10;
+    }
+    if !w.ensure_char_sections() {
+        return 11;
+    }
+    let Some(sections) = w.char_sections.as_ref() else {
+        return 11;
+    };
     let Some(chain) = w.chain.as_mut() else {
         return 10;
-    };
-    let Ok(sections) = benilla_formats::CharSections::load(chain) else {
-        return 11;
     };
     let look = sections.composite_body(
         chain,
@@ -97,7 +103,7 @@ pub extern "C" fn bn_char_skin_rgba(
 /// Dressed variant of [`bn_char_skin_rgba`]: items are `ItemDisplayInfo` ids in
 /// the body-slot order the compositor uses (`equip_blits`): shirt, chest, belt,
 /// pants, boots, wrist, gloves, tabard. `displays` points at 8 `u32` (0 = bare).
-/// The equipment textures are composited exactly as the reference client's
+/// The equipment textures are composited exactly as the client's
 /// `0x477...` blitters do, so a shirt/pants/boots change the body atlas without
 /// touching the M2 or its geosets.
 #[no_mangle]
@@ -126,18 +132,31 @@ pub extern "C" fn bn_char_skin_dressed(
         unsafe { *(displays as *const [u32; 8]) }
     };
     let w = unsafe { &mut *world };
+    if w.chain.is_none() {
+        return 10;
+    }
+    if !w.ensure_char_sections() {
+        return 11;
+    }
+    if !w.ensure_item_display() {
+        return 14;
+    }
+    let Some(sections) = w.char_sections.as_ref() else {
+        return 11;
+    };
+    let Some(catalog) = w.item_display.as_ref() else {
+        return 14;
+    };
     let Some(chain) = w.chain.as_mut() else {
         return 10;
     };
-    let Ok(sections) = benilla_formats::CharSections::load(chain) else {
-        return 11;
-    };
-    let catalog = match benilla_formats::load_item_display_catalog(chain) {
-        Ok(c) => c,
-        Err(_) => return 14,
-    };
-    let equipment: [Option<&benilla_formats::ItemDisplay>; 8] =
-        std::array::from_fn(|i| if ids[i] == 0 { None } else { catalog.get(ids[i]) });
+    let equipment: [Option<&benilla_formats::ItemDisplay>; 8] = std::array::from_fn(|i| {
+        if ids[i] == 0 {
+            None
+        } else {
+            catalog.get(ids[i])
+        }
+    });
     let look = sections.composite_body(
         chain,
         race as u8,
@@ -202,10 +221,10 @@ pub extern "C" fn bn_item_display_scan(
         return 0;
     }
     let w = unsafe { &mut *world };
-    let Some(chain) = w.chain.as_mut() else {
+    if !w.ensure_item_display() {
         return 0;
-    };
-    let Ok(catalog) = benilla_formats::load_item_display_catalog(chain) else {
+    }
+    let Some(catalog) = w.item_display.as_ref() else {
         return 0;
     };
     let mut n = 0u32;
@@ -238,10 +257,10 @@ pub extern "C" fn bn_item_display_info(
         return 0;
     }
     let w = unsafe { &mut *world };
-    let Some(chain) = w.chain.as_mut() else {
+    if !w.ensure_item_display() {
         return 0;
-    };
-    let Ok(catalog) = benilla_formats::load_item_display_catalog(chain) else {
+    }
+    let Some(catalog) = w.item_display.as_ref() else {
         return 0;
     };
     let Some(d) = catalog.get(id) else {

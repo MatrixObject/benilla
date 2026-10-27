@@ -1,6 +1,6 @@
 // FFI smoke test: directly call the benilla crate's C ABI functions.
 // They are `pub` in the crate, so no DLL linking is needed.
-use benilla::{BnWorld, bn_init, bn_shutdown, bn_num_archives, bn_load_tile};
+use benilla::{bn_init, bn_load_tile, bn_num_archives, bn_shutdown, BnWorld};
 
 fn c_char_ptr(s: &str) -> *const std::ffi::c_char {
     s.as_ptr() as *const std::ffi::c_char

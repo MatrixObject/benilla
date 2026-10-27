@@ -66,8 +66,7 @@ fn dump(name: &str, data: &str) {
             let v = &m.vertices[i];
             println!(
                 "  v{i} pos=({:.2},{:.2},{:.2}) bone0={} w0={}",
-                v.position.x, v.position.y, v.position.z,
-                v.bone_indices[0], v.bone_weights[0]
+                v.position.x, v.position.y, v.position.z, v.bone_indices[0], v.bone_weights[0]
             );
         }
 
@@ -94,9 +93,30 @@ fn dump(name: &str, data: &str) {
                 let va = &m.vertices[a];
                 let vb = &m.vertices[b];
                 let vc = &m.vertices[c];
-                let dab = dist3(va.position.x, va.position.y, va.position.z, vb.position.x, vb.position.y, vb.position.z);
-                let dbc = dist3(vb.position.x, vb.position.y, vb.position.z, vc.position.x, vc.position.y, vc.position.z);
-                let dca = dist3(vc.position.x, vc.position.y, vc.position.z, va.position.x, va.position.y, va.position.z);
+                let dab = dist3(
+                    va.position.x,
+                    va.position.y,
+                    va.position.z,
+                    vb.position.x,
+                    vb.position.y,
+                    vb.position.z,
+                );
+                let dbc = dist3(
+                    vb.position.x,
+                    vb.position.y,
+                    vb.position.z,
+                    vc.position.x,
+                    vc.position.y,
+                    vc.position.z,
+                );
+                let dca = dist3(
+                    vc.position.x,
+                    vc.position.y,
+                    vc.position.z,
+                    va.position.x,
+                    va.position.y,
+                    va.position.z,
+                );
                 println!(
                     "  tri{t} ({} {} {}) ab={:.2} bc={:.2} ca={:.2}",
                     a, b, c, dab, dbc, dca

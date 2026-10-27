@@ -34,9 +34,19 @@ fn main() {
             let mut id: u16 = 0;
             let mut bone: u16 = 0;
             let mut pos = [0f32; 3];
-            let ok = bn_model_attachment_info(cworld, cm.as_ptr(), i, &mut id, &mut bone, pos.as_mut_ptr());
+            let ok = bn_model_attachment_info(
+                cworld,
+                cm.as_ptr(),
+                i,
+                &mut id,
+                &mut bone,
+                pos.as_mut_ptr(),
+            );
             if ok == 1 {
-                println!("   att[{i}] id={id} bone={bone} pos=({:.3},{:.3},{:.3})", pos[0], pos[1], pos[2]);
+                println!(
+                    "   att[{i}] id={id} bone={bone} pos=({:.3},{:.3},{:.3})",
+                    pos[0], pos[1], pos[2]
+                );
             }
         }
         // Sample bone rest positions if any.
@@ -44,7 +54,10 @@ fn main() {
             let mut bp = [0f32; 3];
             let ok = bn_model_bone_rest_position(cworld, cm.as_ptr(), bi, bp.as_mut_ptr());
             if ok == 1 {
-                println!("   bone[{bi}] rest=({:.3},{:.3},{:.3})", bp[0], bp[1], bp[2]);
+                println!(
+                    "   bone[{bi}] rest=({:.3},{:.3},{:.3})",
+                    bp[0], bp[1], bp[2]
+                );
             }
         }
     }

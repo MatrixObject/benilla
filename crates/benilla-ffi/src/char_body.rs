@@ -7,31 +7,14 @@
 //! crate's (`CharSections`, `CharacterGeosets`), so this module re-exports them
 //! over the FFI without touching any benilla crate.
 //!
-//! Animation choice is likewise the reference's own: sequences are keyed by
+//! Animation choice is likewise the client's own: sequences are keyed by
 //! `AnimationData.dbc` id through the model's `AnimationLookup`, with the
 //! `PlayableAnimationLookup` substitute for ids a model does not author
-//! (`0x711960`).
 
-use std::io::Cursor;
-
-use benilla_formats::{CharacterGeosets, EquipGeosets};
+use benilla_formats::EquipGeosets;
 use benilla_m2::M2TextureType;
 
 use crate::{cstr_to_str, BnWorld};
-
-/// Read a model's bytes from the MPQ chain (same lookup `bn_model_fill` does).
-fn read_model(w: &BnWorld, path: &str) -> Option<Vec<u8>> {
-    for a in w.archives.iter().rev() {
-        if !a.contains(path) {
-            continue;
-        }
-        if let Ok(bytes) = a.read_file(path) {
-            return Some(bytes);
-        }
-        break;
-    }
-    None
-}
 
 /// Write a NUL-terminated string into `out`.
 fn write_cstr(out: *mut u8, cap: u32, s: &str) -> u32 {
@@ -77,10 +60,10 @@ pub extern "C" fn bn_char_hair_texture(
         return 0;
     }
     let w = unsafe { &mut *world };
-    let Some(chain) = w.chain.as_mut() else {
+    if !w.ensure_char_sections() {
         return 0;
-    };
-    let Ok(sections) = benilla_formats::CharSections::load(chain) else {
+    }
+    let Some(sections) = w.char_sections.as_ref() else {
         return 0;
     };
     // The borrow of `sections` ends here; the path is owned by the tables.
@@ -108,10 +91,10 @@ pub extern "C" fn bn_char_skin_extra_texture(
         return 0;
     }
     let w = unsafe { &mut *world };
-    let Some(chain) = w.chain.as_mut() else {
+    if !w.ensure_char_sections() {
         return 0;
-    };
-    let Ok(sections) = benilla_formats::CharSections::load(chain) else {
+    }
+    let Some(sections) = w.char_sections.as_ref() else {
         return 0;
     };
     let path = sections
@@ -130,8 +113,8 @@ pub extern "C" fn bn_char_skin_extra_texture(
 /// bit `0x80` set when the batch's geoset is hidden for this appearance (the
 /// naked default look: no equipment). Returns the number of triangles written.
 ///
-/// The visibility set is the reference's `0x477520` selector driven by the
-/// naked `EquipGeosets::default()`, matching a freshly created character.
+/// The visibility set is the client's selector driven by the
+/// naked `EquipGeosets::default`, matching a freshly created character.
 #[no_mangle]
 pub extern "C" fn bn_char_model_slots(
     world: *mut BnWorld,
@@ -156,7 +139,7 @@ pub extern "C" fn bn_char_model_slots(
 /// Same contract as [`bn_char_model_slots`], but the wearer is dressed: `equip`
 /// is the 10 `CreatureDisplayInfoExtra` equipment columns in bodyslot order
 /// (e0 helm, e2..e10 body), i.e. exactly what a humanoid NPC wears. The
-/// visibility set then follows the reference's equipment branches (helm hides
+/// visibility set then follows the client's equipment branches (helm hides
 /// hair/ears, robes replace legs, tabard, ...) instead of the naked default.
 #[no_mangle]
 pub extern "C" fn bn_char_model_slots_gear(
@@ -182,14 +165,26 @@ pub extern "C" fn bn_char_model_slots_gear(
     // A failed ItemDisplayInfo pass must not hide the body: fall back to the
     // naked geoset set rather than reporting zero visible triangles.
     let eg = equipped_geosets(w, &ids);
-    char_model_slots(w, p, race, sex, hair_style, facial_hair, eg.as_ref(), out, cap)
+    char_model_slots(
+        w,
+        p,
+        race,
+        sex,
+        hair_style,
+        facial_hair,
+        eg.as_ref(),
+        out,
+        cap,
+    )
 }
 
-/// The reference's worn-equipment geoset selectors for an NPC's 10 equipment
+/// The client's worn-equipment geoset selectors for an NPC's 10 equipment
 /// columns (`EquipGeosets`), read off `ItemDisplayInfo`.
 fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 10]) -> Option<EquipGeosets> {
-    let chain = w.chain.as_mut()?;
-    let cat = benilla_formats::load_item_display_catalog(chain).ok()?;
+    if !w.ensure_item_display() {
+        return None;
+    }
+    let cat = w.item_display.as_ref()?;
     let worn: [Option<&benilla_formats::ItemDisplay>; 8] =
         std::array::from_fn(|i| cat.get(ids[2 + i]));
     let mut eg = EquipGeosets::default();
@@ -200,7 +195,7 @@ fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 10]) -> Option<EquipGeosets> {
     }
     // The head slot's HelmetGeosetVisData pair (split by sex in the selector).
     eg.helm_vis = cat.get(ids[0]).and_then(|d| d.worn_helm_vis());
-    // Branch B3's gate: the shirt cuffs, as the reference reads it.
+    // Branch B3's gate: the shirt cuffs, as the client reads it.
     eg.forearm_dressed = benilla_formats::forearm_dressed(&worn);
     Some(eg)
 }
@@ -216,78 +211,79 @@ fn char_model_slots(
     out: *mut u8,
     cap: u32,
 ) -> u32 {
-    let Some(bytes) = read_model(w, p) else {
+    let Some(cached) = crate::m2_cached(&w.archives, p) else {
         return 0;
     };
-    let Ok(fmt) = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())) else {
+    let model = cached.format.model();
+    let Some(skin) = cached.skin.as_ref() else {
         return 0;
     };
-    let model = fmt.model();
-    let Ok(skin) = model.parse_embedded_skin(bytes.as_slice(), 0) else {
-        return 0;
-    };
-    let tris = skin.triangles();
-    let ntri = tris.len() / 3;
-    let n = ntri.min(cap as usize);
+    // One entry per triangle bn_model_fill emits, in the same order: a section
+    // covered by several batches is drawn once per batch, so each copy carries
+    // its own batch's texture slot (the plaza's ground and its shadow decal).
+    let emit = crate::m2_emit_tris(model, skin);
+    let n = emit.len().min(cap as usize);
     if n == 0 {
         return 0;
     }
 
     let naked = EquipGeosets::default();
-    let visible = w
-        .chain
-        .as_mut()
-        .and_then(|chain| CharacterGeosets::load(chain).ok())
-        .map(|gs| {
-            gs.visible_geosets(
-                race as u8,
-                sex as u8,
-                hair_style as u8,
-                facial_hair as u8,
-                equip.unwrap_or(&naked),
-            )
-        });
+    w.ensure_char_geosets();
+    let visible = w.char_geosets.as_ref().map(|gs| {
+        gs.visible_geosets(
+            race as u8,
+            sex as u8,
+            hair_style as u8,
+            facial_hair as u8,
+            equip.unwrap_or(&naked),
+        )
+    });
 
-    // Default: body slot, shown (a batch-less triangle keeps the model's own
-    // material, as the reference draws it).
-    let mut flags = vec![0u8; tris.len()];
+    // Character body slots exist ONLY for a character model. On any other model
+    // (`Interface\Glues\Models\UI_Human\UI_Human.m2` has 28 textures) the "slot"
+    // must be the TEXTURE INDEX, so every batch reaches its own BLP.
+    let is_char = p.to_ascii_lowercase().contains("character\\");
+    let batches = skin.batches();
     let sections = skin.submeshes();
-    for b in skin.batches() {
+
+    for (i, t) in emit.iter().take(n).enumerate() {
+        let b = &batches[t.batch as usize];
         let Some(sec) = sections.get(b.skin_section_index as usize) else {
             continue;
         };
-        let start = sec.triangle_start as usize;
-        let end = (start + sec.triangle_count as usize).min(flags.len());
-        if start >= end {
-            continue;
-        }
-        let tex = model
+        let tex_index = model
             .raw_data
             .texture_lookup_table
             .get(b.texture_combo_index as usize)
-            .and_then(|&ti| model.textures.get(ti as usize));
-        let slot = char_slot_of(tex);
-        let hidden = visible.as_ref().is_some_and(|v| !v.contains(&sec.id));
-        let byte = if hidden { slot | 0x80 } else { slot };
-        flags[start..end].fill(byte);
-    }
-
-    for i in 0..n {
+            .copied();
+        let tex = tex_index.and_then(|ti| model.textures.get(ti as usize));
+        let slot = if is_char {
+            char_slot_of(tex)
+        } else {
+            // Low 7 bits = texture index; bit 7 stays clear (a non-character model
+            // is never geoset-hidden).
+            tex_index.unwrap_or(0).min(0x7f) as u8
+        };
+        let hidden = is_char && visible.as_ref().is_some_and(|v| !v.contains(&sec.id));
+        let byte = if hidden { slot | 0x80 } else { slot & 0x7f };
         unsafe {
-            *out.add(i) = flags[i * 3];
+            *out.add(i) = byte;
         }
     }
     n as u32
 }
 
 /// Resolve an `AnimationData.dbc` id to the model's sequence slot, the
-/// reference's `0x711960` ownership test plus the `PlayableAnimationLookup`
+/// client's ownership test plus the `PlayableAnimationLookup`
 /// substitute. Returns `None` when the model authors neither.
 fn resolve_anim_slot(model: &benilla_m2::M2Model, id: u16) -> Option<u16> {
     if model.owns_animation(id) {
         return Some(model.animation_lookup[id as usize]);
     }
-    let sub = model.playable_animation_lookup.get(id as usize)?.resolved_id;
+    let sub = model
+        .playable_animation_lookup
+        .get(id as usize)?
+        .resolved_id;
     if model.owns_animation(sub) {
         Some(model.animation_lookup[sub as usize])
     } else {
@@ -315,20 +311,17 @@ pub extern "C" fn bn_model_anim_by_id(
         return 0;
     };
     let w = unsafe { &*world };
-    let Some(bytes) = read_model(w, p) else {
+    let Some(cached) = crate::m2_cached(&w.archives, p) else {
         return 0;
     };
-    let Ok(fmt) = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())) else {
-        return 0;
-    };
-    let model = fmt.model();
+    let model = cached.format.model();
     // The requested id, else its `PlayableAnimationLookup` substitute. An id
     // the model does not author misses (the caller keeps its current
-    // sequence), as the reference's ownership test does.
+    // sequence), as the client's ownership test does.
     let Some(slot) = resolve_anim_slot(model, anim_id as u16) else {
         return 0;
     };
-    let anims = benilla_formats::parse_m2_animations(&bytes);
+    let anims = benilla_formats::parse_m2_animations(&cached.bytes);
     let Some(a) = anims.iter().find(|a| a.seq_index == slot as usize) else {
         return 0;
     };
@@ -358,10 +351,10 @@ pub extern "C" fn bn_model_anim_ids(
         return 0;
     };
     let w = unsafe { &*world };
-    let Some(bytes) = read_model(w, p) else {
+    let Some(cached) = crate::m2_cached(&w.archives, p) else {
         return 0;
     };
-    let anims = benilla_formats::parse_m2_animations(&bytes);
+    let anims = benilla_formats::parse_m2_animations(&cached.bytes);
     let n = anims.len().min(cap as usize);
     for (i, a) in anims.iter().take(n).enumerate() {
         unsafe {

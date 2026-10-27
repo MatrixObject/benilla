@@ -37,9 +37,9 @@ fn shown_names() -> std::collections::HashSet<String> {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir.clone()).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -156,7 +156,9 @@ fn main() {
         for line in text.lines().filter(|l| l.starts_with("F\t")) {
             let name = line.split('\t').nth(1).unwrap_or("");
             let lower = name.to_ascii_lowercase();
-            if (lower.contains("login") || lower.contains("account") || lower.contains("password")
+            if (lower.contains("login")
+                || lower.contains("account")
+                || lower.contains("password")
                 || lower.contains("edit"))
                 && line.split('\t').nth(2) == Some("1")
             {
@@ -166,14 +168,18 @@ fn main() {
     }
 
     // Record whether the login button's handler reaches DefaultServerLogin,
-    // then click. (The glue events fired by the host land in script.errors() /
+    // then click. (The glue events fired by the host land in script.errors /
     // the dump, so watch visibility changes too.)
     let before = shown_names();
     println!(
         "== patch: {}",
-        eval_str(r#"local orig = DefaultServerLogin _G.CAP = "not-called" DefaultServerLogin = function(a, p) _G.CAP = tostring(a) return orig(a, p) end return "wrapped""#)
+        eval_str(
+            r#"local orig = DefaultServerLogin _G.CAP = "not-called" DefaultServerLogin = function(a, p) _G.CAP = tostring(a) return orig(a, p) end return "wrapped""#
+        )
     );
-    let r = eval_str(r#"AccountLoginAccountEdit:SetText("acc") AccountLoginPasswordEdit:SetText("pw") AccountLoginLoginButton:Click() return "clicked""#);
+    let r = eval_str(
+        r#"AccountLoginAccountEdit:SetText("acc") AccountLoginPasswordEdit:SetText("pw") AccountLoginLoginButton:Click() return "clicked""#,
+    );
     println!("== login eval: {r:?}");
     println!("== CAP={}", eval_str("return tostring(_G.CAP)"));
     // login -> charselect runs through GlueFrameFadeOut(AccountLoginUI, LOGIN_FADE_OUT=0.5s)
@@ -183,7 +189,11 @@ fn main() {
     for i in 0..50 {
         bn_ui_tick(0.1);
         if eval_str("return tostring(CharacterSelect:IsShown())") == "1" {
-            println!("== charselect shown after {} ticks ({:.1}s)", i + 1, (i + 1) as f32 * 0.1);
+            println!(
+                "== charselect shown after {} ticks ({:.1}s)",
+                i + 1,
+                (i + 1) as f32 * 0.1
+            );
             switched = true;
             break;
         }
@@ -192,7 +202,9 @@ fn main() {
         println!(
             "== charselect NEVER shown; AccountLogin={} GlueScreen={}",
             eval_str("return tostring(AccountLogin:IsShown())"),
-            eval_str("return tostring(GetCurrentGlueScreenName and GetCurrentGlueScreenName() or '?')")
+            eval_str(
+                "return tostring(GetCurrentGlueScreenName and GetCurrentGlueScreenName() or '?')"
+            )
         );
     }
     // CharacterSelect_OnShow asks for the roster; the stub host queues it and bn_ui_tick
@@ -208,8 +220,10 @@ fn main() {
     let (bytes, nf, shown, has_nezha) = dump_stats();
     println!("== charselect dump: {bytes} bytes, {nf} frames, {shown} shown, roster={has_nezha}");
 
-    // Press Enter World (the reference's own press path).
-    let r = eval_str(r#"CharacterSelect_SelectCharacter(0) CharSelectEnterWorldButton:Click() return "clicked""#);
+    // Press Enter World (the client's own press path).
+    let r = eval_str(
+        r#"CharacterSelect_SelectCharacter(0) CharSelectEnterWorldButton:Click() return "clicked""#,
+    );
     println!("== enter world eval: {r:?}");
     bn_ui_tick(0.1);
 
@@ -222,7 +236,10 @@ fn main() {
 
     // Resize the root to a 16:9 viewport: dump coordinates must reflow to it
     // so the render host can draw and point 1:1 in viewport pixels.
-    println!("== set_screen_size(1920,1080) -> {}", bn_ui_set_screen_size(1920.0, 1080.0));
+    println!(
+        "== set_screen_size(1920,1080) -> {}",
+        bn_ui_set_screen_size(1920.0, 1080.0)
+    );
     println!(
         "== screen root now: {}x{}",
         eval_str("return tostring(GetScreenWidth())"),

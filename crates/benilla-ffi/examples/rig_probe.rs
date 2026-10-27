@@ -86,12 +86,7 @@ unsafe fn run() {
         fish.capacity(),
         fish.as_bytes()
     );
-    let total = bn_doodad_rig_info(
-        w,
-        fish_c.as_ptr(),
-        table.as_mut_ptr(),
-        512,
-    );
+    let total = bn_doodad_rig_info(w, fish_c.as_ptr(), table.as_mut_ptr(), 512);
     println!("rig info: {total} u32");
     if total >= 12 {
         let t = &table;
@@ -105,26 +100,31 @@ unsafe fn run() {
             let o = 12 + j * 4;
             println!(
                 "  submesh {j}: vtx0={} vtxN={} idx0={} idxN={}",
-                t[o], t[o + 1], t[o + 2], t[o + 3]
+                t[o],
+                t[o + 1],
+                t[o + 2],
+                t[o + 3]
             );
         }
         for j in 0..clip_n {
             let o = 12 + sub_n * 4 + j * 8;
             println!(
                 "  clip {j}: seq={} band=[{}..{}] dur={}ms freq={} replay=({}..{}) loop={}",
-                t[o], t[o + 1], t[o + 2], t[o + 3], t[o + 4], t[o + 5], t[o + 6], t[o + 7]
+                t[o],
+                t[o + 1],
+                t[o + 2],
+                t[o + 3],
+                t[o + 4],
+                t[o + 5],
+                t[o + 6],
+                t[o + 7]
             );
         }
     }
 
     // ---- the weighted pick ----
     for roll in [0u32, 1, 16382, 16383, 32766, 32767] {
-        let idx = bn_doodad_rig_pick(
-            w,
-            fish_c.as_ptr(),
-            table[6],
-            roll,
-        );
+        let idx = bn_doodad_rig_pick(w, fish_c.as_ptr(), table[6], roll);
         println!("  pick(roll={roll}) -> {idx}");
     }
 
@@ -141,14 +141,7 @@ unsafe fn run() {
         let mut prev: Option<Vec<f32>> = None;
         for k in 0..6 {
             let t = start + dur * k / 6;
-            let nv = bn_doodad_rig_pose(
-                w,
-                fish_c.as_ptr(),
-                seq,
-                t,
-                buf.as_mut_ptr(),
-                cap,
-            );
+            let nv = bn_doodad_rig_pose(w, fish_c.as_ptr(), seq, t, buf.as_mut_ptr(), cap);
             let mut maxd = 0f32;
             let mut maxi = 0usize;
             let mut bb_min = [f32::MAX; 3];
@@ -181,14 +174,7 @@ unsafe fn run() {
 
         // Cross-check against the existing skinning path: the same model, the
         // same sequence and the SAME time, through bn_model_skinned_positions.
-        let nv = bn_doodad_rig_pose(
-            w,
-            fish_c.as_ptr(),
-            seq,
-            start,
-            buf.as_mut_ptr(),
-            cap,
-        );
+        let nv = bn_doodad_rig_pose(w, fish_c.as_ptr(), seq, start, buf.as_mut_ptr(), cap);
         let mut sbuf = vec![0f32; 400_000];
         let sn = benilla::bn_model_skinned_positions(
             w,
@@ -221,9 +207,9 @@ unsafe fn run() {
                     worst_at = v;
                 }
             }
-            println!("  worst nearest-vertex distance vs the reference skinning: {worst:.6} (ref vert {worst_at})");
+            println!("  worst nearest-vertex distance vs the client skinning: {worst:.6} (client vert {worst_at})");
             // The other direction: every rigged vertex must land on a
-            // reference vertex too.
+            // client vertex too.
             let mut worst2 = 0f32;
             for u in 0..nv as usize {
                 let p = [buf[u * 6], buf[u * 6 + 1], buf[u * 6 + 2]];
@@ -280,14 +266,7 @@ unsafe fn run() {
         let cap = (buf.len() / 6) as u32;
         // Warm up.
         for k in 0..10 {
-            bn_doodad_rig_pose(
-                w,
-                fish_c.as_ptr(),
-                seq,
-                start + k,
-                buf.as_mut_ptr(),
-                cap,
-            );
+            bn_doodad_rig_pose(w, fish_c.as_ptr(), seq, start + k, buf.as_mut_ptr(), cap);
         }
         let n = 2000;
         let t0 = std::time::Instant::now();

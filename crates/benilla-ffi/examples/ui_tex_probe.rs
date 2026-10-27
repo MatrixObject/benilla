@@ -3,9 +3,9 @@
 use benilla::*;
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -49,7 +49,14 @@ fn main() {
         for v in &variants {
             let cv = std::ffi::CString::new(v.as_str()).unwrap();
             let (mut w, mut h) = (0u32, 0u32);
-            let n = bn_texture(cworld, cv.as_ptr(), &mut w, &mut h, buf.as_mut_ptr(), buf.len() as u32);
+            let n = bn_texture(
+                cworld,
+                cv.as_ptr(),
+                &mut w,
+                &mut h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            );
             println!("{:<62} -> {} bytes ({}x{})", v, n, w, h);
             if n > 0 {
                 for (dp, out) in DUMP {

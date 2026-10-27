@@ -2,13 +2,13 @@
 //!
 //! A creature's look never crosses the wire: the server sends a display id and
 //! the client resolves it through `CreatureDisplayInfo` + `CreatureModelData`
-//! (+ `CreatureDisplayInfoExtra` for a humanoid NPC). The reference resolves
-//! these inside `benilla-app`, which the FFI boundary excludes, so this module
+//! (+ `CreatureDisplayInfoExtra` for a humanoid NPC). The client resolves
+//! these inside the app crate, which the FFI boundary excludes, so this module
 //! runs the formats-level `CreatureCatalog` over the chain the handle already
 //! holds and hands the host a plain text line it can parse:
 //!
-//!   bn_creature_display_info(world, id, buf, cap) -> bytes written (0 = miss)
-//!   bn_creature_scan(world, needle, from, to, buf, cap) -> bytes written
+//! bn_creature_display_info(world, id, buf, cap) -> bytes written (0 = miss)
+//! bn_creature_scan(world, needle, from, to, buf, cap) -> bytes written
 //!
 //! The model path is normalised to `.m2` (`CreatureModelData` authors `.mdx`)
 //! because the host feeds it straight back into `bn_model_fill`, which reads
@@ -69,7 +69,7 @@ fn copy_out(text: &str, out: *mut c_char, cap: u32) -> u32 {
 /// Write one display row as
 /// `id|model=<.m2>|scale=<f>|tex=<t0>,<t1>,<t2>|npc=<race>/<sex>|bake=<name>`
 /// plus, for a humanoid NPC, `|look=<skin>/<face>/<hair>/<haircolor>/<facial>`
-/// and `|equip=<e0>,...,<e9>` (CreatureDisplayInfoExtra equipment, ItemDisplayInfo
+/// and `|equip=<e0>, ...,<e9>` (CreatureDisplayInfoExtra equipment, ItemDisplayInfo
 /// ids in bodyslot order - e0 is the helm).
 ///
 /// `model` is what the host renders, `scale` is the client's combined
@@ -99,7 +99,11 @@ pub extern "C" fn bn_creature_display_info(
         .map(|t| t.as_deref().unwrap_or(""))
         .collect();
     let (race, sex, bake) = match model.npc_appearance.as_ref() {
-        Some(a) => (a.race as u32, a.sex as u32, a.bake_name.as_deref().unwrap_or("")),
+        Some(a) => (
+            a.race as u32,
+            a.sex as u32,
+            a.bake_name.as_deref().unwrap_or(""),
+        ),
         None => (0, 0, ""),
     };
     let mut line = format!(

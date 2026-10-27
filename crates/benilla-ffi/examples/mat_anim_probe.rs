@@ -65,24 +65,24 @@ fn main() {
                 String::from_utf8_lossy(&bytes).into_owned()
             };
             for j in 0..sub_n {
-            submeshes += 1;
-            let mut blend = 0u32;
-            benilla::bn_doodad_blend(w, i, j, &mut blend);
-            *blend_counts.entry(blend).or_insert(0) += 1;
-            if blend & 0xff == 1 && alphatest.len() < 12 && !alphatest.contains(&path) {
-                alphatest.push(path.clone());
-            }
-            let mut tex_buf = [0i8; 512];
-            // bn_doodad_texture returns 1 on success regardless of length;
-            // an empty path is a NUL at [0].
-            benilla::bn_doodad_texture(w, i, j, tex_buf.as_mut_ptr(), 512);
-            if tex_buf[0] == 0 {
-                empty_tex += 1;
-                if empty_tex_models.len() < 12 && !empty_tex_models.contains(&path) {
-                    empty_tex_models.push(path.clone());
+                submeshes += 1;
+                let mut blend = 0u32;
+                benilla::bn_doodad_blend(w, i, j, &mut blend);
+                *blend_counts.entry(blend).or_insert(0) += 1;
+                if blend & 0xff == 1 && alphatest.len() < 12 && !alphatest.contains(&path) {
+                    alphatest.push(path.clone());
                 }
-            }
-            let mut out = [0f32; 6];
+                let mut tex_buf = [0i8; 512];
+                // bn_doodad_texture returns 1 on success regardless of length;
+                // an empty path is a NUL at [0].
+                benilla::bn_doodad_texture(w, i, j, tex_buf.as_mut_ptr(), 512);
+                if tex_buf[0] == 0 {
+                    empty_tex += 1;
+                    if empty_tex_models.len() < 12 && !empty_tex_models.contains(&path) {
+                        empty_tex_models.push(path.clone());
+                    }
+                }
+                let mut out = [0f32; 6];
                 let mask = benilla::bn_doodad_mat_anim(w, i, j, 0.0, out.as_mut_ptr());
                 if mask == 0 {
                     continue;

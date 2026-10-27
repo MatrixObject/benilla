@@ -1,5 +1,5 @@
 // Diagnose why ADT probes find nothing: read each MPQ's (listfile) and grep
-// .adt/.wdt, and probe WDT paths directly. Also list root MPQs that open.
+//.adt/.wdt, and probe WDT paths directly. Also list root MPQs that open.
 fn main() {
     let data = "I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data";
     let files: Vec<String> = std::fs::read_dir(data)
@@ -25,7 +25,11 @@ fn main() {
                     .lines()
                     .filter(|l| l.to_lowercase().ends_with(".adt"))
                     .collect();
-                println!("{f}: listfile {} lines, {} adt entries", txt.lines().count(), adts.len());
+                println!(
+                    "{f}: listfile {} lines, {} adt entries",
+                    txt.lines().count(),
+                    adts.len()
+                );
                 for a in adts.iter().take(6) {
                     println!("    {a}");
                 }
@@ -42,7 +46,9 @@ fn main() {
     ];
     for f in &files {
         let p = format!("{data}\\{f}");
-        let Ok(a) = benilla_mpq::Archive::open(&p) else { continue };
+        let Ok(a) = benilla_mpq::Archive::open(&p) else {
+            continue;
+        };
         for pr in probes {
             if a.contains(pr) {
                 println!("{f}: FOUND {pr}");

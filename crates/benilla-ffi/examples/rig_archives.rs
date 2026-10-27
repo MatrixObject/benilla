@@ -20,10 +20,7 @@ fn main() {
     let mut skipped: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(data_dir).unwrap().flatten() {
         let p = entry.path();
-        if !p
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
-        {
+        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mpq")) {
             continue;
         }
         match Archive::open(&p) {
@@ -31,7 +28,11 @@ fn main() {
             Err(e) => skipped.push(format!("{} ({e})", p.display())),
         }
     }
-    println!("{} archives opened, {} skipped", archives.len(), skipped.len());
+    println!(
+        "{} archives opened, {} skipped",
+        archives.len(),
+        skipped.len()
+    );
     for s in &skipped {
         println!("  skipped: {s}");
     }

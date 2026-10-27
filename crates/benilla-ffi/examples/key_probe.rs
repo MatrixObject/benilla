@@ -41,9 +41,9 @@ fn acct() -> String {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let world = bn_init(cstr(&data_dir).as_ptr());
     if world.is_null() {
         eprintln!("bn_init failed");
@@ -56,11 +56,17 @@ fn main() {
     for _ in 0..3 {
         bn_ui_tick(0.1);
     }
-    println!("== load: {frames} frames, screen={}", eval_str("return GetCurrentGlueScreenName()"));
+    println!(
+        "== load: {frames} frames, screen={}",
+        eval_str("return GetCurrentGlueScreenName()")
+    );
     let mut shown = eval_str("return tostring(AccountLogin:IsShown())") == "1";
     if !shown {
         // Land on the login screen whatever the glue flow opened on.
-        println!("== forcing login screen: {}", eval_str(r#"SetGlueScreen("login") return GetCurrentGlueScreenName()"#));
+        println!(
+            "== forcing login screen: {}",
+            eval_str(r#"SetGlueScreen("login") return GetCurrentGlueScreenName()"#)
+        );
         for _ in 0..5 {
             bn_ui_tick(0.1);
         }
@@ -74,8 +80,16 @@ fn main() {
     }
 
     // (1) Typing with no click: the account box should autoFocus and take it.
-    for (ch, key) in [("N", "N"), ("e", "E"), ("z", "Z"), ("h", "H"), ("a", "A"),
-                      ("1", "1"), ("2", "2"), ("3", "3")] {
+    for (ch, key) in [
+        ("N", "N"),
+        ("e", "E"),
+        ("z", "Z"),
+        ("h", "H"),
+        ("a", "A"),
+        ("1", "1"),
+        ("2", "2"),
+        ("3", "3"),
+    ] {
         let (walk, consumed) = type_char(ch, key);
         println!("   type {ch:?}: keywalk={walk} (2=box) char_consumed={consumed}");
     }
@@ -133,9 +147,11 @@ fn main() {
     for _ in 0..5 {
         bn_ui_tick(0.1);
     }
-    println!("== after ENTER: screen={} CAP={}",
+    println!(
+        "== after ENTER: screen={} CAP={}",
         eval_str("return GetCurrentGlueScreenName()"),
-        eval_str("return tostring(_G.CAP)"));
+        eval_str("return tostring(_G.CAP)")
+    );
 
     bn_shutdown(world);
 }

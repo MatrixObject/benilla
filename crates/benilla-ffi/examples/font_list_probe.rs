@@ -1,6 +1,6 @@
 // One-off probe: which font faces does the chain carry, and which of them
 // cover CJK? Reads the FrameXML/GlueXML Fonts.xml declarations, then tests
-// each face for a real 确 glyph (vs the .notdef box) through the FFI.
+// each face for a real 确 glyph (vs the.notdef box) through the FFI.
 use benilla::*;
 
 fn lit_for(world: *mut BnWorld, font: &str, text: &str) -> usize {
@@ -10,9 +10,19 @@ fn lit_for(world: *mut BnWorld, font: &str, text: &str) -> usize {
     let (mut w, mut h) = (0u32, 0u32);
     let (mut a, mut b, mut c, mut d) = (0f32, 0f32, 0f32, 0f32);
     let n = bn_ui_text_bitmap(
-        world as *const _, cf.as_ptr(), 16.9, 1, ct.as_ptr(),
-        buf.as_mut_ptr(), buf.len() as u32,
-        &mut w, &mut h, &mut a, &mut b, &mut c, &mut d,
+        world as *const _,
+        cf.as_ptr(),
+        16.9,
+        1,
+        ct.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+        &mut w,
+        &mut h,
+        &mut a,
+        &mut b,
+        &mut c,
+        &mut d,
     );
     if n == 0 {
         return 0;
@@ -21,11 +31,10 @@ fn lit_for(world: *mut BnWorld, font: &str, text: &str) -> usize {
 }
 
 fn main() {
-    let data = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
-    let chain = benilla_formats::open_chain(std::path::Path::new(&data))
-        .expect("chain opens");
+    let data = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
+    let chain = benilla_formats::open_chain(std::path::Path::new(&data)).expect("chain opens");
 
     let mut faces: Vec<String> = Vec::new();
     for p in [
@@ -75,7 +84,11 @@ fn main() {
         let cjk = lit_for(world, f, "确");
         let nbp = lit_for(world, f, "\u{20000}");
         let latin = lit_for(world, f, "Account");
-        let mark = if cjk > nbp * 2 && cjk > 0 { "CJK" } else { "   " };
+        let mark = if cjk > nbp * 2 && cjk > 0 {
+            "CJK"
+        } else {
+            "   "
+        };
         println!("{f:<34} {cjk:>6} {nbp:>6} {latin:>8}  {mark}");
     }
     bn_shutdown(world);

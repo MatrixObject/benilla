@@ -1,10 +1,10 @@
 // Probe: the UE host's real input path against the glue login screen --
 // pointer move + button press (bn_ui_mouse_move / bn_ui_mouse_button) instead
-// of `:Click()`, plus the caret/label questions the render host cannot answer
+// of `:Click`, plus the caret/label questions the render host cannot answer
 // by itself:
-//   1. does a pointer press on the login button hit-test and run its handler?
-//   2. does a pointer press on the account editbox take focus (caret region)?
-//   3. what does the button's label look like in the dump (text / font / shown)?
+// 1. does a pointer press on the login button hit-test and run its handler?
+// 2. does a pointer press on the account editbox take focus (caret region)?
+// 3. what does the button's label look like in the dump (text / font / shown)?
 use benilla::*;
 
 fn eval_str(code: &str) -> String {
@@ -33,7 +33,12 @@ fn rows_for(frame: &str) -> Vec<String> {
             let f: Vec<&str> = l.split('\t').collect();
             format!(
                 "  rg={:28} ty={:10} l={:>7} t={:>7} w={:>7} h={:>7} layer={:9} tex='{}' text='{}'",
-                f[2], f[3], f[4], f[5], f[6], f[7],
+                f[2],
+                f[3],
+                f[4],
+                f[5],
+                f[6],
+                f[7],
                 f.get(27).copied().unwrap_or("?"),
                 f.get(8).copied().unwrap_or(""),
                 f.get(14).copied().unwrap_or(""),
@@ -66,9 +71,9 @@ fn press(x: f32, y: f32) -> (u32, u32) {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -84,7 +89,10 @@ fn main() {
     }
     // The UE host hands the VM the viewport in seam units (px / (h/768)),
     // so a 1280x720 window is 1365.33 x 768. Pointer coords share that space.
-    println!("== set_screen_size(1365.33, 768) -> {}", bn_ui_set_screen_size(1365.33, 768.0));
+    println!(
+        "== set_screen_size(1365.33, 768) -> {}",
+        bn_ui_set_screen_size(1365.33, 768.0)
+    );
     for _ in 0..3 {
         bn_ui_tick(0.1);
     }
@@ -105,9 +113,7 @@ fn main() {
     // --- 2. pointer press on the account editbox FIRST: focus + caret row.
     // (Pressing the login button first submits the login and tears the glue
     // screen down, so the caret questions must come before it.)
-    eval_str(
-        r#"AccountLoginAccountEdit:SetText("acc") return "seeded""#,
-    );
+    eval_str(r#"AccountLoginAccountEdit:SetText("acc") return "seeded""#);
     if let Some((x, y)) = centre("AccountLoginAccountEdit") {
         press(x, y);
     }
@@ -142,7 +148,10 @@ fn main() {
     if let Some((x, y)) = centre("AccountLoginLoginButton") {
         press(x, y);
     }
-    println!("== CAP after pointer press = {}", eval_str("return tostring(_G.CAP)"));
+    println!(
+        "== CAP after pointer press = {}",
+        eval_str("return tostring(_G.CAP)")
+    );
 
     bn_shutdown(world);
 }

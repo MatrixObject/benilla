@@ -15,9 +15,9 @@ fn eval_str(code: &str) -> String {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -30,7 +30,10 @@ fn main() {
     for _ in 0..3 {
         bn_ui_tick(0.1);
     }
-    println!("== set_screen_size(1365.33,768) -> {}", bn_ui_set_screen_size(1365.33, 768.0));
+    println!(
+        "== set_screen_size(1365.33,768) -> {}",
+        bn_ui_set_screen_size(1365.33, 768.0)
+    );
     for _ in 0..3 {
         bn_ui_tick(0.1);
     }
@@ -50,8 +53,10 @@ fn main() {
     println!("== visible F rows:");
     for l in text.lines().filter(|l| l.starts_with("F\t")) {
         let f: Vec<&str> = l.split('\t').collect();
-        println!("  name={:32} visible={} strata={} level={} rect=({},{},{},{})",
-            f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
+        println!(
+            "  name={:32} visible={} strata={} level={} rect=({},{},{},{})",
+            f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]
+        );
     }
 
     println!("== every visible FontString row (28 cols, raw):");

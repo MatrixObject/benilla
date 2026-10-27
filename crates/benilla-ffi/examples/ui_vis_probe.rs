@@ -1,9 +1,9 @@
 // Probe: visibility audit of the UI dump. The dump script marks an F row by
-// `IsShown()` alone, which (like the 1.12 API) ignores hidden ancestors, and
+// `IsShown` alone, which (like the 1.12 API) ignores hidden ancestors, and
 // it never asks a region whether it is itself shown. Both leak rows the
 // renderer must not draw. Counts, at the login screen and after reflow:
-//   shown frames, shown-but-not-visible frames (ancestor leak),
-//   regions under shown frames, regions hidden on their own.
+// shown frames, shown-but-not-visible frames (ancestor leak),
+// regions under shown frames, regions hidden on their own.
 use benilla::*;
 
 fn eval_str(code: &str) -> String {
@@ -16,9 +16,9 @@ fn eval_str(code: &str) -> String {
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -32,7 +32,7 @@ fn main() {
         bn_ui_tick(0.1);
     }
 
-    // Lua 5.0: no `#`, no `while ... do` with break-free oddities needed here.
+    // Lua 5.0: no `#`, no `while... do` with break-free oddities needed here.
     let audit = r#"
         local ns, nleak, nreg, nreghid, nregvisleak = 0, 0, 0, 0, 0
         local f = EnumerateFrames()
@@ -135,7 +135,11 @@ fn main() {
         return table.concat(out, " | ")
     "#;
     let hr = eval_str(hid_reg);
-    println!("== hidden regions ({} chars): {}", hr.len(), &hr[..hr.len().min(1500)]);
+    println!(
+        "== hidden regions ({} chars): {}",
+        hr.len(),
+        &hr[..hr.len().min(1500)]
+    );
 
     bn_shutdown(world);
 }

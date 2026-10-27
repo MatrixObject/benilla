@@ -2,7 +2,7 @@
 //!
 //! The host draws a whole FontString as one texture: this module shapes the
 //! string with the client's own TTFs (read off the patch chain, same paths the
-//! app crate's `ui_text` uses) under the reference's step law, applies WoW's
+//! app crate's `ui_text` uses) under the client's step law, applies WoW's
 //! dark outline, and returns RGBA where the glyph is white and the outline is
 //! black — so the host's per-region tint multiply reproduces the FontString
 //! colour while the outline stays black.
@@ -37,7 +37,7 @@ thread_local! {
 pub const DEFAULT_FONT: &str = r"Fonts\FRIZQT__.TTF";
 
 /// Load (and memoize) one face off the patch chain. `path` is the WoW-style
-/// path from `GetFont()` (`Fonts\FRIZQT__.TTF`); a bare file name is looked
+/// path from `GetFont` (`Fonts\FRIZQT__.TTF`); a bare file name is looked
 /// up under `Fonts\`, mirroring the client's font open order loosely.
 pub fn font_for(chain: &benilla_formats::Chain, path: &str) -> Option<FontArc> {
     let mut candidates: Vec<String> = Vec::new();
@@ -125,7 +125,7 @@ pub(crate) fn strip_escapes(s: &str) -> String {
 /// is placed) plus its id, in reading order.
 pub(crate) type ShapedLine = Vec<(f32, ab_glyph::GlyphId)>;
 
-/// Shape `clean` (escapes already stripped) at `size` under the reference's
+/// Shape `clean` (escapes already stripped) at `size` under the client's
 /// step law — one line per `'\n'`, `'\r'` dropped — returning the lines with
 /// their pen positions and the per-line pen widths (last glyph's x + its
 /// horizontal advance, the extent the host aligns to under justifyH). Shared
@@ -171,11 +171,7 @@ pub(crate) fn shape(
     lines.push(cur);
     let widths = lines
         .iter()
-        .map(|l| {
-            l.last()
-                .map(|(x, id)| x + sf.h_advance(*id))
-                .unwrap_or(0.0)
-        })
+        .map(|l| l.last().map(|(x, id)| x + sf.h_advance(*id)).unwrap_or(0.0))
         .collect();
     (lines, widths)
 }
@@ -289,9 +285,9 @@ fn step_line(font: &FontArc, size: f32, thick: bool, s: &str) -> (f32, f32) {
 /// `s` wrapped into byte ranges at `limit` px: a row ends at the last space
 /// that fit (the break's whitespace dropping, the rest staying verbatim), or
 /// at the fitting glyph when `non_space_wrap` says there is no break
-/// opportunity — the line kernel's shape (`0x5c7470`), priced by the same
+/// opportunity — the line kernel's shape, priced by the same
 /// step law the draw lays with and fitting when the price is within the width
-/// rounded up to a whole pixel (`0x5c752a`). A row always takes one char.
+/// rounded up to a whole pixel. A row always takes one char.
 fn wrap_line(
     font: &FontArc,
     size: f32,
@@ -371,7 +367,7 @@ fn wrap_line(
 /// holds the bitmap the HUD later draws (justify lands the same extent on
 /// both sides); `natural_w` is the unwrapped extent `GetStringWidth` reports.
 /// `spacing_px` is the inter-line gap already scaled, stepped to a whole
-/// pixel as `0x5c2146` rounds it.
+/// pixel by the same rounding.
 pub fn measure(
     font_path: Option<&str>,
     size_px: f32,
@@ -414,8 +410,8 @@ pub fn measure(
     let mut rows = widths.len().max(1);
     let mut laid = widths.iter().copied().fold(0.0f32, f32::max);
     if max_lines > 0 && rows > max_lines as usize {
-        // `maxLines` cuts the laid rows first (`0x5c7470`); the ellipsis the
-        // reference appends is a draw-side detail the width does not take.
+        // `maxLines` cuts the laid rows first; the ellipsis the
+        // client appends is a draw-side detail the width does not take.
         rows = max_lines as usize;
         laid = widths.iter().take(rows).copied().fold(0.0f32, f32::max);
     }
@@ -424,16 +420,11 @@ pub fn measure(
 }
 
 /// The EditBox advance table in drawn px: the stepped pen at every raw byte
-/// boundary (`text.len() + 1` from 0, a char's interior bytes carrying its
+/// boundary (`text.len + 1` from 0, a char's interior bytes carrying its
 /// end's value), so index `i` is the x the char at byte `i` is drawn at —
 /// the caret's own byte cursor. Markup is not stripped: an EditBox shows its
 /// text literally, and the index must stay the raw string's.
-pub fn advances_bytes(
-    font_path: Option<&str>,
-    size_px: f32,
-    outline: u32,
-    text: &str,
-) -> Vec<f32> {
+pub fn advances_bytes(font_path: Option<&str>, size_px: f32, outline: u32, text: &str) -> Vec<f32> {
     let mut cum = vec![0.0f32; text.len() + 1];
     if size_px <= 0.5 {
         return cum;
@@ -478,10 +469,9 @@ pub fn advances_bytes(
 
 /// The EditBox row table in raw byte starts, plus the row pitch in drawn px:
 /// [`wrap_line`] over each hard line, with the VM's own bookkeeping after it
-/// (`seam.rs`'s `line_rows`) — a retained walk never passes the end, a text
+/// — a retained walk never passes the end, a text
 /// ending in a break keeps the empty row its caret sits on, and an empty text
 /// is one row. `non_space_wrap` is forced on, as the box's draw does
-/// (`0x77a58f`).
 pub fn wrap_rows(
     font_path: Option<&str>,
     text: &str,
@@ -528,10 +518,11 @@ pub fn wrap_rows(
     (rows, cell_h)
 }
 
-/// Rasterize one (already display-sized) string.
+/// Rasterize one (already display-sized) string, one hard line per `'\n'`
+/// (rows advance by the em). [`rasterize_wrapped`] adds width wrapping.
 ///
 /// * `size_px` — the drawn pixel size (the host applies WoW's em cap and the
-///   seam scale before calling).
+/// seam scale before calling).
 /// * `outline` — 0 none, 1 thin (WoW `OUTLINE`), 2 thick (`THICKOUTLINE`).
 ///
 /// Returns `None` for empty text or a face that will not open.
@@ -548,13 +539,84 @@ pub fn rasterize(
     }
     let font = font_for(chain, font_path)?;
     let size = size_px.max(1.0);
-    let sf = font.as_scaled(PxScale::from(size));
     let thick = outline >= 2;
-    let pad = if outline == 0 { 0.0 } else if thick { 2.0 } else { 1.0 };
+    rasterize_rows(&font, size, thick, outline, &clean, size)
+}
 
-    // ---- layout: the reference's step law, shared with the measurer ----
+/// Rasterize one `FontString` wrapped to `wrap_px` drawn pixels wide (the
+/// region's own width) at `size_px`; hard `'\n'` still breaks rows, so quest
+/// paragraphs survive. Row pitch is the face's own line height plus
+/// `spacing_px` (WoW `SetSpacing`), so wrapped rows never overlap the way the
+/// plain em pitch made them. `wrap_px <= 1` means no width wrap.
+pub fn rasterize_wrapped(
+    chain: &benilla_formats::Chain,
+    font_path: &str,
+    size_px: f32,
+    outline: u32,
+    text: &str,
+    wrap_px: f32,
+    spacing_px: f32,
+) -> Option<TextBitmap> {
+    let clean = strip_escapes(text);
+    if clean.trim().is_empty() || size_px <= 0.5 {
+        return None;
+    }
+    let font = font_for(chain, font_path)?;
+    let size = size_px.max(1.0);
+    let thick = outline >= 2;
+
+    // Wrap each hard line to `wrap_px` (the break's own whitespace dropping,
+    // the rest verbatim) and join the rows with `'\n'` for `shape`.
+    let laid: String = if wrap_px > 1.0 {
+        let mut out = String::with_capacity(clean.len() + 16);
+        for (li, line) in clean.split('\n').enumerate() {
+            if li > 0 {
+                out.push('\n');
+            }
+            let mut first = true;
+            for (a, b) in wrap_line(&font, size, thick, line, wrap_px, false) {
+                if !first {
+                    out.push('\n');
+                }
+                out.push_str(&line[a..b]);
+                first = false;
+            }
+        }
+        out
+    } else {
+        clean
+    };
+
+    // The face's own line height (ascent minus descent plus the line gap) is
+    // the client's `Resolved::size`; never smaller than the em.
+    let sf = font.as_scaled(PxScale::from(size));
+    let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).max(size);
+    let pitch = line_h + spacing_px.max(0.0);
+    rasterize_rows(&font, size, thick, outline, &laid, pitch)
+}
+
+/// Shared body of [`rasterize`] / [`rasterize_wrapped`]: `text` is already laid
+/// out with `'\n'` hard breaks; rows advance by `pitch`.
+fn rasterize_rows(
+    font: &FontArc,
+    size: f32,
+    thick: bool,
+    outline: u32,
+    text: &str,
+    pitch: f32,
+) -> Option<TextBitmap> {
+    let sf = font.as_scaled(PxScale::from(size));
+    let pad = if outline == 0 {
+        0.0
+    } else if thick {
+        2.0
+    } else {
+        1.0
+    };
+
+    // ---- layout: the client's step law, shared with the measurer ----
     // Per-glyph y stays at `ascent`; the passes below add `li * pitch`.
-    let (shaped, line_w) = shape(&font, size, thick, &clean);
+    let (shaped, line_w) = shape(font, size, thick, text);
     let ascent = sf.ascent();
     let lines: Vec<Vec<Glyph>> = shaped
         .iter()
@@ -565,9 +627,12 @@ pub fn rasterize(
         })
         .collect();
     let n_lines = lines.len();
-    let pitch = size;
     let pen_w = line_w.iter().copied().fold(0.0f32, f32::max);
-    let pen_h = n_lines as f32 * pitch;
+    let pen_h = if n_lines == 0 {
+        0.0
+    } else {
+        (n_lines - 1) as f32 * pitch + size
+    };
     if pen_w <= 0.0 {
         return None;
     }
@@ -667,7 +732,11 @@ pub fn rasterize(
             continue;
         }
         let g = g_cov[i];
-        let rgb = if a > 0.0001 { (g / a).clamp(0.0, 1.0) } else { 0.0 };
+        let rgb = if a > 0.0001 {
+            (g / a).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let base = i * 4;
         let v = (rgb * 255.0).round() as u8;
         rgba[base] = v;

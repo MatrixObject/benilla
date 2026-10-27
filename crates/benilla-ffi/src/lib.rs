@@ -14,15 +14,15 @@
 
 // Built as a cdylib (`benilla.dll`); the UE side declares the same
 
-// functions `extern "C"` and links against the .dll.
+// functions `extern "C"` and links against the.dll.
 
 use std::collections::HashMap;
 
 use std::ffi::c_char;
 
 use benilla_ui::script::{
-    GossipMenu, GossipOptionView, GossipQuestRow, MerchantItem, MerchantState,
-    QuestPanel, QuestState,
+    GossipMenu, GossipOptionView, GossipQuestRow, MerchantItem, MerchantState, QuestPanel,
+    QuestState,
 };
 
 // ---- WoW <-> UE5 coordinate-system converter (single source of truth) ----
@@ -49,10 +49,14 @@ mod char_skin;
 
 mod char_body;
 
+// ---- M2 particle emitters (glue backdrop flames / motes) ----
+
+mod model_particles;
+
 // ---- Player locomotion, collision probe and third-person camera ----
 //
-// The reference client's player state/mover/camera live in benilla-app (Bevy),
-// which cannot be linked here; this module carries the same laws over the
+// The player state, mover and camera of the full client live in crates this
+// one cannot link; this module carries the same laws over the
 // ADT/WMO data this handle already loads.
 
 mod player;
@@ -69,6 +73,8 @@ mod net;
 
 mod creature;
 
+mod exterior;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -80,11 +86,9 @@ use benilla_mpq::Archive;
 // ---- C ABI data shapes (plain POD; no Rust types cross the boundary) ----
 
 #[repr(C)]
-
 #[derive(Clone, Copy)]
 
 pub struct BnVertex {
-
     pub x: f32,
 
     pub y: f32,
@@ -100,15 +104,12 @@ pub struct BnVertex {
     pub u: f32,
 
     pub v: f32,
-
 }
 
 #[repr(C)]
-
 #[derive(Clone, Copy)]
 
 pub struct BnTriangle {
-
     // u32, not u16: a single WMO instance bakes up to ~840k verts (Stormwind),
     // so u16 indices silently truncated every building over 65535 verts.
     pub a: u32,
@@ -121,13 +122,11 @@ pub struct BnTriangle {
 
     /// bit 0x01 = two-sided (M2 material render flag 0x04): don't back-face cull.
     pub flags: u8,
-
 }
 
 /// Opaque handle to the Rust-side state (MPQ chain + loaded tiles).
 
 pub struct BnWorld {
-
     archives: Vec<Archive>,
 
     /// The Data directory the chain was opened from: the background WMO
@@ -174,11 +173,12 @@ pub struct BnWorld {
     /// model, re-placed per instance into the tile's liquid buffer.
     wmo_group_liquids: HashMap<String, Arc<Vec<benilla_formats::LiquidMesh>>>,
 
-    /// Parsed doodad (terrain M2) geometry by model path, shared by placements.
-    doodad_models: HashMap<String, Vec<benilla_formats::RenderSubmesh>>,
-
     /// Baked tile-local doodad geometry by MDDF index (rebuilt on tile load).
     doodad_flats: HashMap<u32, WmoFlat>,
+
+    /// The tile's WMO-internal doodads (MODD), world-composed; indexed after
+    /// the MDDF placements in the merged doodad enumeration.
+    wmo_doodads: Vec<WmoDoodadInst>,
 
     /// Middle-layer player (locomotion, collision, camera) once `bn_player_reset`.
     player: Option<player::Player>,
@@ -191,14 +191,61 @@ pub struct BnWorld {
     /// `bn_minimap_tile_path`. The minimap tiles are authored art, not a 3D pass.
     minimap: Option<benilla_formats::MinimapTranslate>,
 
+    /// Character DBCs, parsed once per session. Spawning one humanoid NPC asks
+    /// for `CharSections` six times and `ItemDisplayInfo` twice, and every pass
+    /// used to re-read the tables from the MPQ (tens of ms per load).
+    char_sections: Option<benilla_formats::CharSections>,
+    item_display: Option<benilla_formats::ItemDisplayCatalog>,
+    char_geosets: Option<benilla_formats::CharacterGeosets>,
+}
+
+impl BnWorld {
+    /// Load `CharSections.dbc` unless already cached. `false` = no chain or a
+    /// read error (the caller keeps its previous failure code).
+    fn ensure_char_sections(&mut self) -> bool {
+        if self.char_sections.is_none() {
+            let Some(chain) = self.chain.as_mut() else {
+                return false;
+            };
+            let Ok(s) = benilla_formats::CharSections::load(chain) else {
+                return false;
+            };
+            self.char_sections = Some(s);
+        }
+        true
+    }
+
+    fn ensure_item_display(&mut self) -> bool {
+        if self.item_display.is_none() {
+            let Some(chain) = self.chain.as_mut() else {
+                return false;
+            };
+            let Ok(c) = benilla_formats::load_item_display_catalog(chain) else {
+                return false;
+            };
+            self.item_display = Some(c);
+        }
+        true
+    }
+
+    fn ensure_char_geosets(&mut self) -> bool {
+        if self.char_geosets.is_none() {
+            let Some(chain) = self.chain.as_mut() else {
+                return false;
+            };
+            let Ok(g) = benilla_formats::CharacterGeosets::load(chain) else {
+                return false;
+            };
+            self.char_geosets = Some(g);
+        }
+        true
+    }
 }
 
 /// Convert a WoW position to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
 
 fn wow_to_ue(px: f32, py: f32, pz: f32) -> BnVertex {
-
     BnVertex {
-
         x: px,
 
         y: -py,
@@ -214,17 +261,13 @@ fn wow_to_ue(px: f32, py: f32, pz: f32) -> BnVertex {
         u: 0.0,
 
         v: 0.0,
-
-}
-
     }
+}
 
 /// Convert a WoW normal/vector to UE (same as model.cpp fixCoordSystem: (x, -y, z)).
 
 pub(crate) fn wow_vec_to_ue(vx: f32, vy: f32, vz: f32) -> (f32, f32, f32) {
-
     (vx, -vy, vz)
-
 }
 
 /// A CStr->&str helper that is safe to call from FFI (the caller guarantees a
@@ -232,17 +275,13 @@ pub(crate) fn wow_vec_to_ue(vx: f32, vy: f32, vz: f32) -> (f32, f32, f32) {
 /// valid NUL-terminated C string).
 
 fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
-
     if s.is_null() {
-
         return None;
-
     }
 
     // SAFETY: FFI contract — pointers are valid, NUL-terminated C strings.
 
     unsafe { std::ffi::CStr::from_ptr(s) }.to_str().ok()
-
 }
 
 // ---- init / shutdown ----
@@ -254,61 +293,39 @@ fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
 #[no_mangle]
 
 pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
-
     let dir = match cstr_to_str(data_dir) {
-
         Some(s) => s,
 
         None => return std::ptr::null_mut(),
-
     };
 
     let data = Path::new(dir);
 
     if !data.is_dir() {
-
         return std::ptr::null_mut();
-
     }
 
     let mut archives: Vec<Archive> = Vec::new();
 
     if let Ok(read) = std::fs::read_dir(data) {
-
         for entry in read.flatten() {
-
             let p = entry.path();
 
-            if !p
-
-                .extension()
-
-                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
-
-            {
-
+            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mpq")) {
                 continue;
-
             }
 
             if let Ok(a) = Archive::open(&p) {
-
                 archives.push(a);
-
             }
-
         }
-
     }
 
     if archives.is_empty() {
-
         return std::ptr::null_mut();
-
     }
 
     Box::into_raw(Box::new(BnWorld {
-
         archives,
 
         data_dir: dir.to_string(),
@@ -336,9 +353,9 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         wmo_group_liquids: HashMap::new(),
 
-        doodad_models: HashMap::new(),
-
         doodad_flats: HashMap::new(),
+
+        wmo_doodads: Vec::new(),
 
         player: None,
 
@@ -346,20 +363,20 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         minimap: None,
 
-    }))
+        char_sections: None,
 
+        item_display: None,
+
+        char_geosets: None,
+    }))
 }
 
 #[no_mangle]
 
 pub extern "C" fn bn_shutdown(world: *mut BnWorld) {
-
     if !world.is_null() {
-
         let _ = unsafe { Box::from_raw(world) };
-
     }
-
 }
 
 /// How many MPQ archives are registered (diagnostics).
@@ -367,21 +384,13 @@ pub extern "C" fn bn_shutdown(world: *mut BnWorld) {
 #[no_mangle]
 
 pub extern "C" fn bn_num_archives(world: *const BnWorld) -> u32 {
-
     if world.is_null() {
-
         return 0;
-
     }
 
     // SAFETY: caller owns the handle and passes a valid one.
 
-    unsafe { &*world }
-
-        .archives
-
-        .len() as u32
-
+    unsafe { &*world }.archives.len() as u32
 }
 
 // ---- map / terrain ----
@@ -418,7 +427,7 @@ pub struct TileFlat {
     /// tile-local through the same WoW->UE mirror as the terrain.
     lverts: Vec<BnVertex>,
     /// Per-liquid-vertex depth coordinate, parallel to `lverts`: the ADT
-    /// depth byte through the reference's LUT (0..1) and the WMO per-vertex
+    /// depth byte through the client's LUT (0..1) and the WMO per-vertex
     /// authored alpha. `liquid.wgsl` carries it in UV1.x and it drives both the
     /// swatch row and the sheet opacity.
     ldepth: Vec<f32>,
@@ -448,7 +457,12 @@ fn liquid_kind_code(k: benilla_formats::LiquidKind) -> u32 {
 /// (tile centre at origin, X/Y only; Z stays world-absolute) and then go
 /// through the same WoW->UE mirror as every other mesh.
 fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
-    let tile = benilla_formats::adt_to_tile_mesh(bytes).ok()?;
+    build_tile_flat_mesh(&benilla_formats::adt_to_tile_mesh(bytes).ok()?)
+}
+
+/// [`build_tile_flat`] over an already parsed mesh (the tile worker parses
+/// once and uses it for both the render tile and the collision tile).
+fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
     if tile.chunks.is_empty() {
         return None;
     }
@@ -554,6 +568,502 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
     Some(out)
 }
 
+// ---- Background ADT tile prefetch ----
+//
+// A tile entering the residency window used to be parsed (twice: MCNK for the
+// height field, then the flattened mesh) and have its chunk layer BLPs decoded
+// on the game thread - one 10-60 ms hitch per tile walked into. The host names
+// every wanted-but-missing tile to `bn_tile_prefetch`; a worker opens its own
+// chain, parses the tile once, queues the layer textures through the existing
+// decode pool, and parks the result for `bn_load_tile` to install.
+
+struct TilePrep {
+    mcnk: Vec<McnkChunk>,
+
+    flat: Option<TileFlat>,
+
+    /// The tile's WMO-internal doodads, resolved on the worker so the adopted
+    /// tile's doodad enumeration is complete when the host first samples it.
+    wmo_doodads: Arc<Vec<WmoDoodadInst>>,
+}
+
+struct TileJob {
+    dir: String,
+
+    path: String,
+
+    /// Lowercase path, the cache key (MPQ lookups are case-insensitive).
+    key: String,
+}
+
+struct TileJobs {
+    queue: Mutex<VecDeque<TileJob>>,
+
+    ready: Condvar,
+}
+
+fn tile_jobs() -> &'static TileJobs {
+    static JOBS: OnceLock<TileJobs> = OnceLock::new();
+
+    JOBS.get_or_init(|| TileJobs {
+        queue: Mutex::new(VecDeque::new()),
+
+        ready: Condvar::new(),
+    })
+}
+
+/// Prepared tiles keyed by lowercase ADT path, least-recently queued first.
+/// `None` = the worker is still on it; a ready entry is moved (not cloned)
+/// into the world by `bn_load_tile`.
+struct TilePreps {
+    entries: HashMap<String, Option<Arc<TilePrep>>>,
+
+    order: VecDeque<String>,
+}
+
+/// The host spawns wanted tiles nearest-first, so a few prepared tiles are
+/// always enough lead; the body also parks its own 5x5 walking window (the
+/// ring a border step needs, one tile early), so this covers both.
+const TILE_PREFETCH_BUDGET: usize = 32;
+
+fn tile_prep_cache() -> &'static Mutex<TilePreps> {
+    static CACHE: OnceLock<Mutex<TilePreps>> = OnceLock::new();
+
+    CACHE.get_or_init(|| {
+        Mutex::new(TilePreps {
+            entries: HashMap::new(),
+
+            order: VecDeque::new(),
+        })
+    })
+}
+
+fn tile_prep_trim(cache: &mut TilePreps) {
+    while cache.order.len() > TILE_PREFETCH_BUDGET {
+        let Some(old) = cache.order.pop_front() else {
+            return;
+        };
+
+        cache.entries.remove(&old);
+    }
+}
+
+// The body's walking collision used to be re-read and re-parsed on the game
+// thread (`player::load_tile`, 40-60 ms) the first tick after it crossed a
+// tile border - three hitches in a row when a corner brought three new tiles
+// into its 3x3 window. The same ADT is already in the tile worker's hands, so
+// the worker parks its collision half here, keyed by the same lowercase path.
+
+struct TileCols {
+    entries: HashMap<String, player::TileCol>,
+
+    order: VecDeque<String>,
+}
+
+/// The body's 3x3 window, the parked ring around it (the 5x5 prefetch makes a
+/// border step ready before it happens), and the tiles it just left.
+const COLLISION_TILE_BUDGET: usize = 32;
+
+fn tile_cols() -> &'static Mutex<TileCols> {
+    static CACHE: OnceLock<Mutex<TileCols>> = OnceLock::new();
+
+    CACHE.get_or_init(|| {
+        Mutex::new(TileCols {
+            entries: HashMap::new(),
+
+            order: VecDeque::new(),
+        })
+    })
+}
+
+fn tile_col_key(map: &str, tx: i32, ty: i32) -> String {
+    format!("World\\Maps\\{map}\\{map}_{tx}_{ty}.adt").to_ascii_lowercase()
+}
+
+/// The parsed collision tile for `map`/`tx`/`ty`, moved out of the cache.
+pub(crate) fn collision_tile_take(map: &str, tx: i32, ty: i32) -> Option<player::TileCol> {
+    let key = tile_col_key(map, tx, ty);
+
+    let mut cache = tile_cols().lock().ok()?;
+
+    let col = cache.entries.remove(&key)?;
+
+    if let Some(pos) = cache.order.iter().position(|k| k == &key) {
+        cache.order.remove(pos);
+    }
+
+    Some(col)
+}
+
+/// Park a collision tile for `player::ensure_tiles` to take.
+pub(crate) fn collision_tile_put(map: &str, tx: i32, ty: i32, col: player::TileCol) {
+    collision_tile_put_key(tile_col_key(map, tx, ty), col);
+}
+
+fn collision_tile_put_key(key: String, col: player::TileCol) {
+    let Ok(mut cache) = tile_cols().lock() else {
+        return;
+    };
+
+    if cache.entries.insert(key.clone(), col).is_none() {
+        cache.order.push_back(key);
+    }
+
+    while cache.order.len() > COLLISION_TILE_BUDGET {
+        let Some(old) = cache.order.pop_front() else {
+            return;
+        };
+
+        cache.entries.remove(&old);
+    }
+}
+
+fn tile_worker() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("bn-tile".to_string())
+            .spawn(|| {
+                let mut chain: Option<(String, benilla_formats::Chain)> = None;
+
+                loop {
+                    let job = {
+                        let jobs = tile_jobs();
+
+                        let mut q = match jobs.queue.lock() {
+                            Ok(q) => q,
+
+                            Err(_) => return,
+                        };
+
+                        while q.is_empty() {
+                            q = match jobs.ready.wait(q) {
+                                Ok(q) => q,
+
+                                Err(_) => return,
+                            };
+                        }
+
+                        q.pop_front()
+                    };
+
+                    let Some(job) = job else { continue };
+
+                    let job_t0 = std::time::Instant::now();
+
+                    if chain.as_ref().map_or(true, |(d, _)| d != &job.dir) {
+                        chain = benilla_formats::Chain::open(Path::new(&job.dir))
+                            .ok()
+                            .map(|c| (job.dir.clone(), c));
+                    }
+
+                    let mut models: Vec<(String, String)> = Vec::new();
+
+                    let mut wmo_models: Vec<String> = Vec::new();
+
+                    // The WMO roots' props, for the model prefetch after the
+                    // publish (the resolved list rides the prep itself).
+                    let mut wmo_doodad_models: Vec<(String, String)> = Vec::new();
+
+                    // Held back until the models above are parked: the body
+                    // folds whatever is parked on the tick it adopts the tile,
+                    // so publishing first means an MPQ parse on that tick.
+                    let mut collision_tile: Option<player::TileCol> = None;
+
+                    let prep = chain.as_mut().and_then(|(_, c)| {
+                        if !c.contains(&job.path) {
+                            return None;
+                        }
+
+                        // Filled only when the tile mesh exists; the prep
+                        // carries the (possibly empty) list either way.
+                        let mut wmo_doodad_resolved: Option<Vec<WmoDoodadInst>> = None;
+
+                        let bytes = c.read_file(&job.path).ok()?;
+
+                        let mcnk = match benilla_adt::parse_adt(&mut Cursor::new(bytes.as_slice()))
+                            .ok()?
+                        {
+                            benilla_adt::ParsedAdt::Root(root) => root.mcnk_chunks,
+
+                            _ => return None,
+                        };
+
+                        // One ADT parse feeds both halves: the flattened
+                        // render mesh and the body's collision tile.
+                        let tile = benilla_formats::adt_to_tile_mesh(&bytes).ok();
+
+                        if let Some(t) = &tile {
+                            collision_tile = Some(player::tile_col_from_mesh(t));
+                        }
+
+                        let flat = tile.as_ref().and_then(build_tile_flat_mesh);
+
+                        // Queue the chunk layer BLPs now: the terrain stage
+                        // then finds them decoded instead of decoding up to
+                        // four 256x256 sheets on the game thread.
+                        if let Some(t) = &flat {
+                            let mut seen = std::collections::HashSet::new();
+
+                            for chunk in &t.chunks {
+                                for layer in chunk.layers.iter().chain(std::iter::once(&chunk.tex))
+                                {
+                                    if !layer.is_empty() && seen.insert(tex_key(layer)) {
+                                        tex_request(&job.dir, layer);
+                                    }
+                                }
+                            }
+
+                            // The tile's prop models, for the parse cache and
+                            // the body's footprint parking (under the raw ADT
+                            // path, which is what the collision tile asks for).
+                            let mut model_seen = std::collections::HashSet::new();
+                            for d in &t.doodads {
+                                let model = d.model.trim();
+                                if !model.is_empty() && model_seen.insert(model.to_string()) {
+                                    models.push((model.to_string(), chain_model_path(model)));
+                                }
+                            }
+
+                            let mut wmo_seen = std::collections::HashSet::new();
+                            for w in &t.wmos {
+                                let model = w.model.trim();
+                                if !model.is_empty() && wmo_seen.insert(model.to_string()) {
+                                    wmo_models.push(model.to_string());
+                                }
+                            }
+
+                            // The buildings' own props, resolved here (before
+                            // the publish) so the host's first doodad count
+                            // samples the full enumeration; their models join
+                            // the prefetch queue below.
+                            let resolved = resolve_wmo_doodads(Some(c), &t.wmos);
+                            for d in &resolved {
+                                let model = d.model.trim();
+                                if !model.is_empty() && model_seen.insert(model.to_string()) {
+                                    wmo_doodad_models
+                                        .push((model.to_string(), chain_model_path(model)));
+                                }
+                            }
+                            wmo_doodad_resolved = Some(resolved);
+                        }
+
+                        Some(TilePrep {
+                            mcnk,
+                            flat,
+                            wmo_doodads: Arc::new(wmo_doodad_resolved.unwrap_or_default()),
+                        })
+                    });
+
+                    let parse_ms = job_t0.elapsed().as_secs_f64() * 1000.0;
+
+                    if let Ok(mut cache) = tile_prep_cache().lock() {
+                        // A trimmed request is not resurrected: the host only
+                        // keeps entries it still wants.
+                        if cache.entries.contains_key(&job.key) {
+                            cache.entries.insert(job.key.clone(), prep.map(Arc::new));
+                        }
+                    }
+
+                    // Prop model parses run after the prep is published, so
+                    // the ADT is never late to the build that wants it: the
+                    // build reaches its doodad gather a few hundred ms later.
+                    let models_t0 = std::time::Instant::now();
+
+                    if let Some((_, c)) = chain.as_mut() {
+                        prefetch_doodad_models(c, &models);
+
+                        prefetch_doodad_models(c, &wmo_doodad_models);
+
+                        // The body folds these meshes into its tile on the tick
+                        // it adopts the new ADT; parking them here keeps that
+                        // tick free of an MPQ parse. One parking per model is
+                        // enough until the body takes it.
+                        for m in &wmo_models {
+                            if player::wmo_collision_parked(m) {
+                                continue;
+                            }
+                            if let Ok(mesh) = benilla_formats::load_wmo_collision_tris(c, m) {
+                                player::wmo_collision_park(m, mesh);
+                            }
+                        }
+                    }
+
+                    // The tile's WMO meshes are parked now, so the body can
+                    // adopt the collision tile without a parse on that tick.
+                    if let Some(col) = collision_tile.take() {
+                        collision_tile_put_key(job.key.clone(), col);
+                    }
+
+                    // Group liquids last: the body's MLIQ slice must find them
+                    // cached, and a city model's group files are hundreds of
+                    // MPQ reads. Parked after the tile is published so this
+                    // read never delays the body's adoption.
+                    if let Some((_, c)) = chain.as_mut() {
+                        for m in &wmo_models {
+                            let key = wmo_key(m);
+                            if wmo_liquid_has(&key) {
+                                continue;
+                            }
+                            let meshes = read_wmo_group_liquids(Some(c), m);
+                            wmo_liquid_store(&key, Arc::new(meshes));
+                        }
+                    }
+
+                    let models_ms = models_t0.elapsed().as_secs_f64() * 1000.0;
+                    let job_ms = job_t0.elapsed().as_secs_f64() * 1000.0;
+                    if job_ms > 30.0 {
+                        eprintln!(
+                            "bn_tile: {} {:.1}ms (parse {:.1}, {} doodads {:.1})",
+                            job.path,
+                            job_ms,
+                            parse_ms,
+                            models.len(),
+                            models_ms
+                        );
+                    }
+                }
+            });
+    });
+}
+
+/// Prepare `World\Maps\<map>\<map>_<x>_<z>.adt` off the game thread, so a later
+/// `bn_load_tile` installs it without reading the MPQ or parsing. 1 = ready,
+/// 3 = already queued, 0 = queued now, 2 = bad arguments.
+#[no_mangle]
+pub extern "C" fn bn_tile_prefetch(
+    world: *const BnWorld,
+    map_name: *const c_char,
+    x: i32,
+    z: i32,
+) -> u32 {
+    if world.is_null() {
+        return 2;
+    }
+
+    let Some(map) = cstr_to_str(map_name) else {
+        return 2;
+    };
+
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+
+    prefetch_tile_inner(w, map, x, z, false)
+}
+
+/// Queue the body's walking window to the tile worker: the 3x3 collision ring
+/// plus the ring beyond it. The host streams around the camera focus, which can
+/// lag the tile the body is about to walk into; the worker parses the same ADT
+/// for the render mesh anyway, so this only asks it to stay ahead. Queuing the
+/// outer ring too means the ring a border step will need is already parsed when
+/// the body arrives, instead of a 27-46 ms ADT parse on that tick. The queue
+/// dedupes, so a repeat call is a cache lookup.
+///
+/// Nearest tiles go to the head of the queue, farthest first so the centre
+/// ends up at the front: a job takes tens of ms (its doodad models take far
+/// longer), and behind whatever the stream asked for earlier the ring the body
+/// is about to step into was the last thing parsed.
+pub(crate) fn player_prefetch_window(w: &BnWorld, map: &str, tx: i32, ty: i32) {
+    let mut window: Vec<(i32, i32, i32)> = Vec::with_capacity(25);
+
+    for dx in -2..=2 {
+        for dy in -2..=2 {
+            let (x, z) = (tx + dx, ty + dy);
+
+            if (0..=63).contains(&x) && (0..=63).contains(&z) {
+                window.push((dx * dx + dy * dy, x, z));
+            }
+        }
+    }
+
+    window.sort_unstable_by_key(|&(d, _, _)| d);
+
+    for &(_, x, z) in window.iter().rev() {
+        prefetch_tile_inner(w, map, x, z, true);
+    }
+}
+
+/// Lift a still-queued job to the head of the queue.
+fn promote_tile_job(key: &str) {
+    let Ok(mut q) = tile_jobs().queue.lock() else {
+        return;
+    };
+
+    let Some(pos) = q.iter().position(|j| j.key == key) else {
+        return;
+    };
+
+    let Some(job) = q.remove(pos) else {
+        return;
+    };
+
+    q.push_front(job);
+}
+
+fn prefetch_tile_inner(w: &BnWorld, map: &str, x: i32, z: i32, front: bool) -> u32 {
+    let path = format!("World\\Maps\\{map}\\{map}_{x}_{z}.adt");
+
+    let key = path.to_ascii_lowercase();
+
+    if w.tile_path == key {
+        return 1;
+    }
+
+    let mut queued = true;
+
+    {
+        let Ok(mut cache) = tile_prep_cache().lock() else {
+            return 2;
+        };
+
+        match cache.entries.get(&key) {
+            Some(Some(_)) => return 1,
+
+            Some(None) => {}
+
+            None => {
+                cache.entries.insert(key.clone(), None);
+
+                cache.order.push_back(key.clone());
+
+                tile_prep_trim(&mut cache);
+
+                queued = false;
+            }
+        }
+    }
+
+    if queued {
+        if front {
+            promote_tile_job(&key);
+        }
+
+        return 3;
+    }
+
+    tile_worker();
+
+    if let Ok(mut q) = tile_jobs().queue.lock() {
+        let job = TileJob {
+            dir: w.data_dir.clone(),
+
+            path,
+
+            key,
+        };
+
+        if front {
+            q.push_front(job);
+        } else {
+            q.push_back(job);
+        }
+
+        tile_jobs().ready.notify_one();
+    }
+
+    0
+}
 
 /// Load and parse a terrain tile `World\Maps\<map>\<map>_<x>_<z>.adt` from the
 
@@ -562,7 +1072,6 @@ fn build_tile_flat(bytes: &[u8]) -> Option<TileFlat> {
 #[no_mangle]
 
 pub extern "C" fn bn_load_tile(
-
     world: *mut BnWorld,
 
     map_name: *const c_char,
@@ -570,21 +1079,15 @@ pub extern "C" fn bn_load_tile(
     x: i32,
 
     z: i32,
-
 ) -> u32 {
-
     if world.is_null() {
-
         return 0;
-
     }
 
     let map = match cstr_to_str(map_name) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: caller guarantees a valid, exclusive handle.
@@ -601,23 +1104,52 @@ pub extern "C" fn bn_load_tile(
         return w.mcnk.len() as u32;
     }
 
+    // A prefetched tile was read and parsed off the game thread: take it over
+    // without touching the MPQ. The cache held the only reference, so the
+    // unwrap never copies; a failed prep falls through to the direct path.
+    let prefetched = tile_prep_cache()
+        .lock()
+        .ok()
+        .and_then(|mut c| c.entries.remove(&path_lower))
+        .flatten()
+        .and_then(|p| Arc::try_unwrap(p).ok());
+
+    if let Some(prep) = prefetched {
+        w.mcnk = prep.mcnk;
+
+        w.tile = prep.flat;
+
+        w.tile_path = path_lower;
+
+        w.wmo_doodads = Arc::try_unwrap(prep.wmo_doodads).unwrap_or_else(|a| (*a).clone());
+
+        // Instance indices address the new tile's MODF/MDDF lists; drop stale
+        // bakes (models stay cached: path-keyed).
+        w.tile_seq += 1;
+
+        w.wmo_flats.clear();
+
+        w.doodad_flats.clear();
+
+        return w.mcnk.len() as u32;
+    }
+
     for a in w.archives.iter().rev() {
-
         if !a.contains(&path) {
-
             continue;
-
         }
 
         if let Ok(bytes) = a.read_file(&path) {
-
             if let Ok(parsed) = benilla_adt::parse_adt(&mut Cursor::new(bytes.as_slice())) {
-
                 if let benilla_adt::ParsedAdt::Root(root) = parsed {
-
                     w.mcnk = root.mcnk_chunks;
                     w.tile = build_tile_flat(&bytes);
                     w.tile_path = path_lower;
+                    // No worker ran for this tile: resolve the buildings'
+                    // props here. The root cache keeps every repeat free;
+                    // the first city tile pays one root read + parse.
+                    let wmos = w.tile.as_ref().map(|t| t.wmos.clone()).unwrap_or_default();
+                    w.wmo_doodads = resolve_wmo_doodads(w.chain.as_mut(), &wmos);
 
                     // Instance indices address the new tile's MODF/MDDF lists;
                     // drop stale bakes (models stay cached: path-keyed).
@@ -626,25 +1158,18 @@ pub extern "C" fn bn_load_tile(
                     w.doodad_flats.clear();
 
                     return w.mcnk.len() as u32;
-
                 }
-
             }
 
             break;
-
         }
-
     }
 
     0
-
 }
 
-// ---- streaming: the official residency window (benilla-world
-// terrain_stream/window.rs reimplemented as a pure function, because
-// benilla-world pulls in the whole bevy stack and cannot be a dependency
-// here): inner = 1 + trunc(farclip / CHUNK_SIZE) chunks,
+// ---- streaming: the tile residency window as a pure function:
+// inner = 1 + trunc(farclip / CHUNK_SIZE) chunks,
 // outer = max(inner + 2, 8) chunks; a tile is wanted when any of its chunks
 // lies in the outer window.
 
@@ -729,11 +1254,8 @@ pub extern "C" fn bn_tile_center(world: *const BnWorld, out: *mut f32) -> u32 {
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_vertex_count(world: *const BnWorld) -> u32 {
-
     if world.is_null() {
-
         return 0;
-
     }
 
     // SAFETY: valid const handle.
@@ -741,7 +1263,6 @@ pub extern "C" fn bn_terrain_vertex_count(world: *const BnWorld) -> u32 {
     let w = unsafe { &*world };
 
     w.tile.as_ref().map_or(0, |t| t.verts.len() as u32)
-
 }
 
 /// Terrain index count the UE side should pre-allocate.
@@ -749,17 +1270,13 @@ pub extern "C" fn bn_terrain_vertex_count(world: *const BnWorld) -> u32 {
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_index_count(world: *const BnWorld) -> u32 {
-
     if world.is_null() {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
 
     w.tile.as_ref().map_or(0, |t| t.idx.len() as u32)
-
 }
 
 /// Fill `out` (pre-allocated) with terrain vertices. Returns count written.
@@ -767,19 +1284,14 @@ pub extern "C" fn bn_terrain_index_count(world: *const BnWorld) -> u32 {
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_fill_vertices(
-
     world: *const BnWorld,
 
     out: *mut BnVertex,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
@@ -793,27 +1305,15 @@ pub extern "C" fn bn_terrain_fill_vertices(
     unsafe { std::ptr::copy_nonoverlapping(t.verts.as_ptr(), out, n) };
 
     n as u32
-
 }
 
 /// Fill `out` (pre-allocated) with terrain triangle indices. Returns count written.
 
 #[no_mangle]
 
-pub extern "C" fn bn_terrain_fill_indices(
-
-    world: *const BnWorld,
-
-    out: *mut u16,
-
-    cap: u32,
-
-) -> u32 {
-
+pub extern "C" fn bn_terrain_fill_indices(world: *const BnWorld, out: *mut u16, cap: u32) -> u32 {
     if world.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
@@ -825,7 +1325,6 @@ pub extern "C" fn bn_terrain_fill_indices(
     unsafe { std::ptr::copy_nonoverlapping(t.idx.as_ptr(), out, n) };
 
     n as u32
-
 }
 
 /// Liquid meshes (wet MCLQ surfaces) in the loaded tile (0 when no tile).
@@ -925,9 +1424,8 @@ pub extern "C" fn bn_liquid_fill_depths(world: *const BnWorld, out: *mut f32, ca
 }
 
 /// The animated liquid frame sets per material class (0 water, 1 ocean,
-/// 2 magma): `XTextures\<dir>\<stem>.<1..=count>.blp`, the reference's fixed
-/// queues (`lake_a` `0x6851b0`, `ocean_h` `0x685010`, `lava` `0x6855a0`),
-/// mirroring `benilla-world`'s FRAME_SETS.
+/// 2 magma): `XTextures\<dir>\<stem>.<1..=count>.blp`, the client's fixed
+/// queues (`lake_a`, `ocean_h`, `lava`).
 const LIQUID_FRAME_SETS: [(&str, &str, u32); 3] = [
     ("river", "lake_a", 30),
     ("ocean", "ocean_h", 30),
@@ -1035,49 +1533,31 @@ pub extern "C" fn bn_liquid_frame_atlas(
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_chunk_count(world: *const BnWorld) -> u32 {
-
     if world.is_null() {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
 
     w.tile.as_ref().map_or(0, |t| t.chunks.len() as u32)
-
 }
 
 /// Chunk `i` index range: writes {vtx0, vtx_n, idx0, idx_n}. Returns 1 on success.
 
 #[no_mangle]
 
-pub extern "C" fn bn_terrain_chunk_range(
-
-    world: *const BnWorld,
-
-    i: u32,
-
-    out: *mut u32,
-
-) -> u32 {
-
+pub extern "C" fn bn_terrain_chunk_range(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
     if world.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
 
     let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
-
         return 0;
-
     };
 
     unsafe {
-
         *out = c.vtx0;
 
         *out.add(1) = c.vtx_n;
@@ -1085,11 +1565,9 @@ pub extern "C" fn bn_terrain_chunk_range(
         *out.add(2) = c.idx0;
 
         *out.add(3) = c.idx_n;
-
     }
 
     1
-
 }
 
 /// Chunk `i` MTEX base texture name into `buf` (NUL-terminated). Returns 1 on success.
@@ -1097,7 +1575,6 @@ pub extern "C" fn bn_terrain_chunk_range(
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_chunk_texture(
-
     world: *const BnWorld,
 
     i: u32,
@@ -1105,21 +1582,15 @@ pub extern "C" fn bn_terrain_chunk_texture(
     buf: *mut c_char,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || buf.is_null() || cap == 0 {
-
         return 0;
-
     }
 
     let w = unsafe { &*world };
 
     let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
-
         return 0;
-
     };
 
     let bytes = c.tex.as_bytes();
@@ -1127,15 +1598,12 @@ pub extern "C" fn bn_terrain_chunk_texture(
     let n = bytes.len().min(cap as usize - 1);
 
     unsafe {
-
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
 
         *buf.add(n) = 0;
-
     }
 
     1
-
 }
 
 /// Chunk `i` MCLY layer count (0..4; 0 when no tile/chunk).
@@ -1212,7 +1680,9 @@ pub extern "C" fn bn_terrain_chunk_alpha(
     for ch in (layers.saturating_sub(1))..3 {
         let mut k = ch;
         while k < n {
-            unsafe { *out.add(k) = 0; }
+            unsafe {
+                *out.add(k) = 0;
+            }
             k += 4;
         }
     }
@@ -1228,11 +1698,8 @@ pub extern "C" fn bn_terrain_chunk_alpha(
 #[no_mangle]
 
 pub extern "C" fn bn_terrain_height_at(world: *const BnWorld, x: f32, y: f32) -> f32 {
-
     if world.is_null() {
-
         return 0.0;
-
     }
 
     let w = unsafe { &*world };
@@ -1246,21 +1713,16 @@ pub extern "C" fn bn_terrain_height_at(world: *const BnWorld, x: f32, y: f32) ->
     let (mut best, mut best_d) = (0.0f32, f32::MAX);
 
     for v in &t.verts {
-
         let d = (v.x - x) * (v.x - x) + (v.y - y) * (v.y - y);
 
         if d < best_d {
-
             best_d = d;
 
             best = v.z;
-
         }
-
     }
 
     best
-
 }
 
 // ---- WMO buildings (phase 2) ----
@@ -1280,8 +1742,11 @@ pub struct WmoSub {
     tex: String,
     /// MOMT flag 0x04: emit triangles two-sided (no back-face culling).
     two_sided: bool,
-    /// Blend class (0..4, 0x100 = additive), `bn_doodad_blend`'s encoding.
+    /// Blend class (0..4, `0x100` = additive), `bn_doodad_blend`'s encoding.
     blend: u32,
+    /// The WMO group this batch was authored in (`u16::MAX` when the model's
+    /// group table is unknown): the portal PVS answers per group.
+    group: u16,
 }
 
 /// One WMO instance baked into tile-local UE axes: `world = position + in_wow·v`,
@@ -1290,6 +1755,12 @@ pub struct WmoFlat {
     verts: Vec<BnVertex>,
     idx: Vec<u32>,
     subs: Vec<WmoSub>,
+    /// The placement's world bounding sphere (WoW yards): the far-clip test's
+    /// `center`/`radius` inputs. Baked from the
+    /// same transformed positions the verts carry, so it needs no second pass.
+    sphere: ([f32; 3], f32),
+    /// The placement's world AABB (WoW yards): min and max corners.
+    aabb: ([f32; 3], [f32; 3]),
 }
 
 /// Hamilton product `a·b` on `[x, y, z, w]` (apply `b` first, then `a`), the
@@ -1344,7 +1815,10 @@ fn placement_quat(rotation_deg: [f32; 3]) -> [f32; 4] {
     );
     q_mul(
         q_rot_x(FRAC_PI_2),
-        q_mul(q_rot_y(ry - PI), q_mul(q_rot_z(-rx), q_rot_x(rz - FRAC_PI_2))),
+        q_mul(
+            q_rot_y(ry - PI),
+            q_mul(q_rot_z(-rx), q_rot_x(rz - FRAC_PI_2)),
+        ),
     )
 }
 
@@ -1363,21 +1837,54 @@ fn build_wmo_flat(
     model_path: &str,
     chain: Option<&benilla_formats::Chain>,
 ) -> WmoFlat {
-    let q = placement_quat(rotation_deg);
+    build_wmo_flat_q(
+        subs,
+        position,
+        placement_quat(rotation_deg),
+        center,
+        scale,
+        model_path,
+        chain,
+    )
+}
+
+/// The same bake with the world quaternion prepared by the caller: a WMO's
+/// own doodads compose the placement quaternion with the MODD orientation.
+fn build_wmo_flat_q(
+    subs: &[benilla_formats::RenderSubmesh],
+    position: [f32; 3],
+    q: [f32; 4],
+    center: (f32, f32),
+    scale: f32,
+    model_path: &str,
+    chain: Option<&benilla_formats::Chain>,
+) -> WmoFlat {
     let mut out = WmoFlat {
         verts: Vec::new(),
         idx: Vec::new(),
         subs: Vec::new(),
+        sphere: ([0.0; 3], 0.0),
+        aabb: ([0.0; 3], [0.0; 3]),
     };
-    for sm in subs {
+    // World-space AABB of the placement, for the bounding sphere below.
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    let group_of = wmo_groups_lookup(&wmo_key(model_path));
+    for (k, sm) in subs.iter().enumerate() {
+        let group = group_of
+            .as_ref()
+            .and_then(|g| g.get(k).copied())
+            .unwrap_or(u16::MAX);
         let vtx0 = out.verts.len() as u32;
         for (i, p) in sm.positions.iter().enumerate() {
             let r = q_rot(q, [p[0] * scale, p[1] * scale, p[2] * scale]);
-            let (wx, wy, wz) = (
-                r[0] + position[0],
-                r[1] + position[1],
-                r[2] + position[2],
-            );
+            let (wx, wy, wz) = (r[0] + position[0], r[1] + position[1], r[2] + position[2]);
+            lo[0] = lo[0].min(wx);
+            lo[1] = lo[1].min(wy);
+            lo[2] = lo[2].min(wz);
+            hi[0] = hi[0].max(wx);
+            hi[1] = hi[1].max(wy);
+            hi[2] = hi[2].max(wz);
             let (x, y, z) = wow_vec_to_ue(wx - center.0, wy - center.1, wz);
             let (nx, ny, nz) = if sm.normals.len() == sm.positions.len() {
                 let n = q_rot(q, sm.normals[i]);
@@ -1430,6 +1937,7 @@ fn build_wmo_flat(
             vtx_n: sm.positions.len() as u32,
             idx0,
             idx_n: out.idx.len() as u32 - idx0,
+            group,
             tex,
             two_sided: sm.two_sided,
             blend: match sm.blend {
@@ -1440,6 +1948,22 @@ fn build_wmo_flat(
                 benilla_formats::ModelBlend::Mod2x => 4,
             } | if sm.additive { 0x100 } else { 0 },
         });
+    }
+    if !out.verts.is_empty() {
+        let c = [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ];
+        // Circumsphere (half the box diagonal): the far-clip wall must never
+        // eat a corner the box test would have kept.
+        let r = (0..3)
+            .map(|a| hi[a] - lo[a])
+            .fold(0.0f32, |acc, v| acc + v * v)
+            .sqrt()
+            * 0.5;
+        out.sphere = (c, r.max(1.0));
+        out.aabb = (lo, hi);
     }
     out
 }
@@ -1536,10 +2060,7 @@ fn append_wmo_liquids(
         w.wmo_group_liquids.insert(model_path.to_string(), meshes);
     }
     // Disjoint field borrows: the tile buffer and the path-keyed cache.
-    let (Some(tile), Some(meshes)) = (
-        w.tile.as_mut(),
-        w.wmo_group_liquids.get(model_path),
-    ) else {
+    let (Some(tile), Some(meshes)) = (w.tile.as_mut(), w.wmo_group_liquids.get(model_path)) else {
         return;
     };
     let q = placement_quat(rotation_deg);
@@ -1551,11 +2072,7 @@ fn append_wmo_liquids(
         let vtx0 = tile.lverts.len() as u32;
         for (vi, p) in m.positions.iter().enumerate() {
             let r = q_rot(q, *p);
-            let (wx, wy, wz) = (
-                r[0] + position[0],
-                r[1] + position[1],
-                r[2] + position[2],
-            );
+            let (wx, wy, wz) = (r[0] + position[0], r[1] + position[1], r[2] + position[2]);
             let (x, y, z) = wow_vec_to_ue(wx - center.0, wy - center.1, wz);
             let uv = m.uvs.get(vi).copied().unwrap_or([0.0, 0.0]);
             tile.lverts.push(BnVertex {
@@ -1571,7 +2088,7 @@ fn append_wmo_liquids(
                 v: uv[1],
             });
             // WMO water carries the authored per-vertex opacity byte through
-            // the zone's alpha ramp; the reference reads it as the sheet alpha.
+            // the zone's alpha ramp; the client reads it as the sheet alpha.
             tile.ldepth.push(m.depths.get(vi).copied().unwrap_or(0.0));
         }
         let idx0 = tile.lidx.len() as u32;
@@ -1602,7 +2119,6 @@ struct WmoEntry {
     ready: bool,
 
     subs: Option<Arc<Vec<benilla_formats::RenderSubmesh>>>,
-
 }
 
 /// Case-folded root path, the key both the tile's placements and the host's
@@ -1631,6 +2147,8 @@ enum WmoJob {
         /// Tile path the placement belongs to (the flat cache key).
         path: String,
         i: u32,
+        /// MODF `unique_id`: the key the far-clip cull addresses this placement by.
+        uid: u32,
         model: String,
         position: [f32; 3],
         rotation: [f32; 3],
@@ -1642,7 +2160,6 @@ struct WmoJobs {
     queue: Mutex<VecDeque<WmoJob>>,
 
     ready: Condvar,
-
 }
 
 fn wmo_jobs() -> &'static WmoJobs {
@@ -1660,6 +2177,48 @@ fn wmo_lookup(key: &str) -> Option<Arc<Vec<benilla_formats::RenderSubmesh>>> {
     cache.get(key).and_then(|e| e.subs.clone())
 }
 
+/// The WMO group each submesh of a model came from, parallel to `load_wmo`'s
+/// submesh list. The portal PVS answers per group, so a placement's geometry is
+/// only toggleable one room at a time while each batch knows its group.
+fn wmo_groups() -> &'static Mutex<HashMap<String, Arc<Vec<u16>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u16>>>>> = OnceLock::new();
+
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wmo_groups_lookup(key: &str) -> Option<Arc<Vec<u16>>> {
+    wmo_groups().lock().ok()?.get(key).cloned()
+}
+
+fn wmo_groups_store(key: &str, groups: Vec<u16>) {
+    if let Ok(mut cache) = wmo_groups().lock() {
+        cache.insert(key.to_string(), Arc::new(groups));
+    }
+}
+
+/// `load_wmo`'s walk keeping the group index: the root, then every group file,
+/// one submesh per render batch.
+fn load_wmo_grouped(
+    chain: &mut benilla_formats::Chain,
+    raw_path: &str,
+) -> Option<(Vec<benilla_formats::RenderSubmesh>, Vec<u16>)> {
+    let root_path = raw_path.to_ascii_lowercase();
+    let bytes = chain.read_file(&root_path).ok()?;
+    let root = benilla_formats::parse_wmo_root(&bytes).ok()?;
+    let stem = root_path.strip_suffix(".wmo").unwrap_or(&root_path);
+    let mut subs: Vec<benilla_formats::RenderSubmesh> = Vec::new();
+    let mut groups: Vec<u16> = Vec::new();
+    for gi in 0..root.group_count() {
+        let Ok(gbytes) = chain.read_file(&format!("{stem}_{gi:03}.wmo")) else {
+            continue;
+        };
+        let gs = benilla_formats::wmo_group_submeshes(&gbytes, &root).ok()?;
+        groups.resize(subs.len() + gs.len(), gi as u16);
+        subs.extend(gs);
+    }
+    Some((subs, groups))
+}
+
 fn wmo_pending(key: &str) -> bool {
     wmo_cache()
         .lock()
@@ -1672,7 +2231,6 @@ struct WmoFlatEntry {
     ready: bool,
 
     flat: Option<Arc<WmoFlat>>,
-
 }
 
 /// Baked placements of one tile path. Keyed by path, not by the tile serial:
@@ -1769,6 +2327,27 @@ fn wmo_flat_pending(path: &str, i: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// World bounding spheres of every WMO placement baked so far, keyed by MODF
+/// `unique_id`. The flat cache is released once the host copies a tile's
+/// geometry, but the far-clip cull queries long after, by uid alone.
+fn wmo_spheres() -> &'static Mutex<HashMap<u32, ([f32; 3], f32)>> {
+    static SPHERES: OnceLock<Mutex<HashMap<u32, ([f32; 3], f32)>>> = OnceLock::new();
+    SPHERES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wmo_sphere_store(uid: u32, flat: Option<&WmoFlat>) {
+    if let (Ok(mut m), Some(f)) = (wmo_spheres().lock(), flat) {
+        m.insert(uid, f.sphere);
+    }
+}
+
+/// Doodad placement bounding spheres by MDDF/WMO-doodad uid, surviving the
+/// per-tile `doodad_flats` release the same way the WMO table does.
+fn doodad_spheres() -> &'static Mutex<HashMap<u32, ([f32; 3], f32)>> {
+    static SPHERES: OnceLock<Mutex<HashMap<u32, ([f32; 3], f32)>>> = OnceLock::new();
+    SPHERES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn wmo_flat_store(path: &str, i: u32, flat: Option<Arc<WmoFlat>>) {
     if let Ok(mut cache) = wmo_flat_cache().lock() {
         let add = flat.as_ref().map_or(0, |f| wmo_flat_size(f));
@@ -1781,10 +2360,7 @@ fn wmo_flat_store(path: &str, i: u32, flat: Option<Arc<WmoFlat>>) {
                 if !e.ready {
                     let old = e.flat.as_ref().map_or(0, |f| wmo_flat_size(f));
 
-                    *e = WmoFlatEntry {
-                        ready: true,
-                        flat,
-                    };
+                    *e = WmoFlatEntry { ready: true, flat };
 
                     t.bytes = t.bytes.saturating_sub(old) + add;
 
@@ -1859,25 +2435,26 @@ fn wmo_worker() {
 
                     match job {
                         WmoJob::Parse { key, model, .. } => {
-                            let subs = chain
+                            let parsed = chain
                                 .as_mut()
-                                .and_then(|(_, c)| benilla_formats::load_wmo(c, &model).ok())
-                                .map(Arc::new);
+                                .and_then(|(_, c)| load_wmo_grouped(c, &model));
+                            let (subs, groups) = match parsed {
+                                Some((s, g)) => (Some(Arc::new(s)), Some(g)),
+                                None => (None, None),
+                            };
 
+                            if let Some(g) = groups {
+                                wmo_groups_store(&key, g);
+                            }
                             if let Ok(mut cache) = wmo_cache().lock() {
-                                cache.insert(
-                                    key,
-                                    WmoEntry {
-                                        ready: true,
-                                        subs,
-                                    },
-                                );
+                                cache.insert(key, WmoEntry { ready: true, subs });
                             }
                         }
 
                         WmoJob::Flat {
                             path,
                             i,
+                            uid,
                             model,
                             position,
                             rotation,
@@ -1903,13 +2480,13 @@ fn wmo_worker() {
                                 None => {
                                     let parsed = chain
                                         .as_mut()
-                                        .and_then(|(_, c)| {
-                                            benilla_formats::load_wmo(c, &model).ok()
-                                        })
-                                        .map(Arc::new);
+                                        .and_then(|(_, c)| load_wmo_grouped(c, &model))
+                                        .map(|(s, g)| {
+                                            wmo_groups_store(&key, g);
+                                            Arc::new(s)
+                                        });
 
-                                    if let (Ok(mut cache), Some(s)) =
-                                        (wmo_cache().lock(), &parsed)
+                                    if let (Ok(mut cache), Some(s)) = (wmo_cache().lock(), &parsed)
                                     {
                                         cache.insert(
                                             key.clone(),
@@ -1945,11 +2522,24 @@ fn wmo_worker() {
                             // them cached and only transforms them.
                             if !wmo_liquid_has(&key) {
                                 if let Some((_, c)) = chain.as_mut() {
-                                    let meshes =
-                                        read_wmo_group_liquids(Some(c), &model);
+                                    let meshes = read_wmo_group_liquids(Some(c), &model);
 
                                     wmo_liquid_store(&key, Arc::new(meshes));
                                 }
+                            }
+
+                            if !exterior::nav_known(&key) {
+                                if let Some((_, c)) = chain.as_mut() {
+                                    let nav = exterior::load_nav(c, &key);
+
+                                    exterior::store_nav(&key, nav);
+                                }
+                            }
+
+                            wmo_sphere_store(uid, flat.as_deref());
+
+                            if let Some(f) = flat.as_deref() {
+                                exterior::register_wmo(uid, &key, position, rotation, f.aabb);
                             }
 
                             wmo_flat_store(&path, i, flat);
@@ -2026,6 +2616,7 @@ pub extern "C" fn bn_wmo_prefetch_tile(world: *const BnWorld) -> u32 {
                 dir: dir.clone(),
                 path: path.clone(),
                 i,
+                uid: inst.unique_id,
                 model: inst.model.clone(),
                 position: inst.position,
                 rotation: inst.rotation,
@@ -2098,7 +2689,7 @@ pub extern "C" fn bn_wmo_instance_count(world: *const BnWorld) -> u32 {
 
 /// MODF `unique_id` of instance `i` into `out`. Returns 1 on success.
 /// A straddling WMO appears in every overlapping tile's ADT with the same
-/// uid; the reference dedups by it (`0x694bc0`), and so does the host.
+/// uid; the client dedups by it, and so does the host.
 #[no_mangle]
 pub extern "C" fn bn_wmo_unique_id(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
     if world.is_null() || out.is_null() {
@@ -2132,10 +2723,16 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     if let Some(f) = w.wmo_flats.get(&i) {
         return f.subs.len() as u32;
     }
-    let Some((model_path, pos, rot, center)) = w.tile.as_ref().and_then(|t| {
-        t.wmos
-            .get(i as usize)
-            .map(|inst| (inst.model.clone(), inst.position, inst.rotation, t.center))
+    let Some((model_path, pos, rot, center, uid)) = w.tile.as_ref().and_then(|t| {
+        t.wmos.get(i as usize).map(|inst| {
+            (
+                inst.model.clone(),
+                inst.position,
+                inst.rotation,
+                t.center,
+                inst.unique_id,
+            )
+        })
     }) else {
         return 0;
     };
@@ -2169,10 +2766,11 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
             let Some(chain) = w.chain.as_mut() else {
                 return 0;
             };
-            let Ok(subs) = benilla_formats::load_wmo(chain, &model_path) else {
+            let Some((subs, groups)) = load_wmo_grouped(chain, &model_path) else {
                 return 0;
             };
             let subs = Arc::new(subs);
+            wmo_groups_store(&key, groups);
             w.wmo_models.insert(key.clone(), subs.clone());
             if let Ok(mut cache) = wmo_cache().lock() {
                 cache.insert(
@@ -2188,6 +2786,15 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     let subs = &w.wmo_models[&key];
     let flat = build_wmo_flat(subs, pos, rot, center, 1.0, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
+    wmo_sphere_store(uid, Some(&flat));
+    if !exterior::nav_known(&key) {
+        let nav = w
+            .chain
+            .as_mut()
+            .and_then(|c| exterior::load_nav(c, &key));
+        exterior::store_nav(&key, nav);
+    }
+    exterior::register_wmo(uid, &key, pos, rot, flat.aabb);
     w.wmo_flats.insert(i, Arc::new(flat));
     // MLIQ (Stormwind canals): place the model's group liquids beside the ADT
     // MCLQ so the host's liquid pass picks them up unchanged. The cache above
@@ -2195,6 +2802,32 @@ pub extern "C" fn bn_wmo_instance_load(world: *mut BnWorld, i: u32) -> u32 {
     // (`bn_load_tile` clears wmo_flats together with the old tile buffer).
     append_wmo_liquids(w, &model_path, pos, rot, center);
     n
+}
+
+/// World-space placement (WoW yards, x/y/z) of WMO instance `i` of the
+/// resident tile. A city-scale WMO is listed in every ADT it overlaps; the
+/// host derives the placement's home ADT from this so exactly one resident
+/// tile draws it, deterministically, instead of racing for the claim.
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_position(world: *const BnWorld, i: u32, out: *mut f32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.wmos.get(i as usize))
+        .map(|inst| inst.position)
+    else {
+        return 0;
+    };
+    unsafe {
+        *out = p[0];
+        *out.add(1) = p[1];
+        *out.add(2) = p[2];
+    }
+    3
 }
 
 /// Baked vertex count of instance `i` (0 before load).
@@ -2220,7 +2853,9 @@ pub extern "C" fn bn_wmo_instance_fill_vertices(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let Some(f) = wmo_flat(world, i) else {
+        return 0;
+    };
     let n = f.verts.len().min(cap as usize);
     unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr(), out, n) };
     n as u32
@@ -2239,7 +2874,9 @@ pub extern "C" fn bn_wmo_instance_fill_triangles(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let Some(f) = wmo_flat(world, i) else {
+        return 0;
+    };
     let n = f.idx.len().min(cap as usize);
     for (j, sm) in f.subs.iter().enumerate() {
         if (sm.idx0 as usize) >= n {
@@ -2276,9 +2913,13 @@ pub extern "C" fn bn_wmo_instance_fill_vertices_range(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let Some(f) = wmo_flat(world, i) else {
+        return 0;
+    };
     let start = (first as usize).min(f.verts.len());
-    let n = (f.verts.len() - start).min(count as usize).min(cap as usize);
+    let n = (f.verts.len() - start)
+        .min(count as usize)
+        .min(cap as usize);
     unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr().add(start), out, n) };
     n as u32
 }
@@ -2299,7 +2940,9 @@ pub extern "C" fn bn_wmo_instance_fill_triangles_range(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = wmo_flat(world, i) else { return 0 };
+    let Some(f) = wmo_flat(world, i) else {
+        return 0;
+    };
     let begin = (first as usize).min(f.idx.len());
     let n = (f.idx.len() - begin).min(count as usize).min(cap as usize);
     let end = begin + n;
@@ -2308,14 +2951,16 @@ pub extern "C" fn bn_wmo_instance_fill_triangles_range(
         if sub0 >= end {
             break;
         }
-        let sub_end = (sub0 + sm.idx_n as usize).min(end);
-        let mut k = sub0.max(begin);
-        // Slots are 3-aligned inside a submesh: step from the submesh start.
-        let align = (k - sub0) % 3;
-        if align != 0 {
-            k += 3 - align;
-        }
-        while k + 2 < sub_end {
+        let sub_last = sub0 + sm.idx_n as usize;
+        // First triangle start at or after `begin`; a triangle is written when
+        // its START slot lies in the range, even if its last two index slots
+        // run past `end`. The caller's chunk boundary otherwise dropped the
+        // straddling triangle (one per chunk per instance).
+        let mut k = sub0 + begin.saturating_sub(sub0).div_ceil(3) * 3;
+        while k + 2 < sub_last {
+            if k >= end {
+                break;
+            }
             unsafe {
                 *out.add(k - begin) = BnTriangle {
                     a: f.idx[k],
@@ -2350,6 +2995,7 @@ pub extern "C" fn bn_wmo_instance_submesh(
         *out.add(1) = sm.vtx_n;
         *out.add(2) = sm.idx0;
         *out.add(3) = sm.idx_n;
+        *out.add(4) = u32::from(sm.group);
     }
     1
 }
@@ -2378,6 +3024,70 @@ pub extern "C" fn bn_wmo_instance_texture(
     1
 }
 
+/// Whether the WMO placement `uid` sits inside the far-clip wall, the one CPU
+/// test benilla's draw gate runs on it: planar
+/// depth along camera-forward to the nearest point of the placement's world
+/// bounding sphere, compared against `farclip`. `eye` and `fwd` are three
+/// floats each in WoW world coordinates (yards, x north, y west, z up), `fwd`
+/// unit. Writes 1 (drawable) or 0 (behind the wall) to `out`; returns 1 when
+/// the placement's sphere is known, 0 when it was never baked (fail-open:
+/// `out` is left at 1, like the portal gate on an out-of-range room).
+#[no_mangle]
+pub extern "C" fn bn_wmo_drawable(
+    uid: u32,
+    eye: *const f32,
+    fwd: *const f32,
+    farclip: f32,
+    out: *mut u32,
+) -> u32 {
+    if eye.is_null() || fwd.is_null() || out.is_null() {
+        return 0;
+    }
+    unsafe { *out = 1 };
+    let Some((c, r)) = wmo_spheres().lock().ok().and_then(|m| m.get(&uid).copied()) else {
+        return 0;
+    };
+    // SAFETY: caller guarantees two valid three-float arrays.
+    let (e, f) = unsafe { ([*eye, *eye.add(1), *eye.add(2)], [*fwd, *fwd.add(1), *fwd.add(2)]) };
+    let depth = (c[0] - e[0]) * f[0] + (c[1] - e[1]) * f[1] + (c[2] - e[2]) * f[2] - r;
+    // The client's `farclip` range: 177 to 777.
+    let wall = farclip.clamp(177.0, 777.0);
+    unsafe { *out = (depth <= wall) as u32 };
+    1
+}
+
+/// Whether the doodad placement `uid` (MDDF, or a WMO-internal MODD's
+/// synthetic uid) sits inside the far-clip wall — the same
+/// test as `bn_wmo_drawable`, which the client runs on doodads too
+/// (doodads and WMOs share the distance gate). Same
+/// fail-open contract on an unknown sphere.
+#[no_mangle]
+pub extern "C" fn bn_doodad_drawable(
+    uid: u32,
+    eye: *const f32,
+    fwd: *const f32,
+    farclip: f32,
+    out: *mut u32,
+) -> u32 {
+    if eye.is_null() || fwd.is_null() || out.is_null() {
+        return 0;
+    }
+    unsafe { *out = 1 };
+    let Some((c, r)) = doodad_spheres()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&uid).copied())
+    else {
+        return 0;
+    };
+    // SAFETY: caller guarantees two valid three-float arrays.
+    let (e, f) = unsafe { ([*eye, *eye.add(1), *eye.add(2)], [*fwd, *fwd.add(1), *fwd.add(2)]) };
+    let depth = (c[0] - e[0]) * f[0] + (c[1] - e[1]) * f[1] + (c[2] - e[2]) * f[2] - r;
+    let wall = farclip.clamp(177.0, 777.0);
+    unsafe { *out = (depth <= wall) as u32 };
+    1
+}
+
 /// Submesh `j` of instance `i` blend class: 0 Opaque, 1 AlphaTest, 2 Blend,
 /// 3 Mod, 4 Mod2x; bit 0x100 = additive. Returns 1 on success.
 #[no_mangle]
@@ -2401,14 +3111,286 @@ pub extern "C" fn bn_wmo_instance_blend(
 
 // ---- doodads (MDDF terrain M2 placements): the WMO instance FFI mirrored ----
 
-/// MDDF doodad placements in the loaded tile (0 when no tile).
+// Process-wide parse cache for doodad models, keyed by lowercase model path.
+//
+// Every tile carries its own props, so the first placement of each model used
+// to read and parse the M2 on the game thread while the player walked into the
+// tile (30-80 ms per model, a handful of models per tile). The tile prefetch
+// worker fills this cache ahead of the build, so `bn_doodad_load` finds the
+// parse instead of paying for it; a tile whose prefetch lost the race still
+// parses on the game thread and shares the result with every later tile.
+
+struct DoodadMeshEntry {
+    subs: Arc<Vec<benilla_formats::RenderSubmesh>>,
+    weight: usize,
+}
+
+struct DoodadMeshCache {
+    entries: HashMap<String, DoodadMeshEntry>,
+    /// Least-recently-used order (front is oldest).
+    order: VecDeque<String>,
+    weight: usize,
+}
+
+/// Rough bytes kept parsed (`positions.len * 4 * 12` covers position, normal
+/// and UV; indices are u16). A long tour visits every prop model in the world.
+const DOODAD_MESH_CACHE_BYTES: usize = 96 << 20;
+
+fn doodad_mesh_cache() -> &'static Mutex<DoodadMeshCache> {
+    static CACHE: OnceLock<Mutex<DoodadMeshCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(DoodadMeshCache {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            weight: 0,
+        })
+    })
+}
+
+fn doodad_mesh_weight(subs: &[benilla_formats::RenderSubmesh]) -> usize {
+    subs.iter()
+        .map(|s| s.positions.len() * 48 + s.indices.len() * 2)
+        .sum()
+}
+
+/// The cached parse of `path`; touches its LRU position.
+fn doodad_mesh_cached(path: &str) -> Option<Arc<Vec<benilla_formats::RenderSubmesh>>> {
+    let key = chain_model_path(path);
+    let mut cache = doodad_mesh_cache().lock().ok()?;
+    let subs = cache.entries.get(&key)?.subs.clone();
+    if let Some(pos) = cache.order.iter().position(|k| k == &key) {
+        cache.order.remove(pos);
+    }
+    cache.order.push_back(key);
+    Some(subs)
+}
+
+/// Keep a parsed model for every placement and tile that follows.
+fn doodad_mesh_insert(
+    path: &str,
+    subs: Vec<benilla_formats::RenderSubmesh>,
+) -> Arc<Vec<benilla_formats::RenderSubmesh>> {
+    let weight = doodad_mesh_weight(&subs);
+    let subs = Arc::new(subs);
+    let key = chain_model_path(path);
+    if let Ok(mut cache) = doodad_mesh_cache().lock() {
+        if let Some(old) = cache.entries.insert(
+            key.clone(),
+            DoodadMeshEntry {
+                subs: subs.clone(),
+                weight,
+            },
+        ) {
+            cache.weight = cache.weight.saturating_sub(old.weight);
+        }
+        if let Some(pos) = cache.order.iter().position(|k| k == &key) {
+            cache.order.remove(pos);
+        }
+        cache.order.push_back(key);
+        cache.weight += weight;
+        while cache.weight > DOODAD_MESH_CACHE_BYTES && cache.order.len() > 1 {
+            let Some(victim) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = cache.entries.remove(&victim) {
+                cache.weight = cache.weight.saturating_sub(old.weight);
+            }
+        }
+    }
+    subs
+}
+
+/// The model path as the chain stores it: lowercase, `.mdx`/`.mdl` as `.m2`
+/// (mirrors `benilla_formats::load_m2_mesh`'s normalization).
+fn chain_model_path(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    match lower
+        .strip_suffix(".mdx")
+        .or_else(|| lower.strip_suffix(".mdl"))
+    {
+        Some(stem) => format!("{stem}.m2"),
+        None => lower,
+    }
+}
+
+/// Read `path`'s bytes through the worker's own chain (never the game thread's).
+fn read_m2_bytes_chain(chain: &mut benilla_formats::Chain, raw: &str) -> Option<Vec<u8>> {
+    chain.read_file(&chain_model_path(raw)).ok()
+}
+
+/// A WMO's own doodad (MODD) composed into world WoW coords: model path, world
+/// position, world quaternion, uniform scale, and a synthetic straddle uid.
+/// benilla spawns exactly these per placement — doodad set 0 plus the MODF
+/// `doodad_set`; the
+/// per-group MODR split is draw-time culling this host does not do, so every
+/// prop of the two sets draws.
+#[derive(Clone)]
+struct WmoDoodadInst {
+    model: String,
+    position: [f32; 3],
+    quat: [f32; 4],
+    scale: f32,
+    uid: u32,
+}
+
+/// A root's MODD/MODS tables, WMO model space, cached by root path: the
+/// compose is per placement, the MPQ read and parse once per model.
+struct WmoRootDoodads {
+    insts: Vec<(String, [f32; 3], [f32; 4], f32)>,
+    sets: Vec<(u32, u32)>,
+}
+
+fn wmo_root_doodads(
+    chain: Option<&mut benilla_formats::Chain>,
+    root_path: &str,
+) -> Option<Arc<WmoRootDoodads>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<WmoRootDoodads>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = root_path.to_ascii_lowercase();
+    if let Ok(c) = cache.lock() {
+        if let Some(hit) = c.get(&key) {
+            return hit.clone();
+        }
+    }
+    let parsed = chain.and_then(|c| {
+        let bytes = c.read_file(&key).ok()?;
+        let root = benilla_formats::parse_wmo_root(&bytes).ok()?;
+        Some(Arc::new(WmoRootDoodads {
+            insts: root
+                .doodads()
+                .iter()
+                .map(|d| (d.model.clone(), d.position, d.orientation, d.scale))
+                .collect(),
+            sets: root
+                .doodad_sets()
+                .iter()
+                .map(|s| (s.start, s.count))
+                .collect(),
+        }))
+    });
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= 256 {
+            c.clear();
+        }
+        c.insert(key, parsed.clone());
+    }
+    parsed
+}
+
+/// fnv-1a of root path, placement uid and doodad index: stable across the
+/// tiles a straddling building appears in, so the host's per-uid claim dedups
+/// a building's props exactly like an MDDF uid.
+fn wmo_doodad_uid(root: &str, placement_uid: u32, index: u32) -> u32 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in root
+        .bytes()
+        .chain(placement_uid.to_le_bytes())
+        .chain(index.to_le_bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let v = (h ^ (h >> 32)) as u32;
+    if v == 0 {
+        1
+    } else {
+        v
+    }
+}
+
+fn resolve_wmo_doodads(
+    mut chain: Option<&mut benilla_formats::Chain>,
+    wmos: &[benilla_formats::WmoInstance],
+) -> Vec<WmoDoodadInst> {
+    let mut out = Vec::new();
+    for inst in wmos {
+        let Some(root) = wmo_root_doodads(chain.as_deref_mut(), &inst.model) else {
+            continue;
+        };
+        let q_place = placement_quat(inst.rotation);
+        let mut ranges: Vec<(u32, u32)> = root.sets.first().copied().into_iter().collect();
+        if inst.doodad_set != 0 {
+            if let Some(s) = root.sets.get(inst.doodad_set as usize) {
+                ranges.push(*s);
+            }
+        }
+        for (start, count) in ranges {
+            for (di, (model, pos, q_local, scale)) in root
+                .insts
+                .iter()
+                .enumerate()
+                .skip(start as usize)
+                .take(count as usize)
+            {
+                if model.is_empty() {
+                    continue; // the MODN name did not resolve
+                }
+                let p = q_rot(q_place, *pos);
+                out.push(WmoDoodadInst {
+                    model: model.clone(),
+                    position: [
+                        p[0] + inst.position[0],
+                        p[1] + inst.position[1],
+                        p[2] + inst.position[2],
+                    ],
+                    quat: q_mul(q_place, *q_local),
+                    scale: *scale,
+                    uid: wmo_doodad_uid(&inst.model, inst.unique_id, di as u32),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Parse a prepared tile's prop models on the worker: the mesh (shared with
+/// `bn_doodad_load`), its rig (shared with `bn_doodad_rig_info`) and the base
+/// footprint the body walks against. `models` pairs the raw ADT path (the
+/// footprint's key) with its normalized form (the cache key).
+fn prefetch_doodad_models(chain: &mut benilla_formats::Chain, models: &[(String, String)]) {
+    for (raw, path) in models {
+        let Some(bytes) = read_m2_bytes_chain(chain, path) else {
+            continue;
+        };
+        let subs = match doodad_mesh_cached(path) {
+            Some(s) => s,
+            None => {
+                match benilla_formats::parse_m2_render_submeshes(&bytes, &parent_dir_of(path), &[])
+                {
+                    Ok(s) => doodad_mesh_insert(path, s),
+                    Err(_) => continue,
+                }
+            }
+        };
+        player::footprint_park(raw, player::footprint_of(subs.as_slice()));
+        doodad_rig::rig_ensure_from_bytes(path, &bytes, subs);
+    }
+}
+
+/// The directory part of a model path (the `load_m2_mesh` skin/texture base).
+fn parent_dir_of(path: &str) -> String {
+    match path.rfind(['\\', '/']) {
+        Some(i) => path[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Doodad placements in the loaded tile: the MDDF props plus the tile's
+/// WMO-internal doodads (0 when no tile).
 #[no_mangle]
 pub extern "C" fn bn_doodad_count(world: *const BnWorld) -> u32 {
     if world.is_null() {
         return 0;
     }
     let w = unsafe { &*world };
-    w.tile.as_ref().map_or(0, |t| t.doodads.len() as u32)
+    w.tile.as_ref().map_or(0, |t| t.doodads.len() as u32) + w.wmo_doodads.len() as u32
+}
+
+/// A merged doodad index past the MDDF placements, or `None` in the MDDF
+/// range (the caller handles those) / out of range.
+fn wmo_doodad_at(w: &BnWorld, i: u32) -> Option<&WmoDoodadInst> {
+    let mddf_n = w.tile.as_ref().map_or(0, |t| t.doodads.len()) as u32;
+    w.wmo_doodads.get(i.checked_sub(mddf_n)? as usize)
 }
 
 /// The baked flat for doodad `i`, or `None` before `bn_doodad_load`.
@@ -2420,9 +3402,11 @@ fn doodad_flat<'a>(world: *const BnWorld, i: u32) -> Option<&'a WmoFlat> {
     unsafe { &*world }.doodad_flats.get(&i)
 }
 
-/// Bake doodad `i` (load its M2 through the official `load_m2_mesh`, apply the
-/// MDDF placement with scale, cache). Returns the submesh count on success
-/// (UE iterates `[0, n)`), 0 on a miss or load failure.
+/// Bake doodad `i` (load its M2 through the official `load_m2_mesh`, apply
+/// the placement, cache). The merged index space: an MDDF placement applies
+/// its Euler rotation; a WMO-internal doodad applies its world-composed MODD
+/// quaternion. Returns the submesh count on success (UE iterates `[0, n)`),
+/// 0 on a miss or load failure.
 #[no_mangle]
 pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
     if world.is_null() {
@@ -2433,31 +3417,75 @@ pub extern "C" fn bn_doodad_load(world: *mut BnWorld, i: u32) -> u32 {
     if let Some(f) = w.doodad_flats.get(&i) {
         return f.subs.len() as u32;
     }
-    let Some((model_path, pos, rot, scale, center)) = w.tile.as_ref().and_then(|t| {
-        t.doodads.get(i as usize).map(|d| {
+    let center = w.tile.as_ref().map(|t| t.center);
+    let mddf = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.doodads.get(i as usize).map(|d| (d, t.center)))
+        .map(|(d, center)| (d.model.clone(), d.position, d.rotation, d.scale, center));
+    let placement = match mddf {
+        Some((model, pos, rot, scale, center)) => (model, pos, rot, scale, center, None),
+        None => {
+            let Some(d) = wmo_doodad_at(w, i) else {
+                return 0;
+            };
+            let Some(center) = center else {
+                return 0;
+            };
             (
                 d.model.clone(),
                 d.position,
-                d.rotation,
+                [0.0; 3],
                 d.scale,
-                t.center,
+                center,
+                Some(d.quat),
             )
-        })
-    }) else {
-        return 0;
+        }
     };
-    if !w.doodad_models.contains_key(&model_path) {
-        let Some(chain) = w.chain.as_mut() else {
-            return 0;
-        };
-        // `.mdx` -> `.m2` normalization happens inside load_m2_mesh.
-        let Ok(subs) = benilla_formats::load_m2_mesh(chain, &model_path) else {
-            return 0;
-        };
-        w.doodad_models.insert(model_path.clone(), subs);
+    let (model_path, pos, rot, scale, center, quat) = placement;
+    let subs = match doodad_mesh_cached(&model_path) {
+        Some(s) => s,
+        None => {
+            let Some(chain) = w.chain.as_mut() else {
+                return 0;
+            };
+            // `.mdx` -> `.m2` normalization happens inside load_m2_mesh.
+            let Ok(subs) = benilla_formats::load_m2_mesh(chain, &model_path) else {
+                return 0;
+            };
+            doodad_mesh_insert(&model_path, subs)
+        }
+    };
+    let flat = match quat {
+        Some(q) => build_wmo_flat_q(&subs, pos, q, center, scale, &model_path, w.chain.as_ref()),
+        None => build_wmo_flat(
+            &subs,
+            pos,
+            rot,
+            center,
+            scale,
+            &model_path,
+            w.chain.as_ref(),
+        ),
+    };
+    // The far-clip cull addresses the placement by uid after the tile drops
+    // its flats, so the baked sphere rides the uid-keyed table.
+    if let Some(uid) = w
+        .tile
+        .as_ref()
+        .and_then(|t| t.doodads.get(i as usize).map(|d| d.unique_id))
+        .or_else(|| wmo_doodad_at(w, i).map(|d| d.uid))
+    {
+        if let Ok(mut m) = doodad_spheres().lock() {
+            m.insert(uid, flat.sphere);
+        }
+        exterior::register_doodad(
+            uid,
+            pos,
+            quat.unwrap_or_else(|| placement_quat(rot)),
+            flat.aabb,
+        );
     }
-    let subs = &w.doodad_models[&model_path];
-    let flat = build_wmo_flat(subs, pos, rot, center, scale, &model_path, w.chain.as_ref());
     let n = flat.subs.len() as u32;
     w.doodad_flats.insert(i, flat);
     n
@@ -2486,7 +3514,9 @@ pub extern "C" fn bn_doodad_fill_vertices(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = doodad_flat(world, i) else { return 0 };
+    let Some(f) = doodad_flat(world, i) else {
+        return 0;
+    };
     let n = f.verts.len().min(cap as usize);
     unsafe { std::ptr::copy_nonoverlapping(f.verts.as_ptr(), out, n) };
     n as u32
@@ -2505,7 +3535,9 @@ pub extern "C" fn bn_doodad_fill_triangles(
     if out.is_null() {
         return 0;
     }
-    let Some(f) = doodad_flat(world, i) else { return 0 };
+    let Some(f) = doodad_flat(world, i) else {
+        return 0;
+    };
     let n = f.idx.len().min(cap as usize);
     for (j, sm) in f.subs.iter().enumerate() {
         if (sm.idx0 as usize) >= n {
@@ -2529,12 +3561,7 @@ pub extern "C" fn bn_doodad_fill_triangles(
 
 /// Submesh `j` of doodad `i`: writes {vtx0, vtx_n, idx0, idx_n}. Returns 1 on success.
 #[no_mangle]
-pub extern "C" fn bn_doodad_submesh(
-    world: *const BnWorld,
-    i: u32,
-    j: u32,
-    out: *mut u32,
-) -> u32 {
+pub extern "C" fn bn_doodad_submesh(world: *const BnWorld, i: u32, j: u32, out: *mut u32) -> u32 {
     if out.is_null() {
         return 0;
     }
@@ -2593,6 +3620,7 @@ pub extern "C" fn bn_doodad_model_path(
         .tile
         .as_ref()
         .and_then(|t| t.doodads.get(i as usize).map(|d| d.model.clone()))
+        .or_else(|| wmo_doodad_at(w, i).map(|d| d.model.clone()))
     else {
         return 0;
     };
@@ -2618,9 +3646,10 @@ pub extern "C" fn bn_doodad_model_path(
     1
 }
 
-/// MDDF `unique_id` of doodad `i` into `out`. Returns 1 on success.
+/// `unique_id` of doodad `i` into `out`: the MDDF uid, or a WMO doodad's
+/// synthetic one (root path + placement uid + index, stable across tiles).
 /// A straddling doodad appears in every overlapping tile's ADT with the same
-/// uid; the reference dedups by it (`0x694bc0`), and so does the host.
+/// uid; the client dedups by it, and so does the host.
 #[no_mangle]
 pub extern "C" fn bn_doodad_unique_id(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
     if world.is_null() || out.is_null() {
@@ -2632,6 +3661,7 @@ pub extern "C" fn bn_doodad_unique_id(world: *const BnWorld, i: u32, out: *mut u
         .tile
         .as_ref()
         .and_then(|t| t.doodads.get(i as usize).map(|d| d.unique_id))
+        .or_else(|| wmo_doodad_at(w, i).map(|d| d.uid))
     else {
         return 0;
     };
@@ -2644,12 +3674,20 @@ pub extern "C" fn bn_doodad_unique_id(world: *const BnWorld, i: u32, out: *mut u
 /// The baked submesh `j` of loaded doodad `i`, or `None` before load / out of
 /// range (the flat's submesh order is the model's, possibly truncated at the
 /// u16 cap, so indexing the model cache mirrors the published ranges).
-fn doodad_submesh(w: &BnWorld, i: u32, j: u32) -> Option<&benilla_formats::RenderSubmesh> {
+fn doodad_submesh(
+    w: &BnWorld,
+    i: u32,
+    j: u32,
+) -> Option<(Arc<Vec<benilla_formats::RenderSubmesh>>, usize)> {
     if !w.doodad_flats.contains_key(&i) {
         return None;
     }
-    let path = w.tile.as_ref()?.doodads.get(i as usize)?.model.clone();
-    w.doodad_models.get(&path)?.get(j as usize)
+    let path = match w.tile.as_ref().and_then(|t| t.doodads.get(i as usize)) {
+        Some(d) => d.model.clone(),
+        None => wmo_doodad_at(w, i)?.model.clone(),
+    };
+    let subs = doodad_mesh_cached(&path)?;
+    ((j as usize) < subs.len()).then_some((subs, j as usize))
 }
 
 /// Material animation of loaded doodad `i` submesh `j` at `elapsed` seconds
@@ -2672,9 +3710,10 @@ pub extern "C" fn bn_doodad_mat_anim(
     }
     // SAFETY: caller owns a valid const handle.
     let w = unsafe { &*world };
-    let Some(sm) = doodad_submesh(w, i, j) else {
+    let Some((subs, sm)) = doodad_submesh(w, i, j) else {
         return 0;
     };
+    let sm = &subs[sm];
     let band = elapsed as f32;
     let mut mask = 0u32;
 
@@ -2732,9 +3771,10 @@ pub extern "C" fn bn_doodad_blend(world: *const BnWorld, i: u32, j: u32, out: *m
     }
     // SAFETY: caller owns a valid const handle.
     let w = unsafe { &*world };
-    let Some(sm) = doodad_submesh(w, i, j) else {
+    let Some((subs, sm)) = doodad_submesh(w, i, j) else {
         return 0;
     };
+    let sm = &subs[sm];
     let mut v = match sm.blend {
         benilla_formats::ModelBlend::Opaque => 0,
         benilla_formats::ModelBlend::AlphaTest => 1,
@@ -2764,9 +3804,10 @@ pub extern "C" fn bn_doodad_wrap(world: *const BnWorld, i: u32, j: u32, out: *mu
     }
     // SAFETY: caller owns a valid const handle.
     let w = unsafe { &*world };
-    let Some(sm) = doodad_submesh(w, i, j) else {
+    let Some((subs, sm)) = doodad_submesh(w, i, j) else {
         return 0;
     };
+    let sm = &subs[sm];
     unsafe {
         *out = (sm.wrap_x as u32) | ((sm.wrap_y as u32) << 1);
     }
@@ -2792,7 +3833,10 @@ mod wmo_placement_tests {
                 [-0.691160, -0.107332, -0.156292, 0.697388],
             ),
             ([0.0, 0.0, 90.0], [FRAC_1_SQRT_2, -FRAC_1_SQRT_2, 0.0, 0.0]),
-            ([30.0, 45.0, 60.0], [0.360423, -0.822363, -0.391904, 0.200562]),
+            (
+                [30.0, 45.0, 60.0],
+                [0.360423, -0.822363, -0.391904, 0.200562],
+            ),
         ];
         for (deg, expected) in cases {
             let q = placement_quat(deg);
@@ -2803,72 +3847,198 @@ mod wmo_placement_tests {
     }
 }
 
+#[cfg(test)]
+mod m2_batch_parity_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Canonical blend class from benilla-formats' `ModelBlend` + additive bit,
+    /// in the FFI's numbering (3 and 4 are both additive to the host, so the
+    /// two collapse there).
+    fn canonical_class(blend: benilla_formats::ModelBlend, additive: bool) -> u8 {
+        use benilla_formats::ModelBlend::*;
+        match blend {
+            Opaque => 0,
+            AlphaTest => 1,
+            Blend if additive => 3,
+            Blend => 2,
+            Mod => 5,
+            Mod2x => 6,
+        }
+    }
+
+    fn host_class(blend: u8) -> u8 {
+        if blend == 4 {
+            3
+        } else {
+            blend
+        }
+    }
+
+    /// A vertex's identity by authored attributes; both paths copy the same
+    /// `model.vertices` values, so the bit patterns match exactly.
+    fn vertex_key(p: [f32; 3], n: [f32; 3], uv: [f32; 2]) -> [u32; 8] {
+        [
+            p[0].to_bits(),
+            p[1].to_bits(),
+            p[2].to_bits(),
+            n[0].to_bits(),
+            n[1].to_bits(),
+            n[2].to_bits(),
+            uv[0].to_bits(),
+            uv[1].to_bits(),
+        ]
+    }
+
+    /// Triangle (three vertex keys) plus blend class and two-sided flag.
+    type TriKey = ([u32; 8], [u32; 8], [u32; 8], u8, u8);
+
+    /// `m2_emit_tris` must reproduce `parse_m2_render_submeshes`, the canonical
+    /// per-batch draw list: the same triangles with the same multiplicity (the
+    /// glue plaza's ground draws once under its shadow decal, a creature's body
+    /// once under a glow overlay), each with its batch's own blend class and
+    /// two-sided flag. These models carry the cases that were wrong: overlapping
+    /// batches (UI_Human, UI_MainMenu), a character body with hair/object
+    /// batches, tauren fur (SkinExtra), and a mount mixing opaque and masked
+    /// layers.
+    #[test]
+    fn emit_matches_canonical_batches() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let paths = [
+            "Interface\\Glues\\Models\\UI_Human\\UI_Human.m2",
+            "Interface\\Glues\\Models\\UI_MainMenu\\UI_MainMenu.m2",
+            "Character\\Human\\Male\\HumanMale.m2",
+            "Character\\Tauren\\Male\\TaurenMale.m2",
+            "Creature\\RidingHorse\\RidingHorse.m2",
+        ];
+        let mut checked = 0;
+        for path in paths {
+            let Ok(bytes) = chain.read_file(path) else {
+                continue;
+            };
+            let Ok(fmt) = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())) else {
+                continue;
+            };
+            let model = fmt.model();
+            let Ok(skin) = model.parse_embedded_skin(bytes.as_slice(), 0) else {
+                continue;
+            };
+
+            let mut ours: HashMap<TriKey, i64> = HashMap::new();
+            for t in m2_emit_tris(model, &skin) {
+                let b = &skin.batches()[t.batch as usize];
+                let flags = u8::from(
+                    model
+                        .materials
+                        .get(b.material_index as usize)
+                        .is_some_and(|m| m.flags.bits() & 0x04 != 0),
+                );
+                let key = |i: u32| {
+                    let v = &model.vertices[i as usize];
+                    vertex_key(
+                        [v.position.x, v.position.y, v.position.z],
+                        [v.normal.x, v.normal.y, v.normal.z],
+                        [v.tex_coords.x, v.tex_coords.y],
+                    )
+                };
+                *ours
+                    .entry((
+                        key(t.a),
+                        key(t.b),
+                        key(t.c),
+                        host_class(m2_blend_class(model, b)),
+                        flags,
+                    ))
+                    .or_default() += 1;
+            }
+
+            let subs = benilla_formats::parse_m2_render_submeshes(&bytes, "", &[])
+                .unwrap_or_else(|e| panic!("{path}: canonical parse: {e}"));
+            let mut theirs: HashMap<TriKey, i64> = HashMap::new();
+            for s in &subs {
+                let blend = canonical_class(s.blend, s.additive);
+                for tri in s.indices.as_chunks::<3>().0 {
+                    let key = |i: u32| {
+                        let i = i as usize;
+                        vertex_key(s.positions[i], s.normals[i], s.uvs[i])
+                    };
+                    *theirs
+                        .entry((
+                            key(tri[0]),
+                            key(tri[1]),
+                            key(tri[2]),
+                            blend,
+                            u8::from(s.two_sided),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+            assert_eq!(ours, theirs, "{path}: emit list differs from canonical");
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            paths.len(),
+            "a parity model is missing from the install"
+        );
+    }
+}
+
 // ---- M2 model ----
 
 /// Resolve an M2 model path in the MPQ chain, returning its bytes.
 
 fn m2_bytes(world: &BnWorld, model_path: &str) -> Option<Vec<u8>> {
-
     for a in world.archives.iter().rev() {
-
         if !a.contains(model_path) {
-
             continue;
-
         }
 
         if let Ok(bytes) = a.read_file(model_path) {
-
             return Some(bytes);
-
         }
 
         break;
-
     }
 
     None
-
 }
 
 /// Read a u32 at byte offset (0 on OOB).
 
 fn rd_u32(b: &[u8], o: usize) -> Option<u32> {
-
-    let mut s = [0u8; 4]; s.copy_from_slice(b.get(o..o + 4)?);
+    let mut s = [0u8; 4];
+    s.copy_from_slice(b.get(o..o + 4)?);
 
     Some(u32::from_le_bytes(s))
-
 }
 
 /// Read a u16 at byte offset (0 on OOB).
 
 fn rd_u16(b: &[u8], o: usize) -> Option<u16> {
-
-    let mut s = [0u8; 2]; s.copy_from_slice(b.get(o..o + 2)?);
+    let mut s = [0u8; 2];
+    s.copy_from_slice(b.get(o..o + 2)?);
 
     Some(u16::from_le_bytes(s))
-
 }
 
 /// Read an i16 at byte offset.
 
 fn rd_i16(b: &[u8], o: usize) -> Option<i16> {
-
-    let mut s = [0u8; 2]; s.copy_from_slice(b.get(o..o + 2)?);
+    let mut s = [0u8; 2];
+    s.copy_from_slice(b.get(o..o + 2)?);
 
     Some(i16::from_le_bytes(s))
-
 }
 
 /// Read an f32 at byte offset (0 on OOB).
 
 fn rd_f32(b: &[u8], o: usize) -> Option<f32> {
-
-    let mut s = [0u8; 4]; s.copy_from_slice(b.get(o..o + 4)?);
+    let mut s = [0u8; 4];
+    s.copy_from_slice(b.get(o..o + 4)?);
 
     Some(f32::from_le_bytes(s))
-
 }
 
 /// The M2 header array count+offset pair for a given array tag at a header
@@ -2878,13 +4048,11 @@ fn rd_f32(b: &[u8], o: usize) -> Option<f32> {
 /// @ofs+4). Returns (count, offset) or None when the record is absent.
 
 fn m2_array_at(b: &[u8], ofs: usize, count_off: usize, ofs_off: usize) -> Option<(u32, u32)> {
-
     let c = rd_u32(b, ofs + count_off)?;
 
     let o = rd_u32(b, ofs + ofs_off)?;
 
     Some((c, o))
-
 }
 
 /// Locate the model-arrays base: the count/ofs record where `nBones`,
@@ -2896,39 +4064,27 @@ fn m2_array_at(b: &[u8], ofs: usize, count_off: usize, ofs_off: usize) -> Option
 const M2_ARRAYS: usize = 0x0C;
 
 fn m2_vertex_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0x38, 0x3C) // nVertices @0x44/0x48
-
 }
 
 fn m2_triangle_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0x04, 0x08) // nTriangles
-
 }
 
 fn m2_bones_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0x28, 0x2C) // nBones @0x34/0x38
-
 }
 
 fn m2_anim_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0x10, 0x14) // nAnimations @0x1C/0x20
-
 }
 
 fn m2_texture_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0x50, 0x54) // nTextures @0x5C/0x60
-
 }
 
 fn m2_attachment_array(b: &[u8]) -> Option<(u32, u32)> {
-
     m2_array_at(b, M2_ARRAYS, 0xF8, 0xFC) // nAttachments @0x104/0x108
-
 }
 
 /// Global-sequence durations (header ofsGlobalSequences @0x14 count,
@@ -2949,53 +4105,46 @@ fn parse_m2_global_sequences(b: &[u8]) -> Vec<u32> {
 /// Vertex count of the M2 file.
 
 pub fn m2_vertex_count(bytes: &[u8]) -> u32 {
-
     m2_vertex_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Triangle count of the M2 file.
 
 pub fn m2_triangle_count(bytes: &[u8]) -> u32 {
-
     m2_triangle_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Number of embedded BLP textures in the model.
 
 pub fn m2_texture_count(bytes: &[u8]) -> u32 {
-
     m2_texture_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Number of attachment points in the model.
 
 pub fn m2_attachment_count(bytes: &[u8]) -> u32 {
-
     m2_attachment_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Rest-pose bone world positions: walk each bone's parent chain,
 
 /// accumulating pivot translations. Returns a `Vec<[f32;3]>` of size
 
-/// `model.bones.len()` (in WoW Y-up coords, same space as `bone.pivot`).
+/// `model.bones.len` (in WoW Y-up coords, same space as `bone.pivot`).
 
 pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
-
     let (count, ofs) = m2_bones_array(bytes)?;
 
-    let capped = std::cmp::min(count as usize, bytes.len().saturating_sub(ofs as usize) / 108);
+    let capped = std::cmp::min(
+        count as usize,
+        bytes.len().saturating_sub(ofs as usize) / 108,
+    );
 
     let mut parents = Vec::with_capacity(capped);
 
     let mut pivots = Vec::with_capacity(capped);
 
     for i in 0..capped {
-
         let rec = ofs as usize + i * 108;
 
         let parent = rd_u16(bytes, rec + 8).unwrap_or(0xffff) as i16;
@@ -3009,7 +4158,6 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
         parents.push(parent);
 
         pivots.push([px, py, pz]);
-
     }
 
     // Accumulate: world = pivot + (parent>=0 ? world[parent] : 0).
@@ -3019,9 +4167,7 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
     let mut resolved = vec![false; capped];
 
     for i in 0..capped {
-
         fn walk(
-
             i: usize,
 
             parents: &[i16],
@@ -3031,13 +4177,9 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
             out: &mut [[f32; 3]],
 
             resolved: &mut [bool],
-
         ) {
-
             if resolved[i] || out[i][0].is_nan() {
-
                 return;
-
             }
 
             resolved[i] = true;
@@ -3049,7 +4191,6 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
             let mut guard = 0;
 
             while p < parents.len() && guard < 512 {
-
                 acc[0] += pivots[p][0];
 
                 acc[1] += pivots[p][1];
@@ -3059,19 +4200,203 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
                 p = parents[p] as usize;
 
                 guard += 1;
-
             }
 
             out[i] = acc;
-
         }
 
         walk(i, &parents, &pivots, &mut out, &mut resolved);
-
     }
 
     Some(out)
+}
 
+/// One M2 triangle to draw, with the skin batch it belongs to.
+pub(crate) struct M2EmitTri {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    /// Index into [`benilla_m2::Skin::batches`], for texture/blend/two-sided.
+    pub batch: u16,
+}
+
+/// The M2's static draw list, in batch file order: one entry per triangle a
+/// batch actually draws. Canonical `parse_m2_render_submeshes` makes one submesh
+/// per batch, so a section covered by several batches (the glue plaza's ground
+/// plus its shadow decal, a creature's body plus a glow overlay) is drawn once
+/// per batch, and a triangle no batch covers is never drawn. Constant-invisible
+/// batches drop here too, as the client's static cull does.
+pub(crate) fn m2_emit_tris(model: &benilla_m2::M2Model, skin: &benilla_m2::Skin) -> Vec<M2EmitTri> {
+    let lookup = skin.indices();
+    let tris = skin.triangles();
+    let sections = skin.submeshes();
+    let mut out = Vec::new();
+    for (bi, b) in skin.batches().iter().enumerate() {
+        let Some(sec) = sections.get(b.skin_section_index as usize) else {
+            continue;
+        };
+        // `triangle_start`/`triangle_count` are flat index slots, not triangles.
+        let start = sec.triangle_start as usize;
+        let end = start
+            .saturating_add(sec.triangle_count as usize)
+            .min(tris.len());
+        if start >= end || m2_batch_static_alpha(model, b) == Some(0.0) {
+            continue;
+        }
+        for t in tris[start..end].as_chunks::<3>().0 {
+            let (Some(&a), Some(&b2), Some(&c)) = (
+                lookup.get(t[0] as usize),
+                lookup.get(t[1] as usize),
+                lookup.get(t[2] as usize),
+            ) else {
+                continue;
+            };
+            let nv = model.vertices.len();
+            if a as usize >= nv || b2 as usize >= nv || c as usize >= nv {
+                continue;
+            }
+            out.push(M2EmitTri {
+                a: u32::from(a),
+                b: u32::from(b2),
+                c: u32::from(c),
+                batch: bi as u16,
+            });
+        }
+    }
+    out
+}
+
+/// A batch's static alpha factor `colorAlpha · transparencyWeight`. `Some(0.0)`
+/// when constant tracks hide it; `None` when a track varies, leaving the
+/// decision to the frame the client samples.
+fn m2_batch_static_alpha(model: &benilla_m2::M2Model, b: &benilla_m2::SkinBatch) -> Option<f32> {
+    let scalar = |t: Option<&benilla_m2::M2ScalarTrack>| match t {
+        Some(t) if t.keys.is_empty() => Some(1.0),
+        Some(t) => t.constant(),
+        None => Some(1.0),
+    };
+    let color = scalar(model.color_alpha_tracks.get(b.color_index as usize));
+    let weight = if b.texture_count != 0 {
+        scalar(
+            model
+                .transparency_lookup
+                .get(b.weight_combo_index as usize)
+                .and_then(|&t| model.transparency_tracks.get(t as usize)),
+        )
+    } else {
+        Some(1.0)
+    };
+    match (color, weight) {
+        (Some(c), Some(w)) => Some(c * w),
+        _ => None,
+    }
+}
+
+/// The UE material class for a batch's M2 blend mode, through the same remap as
+/// benilla-formats `m2_batches`: 0 opaque, 1 alpha-key, 2 alpha, 3/4 additive
+/// (NoAlphaAdd/Add), 5 Mod, 6 Mod2x.
+pub(crate) fn m2_blend_class(model: &benilla_m2::M2Model, b: &benilla_m2::SkinBatch) -> u8 {
+    match model
+        .materials
+        .get(b.material_index as usize)
+        .map(|m| m.blend_mode.bits())
+    {
+        Some(0) | None => 0,
+        Some(1) => 1,
+        Some(3) => 3,
+        Some(4) => 4,
+        Some(5) => 5,
+        Some(6) => 6,
+        Some(_) => 2,
+    }
+}
+
+// ---- Parsed M2 cache ----
+//
+// One spawn drives six to eight model entry points (counts, fill, character
+// slots, texture names, animation lookup) and every one used to re-read the
+// MD20 from the MPQ: the read alone measures ~20 ms for a character model, so
+// a single NPC cost 100-300 ms on the game thread. The bytes, the parsed model
+// and the embedded skin are path-keyed and read once per install.
+
+struct M2Cached {
+    bytes: Vec<u8>,
+    format: benilla_m2::M2Format,
+    /// Embedded skin profile 0; `None` for a skin-less model (the dense-triple
+    /// fallback applies).
+    skin: Option<benilla_m2::Skin>,
+}
+
+/// Bound on the raw M2 bytes kept parsed: a long tour visits every creature
+/// model in the world, and character M2s run 2-4 MB each.
+const M2_CACHE_BYTES: usize = 128 << 20;
+
+struct M2Cache {
+    entries: HashMap<String, Arc<M2Cached>>,
+    /// Least-recently-used order (front is oldest).
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+fn m2_cache() -> &'static Mutex<M2Cache> {
+    static CACHE: OnceLock<Mutex<M2Cache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(M2Cache {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+        })
+    })
+}
+
+/// The parsed `path` from the chain, reading it only once per install.
+fn m2_cached(archives: &[Archive], path: &str) -> Option<Arc<M2Cached>> {
+    let key = path.to_ascii_lowercase();
+    if let Ok(mut cache) = m2_cache().lock() {
+        if let Some(e) = cache.entries.get(&key).cloned() {
+            if let Some(pos) = cache.order.iter().position(|k| k == &key) {
+                cache.order.remove(pos);
+                cache.order.push_back(key);
+            }
+            return Some(e);
+        }
+    }
+
+    let mut bytes = None;
+    for a in archives.iter().rev() {
+        if !a.contains(path) {
+            continue;
+        }
+        if let Ok(b) = a.read_file(path) {
+            bytes = Some(b);
+        }
+        break;
+    }
+    let bytes = bytes?;
+    let format = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())).ok()?;
+    let skin = format.model().parse_embedded_skin(bytes.as_slice(), 0).ok();
+    let entry = Arc::new(M2Cached {
+        bytes,
+        format,
+        skin,
+    });
+
+    if let Ok(mut cache) = m2_cache().lock() {
+        if let Some(old) = cache.entries.insert(key.clone(), entry.clone()) {
+            cache.bytes = cache.bytes.saturating_sub(old.bytes.len());
+        }
+        cache.order.push_back(key);
+        cache.bytes += entry.bytes.len();
+        while cache.bytes > M2_CACHE_BYTES && cache.order.len() > 1 {
+            let Some(victim) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = cache.entries.remove(&victim) {
+                cache.bytes = cache.bytes.saturating_sub(old.bytes.len());
+            }
+        }
+    }
+    Some(entry)
 }
 
 /// One M2 vertex: `position` (C3, @0), weights (@0x0c), 4 bone indices
@@ -3082,7 +4407,7 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
 
 ///
 
-///   world_pos = Σ (bone_world_matrix[k] * (position - pivot[k] + pivot[k].world)) * (w_k / 255)
+/// world_pos = Σ (bone_world_matrix[k] * (position - pivot[k] + pivot[k].world)) * (w_k / 255)
 
 ///
 
@@ -3095,7 +4420,6 @@ pub fn m2_bone_rest_positions(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
 #[no_mangle]
 
 pub extern "C" fn bn_model_fill(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -3105,211 +4429,127 @@ pub extern "C" fn bn_model_fill(
     out_triangles: *mut BnTriangle,
 
     cap: u32,
-
 ) -> u32 {
-
-    if world.is_null()
-
-        || model_path.is_null()
-
-        || out_vertices.is_null()
-
-        || out_triangles.is_null()
-
+    if world.is_null() || model_path.is_null() || out_vertices.is_null() || out_triangles.is_null()
     {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
+    let model = cached.format.model();
 
-        if !a.contains(p) {
+    let nv = model.vertices.len().min(cap as usize);
 
-            continue;
+    for i in 0..nv {
+        let v = &model.vertices[i];
 
+        // model.cpp initCommon: just fixCoordSystem(pos), no bone transform.
+
+        // Bone matrices are only applied during animation ticks.
+
+        let (qx, qy, qz) = wow_vec_to_ue(v.position.x, v.position.y, v.position.z);
+
+        let (nx, ny, nz) = wow_vec_to_ue(v.normal.x, v.normal.y, v.normal.z);
+
+        // SAFETY: out_vertices has room for cap BnVertex.
+
+        unsafe {
+            *out_vertices.add(i) = BnVertex {
+                x: qx,
+
+                y: qy,
+
+                z: qz,
+
+                nx,
+
+                ny,
+
+                nz,
+
+                u: v.tex_coords.x,
+
+                v: v.tex_coords.y,
+            };
         }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            if let Ok(fmt) = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())) {
-
-                let model = fmt.model();
-
-                let nv = model.vertices.len().min(cap as usize);
-
-                for i in 0..nv {
-
-                    let v = &model.vertices[i];
-
-                    // model.cpp initCommon: just fixCoordSystem(pos), no bone transform.
-
-                    // Bone matrices are only applied during animation ticks.
-
-                    let (qx, qy, qz) = wow_vec_to_ue(v.position.x, v.position.y, v.position.z);
-
-                    let (nx, ny, nz) = wow_vec_to_ue(v.normal.x, v.normal.y, v.normal.z);
-
-                    // SAFETY: out_vertices has room for cap BnVertex.
-
-                    unsafe {
-
-                        *out_vertices.add(i) = BnVertex {
-
-                            x: qx,
-
-                            y: qy,
-
-                            z: qz,
-
-                            nx,
-
-                            ny,
-
-                            nz,
-
-                            u: v.tex_coords.x,
-
-                            v: v.tex_coords.y,
-
-                        };
-
-                    }
-
-                }
-
-                // Real winding: the model's embedded skin profile (index 0) holds
-
-                // the true triangle index buffer. Fall back to sequential triples
-
-                // when no skin is embedded, so the mesh is always closed.
-
-                // nezha original: final_vertex_index = indexLookup[triangles[i]]
-
-                // skin.indices() = indexLookup (vertex remap table)
-
-                // skin.triangles() = triangle index array (indices into indexLookup)
-
-                let skin = model.parse_embedded_skin(bytes.as_slice(), 0).ok();
-
-                let (tri, two_sided): (Vec<u16>, Vec<bool>) = match skin {
-
-                    Some(s) => {
-
-                        let index_lookup = s.indices();
-
-                        let tris = s.triangles();
-
-                        let tri: Vec<u16> = tris.iter()
-
-                            .map(|&t| index_lookup.get(t as usize).copied().unwrap_or(t))
-
-                            .collect();
-
-                        // Per-batch two-sided from M2 material render flag 0x04,
-                        // same semantics as benilla-formats m2_batches: the section
-                        // range covers the FLAT u16 triangle array
-                        // (triangle_start..+triangle_count, no *3).
-                        let mut ts = vec![false; tri.len()];
-
-                        let sections = s.submeshes();
-
-                        for b in s.batches() {
-
-                            let Some(sec) = sections.get(b.skin_section_index as usize) else {
-
-                                continue;
-
-                            };
-
-                            let start = sec.triangle_start as usize;
-
-                            let end = (start + sec.triangle_count as usize).min(ts.len());
-
-                            if start >= end {
-
-                                continue;
-
-                            }
-
-                            let two = model
-
-                                .materials
-
-                                .get(b.material_index as usize)
-
-                                .is_some_and(|m| m.flags.bits() & 0x04 != 0);
-
-                            if two {
-
-                                ts[start..end].fill(true);
-
-                            }
-
-                        }
-
-                        (tri, ts)
-                    }
-
-                    None => ((0..nv).map(|i| i as u16).collect(), vec![false; nv]),
-                };
-
-                let mut ti = 0u32;
-
-                let mut n = 0usize;
-
-                while n + 2 < tri.len() && ti < cap {
-
-                    // SAFETY: out_triangles has room for cap BnTriangle.
-
-                    unsafe {
-
-                        *out_triangles.add(ti as usize) = BnTriangle {
-
-                            a: tri[n] as u32,
-
-                            b: tri[n + 1] as u32,
-
-                            c: tri[n + 2] as u32,
-
-                            material: 0,
-
-                            flags: if two_sided[n] { 1 } else { 0 },
-
-                        };
-
-                    }
-
-                    ti += 1;
-
-                    n += 3;
-
-                }
-
-                return ti;
-
-            }
-
-            break;
-
-        }
-
     }
 
-    0
+    // Real winding: the model's embedded skin profile (index 0) holds
 
+    // the true triangle index buffer. Fall back to sequential triples
+
+    // when no skin is embedded, so the mesh is always closed.
+
+    // nezha original: final_vertex_index = indexLookup[triangles[i]]
+
+    // skin.indices = indexLookup (vertex remap table)
+
+    // skin.triangles = triangle index array (indices into indexLookup)
+
+    let ntri = match &cached.skin {
+        Some(skin) => {
+            let batches = skin.batches();
+            let mut ti = 0usize;
+            for t in m2_emit_tris(model, skin) {
+                if ti >= cap as usize {
+                    break;
+                }
+                let b = &batches[t.batch as usize];
+                let flags = u8::from(
+                    model
+                        .materials
+                        .get(b.material_index as usize)
+                        .is_some_and(|m| m.flags.bits() & 0x04 != 0),
+                );
+                // SAFETY: out_triangles has room for cap BnTriangle.
+                unsafe {
+                    *out_triangles.add(ti) = BnTriangle {
+                        a: t.a,
+                        b: t.b,
+                        c: t.c,
+                        material: m2_blend_class(model, b),
+                        flags,
+                    };
+                }
+                ti += 1;
+            }
+            ti
+        }
+        None => {
+            // No embedded skin: dense sequential triples, so the mesh
+            // is always closed (the old fallback).
+            let mut ti = 0usize;
+            while ti * 3 + 2 < nv && ti < cap as usize {
+                let n = ti * 3;
+                // SAFETY: out_triangles has room for cap BnTriangle.
+                unsafe {
+                    *out_triangles.add(ti) = BnTriangle {
+                        a: n as u32,
+                        b: (n + 1) as u32,
+                        c: (n + 2) as u32,
+                        material: 0,
+                        flags: 0,
+                    };
+                }
+                ti += 1;
+            }
+            ti
+        }
+    };
+
+    ntri as u32
 }
 
 /// Count of M2 vertices. The UE renderer sizes its vertex buffer from this
@@ -3318,52 +4558,22 @@ pub extern "C" fn bn_model_fill(
 
 #[no_mangle]
 
-pub extern "C" fn bn_model_vertex_count(
-
-    world: *const BnWorld,
-
-    model_path: *const c_char,
-
-) -> u32 {
-
+pub extern "C" fn bn_model_vertex_count(world: *const BnWorld, model_path: *const c_char) -> u32 {
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
-
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_vertex_count(bytes.as_slice());
-
-        }
-
-        break;
-
-    }
-
-    0
-
+    m2_cached(&w.archives, p).map_or(0, |c| c.format.model().vertices.len() as u32)
 }
 
 /// Count of M2 triangles. The UE renderer sizes its index buffer from this.
@@ -3372,76 +4582,37 @@ pub extern "C" fn bn_model_vertex_count(
 
 #[no_mangle]
 
-pub extern "C" fn bn_model_triangle_count(
-
-    world: *const BnWorld,
-
-    model_path: *const c_char,
-
-) -> u32 {
-
+pub extern "C" fn bn_model_triangle_count(world: *const BnWorld, model_path: *const c_char) -> u32 {
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
+    let model = cached.format.model();
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            // Match bn_model_fill exactly: the true index buffer is the
-
-            // embedded skin's triangle list (indexLookup-mapped). Count its
-
-            // triangles (indices / 3).
-
-            if let Ok(fmt) = benilla_m2::parse_m2(&mut Cursor::new(bytes.as_slice())) {
-
-                let model = fmt.model();
-
-                if let Ok(skin) = model.parse_embedded_skin(bytes.as_slice(), 0) {
-
-                    return (skin.triangles().len() / 3) as u32;
-
-                }
-
-                // No embedded skin: fall back to a dense sequential triangle
-
-                // strip over the vertex list (same fallback bn_model_fill
-
-                // uses), which is floor(verts/3).
-
-                return (model.vertices.len() / 3) as u32;
-
-            }
-
-            break;
-
-        }
-
+    // Match bn_model_fill exactly: one triangle per (batch, section
+    // triangle) pair, so a section covered by several batches counts
+    // once per batch.
+    if let Some(skin) = &cached.skin {
+        return m2_emit_tris(model, skin).len() as u32;
     }
 
-    0
-
+    // No embedded skin: fall back to a dense sequential triangle
+    // strip over the vertex list (same fallback bn_model_fill
+    // uses), which is floor(verts/3).
+    (model.vertices.len() / 3) as u32
 }
 
 /// Count of embedded M2 textures (the `textures` array, one BLP each).
@@ -3452,52 +4623,26 @@ pub extern "C" fn bn_model_triangle_count(
 
 #[no_mangle]
 
-pub extern "C" fn bn_model_texture_count(
-
-    world: *const BnWorld,
-
-    model_path: *const c_char,
-
-) -> u32 {
-
+pub extern "C" fn bn_model_texture_count(world: *const BnWorld, model_path: *const c_char) -> u32 {
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_texture_count(bytes.as_slice());
-
-        }
-
-        break;
-
-    }
-
-    0
-
+    m2_texture_count(cached.bytes.as_slice())
 }
 
 /// Write the embedded texture `idx`'s BLP filename (or `<index idx>`) into
@@ -3507,7 +4652,6 @@ pub extern "C" fn bn_model_texture_count(
 #[no_mangle]
 
 pub extern "C" fn bn_model_texture_name(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -3517,124 +4661,97 @@ pub extern "C" fn bn_model_texture_name(
     out: *mut u8,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() || cap == 0 {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let bytes = &cached.bytes;
 
-            continue;
+    let (_, ofs) = match m2_texture_array(bytes.as_slice()) {
+        Some(v) => v,
 
-        }
+        None => return 0,
+    };
 
-        if let Ok(bytes) = a.read_file(p) {
+    // Each M2Texture is 0x28: name (max 0x20 bytes) + track.
 
-            let (_, ofs) = match m2_texture_array(bytes.as_slice()) {
+    // Each M2TextureDef is 0x10: type u32 @0, flags u32 @4,
 
-                Some(v) => v,
+    // nameLen u32 @8, nameOfs u32 @12. The filename is a string in
 
-                None => return 0,
+    // the M2 string table (same layout benilla-m2 parses).
 
-            };
+    let rec = ofs as usize + idx as usize * 0x10;
 
-            // Each M2Texture is 0x28: name (max 0x20 bytes) + track.
+    // M2TextureDef: type u32 @0, flags u32 @4, nameLen u32 @8, nameOfs u32 @12.
+    let tex_type = rd_u32(bytes.as_slice(), rec).unwrap_or(0);
 
-            // Each M2TextureDef is 0x10: type u32 @0, flags u32 @4,
+    let (name_len, name_ofs) = match (
+        rd_u32(bytes.as_slice(), rec + 8),
+        rd_u32(bytes.as_slice(), rec + 12),
+    ) {
+        (Some(l), Some(o)) => (l, o),
 
-            // nameLen u32 @8, nameOfs u32 @12. The filename is a string in
+        _ => return 0,
+    };
 
-            // the M2 string table (same layout benilla-m2 parses).
+    let name_bytes = bytes
+        .get(name_ofs as usize..name_ofs as usize + name_len as usize)
+        .map(|s| {
+            let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
 
-            let rec = ofs as usize + idx as usize * 0x10;
+            &s[..end]
+        })
+        .unwrap_or(b"");
 
-            // M2TextureDef: type u32 @0, flags u32 @4, nameLen u32 @8, nameOfs u32 @12.
-            let tex_type = rd_u32(bytes.as_slice(), rec).unwrap_or(0);
+    let is_empty = name_bytes.is_empty();
 
-            let (name_len, name_ofs) = match (rd_u32(bytes.as_slice(), rec + 8), rd_u32(bytes.as_slice(), rec + 12)) {
+    // Monster1/2/3 (11..=13) slots name no file: the WoW client looks
+    // the skin up through CreatureDisplayInfo.dbc. Skin-less load, so
+    // infer candidates beside the model (`Creature\X\X.m2` ->
+    // XSkinBrown/White/Yellow.blp, then X.blp) and keep the first the
+    // chain holds; other empty slots stay empty.
+    let text: Vec<u8> = if is_empty && (11..=13).contains(&tex_type) {
+        let dir_end = p.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
+        let stem_end = p.rfind('.').unwrap_or(p.len());
+        let dir = &p[..dir_end];
+        let stem = &p[dir_end..stem_end];
+        ["SkinBrown", "SkinWhite", "SkinYellow", ""]
+            .iter()
+            .map(|s| format!("{dir}{stem}{s}.blp"))
+            .find(|c| w.chain.as_ref().is_some_and(|ch| ch.contains(c)))
+            .unwrap_or_default()
+            .into_bytes()
+    } else if is_empty {
+        return 0;
+    } else {
+        name_bytes.to_vec()
+    };
 
-                (Some(l), Some(o)) => (l, o),
+    let n = text.len().min((cap as usize) - 1);
 
-                _ => return 0,
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), out, n);
 
-            };
-
-            let name_bytes = bytes
-
-                .get(name_ofs as usize..name_ofs as usize + name_len as usize)
-
-                .map(|s| {
-
-                    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-
-                    &s[..end]
-
-                })
-
-                .unwrap_or(b"");
-
-            let is_empty = name_bytes.is_empty();
-
-            // Monster1/2/3 (11..=13) slots name no file: the WoW client looks
-            // the skin up through CreatureDisplayInfo.dbc. Skin-less load, so
-            // infer candidates beside the model (`Creature\X\X.m2` ->
-            // XSkinBrown/White/Yellow.blp, then X.blp) and keep the first the
-            // chain holds; other empty slots stay empty.
-            let text: Vec<u8> = if is_empty && (11..=13).contains(&tex_type) {
-                let dir_end = p.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
-                let stem_end = p.rfind('.').unwrap_or(p.len());
-                let dir = &p[..dir_end];
-                let stem = &p[dir_end..stem_end];
-                ["SkinBrown", "SkinWhite", "SkinYellow", ""]
-                    .iter()
-                    .map(|s| format!("{dir}{stem}{s}.blp"))
-                    .find(|c| w.chain.as_ref().is_some_and(|ch| ch.contains(c)))
-                    .unwrap_or_default()
-                    .into_bytes()
-            } else if is_empty {
-                return 0;
-            } else {
-                name_bytes.to_vec()
-            };
-
-            let n = text.len().min((cap as usize) - 1);
-
-            unsafe {
-
-                std::ptr::copy_nonoverlapping(text.as_ptr(), out, n);
-
-                *out.add(n) = 0;
-
-            }
-
-            return (n + 1) as u32;
-
-        }
-
-        break;
-
+        *out.add(n) = 0;
     }
 
-    0
-
+    (n + 1) as u32
 }
 
 /// Number of attachment points on the model.
@@ -3642,51 +4759,29 @@ pub extern "C" fn bn_model_texture_name(
 #[no_mangle]
 
 pub extern "C" fn bn_model_attachment_count(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_attachment_count(bytes.as_slice());
-
-        }
-
-        break;
-
-    }
-
-    0
-
+    m2_attachment_count(cached.bytes.as_slice())
 }
 
 /// Attachment record: `out_id`, `out_bone`, `out_pos` (3 floats). Returns 1
@@ -3704,7 +4799,6 @@ pub extern "C" fn bn_model_attachment_count(
 #[no_mangle]
 
 pub extern "C" fn bn_model_attachment_info(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -3716,147 +4810,97 @@ pub extern "C" fn bn_model_attachment_info(
     out_bone: *mut u16,
 
     out_pos: *mut f32,
-
 ) -> u32 {
-
-    if world.is_null() || model_path.is_null() || out_id.is_null()
-
+    if world.is_null()
+        || model_path.is_null()
+        || out_id.is_null()
         || out_bone.is_null()
-
         || out_pos.is_null()
-
     {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let bytes = &cached.bytes;
 
-            continue;
+    let (count, ofs) = match m2_attachment_array(bytes.as_slice()) {
+        Some(v) => v,
 
-        }
+        None => return 0,
+    };
 
-        if let Ok(bytes) = a.read_file(p) {
-
-            let (count, ofs) = match m2_attachment_array(bytes.as_slice()) {
-
-                Some(v) => v,
-
-                None => return 0,
-
-            };
-
-            if idx >= count {
-
-                return 0;
-
-            }
-
-            let rec = ofs as usize + idx as usize * 48;
-
-            let id = rd_u32(&bytes, rec).unwrap_or(0) as u16;
-
-            let bone = rd_u32(&bytes, rec + 4).unwrap_or(0) as u16;
-
-            let px = rd_f32(&bytes, rec + 8).unwrap_or(0.0);
-
-            let py = rd_f32(&bytes, rec + 12).unwrap_or(0.0);
-
-            let pz = rd_f32(&bytes, rec + 16).unwrap_or(0.0);
-
-            let (qx, qy, qz) = wow_vec_to_ue(px, py, pz);
-
-            unsafe {
-
-                *out_id = id;
-
-                *out_bone = bone;
-
-                *out_pos = qx;
-
-                *out_pos.add(1) = qy;
-
-                *out_pos.add(2) = qz;
-
-            }
-
-            return 1;
-
-        }
-
-        break;
-
+    if idx >= count {
+        return 0;
     }
 
-    0
+    let rec = ofs as usize + idx as usize * 48;
 
+    let id = rd_u32(&bytes, rec).unwrap_or(0) as u16;
+
+    let bone = rd_u32(&bytes, rec + 4).unwrap_or(0) as u16;
+
+    let px = rd_f32(&bytes, rec + 8).unwrap_or(0.0);
+
+    let py = rd_f32(&bytes, rec + 12).unwrap_or(0.0);
+
+    let pz = rd_f32(&bytes, rec + 16).unwrap_or(0.0);
+
+    let (qx, qy, qz) = wow_vec_to_ue(px, py, pz);
+
+    unsafe {
+        *out_id = id;
+
+        *out_bone = bone;
+
+        *out_pos = qx;
+
+        *out_pos.add(1) = qy;
+
+        *out_pos.add(2) = qz;
+    }
+
+    1
 }
 
 /// Number of skeleton bones in the model.
 
 #[no_mangle]
 
-pub extern "C" fn bn_model_bone_count(
-
-    world: *const BnWorld,
-
-    model_path: *const c_char,
-
-) -> u32 {
-
+pub extern "C" fn bn_model_bone_count(world: *const BnWorld, model_path: *const c_char) -> u32 {
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_bones_array(bytes.as_slice()).map(|(c, _)| c).unwrap_or(0);
-
-        }
-
-        break;
-
-    }
-
-    0
-
+    m2_bones_array(cached.bytes.as_slice())
+        .map(|(c, _)| c)
+        .unwrap_or(0)
 }
 
 /// Rest-pose world position of bone `idx` in UE axes (Y-flipped). Returns 1
@@ -3866,7 +4910,6 @@ pub extern "C" fn bn_model_bone_count(
 #[no_mangle]
 
 pub extern "C" fn bn_model_bone_rest_position(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -3874,99 +4917,72 @@ pub extern "C" fn bn_model_bone_rest_position(
     idx: u32,
 
     out: *mut f32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let Some(poses) = m2_bone_rest_positions(cached.bytes.as_slice()) else {
+        return 0;
+    };
 
-            continue;
+    if (idx as usize) < poses.len() {
+        let v = poses[idx as usize];
 
+        let (qx, qy, qz) = wow_vec_to_ue(v[0], v[1], v[2]);
+
+        unsafe {
+            *out = qx;
+
+            *out.add(1) = qy;
+
+            *out.add(2) = qz;
         }
 
-        if let Ok(bytes) = a.read_file(p) {
-
-            if let Some(poses) = m2_bone_rest_positions(bytes.as_slice()) {
-
-                if (idx as usize) < poses.len() {
-
-                    let v = poses[idx as usize];
-
-                    let (qx, qy, qz) = wow_vec_to_ue(v[0], v[1], v[2]);
-
-                    unsafe {
-
-                        *out = qx;
-
-                        *out.add(1) = qy;
-
-                        *out.add(2) = qz;
-
-                    }
-
-                    return 1;
-
-                }
-
-            }
-
-        }
-
-        break;
-
+        return 1;
     }
 
     0
-
 }
 
 // ---- M2 skeletal animation (Phase 3) ----
 
 /// A row-major 4x4 matrix, 16 floats.
 
-type BnMat4 = [f32; 16];
+pub(crate) type BnMat4 = [f32; 16];
 
 /// A per-sequence / gseq M2Vec3 (translation or scale) track.
 
 #[derive(Clone)]
 
 struct F32Track {
-
     interp: u16,
 
-    seq: i16,          // -1 = per-sequence timeline, >=0 = gseq index
+    seq: i16, // -1 = per-sequence timeline, >=0 = gseq index
 
     ranges: Vec<(u32, u32)>, // one (lo,hi) key-index window per sequence
 
     times: Vec<u32>,
 
     keys: Vec<[f32; 3]>,
-
 }
 
 impl F32Track {
-
     fn parse(b: &[u8], ofs: usize, anim_count: u32) -> Self {
-
         let interp = rd_u16(b, ofs).unwrap_or(0);
 
         let seq = rd_i16(b, ofs + 2).unwrap_or(-1);
@@ -3988,21 +5004,17 @@ impl F32Track {
         let mut ranges = Vec::with_capacity(n_ranges as usize);
 
         for i in 0..n_ranges as usize {
-
             let lo = rd_u32(b, ofs_ranges + i * 8).unwrap_or(0);
 
             let hi = rd_u32(b, ofs_ranges + i * 8 + 4).unwrap_or(0);
 
             ranges.push((lo, hi));
-
         }
 
         let mut times = Vec::with_capacity(n_times as usize);
 
         for i in 0..n_times as usize {
-
             times.push(rd_u32(b, ofs_times + i * 4).unwrap_or(0));
-
         }
 
         // keys: first n_keys u32 times, then n_keys vec3 values (12 bytes each)
@@ -4012,25 +5024,24 @@ impl F32Track {
         let mut keys = Vec::with_capacity(n);
 
         for i in 0..n {
-
             let _ = rd_u32(b, 0); // key block has no time prefix; times[] is separate
 
             let vofs = ofs_keys + i * 12;
 
             keys.push([
-
                 rd_f32(b, vofs).unwrap_or(0.0),
-
                 rd_f32(b, vofs + 4).unwrap_or(0.0),
-
                 rd_f32(b, vofs + 8).unwrap_or(0.0),
-
             ]);
-
         }
 
-        F32Track { interp, seq, ranges, times, keys }
-
+        F32Track {
+            interp,
+            seq,
+            ranges,
+            times,
+            keys,
+        }
     }
 
     /// Sample at (anim_index, time_ms), mirroring Animated::getValue.
@@ -4040,7 +5051,6 @@ impl F32Track {
     /// Returns Option (None = track unused / no keys).
 
     fn sample(
-
         &self,
 
         anim: usize,
@@ -4050,25 +5060,18 @@ impl F32Track {
         global_time_ms: u32,
 
         global_seqs: &[u32],
-
     ) -> Option<[f32; 3]> {
-
         if self.keys.is_empty() {
-
             return None;
-
         }
 
         if self.interp == 0 {
-
             // INTERPOLATION_NONE: static default value
 
             return Some(self.keys[0]);
-
         }
 
         let (lo, hi): (usize, usize) = if self.seq != -1 {
-
             // gseq track: wrap on the global sequence clock
 
             let gsi = self.seq as usize;
@@ -4080,85 +5083,66 @@ impl F32Track {
             let _ = t;
 
             (0, self.keys.len() - 1)
-
         } else {
-
             // per-sequence track: use ranges[anim] as key window
 
             let (rlo, rhi) = if anim < self.ranges.len() {
-
-                (
-
-                    self.ranges[anim].0 as usize,
-
-                    self.ranges[anim].1 as usize,
-
-                )
-
+                (self.ranges[anim].0 as usize, self.ranges[anim].1 as usize)
             } else if !self.ranges.is_empty() {
-
                 // out-of-range anim: fall back to full range
 
                 (0, self.keys.len() - 1)
-
             } else {
-
                 // no ranges at all: full key range
 
                 (0, self.keys.len() - 1)
-
             };
 
             (rlo.min(self.keys.len() - 1), rhi.min(self.keys.len() - 1))
-
         };
 
         if lo == hi {
-
             return Some(self.keys[lo.min(self.keys.len() - 1)]);
-
         }
 
         // Find bracketing keys within [lo, hi).
 
         // Reference per-sequence semantics (Animated::getValue, animated.h):
 
-        //   time %= times[times.size()-1];  // wrap on the FULL absolute axis
+        // time %= times[times.size-1]; // wrap on the FULL absolute axis
 
-        //   then linear-scan [lo, hi) for the first bracket key.
+        // then linear-scan [lo, hi) for the first bracket key.
 
         // `time_ms` arrives as the clip's absolute timeline time (timeStart + offset).
 
         let total_axis = self.times.last().copied().unwrap_or(0);
 
-        let time_abs = if total_axis > 0 { time_ms % total_axis } else { time_ms };
+        let time_abs = if total_axis > 0 {
+            time_ms % total_axis
+        } else {
+            time_ms
+        };
 
         let mut found = lo.min(self.times.len().saturating_sub(1));
 
         let search_hi = hi.min(self.times.len().saturating_sub(1));
 
         for i in lo..search_hi {
-
             let ti = self.times.get(i).copied().unwrap_or(0);
 
             let ti1 = self.times.get(i + 1).copied().unwrap_or(0);
 
             if time_abs >= ti && time_abs < ti1 {
-
                 found = i;
 
                 break;
-
             }
-
         }
 
         if found >= search_hi {
-
             // No bracket found inside [lo, hi) - clamp to the last bracketable key.
 
             found = search_hi.saturating_sub(1).max(lo);
-
         }
 
         let i0 = found.min(self.keys.len().saturating_sub(2));
@@ -4170,13 +5154,9 @@ impl F32Track {
         let t1 = self.times.get(i1).copied().unwrap_or(0);
 
         let t = if t1 > t0 {
-
             (time_abs.saturating_sub(t0)) as f32 / (t1 - t0) as f32
-
         } else {
-
             0.0
-
         };
 
         let a = &self.keys[i0];
@@ -4184,23 +5164,15 @@ impl F32Track {
         let b = &self.keys[i1];
 
         match self.interp {
-
             1 => Some([
-
                 a[0] + (b[0] - a[0]) * t,
-
                 a[1] + (b[1] - a[1]) * t,
-
                 a[2] + (b[2] - a[2]) * t,
-
             ]),
 
             _ => Some(*a),
-
         }
-
     }
-
 }
 
 /// A single M2QuatTrack.
@@ -4208,7 +5180,6 @@ impl F32Track {
 #[derive(Clone)]
 
 struct QuatTrack {
-
     interp: u16,
 
     seq: i16,
@@ -4218,13 +5189,10 @@ struct QuatTrack {
     times: Vec<u32>,
 
     keys: Vec<[f32; 4]>,
-
 }
 
 impl QuatTrack {
-
     fn parse(b: &[u8], ofs: usize) -> Self {
-
         let interp = rd_u16(b, ofs).unwrap_or(0);
 
         let seq = rd_i16(b, ofs + 2).unwrap_or(-1);
@@ -4244,21 +5212,17 @@ impl QuatTrack {
         let mut ranges = Vec::with_capacity(n_ranges as usize);
 
         for i in 0..n_ranges as usize {
-
             let lo = rd_u32(b, ofs_ranges + i * 8).unwrap_or(0);
 
             let hi = rd_u32(b, ofs_ranges + i * 8 + 4).unwrap_or(0);
 
             ranges.push((lo, hi));
-
         }
 
         let mut times = Vec::with_capacity(n_times as usize);
 
         for i in 0..n_times as usize {
-
             times.push(rd_u32(b, ofs_times + i * 4).unwrap_or(0));
-
         }
 
         let n = n_keys as usize;
@@ -4266,13 +5230,11 @@ impl QuatTrack {
         let mut keys = Vec::with_capacity(n);
 
         for i in 0..n {
-
             let _ = rd_u32(b, 0); // key block has no time prefix
 
             let vofs = ofs_keys + i * 16;
 
             {
-
                 let qx = rd_f32(b, vofs).unwrap_or(0.0);
 
                 let qy = -rd_f32(b, vofs + 4).unwrap_or(0.0); // Y-flip at parse (fixCoordSystemQuat)
@@ -4282,17 +5244,19 @@ impl QuatTrack {
                 let qw = rd_f32(b, vofs + 12).unwrap_or(0.0);
 
                 keys.push([qx, qy, qz, qw]);
-
             }
-
         }
 
-        QuatTrack { interp, seq, ranges, times, keys }
-
+        QuatTrack {
+            interp,
+            seq,
+            ranges,
+            times,
+            keys,
+        }
     }
 
     fn sample(
-
         &self,
 
         anim: usize,
@@ -4302,23 +5266,16 @@ impl QuatTrack {
         global_time_ms: u32,
 
         global_seqs: &[u32],
-
     ) -> Option<[f32; 4]> {
-
         if self.keys.is_empty() {
-
             return None;
-
         }
 
         if self.interp == 0 {
-
             return Some(self.keys[0]);
-
         }
 
         let (lo, hi) = if self.seq != -1 {
-
             let gsi = self.seq as usize;
 
             let dur = global_seqs.get(gsi).copied().unwrap_or(0);
@@ -4326,67 +5283,56 @@ impl QuatTrack {
             let _t = if dur > 0 { global_time_ms % dur } else { 0 };
 
             (0, self.keys.len() - 1)
-
         } else {
-
             let (rlo, rhi) = if anim < self.ranges.len() {
-
                 (self.ranges[anim].0 as usize, self.ranges[anim].1 as usize)
-
             } else {
-
                 (0, self.keys.len() - 1)
-
             };
 
             (rlo.min(self.keys.len() - 1), rhi.min(self.keys.len() - 1))
-
         };
 
         if lo == hi {
-
             return Some(self.keys[lo.min(self.keys.len() - 1)]);
-
         }
 
         // Reference per-sequence semantics (Animated::getValue, animated.h):
 
-        //   time %= times[times.size()-1];  // wrap on the FULL absolute axis
+        // time %= times[times.size-1]; // wrap on the FULL absolute axis
 
-        //   then linear-scan [lo, hi) for the first bracket key.
+        // then linear-scan [lo, hi) for the first bracket key.
 
         // `time_ms` arrives as the clip's absolute timeline time (timeStart + offset).
 
         let total_axis = self.times.last().copied().unwrap_or(0);
 
-        let time_abs = if total_axis > 0 { time_ms % total_axis } else { time_ms };
+        let time_abs = if total_axis > 0 {
+            time_ms % total_axis
+        } else {
+            time_ms
+        };
 
         let mut found = lo.min(self.times.len().saturating_sub(1));
 
         let search_hi = hi.min(self.times.len().saturating_sub(1));
 
         for i in lo..search_hi {
-
             let ti = self.times.get(i).copied().unwrap_or(0);
 
             let ti1 = self.times.get(i + 1).copied().unwrap_or(0);
 
             if time_abs >= ti && time_abs < ti1 {
-
                 found = i;
 
                 break;
-
             }
-
         }
 
         if found >= search_hi {
-
             // No bracket found inside [lo, hi) - clamp to the last bracketable key.
 
             found = search_hi.saturating_sub(1).max(lo);
-
         }
 
         let i0 = found.min(self.keys.len().saturating_sub(2));
@@ -4398,13 +5344,9 @@ impl QuatTrack {
         let t1 = self.times.get(i1).copied().unwrap_or(0);
 
         let t = if t1 > t0 {
-
             (time_abs.saturating_sub(t0)) as f32 / (t1 - t0) as f32
-
         } else {
-
             0.0
-
         };
 
         let a = &self.keys[i0];
@@ -4412,119 +5354,124 @@ impl QuatTrack {
         let b = &self.keys[i1];
 
         Some(quat_slerp(t, *a, *b))
-
     }
-
 }
 
 fn quat_slerp(r: f32, a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-
-    let dot = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
 
     let dot2 = dot.abs();
 
     if dot2 > 0.9995 {
+        let x = a[0] * (1.0 - r) + b[0] * r;
 
-        let x = a[0]*(1.0-r) + b[0]*r;
+        let y = a[1] * (1.0 - r) + b[1] * r;
 
-        let y = a[1]*(1.0-r) + b[1]*r;
+        let z = a[2] * (1.0 - r) + b[2] * r;
 
-        let z = a[2]*(1.0-r) + b[2]*r;
+        let w = a[3] * (1.0 - r) + b[3] * r;
 
-        let w = a[3]*(1.0-r) + b[3]*r;
+        let m = (x * x + y * y + z * z + w * w).sqrt();
 
-        let m = (x*x+y*y+z*z+w*w).sqrt();
+        if m < 1e-8 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
 
-        if m < 1e-8 { return [0.0, 0.0, 0.0, 1.0]; }
-
-        return [x/m, y/m, z/m, w/m];
-
+        return [x / m, y / m, z / m, w / m];
     }
 
     let theta = dot.acos();
 
     let sin_theta = theta.sin();
 
-    if sin_theta < 1e-8 { return a; }
+    if sin_theta < 1e-8 {
+        return a;
+    }
 
     let sa = ((1.0 - r) * theta).sin() / sin_theta;
 
     let sb = (r * theta).sin() / sin_theta;
 
-    let x = a[0]*sa + b[0]*sb;
+    let x = a[0] * sa + b[0] * sb;
 
-    let y = a[1]*sa + b[1]*sb;
+    let y = a[1] * sa + b[1] * sb;
 
-    let z = a[2]*sa + b[2]*sb;
+    let z = a[2] * sa + b[2] * sb;
 
-    let w = a[3]*sa + b[3]*sb;
+    let w = a[3] * sa + b[3] * sb;
 
-    let m = (x*x+y*y+z*z+w*w).sqrt();
+    let m = (x * x + y * y + z * z + w * w).sqrt();
 
-    if m < 1e-8 { return [0.0, 0.0, 0.0, 1.0]; }
+    if m < 1e-8 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
 
-    [x/m, y/m, z/m, w/m]
-
+    [x / m, y / m, z / m, w / m]
 }
 
 fn quat_to_mat4(q: [f32; 4]) -> BnMat4 {
-
     // Reference newQuatRotate (matrix.h L102-110), ROW-MAJOR m[row][col].
 
-    let x = q[0]; let y = q[1]; let z = q[2]; let w = q[3];
+    let x = q[0];
+    let y = q[1];
+    let z = q[2];
+    let w = q[3];
 
-    let xx = x*x; let yy = y*y; let zz = z*z;
+    let xx = x * x;
+    let yy = y * y;
+    let zz = z * z;
 
-    let xy = x*y; let xz = x*z; let yz = y*z;
+    let xy = x * y;
+    let xz = x * z;
+    let yz = y * z;
 
-    let wx = w*x; let wy = w*y; let wz = w*z;
+    let wx = w * x;
+    let wy = w * y;
+    let wz = w * z;
 
     [
-
-        1.0 - 2.0*(yy+zz), 2.0*(xy+wz), 2.0*(xz-wy), 0.0,
-
-        2.0*(xy-wz), 1.0 - 2.0*(xx+zz), 2.0*(yz+wx), 0.0,
-
-        2.0*(xz+wy), 2.0*(yz-wx), 1.0 - 2.0*(xx+yy), 0.0,
-
-        0.0, 0.0, 0.0, 1.0,
-
+        1.0 - 2.0 * (yy + zz),
+        2.0 * (xy + wz),
+        2.0 * (xz - wy),
+        0.0,
+        2.0 * (xy - wz),
+        1.0 - 2.0 * (xx + zz),
+        2.0 * (yz + wx),
+        0.0,
+        2.0 * (xz + wy),
+        2.0 * (yz - wx),
+        1.0 - 2.0 * (xx + yy),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     ]
-
 }
 
 fn mat4_mul(a: &BnMat4, b: &BnMat4) -> BnMat4 {
-
     // ROW-MAJOR: result[r*4+c] = sum_k a[r*4+k]*b[k*4+c]
 
     let mut r = [0.0f32; 16];
 
     for ri in 0..4 {
-
         for ci in 0..4 {
-
             let mut s = 0.0f32;
 
             for k in 0..4 {
-
                 s += a[ri * 4 + k] * b[k * 4 + ci];
-
             }
 
             r[ri * 4 + ci] = s;
-
         }
-
     }
 
     r
-
 }
 
 /// A single M2 bone parsed from a 108-byte record.
 
-struct BnBone {
-
+pub(crate) struct BnBone {
     parent: i16,
 
     pivot: [f32; 3],
@@ -4534,13 +5481,11 @@ struct BnBone {
     rot: QuatTrack,
 
     scale: F32Track,
-
 }
 
 /// Parse all M2 bones from raw M2 bytes.
 
-fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
-
+pub(crate) fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
     let (count, ofs) = m2_bones_array(bytes)?;
 
     let anim_count = m2_anim_array(bytes).map(|(c, _)| c).unwrap_or(0);
@@ -4552,7 +5497,6 @@ fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
     let mut out = Vec::with_capacity(capped);
 
     for i in 0..capped {
-
         let rec = ofs as usize + i * 108;
 
         let parent = rd_u16(bytes, rec + 8)? as i16;
@@ -4563,11 +5507,17 @@ fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
 
         let mut pz = rd_f32(bytes, rec + 104)?;
 
-        if px.is_nan() { px = 0.0; }
+        if px.is_nan() {
+            px = 0.0;
+        }
 
-        if py.is_nan() { py = 0.0; }
+        if py.is_nan() {
+            py = 0.0;
+        }
 
-        if pz.is_nan() { pz = 0.0; }
+        if pz.is_nan() {
+            pz = 0.0;
+        }
 
         // fixCoordSystem: (x, -y, z)
 
@@ -4579,19 +5529,23 @@ fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
 
         let scale = F32Track::parse(bytes, rec + 68, anim_count);
 
-        out.push(BnBone { parent, pivot, trans, rot, scale });
-
+        out.push(BnBone {
+            parent,
+            pivot,
+            trans,
+            rot,
+            scale,
+        });
     }
 
     Some(out)
-
 }
 
 /// Compute the model-space 4x4 matrix for bone `i` at (anim_index, time_ms).
 
-/// Mirrors the reference's Bone::calcMatrix exactly:
+/// Mirrors the client's Bone::calcMatrix exactly:
 
-///   m = T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot)
+/// m = T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot)
 
 /// All post-multiplies in row-major; the pivot sandwich makes a rotated bone
 
@@ -4599,8 +5553,7 @@ fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
 
 /// UE axes (x, -y, z) at parse time; trans/quat are flipped here to match.
 
-fn bone_matrix_at(
-
+pub(crate) fn bone_matrix_at(
     bones: &[BnBone],
 
     anim: usize,
@@ -4612,21 +5565,11 @@ fn bone_matrix_at(
     global_seqs: &[u32],
 
     i: usize,
-
 ) -> BnMat4 {
-
     let b = &bones[i];
 
     let mut m: BnMat4 = [
-
-        1.0, 0.0, 0.0, 0.0,
-
-        0.0, 1.0, 0.0, 0.0,
-
-        0.0, 0.0, 1.0, 0.0,
-
-        0.0, 0.0, 0.0, 1.0,
-
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
 
     // Always build T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot).
@@ -4646,87 +5589,66 @@ fn bone_matrix_at(
     // * T(trans)
 
     if let Some(t) = b.trans.sample(anim, time_ms, global_time_ms, global_seqs) {
-
         m[3] += t[0];
 
         m[7] -= t[1];
 
         m[11] += t[2];
-
     }
 
     // * R(rot)
 
     if let Some(q) = b.rot.sample(anim, time_ms, global_time_ms, global_seqs) {
-
         let qf = [q[0], q[1], q[2], q[3]];
 
         let rm = quat_to_mat4(qf);
 
         m = mat4_mul(&m, &rm);
-
     }
 
     // * S(scale)
 
     if let Some(s) = b.scale.sample(anim, time_ms, global_time_ms, global_seqs) {
-
         let sm: BnMat4 = [
-
-            s[0], 0.0, 0.0, 0.0,
-
-            0.0, s[1], 0.0, 0.0,
-
-            0.0, 0.0, s[2], 0.0,
-
-            0.0, 0.0, 0.0, 1.0,
-
+            s[0], 0.0, 0.0, 0.0, 0.0, s[1], 0.0, 0.0, 0.0, 0.0, s[2], 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
 
         m = mat4_mul(&m, &sm);
-
     }
 
-    // * T(-pivot)  post-multiply, matching reference model.cpp:
+    // * T(-pivot) post-multiply, matching model.cpp:
 
     {
-
-        let px = b.pivot[0]; let py = b.pivot[1]; let pz = b.pivot[2];
+        let px = b.pivot[0];
+        let py = b.pivot[1];
+        let pz = b.pivot[2];
 
         let tneg: BnMat4 = [
-
-            1.0, 0.0, 0.0, -px,
-
-            0.0, 1.0, 0.0, -py,
-
-            0.0, 0.0, 1.0, -pz,
-
-            0.0, 0.0, 0.0, 1.0,
-
+            1.0, 0.0, 0.0, -px, 0.0, 1.0, 0.0, -py, 0.0, 0.0, 1.0, -pz, 0.0, 0.0, 0.0, 1.0,
         ];
 
         m = mat4_mul(&m, &tneg);
-
     }
 
     if b.parent >= 0 && (b.parent as usize) < bones.len() {
-
-        let pmat =
-
-            bone_matrix_at(bones, anim, time_ms, global_time_ms, global_seqs, b.parent as usize);
+        let pmat = bone_matrix_at(
+            bones,
+            anim,
+            time_ms,
+            global_time_ms,
+            global_seqs,
+            b.parent as usize,
+        );
 
         m = mat4_mul(&pmat, &m);
-
     }
 
     m
-
 }
 
 /// All bones' model-space 4x4 matrices at (anim, time_ms).
 
 pub fn m2_bone_matrices(
-
     bytes: &[u8],
 
     anim: usize,
@@ -4736,51 +5658,35 @@ pub fn m2_bone_matrices(
     global_time_ms: u32,
 
     global_seqs: &[u32],
-
 ) -> Option<Vec<BnMat4>> {
-
     let bones = parse_m2_bones(bytes)?;
 
-    Some((0..bones.len())
-
-        .map(|i| bone_matrix_at(&bones, anim, time_ms, global_time_ms, global_seqs, i))
-
-        .collect())
-
+    Some(
+        (0..bones.len())
+            .map(|i| bone_matrix_at(&bones, anim, time_ms, global_time_ms, global_seqs, i))
+            .collect(),
+    )
 }
 
 /// Number of bones in an M2 file.
 
 pub fn m2_bone_count(bytes: &[u8]) -> u32 {
-
     m2_bones_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Number of animation sequences in an M2 file.
 
 pub fn m2_anim_count(bytes: &[u8]) -> u32 {
-
     m2_anim_array(bytes).map(|(c, _)| c).unwrap_or(0)
-
 }
 
 /// Animation sequence `idx`: (time_start_ms, time_end_ms, duration_ms).
 
-pub fn m2_anim_time_range(
-
-    bytes: &[u8],
-
-    idx: u32,
-
-) -> Option<(u32, u32, u32)> {
-
+pub fn m2_anim_time_range(bytes: &[u8], idx: u32) -> Option<(u32, u32, u32)> {
     let (count, ofs) = m2_anim_array(bytes)?;
 
     if idx >= count {
-
         return None;
-
     }
 
     let rec = ofs as usize + idx as usize * 40;
@@ -4792,15 +5698,12 @@ pub fn m2_anim_time_range(
     let dur = te.saturating_sub(ts);
 
     Some((ts, te, dur))
-
 }
 
 /// Global sequence durations in ms.
 
 pub fn m2_global_sequences(bytes: &[u8]) -> Vec<u32> {
-
     parse_m2_global_sequences(bytes)
-
 }
 
 /// Skinned vertex positions: for each vertex, blend the 4 bone matrices
@@ -4809,24 +5712,20 @@ pub fn m2_global_sequences(bytes: &[u8]) -> Vec<u32> {
 
 /// in WoW axes (x, y, z).
 
-pub fn m2_skinned_positions(
-
-    bytes: &[u8],
-
-    anim: usize,
-
-    time_ms: u32,
-
-) -> Option<Vec<[f32; 3]>> {
-
+pub fn m2_skinned_positions(bytes: &[u8], anim: usize, time_ms: u32) -> Option<Vec<[f32; 3]>> {
     let fmt = benilla_m2::parse_m2(&mut std::io::Cursor::new(bytes)).ok()?;
 
     let global_seqs = parse_m2_global_sequences(bytes);
 
     let bones = parse_m2_bones(bytes)?;
 
-    Some(m2_skinned_positions_rig(fmt.model(), &global_seqs, &bones, anim, time_ms))
-
+    Some(m2_skinned_positions_rig(
+        fmt.model(),
+        &global_seqs,
+        &bones,
+        anim,
+        time_ms,
+    ))
 }
 
 /// Skinning core shared by the byte path and the cached-rig path: bone
@@ -4834,7 +5733,6 @@ pub fn m2_skinned_positions(
 /// matrices at one (anim, time) plus the 4-weight vertex blend.
 
 pub fn m2_skinned_positions_rig(
-
     model: &benilla_m2::M2Model,
 
     global_seqs: &[u32],
@@ -4844,43 +5742,32 @@ pub fn m2_skinned_positions_rig(
     anim: usize,
 
     time_ms: u32,
-
 ) -> Vec<[f32; 3]> {
-
     // global_time_ms: for gseq tracks, use global clock.
 
-    // The reference's animate() passes globalTime directly;
+    // The client's animate passes globalTime directly;
 
-    // for gseq tracks the time is wrapped on the gseq duration inside sample().
+    // for gseq tracks the time is wrapped on the gseq duration inside sample.
 
     let global_time_ms = time_ms;
 
     let mats: Vec<BnMat4> = (0..bones.len())
-
         .map(|i| bone_matrix_at(bones, anim, time_ms, global_time_ms, global_seqs, i))
-
         .collect();
 
-      let apply = |m: &BnMat4, v: [f32; 3]| -> [f32; 3] {
+    let apply = |m: &BnMat4, v: [f32; 3]| -> [f32; 3] {
+        // ROW-MAJOR: out.x = m[0][0]*v0 + m[0][1]*v1 + m[0][2]*v2 + m[0][3]
 
-          // ROW-MAJOR: out.x = m[0][0]*v0 + m[0][1]*v1 + m[0][2]*v2 + m[0][3]
-
-          [
-
-              m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3],
-
-              m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
-
-              m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
-
-          ]
-
-      };
+        [
+            m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3],
+            m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
+            m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
+        ]
+    };
 
     let mut out = Vec::with_capacity(model.vertices.len());
 
     for v in model.vertices.iter() {
-
         // fixCoordSystem: vertex local position in UE axes (x, -y, z),
 
         // matching model.cpp initCommon where origVertices[i].pos = fixCoordSystem(pos).
@@ -4892,73 +5779,53 @@ pub fn m2_skinned_positions_rig(
         let local = [v.position.x, -v.position.y, v.position.z];
 
         let idxs = [
-
             v.bone_indices[0] as usize,
-
             v.bone_indices[1] as usize,
-
             v.bone_indices[2] as usize,
-
             v.bone_indices[3] as usize,
-
         ];
 
         let ws = [
-
             v.bone_weights[0] as f32 / 255.0,
-
             v.bone_weights[1] as f32 / 255.0,
-
             v.bone_weights[2] as f32 / 255.0,
-
             v.bone_weights[3] as f32 / 255.0,
-
         ];
 
-          // Reference model.cpp L730: v += mat*pos * (w/255). M2 weights are
+        // Reference model.cpp L730: v += mat*pos * (w/255). M2 weights are
 
-          // authored to sum to 255, so this already equals the standard blend.
+        // authored to sum to 255, so this already equals the standard blend.
 
-          // Fall back to the raw (already UE-axes) local position if a vertex has
+        // Fall back to the raw (already UE-axes) local position if a vertex has
 
-          // no weights at all.
+        // no weights at all.
 
-          let total: f32 = ws.iter().sum();
+        let total: f32 = ws.iter().sum();
 
-          if total < 1e-6 {
+        if total < 1e-6 {
+            out.push(local);
 
-              out.push(local);
+            continue;
+        }
 
-              continue;
+        let mut acc = [0.0f32; 3];
 
-          }
+        for k in 0..4 {
+            let bi = idxs[k];
 
-          let mut acc = [0.0f32; 3];
+            if bi < mats.len() {
+                let sk = apply(&mats[bi], local);
 
-          for k in 0..4 {
+                for j in 0..3 {
+                    acc[j] += ws[k] * sk[j];
+                }
+            }
+        }
 
-              let bi = idxs[k];
-
-              if bi < mats.len() {
-
-                  let sk = apply(&mats[bi], local);
-
-                  for j in 0..3 {
-
-                      acc[j] += ws[k] * sk[j];
-
-                  }
-
-              }
-
-          }
-
-          out.push(acc);
-
+        out.push(acc);
     }
 
     out
-
 }
 
 /// A parsed M2 rig kept for the duration of the session: the animation tick
@@ -4966,105 +5833,66 @@ pub fn m2_skinned_positions_rig(
 /// the model (plus its bone and global-sequence tables) cost ~10 ms per call.
 
 struct M2Rig {
-
-    format: benilla_m2::M2Format,
+    cached: Arc<M2Cached>,
 
     global_seqs: Vec<u32>,
 
     bones: Vec<BnBone>,
-
 }
 
 fn m2_rig_cache() -> &'static Mutex<HashMap<String, Arc<M2Rig>>> {
-
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<M2Rig>>>> = OnceLock::new();
 
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-
 }
 
-/// The cached rig for `path`, parsed from the archives on first use.
+/// The cached rig for `path`, parsed on first use. The M2 bytes and model come
+/// from the shared parsed-model cache, so a rig costs only the two side tables.
 
 fn m2_rig_cached(archives: &[Archive], path: &str) -> Option<Arc<M2Rig>> {
+    let key = path.to_ascii_lowercase();
 
     {
-
         let cache = m2_rig_cache().lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(rig) = cache.get(path) {
-
+        if let Some(rig) = cache.get(&key) {
             return Some(rig.clone());
-
         }
-
     }
 
-    let mut bytes = None;
+    let cached = m2_cached(archives, path)?;
 
-    for a in archives.iter().rev() {
+    let global_seqs = parse_m2_global_sequences(&cached.bytes);
 
-        if a.contains(path) {
-
-            if let Ok(b) = a.read_file(path) {
-
-                bytes = Some(b);
-
-                break;
-
-            }
-
-        }
-
-    }
-
-    let bytes = bytes?;
-
-    let format = benilla_m2::parse_m2(&mut std::io::Cursor::new(bytes.as_slice())).ok()?;
-
-    let global_seqs = parse_m2_global_sequences(&bytes);
-
-    let bones = parse_m2_bones(&bytes)?;
+    let bones = parse_m2_bones(&cached.bytes)?;
 
     let rig = Arc::new(M2Rig {
-
-        format,
+        cached,
 
         global_seqs,
 
         bones,
-
     });
 
     let mut cache = m2_rig_cache().lock().unwrap_or_else(|e| e.into_inner());
 
-    // Bound the cache: a long tour visits every creature model in the world.
+    // Bound the cache: a long tour visits every creature model in the world,
+    // and each rig pins its parsed M2 through the shared cache entry.
 
-    if cache.len() >= 512 {
-
+    if cache.len() >= 128 {
         cache.clear();
-
     }
 
-    cache.insert(path.to_owned(), rig.clone());
+    cache.insert(key, rig.clone());
 
     Some(rig)
-
 }
 
 /// Skinned vertex positions **in UE axes** (x, -y, z), matching the
 
 /// existing `bn_model_fill` coordinate convention.
 
-pub fn m2_skinned_positions_ue(
-
-    bytes: &[u8],
-
-    anim: usize,
-
-    time_ms: u32,
-
-) -> Option<Vec<[f32; 3]>> {
-
+pub fn m2_skinned_positions_ue(bytes: &[u8], anim: usize, time_ms: u32) -> Option<Vec<[f32; 3]>> {
     // m2_skinned_positions now returns UE axes directly (the vertex local
 
     // position is Y-flipped at the skin-blend input, matching model.cpp
@@ -5072,7 +5900,6 @@ pub fn m2_skinned_positions_ue(
     // initCommon). No additional Y flip here.
 
     m2_skinned_positions(bytes, anim, time_ms)
-
 }
 
 /// Number of bones in the model's M2 file.
@@ -5080,99 +5907,55 @@ pub fn m2_skinned_positions_ue(
 #[no_mangle]
 
 pub extern "C" fn bn_model_skeleton_bone_count(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_bone_count(bytes.as_slice());
-
-        }
-
-    }
-
-    0
-
+    m2_bone_count(cached.bytes.as_slice())
 }
 
 /// Number of animation sequences in the model.
 
 #[no_mangle]
 
-pub extern "C" fn bn_model_anim_count(
-
-    world: *const BnWorld,
-
-    model_path: *const c_char,
-
-) -> u32 {
-
+pub extern "C" fn bn_model_anim_count(world: *const BnWorld, model_path: *const c_char) -> u32 {
     if world.is_null() || model_path.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
-
-            continue;
-
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            return m2_anim_count(bytes.as_slice());
-
-        }
-
-    }
-
-    0
-
+    m2_anim_count(cached.bytes.as_slice())
 }
 
 /// Animation sequence info: writes (time_start, time_end, duration) in ms
@@ -5182,7 +5965,6 @@ pub extern "C" fn bn_model_anim_count(
 #[no_mangle]
 
 pub extern "C" fn bn_model_anim_time_range(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -5190,73 +5972,51 @@ pub extern "C" fn bn_model_anim_time_range(
     anim_idx: u32,
 
     out: *mut u32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let Some((ts, te, dur)) = m2_anim_time_range(cached.bytes.as_slice(), anim_idx) else {
+        return 0;
+    };
 
-            continue;
+    unsafe {
+        *out = ts;
 
-        }
+        *out.add(1) = te;
 
-        if let Ok(bytes) = a.read_file(p) {
-
-            if let Some((ts, te, dur)) = m2_anim_time_range(bytes.as_slice(), anim_idx) {
-
-                unsafe {
-
-                    *out = ts;
-
-                    *out.add(1) = te;
-
-                    *out.add(2) = dur;
-
-                }
-
-                return 1;
-
-            }
-
-        }
-
+        *out.add(2) = dur;
     }
 
-    0
-
+    1
 }
 
-/// Temporary diagnostic: dump the rotation-track header for every bone of the
+/// Diagnostic: dump the rotation-track header for every bone of the
 
 /// walk-clip sequence so we can see why the sampler folds it to a static pose.
 
 /// out receives 6 u32 slots per bone: interp, seq, n_ranges, n_times, n_keys,
 
-/// range_hi_for_anim. New FFI middle-layer code only; no original code touched.
+/// range_hi_for_anim.
 
 #[no_mangle]
 
 pub extern "C" fn bn_model_diag_walking_track(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -5266,89 +6026,67 @@ pub extern "C" fn bn_model_diag_walking_track(
     out: *mut u32,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let Some(bones) = parse_m2_bones(cached.bytes.as_slice()) else {
+        return 0;
+    };
 
-            continue;
+    let mut n = 0u32;
 
-        }
-
-        if let Ok(bytes) = a.read_file(p) {
-
-            if let Some(bones) = parse_m2_bones(bytes.as_slice()) {
-
-                let mut n = 0u32;
-
-                for b in bones.iter() {
-
-                    if n >= cap {
-
-                        break;
-
-                    }
-
-                    let r = &b.rot;
-
-                    let hi = if (anim_idx as usize) < r.ranges.len() {
-
-                        r.ranges[anim_idx as usize].1
-
-                    } else { 0xFFFF_FFFF };
-
-                    unsafe {
-
-                        out.add((n as usize) * 6 + 0).write_volatile(r.interp as u32);
-
-                        out.add((n as usize) * 6 + 1).write_volatile((r.seq as i16) as u32);
-
-                        out.add((n as usize) * 6 + 2).write_volatile(r.ranges.len() as u32);
-
-                        out.add((n as usize) * 6 + 3).write_volatile(r.times.len() as u32);
-
-                        out.add((n as usize) * 6 + 4).write_volatile(r.keys.len() as u32);
-
-                        out.add((n as usize) * 6 + 5).write_volatile(hi);
-
-                    }
-
-                    n += 1;
-
-                }
-
-                return n;
-
-            }
-
+    for b in bones.iter() {
+        if n >= cap {
             break;
-
         }
 
+        let r = &b.rot;
+
+        let hi = if (anim_idx as usize) < r.ranges.len() {
+            r.ranges[anim_idx as usize].1
+        } else {
+            0xFFFF_FFFF
+        };
+
+        unsafe {
+            out.add((n as usize) * 6 + 0)
+                .write_volatile(r.interp as u32);
+
+            out.add((n as usize) * 6 + 1)
+                .write_volatile((r.seq as i16) as u32);
+
+            out.add((n as usize) * 6 + 2)
+                .write_volatile(r.ranges.len() as u32);
+
+            out.add((n as usize) * 6 + 3)
+                .write_volatile(r.times.len() as u32);
+
+            out.add((n as usize) * 6 + 4)
+                .write_volatile(r.keys.len() as u32);
+
+            out.add((n as usize) * 6 + 5).write_volatile(hi);
+        }
+
+        n += 1;
     }
 
-    0
-
+    n
 }
 
 /// Diagnostic: dump the ranges + times first/last of a single bone's rotation
@@ -5360,7 +6098,6 @@ pub extern "C" fn bn_model_diag_walking_track(
 #[no_mangle]
 
 pub extern "C" fn bn_model_diag_ranges(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -5370,91 +6107,62 @@ pub extern "C" fn bn_model_diag_ranges(
     out: *mut u32,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
 
     let w = unsafe { &*world };
 
-    for a in w.archives.iter().rev() {
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
 
-        if !a.contains(p) {
+    let Some(bones) = parse_m2_bones(cached.bytes.as_slice()) else {
+        return 0;
+    };
 
-            continue;
+    let Some(b) = bones.get(bone_idx as usize) else {
+        return 0;
+    };
 
-        }
+    let r = &b.rot;
 
-        if let Ok(bytes) = a.read_file(p) {
+    unsafe {
+        out.add(0).write_volatile(r.ranges.len() as u32);
 
-            if let Some(bones) = parse_m2_bones(bytes.as_slice()) {
+        out.add(1)
+            .write_volatile(r.times.first().copied().unwrap_or(0));
 
-                if let Some(b) = bones.get(bone_idx as usize) {
-
-                    let r = &b.rot;
-
-                    unsafe {
-
-                        out.add(0).write_volatile(r.ranges.len() as u32);
-
-                        out.add(1).write_volatile(r.times.first().copied().unwrap_or(0));
-
-                        out.add(2).write_volatile(r.times.last().copied().unwrap_or(0));
-
-                    }
-
-                    let mut n = 3u32;
-
-                    for (i, wpair) in r.ranges.iter().enumerate() {
-
-                        if 3 + 2u32 * (i as u32) + 2 > cap {
-
-                            break;
-
-                        }
-
-                        unsafe {
-
-                            out.add(n as usize).write_volatile(wpair.0);
-
-                            out.add(n as usize + 1).write_volatile(wpair.1);
-
-                        }
-
-                        n += 2;
-
-                    }
-
-                    return n;
-
-                }
-
-                break;
-
-            }
-
-            break;
-
-        }
-
+        out.add(2)
+            .write_volatile(r.times.last().copied().unwrap_or(0));
     }
 
-    0
+    let mut n = 3u32;
 
+    for (i, wpair) in r.ranges.iter().enumerate() {
+        if 3 + 2u32 * (i as u32) + 2 > cap {
+            break;
+        }
+
+        unsafe {
+            out.add(n as usize).write_volatile(wpair.0);
+
+            out.add(n as usize + 1).write_volatile(wpair.1);
+        }
+
+        n += 2;
+    }
+
+    n
 }
 
 /// Skinned vertex positions in **UE axes** (x, -y, z) at `time_ms` of
@@ -5466,7 +6174,6 @@ pub extern "C" fn bn_model_diag_ranges(
 #[no_mangle]
 
 pub extern "C" fn bn_model_skinned_positions(
-
     world: *const BnWorld,
 
     model_path: *const c_char,
@@ -5478,21 +6185,15 @@ pub extern "C" fn bn_model_skinned_positions(
     out: *mut f32,
 
     cap: u32,
-
 ) -> u32 {
-
     if world.is_null() || model_path.is_null() || out.is_null() {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(model_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
@@ -5500,45 +6201,32 @@ pub extern "C" fn bn_model_skinned_positions(
     let w = unsafe { &*world };
 
     let rig = match m2_rig_cached(&w.archives, p) {
-
         Some(r) => r,
 
         None => return 0,
-
     };
 
     let verts = m2_skinned_positions_rig(
-
-        rig.format.model(),
-
+        rig.cached.format.model(),
         &rig.global_seqs,
-
         &rig.bones,
-
         anim_idx as usize,
-
         time_ms,
-
     );
 
     let n = verts.len().min(cap as usize);
 
     for (i, v) in verts.iter().take(n).enumerate() {
-
         unsafe {
-
             *out.add(i * 3) = v[0];
 
             *out.add(i * 3 + 1) = v[1];
 
             *out.add(i * 3 + 2) = v[2];
-
         }
-
     }
 
     n as u32
-
 }
 
 // ---- Background BLP decode ----
@@ -5573,7 +6261,6 @@ struct TexEntry {
     height: u32,
 
     rgba: Vec<u8>,
-
 }
 
 fn tex_pending_entry() -> TexEntry {
@@ -5670,7 +6357,6 @@ struct TexJobs {
     queue: Mutex<VecDeque<(String, String, String)>>,
 
     ready: Condvar,
-
 }
 
 fn tex_jobs() -> &'static TexJobs {
@@ -5758,9 +6444,7 @@ fn tex_lookup(key: &str) -> Option<Option<(u32, u32, Vec<u8>)>> {
     let cache = tex_cache().lock().ok()?;
 
     match cache.get(key) {
-        Some(e) if e.status == TEX_READY => {
-            Some(Some((e.width, e.height, e.rgba.clone())))
-        }
+        Some(e) if e.status == TEX_READY => Some(Some((e.width, e.height, e.rgba.clone()))),
 
         Some(e) if e.status == TEX_FAILED => Some(None),
 
@@ -5846,7 +6530,9 @@ fn tex_workers() {
                             q.pop_front()
                         };
 
-                        let Some((key, dir, path)) = job else { continue };
+                        let Some((key, dir, path)) = job else {
+                            continue;
+                        };
 
                         if chain.as_ref().map_or(true, |(d, _)| d != &dir) {
                             chain = benilla_formats::Chain::open(Path::new(&dir))
@@ -5873,19 +6559,30 @@ fn tex_workers() {
 
 #[no_mangle]
 
-pub extern "C" fn bn_texture_request(
-    world: *const BnWorld,
-    internal_path: *const c_char,
-) -> u32 {
+pub extern "C" fn bn_texture_request(world: *const BnWorld, internal_path: *const c_char) -> u32 {
     if world.is_null() || internal_path.is_null() {
         return 2;
     }
 
-    let p = match cstr_to_str(internal_path) {
-        Some(s) => s,
-
-        None => return 2,
+    let Some(p) = cstr_to_str(internal_path) else {
+        return 2;
     };
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    tex_request(&w.data_dir, p)
+}
+
+/// Queue a background decode into the shared texture cache; 1 = ready
+/// already, 3 = pending already, 0 = queued, 2 = known miss.
+fn tex_request(dir: &str, path: &str) -> u32 {
+    let p = path.trim();
+
+    if p.is_empty() {
+        return 2;
+    }
 
     let key = tex_key(p);
 
@@ -5900,12 +6597,6 @@ pub extern "C" fn bn_texture_request(
             };
         }
     }
-
-    // SAFETY: valid handle.
-
-    let w = unsafe { &*world };
-
-    let dir = w.data_dir.clone();
 
     // Reserve the slot before queueing: a second request for the same path
     // then answers "pending" instead of queueing it twice.
@@ -5922,7 +6613,7 @@ pub extern "C" fn bn_texture_request(
     let jobs = tex_jobs();
 
     if let Ok(mut q) = jobs.queue.lock() {
-        q.push_back((key, dir, p.to_string()));
+        q.push_back((key, dir.to_string(), p.to_string()));
 
         TEX_STAT_QUEUED.fetch_add(1, Ordering::Relaxed);
 
@@ -5943,7 +6634,6 @@ pub extern "C" fn bn_texture_request(
 #[no_mangle]
 
 pub extern "C" fn bn_texture(
-
     world: *const BnWorld,
 
     internal_path: *const c_char,
@@ -5955,29 +6645,20 @@ pub extern "C" fn bn_texture(
     out_rgba: *mut u8,
 
     cap: u32,
-
 ) -> u32 {
-
-    if world.is_null() || internal_path.is_null()
-
+    if world.is_null()
+        || internal_path.is_null()
         || out_rgba.is_null()
-
         || out_width.is_null()
-
         || out_height.is_null()
-
     {
-
         return 0;
-
     }
 
     let p = match cstr_to_str(internal_path) {
-
         Some(s) => s,
 
         None => return 0,
-
     };
 
     // SAFETY: valid handle.
@@ -5990,19 +6671,15 @@ pub extern "C" fn bn_texture(
     let key = tex_key(p);
 
     let decoded = match tex_lookup(&key) {
-
         Some(Some(v)) => {
-
             TEX_STAT_HIT.fetch_add(1, Ordering::Relaxed);
 
             v
-
         }
 
         Some(None) => return 0,
 
         None => {
-
             TEX_STAT_SYNC.fetch_add(1, Ordering::Relaxed);
 
             let v = decode_texture_sync(w, p);
@@ -6010,15 +6687,11 @@ pub extern "C" fn bn_texture(
             tex_store(&key, v.clone());
 
             match v {
-
                 Some(v) => v,
 
                 None => return 0,
-
             }
-
         }
-
     };
 
     let (width, height, rgba) = decoded;
@@ -6026,23 +6699,18 @@ pub extern "C" fn bn_texture(
     let need = width.saturating_mul(height).saturating_mul(4);
 
     if need == 0 || need > cap {
-
         return 0;
-
     }
 
     unsafe {
-
         *out_width = width;
 
         *out_height = height;
 
         std::ptr::copy_nonoverlapping(rgba.as_ptr(), out_rgba, need as usize);
-
     }
 
     need
-
 }
 
 // ---- UI (stage 3): stock FrameXML load + widget-tree dump ----
@@ -6062,11 +6730,13 @@ thread_local! {
     static BN_UI: RefCell<Option<benilla_ui::script::UiScript>> = const { RefCell::new(None) };
 }
 
-/// The dump script: one `F` line per frame, one `R` line per region, tabs
-/// within any field squashed. Each frame is `pcall`ed so one bad widget never
-/// sinks the whole dump. WoW 1.12 runs Lua 5.0: no `#` length operator —
-/// `table.getn`/`table.insert` instead.
-const UI_DUMP_LUA: &str = r#"
+/// The dump's row builders: one `F` line per frame, one `R` line per region,
+/// tabs within any field squashed. Each frame is `pcall`ed so one bad widget
+/// never sinks the whole dump. WoW 1.12 runs Lua 5.0: no `#` length operator —
+/// `table.getn`/`table.insert` instead. `UI_DUMP_WALK_LUA` runs them over the
+/// whole frame list in one eval; the sliced API keeps `dump_one` around in
+/// `BN_DUMP_FRAME` and walks a few hundred frames per call.
+const UI_DUMP_DEFS_LUA: &str = r#"
     local function num(v)
         if v == nil then return "0" end
         return string.format("%.1f", v)
@@ -6078,6 +6748,16 @@ const UI_DUMP_LUA: &str = r#"
     local function clean(s)
         if s == nil then return "" end
         return (string.gsub(tostring(s), "[\t\r\n]", " "))
+    end
+    -- FontString text keeps its hard breaks: the dump's rows split on LF, so a
+    -- break rides as US (0x1f) and the host restores it before rasterizing.
+    -- TAB flattens to a space and CR drops, as the plain clean does.
+    local function text_clean(s)
+        local t = tostring(s)
+        t = string.gsub(t, "\t", " ")
+        t = string.gsub(t, "\r", "")
+        t = string.gsub(t, "\n", "\31")
+        return t
     end
     -- The colour slot (GetTextColor / GetVertexColor): r g b a, 0..1.
     -- pcall'd because one bad region must not sink its frame's rows.
@@ -6182,6 +6862,11 @@ const UI_DUMP_LUA: &str = r#"
         end
         return mine
     end
+    BN_DUMP_FRAME = dump_one
+"#;
+
+/// One full dump over every frame: the caller evals `UI_DUMP_DEFS_LUA` first.
+const UI_DUMP_WALK_LUA: &str = r#"
     local out = {}
     local f = EnumerateFrames()
     while f do
@@ -6231,9 +6916,7 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
         // The loader resolves `<Script file=>`/`<Include file=>` against the
         // document's dir (`dir_of` splits on `/` only), so hand `load_in` the
         // entry with forward slashes; MPQ reads take backslashes.
-        let read = |req: &str| -> Option<Vec<u8>> {
-            chain.read(&req.replace('/', "\\")).ok()
-        };
+        let read = |req: &str| -> Option<Vec<u8>> { chain.read(&req.replace('/', "\\")).ok() };
         let mut rows = 0u32;
         let mut failures: Vec<String> = Vec::new();
         for row in &toc.files {
@@ -6257,20 +6940,16 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
             let entry = path.replace('\\', "/");
             let report = benilla_ui::loader::load_in(&script, &doc, &entry, &read);
             failures.extend(
-                report
-                    .errors
-                    .iter()
-                    .map(|e| format!("{path}: {e}"))
-                    .chain(
-                        report
-                            .missing_files
-                            .iter()
-                            .map(|m| format!("{path}: missing {m}")),
-                    ),
+                report.errors.iter().map(|e| format!("{path}: {e}")).chain(
+                    report
+                        .missing_files
+                        .iter()
+                        .map(|m| format!("{path}: missing {m}")),
+                ),
             );
         }
         let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
-        // The load's last step is arming `PLAYER_LOGIN` (UI_Init `0x49011d`);
+        // The load's last step is arming `PLAYER_LOGIN`;
         // `bn_ui_world_enter` spends it once the player is in the world.
         script.arm_player_login();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
@@ -6302,8 +6981,8 @@ pub extern "C" fn bn_ui_world_enter() -> u32 {
             let Some(script) = slot.as_mut() else { return 0u32 };
             script.fire_event("FRAMES_LOADED", Vec::new());
             script.fire_event("VARIABLES_LOADED", Vec::new());
-            // `FCF_OnUpdate` reads `UIOptionsFrame:IsShown()` every frame; stand
-            // in a closed one, as the reference's chat loader does.
+            // `FCF_OnUpdate` reads `UIOptionsFrame:IsShown` every frame; stand
+            // in a closed one, as the client's chat loader does.
             let _ = script.run(
                 "if not UIOptionsFrame then UIOptionsFrame = CreateFrame('Frame') UIOptionsFrame:Hide() end",
             );
@@ -6379,7 +7058,7 @@ fn insert_after_frame_block(text: &str, frame: &str, row: &str) -> String {
 
 /// Dump the loaded UI tree as TSV text (see `UI_DUMP_LUA` for the format).
 /// Writes at most `cap - 1` bytes plus a NUL; returns bytes written (0 = no
-/// session or failure). Only `IsVisible()` frames come out (invisible ones
+/// session or failure). Only `IsVisible` frames come out (invisible ones
 /// can never paint), in creation order, each frame's regions directly beneath
 /// it.
 #[no_mangle]
@@ -6388,9 +7067,10 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
         return 0;
     }
     let mut text = {
+        let chunk = format!("{UI_DUMP_DEFS_LUA}{UI_DUMP_WALK_LUA}");
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             BN_UI.with(|slot| match slot.borrow().as_ref() {
-                Some(s) => match s.eval::<String>(UI_DUMP_LUA) {
+                Some(s) => match s.eval::<String>(&chunk) {
                     Ok(t) => Some(t),
                     Err(e) => {
                         eprintln!("bn_ui_dump: eval failed: {e}");
@@ -6408,6 +7088,18 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
             _ => return 0,
         }
     };
+    ui_dump_apply_caret(&mut text);
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// Append the focused EditBox caret row (see the seam note below) to a whole
+/// dump's text. Shared by the one-shot and sliced dumps.
+fn ui_dump_apply_caret(text: &mut String) {
     // The EditBox caret seam: the host round trip (advances in, text UI out)
     // answered with the FFI's own font engine, then a synthetic caret region
     // row appended for the focused box. The VM builds the caret as a
@@ -6448,10 +7140,9 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
         })
     }));
     if let Ok(Some((frame, caret_x, cell_h))) = caret {
-        if let Some((left, top, height)) = editbox_text_rect_from_dump(&text, &frame) {
+        if let Some((left, top, height)) = editbox_text_rect_from_dump(text.as_str(), &frame) {
             // Middle-justified single line: the cell centres in the region.
-            const FULL_UV: &str =
-                "0.0000\t0.0000\t1.0000\t0.0000\t1.0000\t1.0000\t0.0000\t1.0000";
+            const FULL_UV: &str = "0.0000\t0.0000\t1.0000\t0.0000\t1.0000\t1.0000\t0.0000\t1.0000";
             let caret_top = top - (height - cell_h).max(0.0) * 0.5;
             let row = format!(
                 "R\t{}\tbn_caret\tTexture\t{:.1}\t{:.1}\t1.5\t{:.1}\tSolid Texture\t\
@@ -6462,167 +7153,197 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
                 cell_h.max(1.0),
                 FULL_UV
             );
-            text = insert_after_frame_block(&text, &frame, &row);
+            *text = insert_after_frame_block(text, &frame, &row);
         }
     }
-    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
-    unsafe {
-        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
-        *buf.add(n) = 0;
-    }
-    n as u32
 }
 
-/// Dump the visible 3D model panes (character-select / character-create
-/// previews) as TSV, one row per pane:
-/// `P handle kind name left top right bottom alpha guid display facing model
-/// looksrc race sex skin face hair hair_color facial g0..g7 ffx`.
-/// Coordinates are the VM's own (root 1365.3x768, y up); the host converts.
-/// `looksrc` is `char` (roster subject), `create` (the glue create screen's
-/// dress-up state), `file` (`SetModel`) or `none`. Returns bytes written
-/// (0 = no session or no visible model pane).
+// ---- Sliced UI dump ----
+//
+// The one-shot dump walks ~3700 frames and builds the ~60 visible ones' rows
+// in one Lua eval: 10-20 ms the host pays inside a single frame, which reads
+// as a periodic hitch. The sliced API parks the frame cursor and the row text
+// between calls, so the host walks a few hundred frames per tick and parses
+// once the scan is done.
+
+const UI_DUMP_STEP_LUA: &str = r#"
+    local budget = __BUDGET__
+    local out = {}
+    local f = BN_DUMP_CURSOR
+    local n = 0
+    while f and n < budget do
+        if f:IsVisible() then
+            local ok, lines = pcall(BN_DUMP_FRAME, f)
+            if ok and type(lines) == "table" then
+                for i = 1, table.getn(lines) do
+                    table.insert(out, lines[i])
+                end
+            end
+        end
+        f = EnumerateFrames(f)
+        n = n + 1
+    end
+    BN_DUMP_CURSOR = f
+    local done = 0
+    if f == nil then done = 1 end
+    return table.concat(out, "\n"), done
+"#;
+
+struct UiDumpScan {
+    text: String,
+
+    done: bool,
+
+    failed: bool,
+}
+
+thread_local! {
+    static UI_DUMP_SCAN: RefCell<Option<UiDumpScan>> = const { RefCell::new(None) };
+}
+
+/// Start a sliced dump: install the row builders in the VM and park the frame
+/// cursor at the first frame. 1 = scan started, 0 = no VM.
 #[no_mangle]
-pub extern "C" fn bn_ui_panes(buf: *mut c_char, cap: u32) -> u32 {
+pub extern "C" fn bn_ui_dump_begin() -> u32 {
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| -> bool {
+            let held = slot.borrow();
+
+            let Some(s) = held.as_ref() else { return false };
+
+            let chunk =
+                format!("{UI_DUMP_DEFS_LUA}\n    BN_DUMP_CURSOR = EnumerateFrames()\n    return 1");
+
+            match s.eval::<f64>(&chunk) {
+                Ok(v) => v != 0.0,
+                Err(e) => {
+                    eprintln!("bn_ui_dump_begin: eval failed: {e}");
+                    false
+                }
+            }
+        })
+    }));
+
+    let started = matches!(started, Ok(true));
+
+    UI_DUMP_SCAN.with(|scan| {
+        *scan.borrow_mut() = started.then(|| UiDumpScan {
+            text: String::new(),
+            done: false,
+            failed: false,
+        });
+    });
+
+    u32::from(started)
+}
+
+/// Walk at most `frames` frames of the sliced dump, accumulating their rows
+/// for `bn_ui_dump_finish`. `*out_done` is 1 once the frame list is exhausted.
+/// Returns 1 on success, 0 when there is no scan or the VM failed.
+#[no_mangle]
+pub extern "C" fn bn_ui_dump_step(frames: u32, out_done: *mut u32) -> u32 {
+    if out_done.is_null() {
+        return 0;
+    }
+
+    let mut done = 0u32;
+
+    let ok = UI_DUMP_SCAN.with(|slot| {
+        let Ok(mut held) = slot.try_borrow_mut() else {
+            return false;
+        };
+
+        let Some(scan) = held.as_mut() else {
+            return false;
+        };
+
+        if scan.failed {
+            return false;
+        }
+
+        if scan.done {
+            done = 1;
+            return true;
+        }
+
+        let chunk = UI_DUMP_STEP_LUA.replace("__BUDGET__", &frames.to_string());
+
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BN_UI.with(|ui| -> Option<(String, f64)> {
+                let held = ui.borrow();
+
+                let s = held.as_ref()?;
+
+                s.eval::<(String, f64)>(&chunk).ok()
+            })
+        }));
+
+        match out {
+            Ok(Some((text, d))) => {
+                if !text.is_empty() {
+                    if !scan.text.is_empty() {
+                        scan.text.push('\n');
+                    }
+
+                    scan.text.push_str(&text);
+                }
+
+                if d != 0.0 {
+                    scan.done = true;
+
+                    done = 1;
+                }
+
+                true
+            }
+
+            _ => {
+                scan.failed = true;
+
+                eprintln!("bn_ui_dump_step: eval failed");
+
+                false
+            }
+        }
+    });
+
+    unsafe {
+        *out_done = done;
+    }
+
+    u32::from(ok)
+}
+
+/// Finish the sliced dump: append the caret row, copy the TSV into `buf`
+/// (NUL-terminated) and reset the scan. 0 bytes when the scan failed.
+#[no_mangle]
+pub extern "C" fn bn_ui_dump_finish(buf: *mut c_char, cap: u32) -> u32 {
     if buf.is_null() || cap == 0 {
         return 0;
     }
-    let text = {
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            BN_UI.with(|slot| {
-                let mut held = slot.borrow_mut();
-                let s = held.as_mut()?;
-                s.resolve();
-                let panes = s.character_panes();
-                let mut subjects = std::collections::HashMap::new();
-                for p in &panes {
-                    subjects.insert(p.handle, (p.guid, p.display, p.kind));
-                }
-                let create = s.glue_create_look();
-                let roster: std::collections::HashMap<u64, net::BnNetChar> =
-                    net::with_chars(|rows| rows.iter().map(|r| (r.guid, *r)).collect())
-                        .unwrap_or_default();
-                let mut text = String::new();
-                for q in s.extract() {
-                    let benilla_ui::script::QuadContent::ModelPane {
-                        handle,
-                        name,
-                        model,
-                        facing,
-                        ffx,
-                        ..
-                    } = q.content
-                    else {
-                        continue;
-                    };
-                    let Some(rect) = q.rect else {
-                        continue;
-                    };
-                    let (guid, display, kind) =
-                        subjects.get(&handle).copied().unwrap_or((0, 0, benilla_ui::widget::FrameKind::Model));
-                    let (mut race, mut sex, mut skin, mut face) = (0u32, 0u32, 0u32, 0u32);
-                    let (mut hair, mut hair_color, mut facial) = (0u32, 0u32, 0u32);
-                    let mut gear = [0u32; 8];
-                    let mut looks = "none";
-                    if guid != 0 {
-                        if let Some(row) = roster.get(&guid) {
-                            race = row.race as u32;
-                            sex = row.gender as u32;
-                            skin = row.skin as u32;
-                            face = row.face as u32;
-                            hair = row.hair_style as u32;
-                            hair_color = row.hair_color as u32;
-                            facial = row.facial_hair as u32;
-                            // Body slots in the enum's equipment order:
-                            // shirt, chest, belt, pants, boots, wrist, gloves, tabard.
-                            gear = [
-                                row.equip_display[3],
-                                row.equip_display[4],
-                                row.equip_display[5],
-                                row.equip_display[6],
-                                row.equip_display[7],
-                                row.equip_display[8],
-                                row.equip_display[9],
-                                row.equip_display[18],
-                            ];
-                            looks = "char";
-                        }
-                    } else if display == 0 {
-                        if let Some(c) = create {
-                            race = c.race as u32;
-                            sex = c.sex as u32;
-                            skin = c.skin as u32;
-                            face = c.face as u32;
-                            hair = c.hair_style as u32;
-                            hair_color = c.hair_color as u32;
-                            facial = c.facial_hair as u32;
-                            looks = "create";
-                        }
-                    }
-                    if model.is_some() && guid == 0 {
-                        looks = "file";
-                    }
-                    let kind_no = match kind {
-                        benilla_ui::widget::FrameKind::Model => 0,
-                        benilla_ui::widget::FrameKind::PlayerModel => 1,
-                        benilla_ui::widget::FrameKind::DressUpModel => 2,
-                        benilla_ui::widget::FrameKind::TabardModel => 3,
-                        _ => 0,
-                    };
-                    let clean = |v: &str| -> String {
-                        v.chars()
-                            .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
-                            .collect()
-                    };
-                    text.push_str(&format!(
-                        "P\t{:?}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{},{},{},{},{}\t{}\n",
-                        handle,
-                        kind_no,
-                        name.as_deref().map(clean).unwrap_or_default(),
-                        rect.left,
-                        rect.top,
-                        rect.right,
-                        rect.bottom,
-                        q.alpha,
-                        guid,
-                        display,
-                        facing,
-                        model.as_deref().map(clean).unwrap_or_default(),
-                        looks,
-                        race,
-                        sex,
-                        skin,
-                        face,
-                        hair,
-                        hair_color,
-                        facial,
-                        gear[0],
-                        gear[1],
-                        gear[2],
-                        gear[3],
-                        gear[4],
-                        gear[5],
-                        gear[6],
-                        gear[7],
-                        if ffx { 1 } else { 0 },
-                    ));
-                }
-                Some(text)
-            })
-        }));
-        match out {
-            Ok(Some(t)) => t,
-            _ => return 0,
-        }
+
+    let scan = UI_DUMP_SCAN.with(|slot| slot.borrow_mut().take());
+
+    let Some(scan) = scan else {
+        return 0;
     };
-    if text.is_empty() {
+
+    if scan.failed {
         return 0;
     }
-    let bytes = text.as_bytes();
-    let n = bytes.len().min(cap as usize - 1);
+
+    let mut text = scan.text;
+
+    ui_dump_apply_caret(&mut text);
+
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n);
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+
         *buf.add(n) = 0;
     }
+
     n as u32
 }
 
@@ -6649,7 +7370,13 @@ pub extern "C" fn bn_ui_message_lines(frame: *const c_char, buf: *mut c_char, ca
                 let clean: String = row
                     .text
                     .chars()
-                    .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
+                    .map(|c| {
+                        if c == '\t' || c == '\n' || c == '\r' {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
                     .collect();
                 text.push_str(&format!(
                     "{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\n",
@@ -6680,22 +7407,21 @@ pub extern "C" fn bn_ui_message_lines(frame: *const c_char, buf: *mut c_char, ca
     n as u32
 }
 
-/// Rasterize one FontString to RGBA8 for the UE HUD painter (see `ui_font`).
+/// Shared body of [`bn_ui_text_bitmap`] / [`bn_ui_text_bitmap_wrap`]:
+/// rasterize one FontString and hand the host its metrics + RGBA. Metrics are
+/// written whenever the raster succeeds — including when `cap` is too small, so
+/// the host can grow its buffer and retry. Returns the bytes written.
 ///
-/// `size_px` is the drawn pixel size (the host applies WoW's em cap and the
-/// seam scale); `outline` is 0 none / 1 thin / 2 thick. Metrics
-/// (`out_w/h` = bitmap size, `out_ox/oy` = pen-box origin inside the bitmap,
-/// `out_pw/ph` = the WoW-measured string extent) are written whenever the
-/// raster succeeds — including when `cap` is too small, so the host can grow
-/// its buffer and retry. Returns the byte count written, 0 = nothing to draw
-/// (empty text, face missing, or `cap` too small).
-#[no_mangle]
-pub extern "C" fn bn_ui_text_bitmap(
+/// `offset` is `(wrap_px, spacing_px)`; honored only when `wrapped`.
+#[allow(clippy::too_many_arguments)]
+fn text_bitmap_common(
     world: *const BnWorld,
     font_path: *const c_char,
     size_px: f32,
     outline: u32,
     text: *const c_char,
+    offset: (f32, f32),
+    wrapped: bool,
     out_rgba: *mut u8,
     cap: u32,
     out_w: *mut u32,
@@ -6719,13 +7445,13 @@ pub extern "C" fn bn_ui_text_bitmap(
         let Some(chain) = w.chain.as_ref() else {
             return None;
         };
-        ui_font::rasterize(
-            chain,
-            font_str.unwrap_or(ui_font::DEFAULT_FONT),
-            size_px,
-            outline,
-            text_str,
-        )
+        let face = font_str.unwrap_or(ui_font::DEFAULT_FONT);
+        if wrapped {
+            ui_font::rasterize_wrapped(chain, face, size_px, outline, text_str, offset.0, offset.1)
+        } else {
+            // The pre-wrap contract: hard lines only, rows advance by the em.
+            ui_font::rasterize(chain, face, size_px, outline, text_str)
+        }
     }));
     let Ok(Some(bm)) = out else {
         return 0;
@@ -6760,9 +7486,87 @@ pub extern "C" fn bn_ui_text_bitmap(
     need
 }
 
+/// Rasterize one FontString to RGBA8, the original single-line layout: rows
+/// advance by the em and no width wrap. Kept byte-for-byte compatible for hosts
+/// built before the wrap flag existed.
+#[no_mangle]
+pub extern "C" fn bn_ui_text_bitmap(
+    world: *const BnWorld,
+    font_path: *const c_char,
+    size_px: f32,
+    outline: u32,
+    text: *const c_char,
+    out_rgba: *mut u8,
+    cap: u32,
+    out_w: *mut u32,
+    out_h: *mut u32,
+    out_ox: *mut f32,
+    out_oy: *mut f32,
+    out_pw: *mut f32,
+    out_ph: *mut f32,
+) -> u32 {
+    text_bitmap_common(
+        world,
+        font_path,
+        size_px,
+        outline,
+        text,
+        (0.0, 0.0),
+        false,
+        out_rgba,
+        cap,
+        out_w,
+        out_h,
+        out_ox,
+        out_oy,
+        out_pw,
+        out_ph,
+    )
+}
+
+/// Same as [`bn_ui_text_bitmap`] but wraps to `wrap_px` drawn pixels
+/// (`<= 1` = no wrap, hard `'\n'` still breaks) with `spacing_px` extra line
+/// gap. This is what the current UE HUD calls.
+#[no_mangle]
+pub extern "C" fn bn_ui_text_bitmap_wrap(
+    world: *const BnWorld,
+    font_path: *const c_char,
+    size_px: f32,
+    outline: u32,
+    wrap_px: f32,
+    spacing_px: f32,
+    text: *const c_char,
+    out_rgba: *mut u8,
+    cap: u32,
+    out_w: *mut u32,
+    out_h: *mut u32,
+    out_ox: *mut f32,
+    out_oy: *mut f32,
+    out_pw: *mut f32,
+    out_ph: *mut f32,
+) -> u32 {
+    text_bitmap_common(
+        world,
+        font_path,
+        size_px,
+        outline,
+        text,
+        (wrap_px, spacing_px),
+        true,
+        out_rgba,
+        cap,
+        out_w,
+        out_h,
+        out_ox,
+        out_oy,
+        out_pw,
+        out_ph,
+    )
+}
+
 // ---- UI glue (stage 7): the main menu (GlueXML) + pointer feedback ----
 //
-// The client's menus live in `Interface\GlueXML`, on a VM the reference never
+// The client's menus live in `Interface\GlueXML`, on a VM the client never
 // shares with the in-game FrameXML state (so loading one replaces the other in
 // `BN_UI`). `bn_ui_load_glue` builds that state from the stock toc with a stub
 // `GlueHost` behind `CGlueMgr`: benilla-ffi stays offline (no networking), so
@@ -6860,7 +7664,7 @@ fn faction_groups<'a>(
         .filter(|g| g.mask_id != 0 && template.group_mask & 1u32.wrapping_shl(g.mask_id) != 0)
 }
 
-/// `0x5ec480`: the race's body display for a sex, then that display's model row.
+/// The race's body display for a sex, then that display's model row.
 fn display_resolves(cats: &GlueCatalogs, display: u32) -> bool {
     let Some(creatures) = cats.creatures.as_ref() else {
         return false;
@@ -6873,7 +7677,6 @@ fn display_resolves(cats: &GlueCatalogs, display: u32) -> bool {
 }
 
 /// The create screen's catalog, assembled the way the glue build walks it
-/// (`0x470430`, `create_catalog` in benilla-app).
 fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
     let mut catalog = GlueCreateCatalog::default();
     let Some(create) = cats.create.as_ref() else {
@@ -6890,8 +7693,8 @@ fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
             let Some(template) = factions.template(row.faction) else {
                 continue;
             };
-            for _ in faction_groups(factions, template)
-                .filter(|g| g.internal.eq_ignore_ascii_case(side))
+            for _ in
+                faction_groups(factions, template).filter(|g| g.internal.eq_ignore_ascii_case(side))
             {
                 let id = row.id;
                 let token = |t: Option<&str>| t.unwrap_or_default().to_string();
@@ -6914,7 +7717,11 @@ fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
     for race in catalog.races.iter().map(|r| r.id).collect::<Vec<_>>() {
         let list = create.class_list(race);
         for &class in &list {
-            if let Some(table) = cats.classes.as_ref().filter(|t| t.has_row(u32::from(class))) {
+            if let Some(table) = cats
+                .classes
+                .as_ref()
+                .filter(|t| t.has_row(u32::from(class)))
+            {
                 catalog.classes.insert(
                     class,
                     GlueCreateClass {
@@ -6965,7 +7772,7 @@ fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
 struct MenuHost;
 
 impl MenuHost {
-    /// The roster rows as the character screen's records take them (`0x4732a0`).
+    /// The roster rows as the character screen's records take them.
     fn map_chars(sync: &MenuSync) -> Vec<GlueCharacter> {
         let text = |s: Option<&str>| s.unwrap_or_default().to_string();
         let mut out = Vec::new();
@@ -6979,7 +7786,12 @@ impl MenuHost {
             out.push(GlueCharacter {
                 guid: row.guid,
                 name: String::from_utf8_lossy(&bytes).into_owned(),
-                race: text(sync.catalogs.create.as_ref().and_then(|r| r.race_name(row.race))),
+                race: text(
+                    sync.catalogs
+                        .create
+                        .as_ref()
+                        .and_then(|r| r.race_name(row.race)),
+                ),
                 class: text(
                     sync.catalogs
                         .classes
@@ -6993,7 +7805,12 @@ impl MenuHost {
                     .as_ref()
                     .and_then(|a| a.name(row.zone))
                     .map(str::to_string),
-                file_string: text(sync.catalogs.create.as_ref().and_then(|r| r.race_file(row.race))),
+                file_string: text(
+                    sync.catalogs
+                        .create
+                        .as_ref()
+                        .and_then(|r| r.race_file(row.race)),
+                ),
                 gender: row.gender,
                 flags: 0,
                 model: sync
@@ -7143,7 +7960,7 @@ impl GlueHost for MenuHost {
                 vec![open_key("CANCEL", "CHAR_CREATE_IN_PROGRESS")]
             }
             // The world entry's guards and the pick. The render host sees the
-            // world through `bn_net_status() == ST_IN_WORLD`.
+            // world through `bn_net_status == ST_IN_WORLD`.
             GlueCall::EnterWorld { guid, flags, .. } => {
                 if flags & 0x4 != 0 {
                     set_dialog(Some("OKAY"));
@@ -7175,17 +7992,15 @@ impl GlueHost for MenuHost {
 
     fn selected_realm_type(&self) -> Option<u32> {
         let index = BN_MENU.with(|m| m.borrow().realm_index)?;
-        net::menu_realms()
-            .get(index as usize)
-            .map(|r| r.realm_type)
+        net::menu_realms().get(index as usize).map(|r| r.realm_type)
     }
 }
 
 /// Load the stock menus (`Interface\GlueXML\GlueXML.toc`) into a fresh glue VM
 /// (`UiScript::new_glue`), seat the offline `MenuHost`, and put the login
-/// screen up (`SET_GLUE_SCREEN "login"`), mirroring the reference's glue build.
+/// screen up (`SET_GLUE_SCREEN "login"`), mirroring the client's glue build.
 /// Returns the live frame count, or 0 on failure. Loading glue replaces any
-/// in-game UI session in `BN_UI` and vice versa (the reference keeps the two
+/// in-game UI session in `BN_UI` and vice versa (the client keeps the two
 /// states apart).
 #[no_mangle]
 pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
@@ -7226,9 +8041,7 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         let toc = benilla_ui::toc::Toc::parse(&benilla_ui::source::decode(&toc_bytes));
         // Same loader contract as `bn_ui_load`: forward slashes in `load_in`
         // entries (dir_of splits on `/` only), backslashes for the MPQ reads.
-        let read = |req: &str| -> Option<Vec<u8>> {
-            chain.read(&req.replace('/', "\\")).ok()
-        };
+        let read = |req: &str| -> Option<Vec<u8>> { chain.read(&req.replace('/', "\\")).ok() };
         let mut rows = 0u32;
         let mut failures: Vec<String> = Vec::new();
         for row in &toc.files {
@@ -7252,16 +8065,12 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
             let entry = path.replace('\\', "/");
             let report = benilla_ui::loader::load_in(&script, &doc, &entry, &read);
             failures.extend(
-                report
-                    .errors
-                    .iter()
-                    .map(|e| format!("{path}: {e}"))
-                    .chain(
-                        report
-                            .missing_files
-                            .iter()
-                            .map(|m| format!("{path}: missing {m}")),
-                    ),
+                report.errors.iter().map(|e| format!("{path}: {e}")).chain(
+                    report
+                        .missing_files
+                        .iter()
+                        .map(|m| format!("{path}: missing {m}")),
+                ),
             );
         }
         // The glue screens' DBC catalogs: the create screen's races/classes and
@@ -7312,11 +8121,10 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         // list), but zhCN's `CharacterSelect_OnShow` calls it and aborts on the
         // nil, skipping its tail (`GlueFrameFadeIn`). Stand it in only while
         // benilla leaves it unset, so a real binding is never shadowed.
-        let _ = script.run(
-            "if not GetBillingPlan then GetBillingPlan = function() return 0, 0, 0 end end",
-        );
+        let _ = script
+            .run("if not GetBillingPlan then GetBillingPlan = function() return 0, 0, 0 end end");
         script.fire_event("FRAMES_LOADED", Vec::new());
-        // Seat the host after the load (as the reference does) and run the
+        // Seat the host after the load (as the client does) and run the
         // calls the load made while it waited.
         let host = std::rc::Rc::new(MenuHost);
         script.set_glue_host(host.clone());
@@ -7386,10 +8194,7 @@ fn publish_realms(script: &mut UiScript) {
             category: r.category,
         })
         .collect();
-    let count: u16 = realms
-        .iter()
-        .map(|r| u16::from(r.characters))
-        .sum::<u16>();
+    let count: u16 = realms.iter().map(|r| u16::from(r.characters)).sum::<u16>();
     eprintln!(
         "bn_menu: publish realms={} chars={count} {:?}",
         realms.len(),
@@ -7398,7 +8203,7 @@ fn publish_realms(script: &mut UiScript) {
             .map(|r| (&r.name, r.category, r.flags, r.characters))
             .collect::<Vec<_>>()
     );
-    // The reference's realm-list reply frame (`0x46c0d2`-`0x46c0e2`): the
+    // The client's realm-list reply frame: the
     // status dialog closed first, then the holder and the rebuild.
     fire(script, vec![GlueSignal::Close]);
     script.set_glue_realms(realms);
@@ -7408,7 +8213,10 @@ fn publish_realms(script: &mut UiScript) {
     let cats = script
         .eval::<f64>("local t = GetRealmCategories(); return t.n or #t")
         .unwrap_or(-1.0);
-    eprintln!("bn_menu: after rebuild screen={:?} realms(1)={n} categories={cats}", script.glue_screen());
+    eprintln!(
+        "bn_menu: after rebuild screen={:?} realms(1)={n} categories={cats}",
+        script.glue_screen()
+    );
 }
 
 /// The `GetCharacterListUpdate` tail, called from the tick for the screen's
@@ -7437,7 +8245,11 @@ fn sync_menu(script: &mut UiScript) {
 
     if snap.status != last_status {
         BN_MENU.with(|m| m.borrow_mut().last_status = snap.status);
-        eprintln!("bn_menu: status {last_status} -> {} (screen={:?})", snap.status, script.glue_screen());
+        eprintln!(
+            "bn_menu: status {last_status} -> {} (screen={:?})",
+            snap.status,
+            script.glue_screen()
+        );
         match snap.status {
             // Auth OK: the roster is up, and its OnShow asks for the list.
             net::ST_CHARS => {
@@ -7576,7 +8388,7 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
 }
 
 /// Move the UI pointer to `(x, y)` in the root's screen space (`bn_ui_set_
-/// screen_size`, y up). Fires hover enter/leave like the reference's cursor
+/// screen_size`, y up). Fires hover enter/leave like the client's cursor
 /// walk. Returns 1 with a session, 0 without.
 #[no_mangle]
 pub extern "C" fn bn_ui_mouse_move(x: f32, y: f32) -> u32 {
@@ -7619,7 +8431,7 @@ pub extern "C" fn bn_ui_mouse_button(x: f32, y: f32, button: *const c_char, down
 }
 
 // ---- keyboard: key names in, one fixed Windows chord table applied here ----
-// (the reference leaves the per-OS keymap to the host; keeping it in the
+// (the client leaves the per-OS keymap to the host; keeping it in the
 // middle layer leaves the UE side a pure event forwarder).
 
 /// The editing action for a taken key-down on an EditBox, from the key name
@@ -7631,7 +8443,11 @@ fn editbox_chord(key: &str, mods: u32) -> Option<benilla_ui::widget::EditAction>
     let ctrl = mods & 2 != 0;
     let k = key.to_ascii_uppercase();
     let mv = |unit: EditUnit, back: bool| {
-        Some(EditAction::Move { unit, back, extend: shift })
+        Some(EditAction::Move {
+            unit,
+            back,
+            extend: shift,
+        })
     };
     match (k.as_str(), ctrl) {
         ("LEFT", false) => mv(EditUnit::Char, true),
@@ -7644,10 +8460,22 @@ fn editbox_chord(key: &str, mods: u32) -> Option<benilla_ui::widget::EditAction>
         ("HOME", true) => mv(EditUnit::Edge, true),
         ("END", false) => mv(EditUnit::Line, false),
         ("END", true) => mv(EditUnit::Edge, false),
-        ("BACKSPACE", false) => Some(EditAction::Delete { unit: EditUnit::Char, back: true }),
-        ("BACKSPACE", true) => Some(EditAction::Delete { unit: EditUnit::Word, back: true }),
-        ("DELETE", false) => Some(EditAction::Delete { unit: EditUnit::Char, back: false }),
-        ("DELETE", true) => Some(EditAction::Delete { unit: EditUnit::Word, back: false }),
+        ("BACKSPACE", false) => Some(EditAction::Delete {
+            unit: EditUnit::Char,
+            back: true,
+        }),
+        ("BACKSPACE", true) => Some(EditAction::Delete {
+            unit: EditUnit::Word,
+            back: true,
+        }),
+        ("DELETE", false) => Some(EditAction::Delete {
+            unit: EditUnit::Char,
+            back: false,
+        }),
+        ("DELETE", true) => Some(EditAction::Delete {
+            unit: EditUnit::Word,
+            back: false,
+        }),
         ("A", true) => Some(EditAction::SelectAll),
         ("U", true) => Some(EditAction::DeleteToEdge { back: true }),
         ("K", true) => Some(EditAction::DeleteToEdge { back: false }),
@@ -7661,7 +8489,7 @@ fn editbox_chord(key: &str, mods: u32) -> Option<benilla_ui::widget::EditAction>
 /// the chord state (bit0 Shift, bit1 Ctrl, bit2 Alt; for a modifier's own
 /// event include its own bit — the state after the event), `down` 1 = press.
 /// A press runs the key-down walk and, when it lands on an EditBox, our keymap
-/// applies the key's editing action (the reference's host job). Returns the
+/// applies the key's editing action (the client's host job). Returns the
 /// KeyWalk of a press (0 declined / 1 frame / 2 box), 1/0 taken for a release,
 /// 0 with no session.
 #[no_mangle]
@@ -7675,7 +8503,9 @@ pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         BN_UI.with(|slot| {
             let mut slot = slot.borrow_mut();
-            let Some(script) = slot.as_mut() else { return 0u32 };
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
             // The alt-arrow gate reads this: arrows pass through an
             // ignoreArrows box only while ALT is held.
             script.set_alt_down(mods & 4 != 0);
@@ -7722,7 +8552,7 @@ pub extern "C" fn bn_ui_char(text: *const c_char) -> u32 {
 }
 
 /// Paste host clipboard text into the focused EditBox, typed a character at a
-/// time as the reference's paste is. Returns 1 if consumed, 0 otherwise.
+/// time as the client's paste is. Returns 1 if consumed, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn bn_ui_paste(text: *const c_char) -> u32 {
     if text.is_null() {
@@ -7983,7 +8813,11 @@ pub extern "C" fn bn_ui_push_merchant(
                 if p.is_null() {
                     None
                 } else {
-                    Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                    Some(
+                        unsafe { std::ffi::CStr::from_ptr(p) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
             };
             // A zero-item push clears the open vendor.
@@ -8025,7 +8859,7 @@ pub extern "C" fn bn_ui_push_merchant(
 
 // ---- glue booth ----
 
-/// The login / character-screen backdrop booth (benilla-app's glue_booth):
+/// The login / character-screen backdrop booth (the glue booth):
 /// the shown `<Model>` frame's inputs for the UE render host. `cam_*` is
 /// **raw WoW model space** - the UE side maps it through (x, -y, z) × 100
 /// exactly like `bn_model_fill` maps the vertices, so camera and mesh land in
@@ -8036,7 +8870,7 @@ pub struct BnBooth {
     pub path: [c_char; 260],
     /// The Model frame rect: left, top, width, height (VM units, Y up).
     pub rect: [f32; 4],
-    /// `GetFacing()` yaw (radians), `GetModelScale()`, `GetPosition()`.
+    /// `GetFacing` yaw (radians), `GetModelScale`, `GetPosition`.
     pub facing: f32,
     pub scale: f32,
     pub pos: [f32; 3],
@@ -8048,11 +8882,100 @@ pub struct BnBooth {
     pub cam_fov: f32,
     pub cam_near: f32,
     pub cam_far: f32,
-    /// The scene's stock fog, mirroring glue_booth.rs `stock_fog`
+    /// The scene's stock fog, mirroring glue_booth `stock_fog`
     /// (AccountLogin.xml `<FogColor>`/`fogFar`, GlueParent.lua `CharModelFogInfo`).
     pub fog_rgb: [f32; 3],
     pub fog_near: f32,
     pub fog_far: f32,
+    /// The glue stage's standing character: 0 none, 1 the select screen's
+    /// selected roster row, 2 the create screen's dress-up look.
+    pub stand_src: u8,
+    /// Appearance bytes (select: the roster row's CharEnum fields; create: the
+    /// create dials).
+    pub stand_race: u8,
+    pub stand_sex: u8,
+    pub stand_skin: u8,
+    pub stand_face: u8,
+    pub stand_hair: u8,
+    pub stand_hair_color: u8,
+    pub stand_facial: u8,
+    /// Body displays in the CharEnum order: shirt, chest, waist, legs, feet,
+    /// wrist, hands, tabard (0 = bare).
+    pub stand_gear: [u32; 8],
+    /// The stage spot (attachment 0) in raw WoW model space.
+    pub stand_pos: [f32; 3],
+    /// The body's in-scene yaw (radians, WoW +Z): the stage bone chain's parked
+    /// yaw plus the screen's facing.
+    pub stand_yaw: f32,
+    /// The stage bone chain's parked uniform scale.
+    pub stand_scale: f32,
+}
+
+/// The glue stage a body stands on: `attachment 0`'s point plus its bone
+/// chain's parked yaw and uniform scale (`glue_booth`'s `attachment_point` +
+/// `stage_frame`). `attachment_point` reduces to the raw record position
+/// because the pivot chain telescopes.
+fn stage_seat(m2: &[u8]) -> Option<([f32; 3], f32, f32)> {
+    let att = benilla_formats::parse_m2_attachments(m2).ok()?;
+    let a = att.iter().find(|a| a.id == 0)?;
+    let skel = benilla_formats::parse_m2_skeleton(m2).ok()?;
+    let gseq = benilla_formats::parse_m2_global_sequence_bones(m2);
+    let mut yaw = 0.0f32;
+    let mut scale = 1.0f32;
+    let mut at = Some(usize::from(a.bone));
+    for _ in 0..=skel.bones.len() {
+        let Some(i) = at else { break };
+        if let Some(g) = gseq.iter().find(|g| usize::from(g.bone) == i) {
+            if let Some(q) = g.rotation.as_ref().and_then(|c| parked(&c.keys)) {
+                yaw += 2.0 * q[2].atan2(q[3]);
+            }
+            if let Some(s) = g.scale.as_ref().and_then(|c| parked(&c.keys)) {
+                scale *= s[0];
+            }
+        }
+        at = usize::try_from(skel.bones.get(i)?.parent).ok();
+    }
+    Some((a.position, yaw, scale))
+}
+
+/// A global-sequence channel's parked key: the stage bones sit at t = 0 and
+/// never animate (the client samples t = 0).
+fn parked<T: Copy>(keys: &[(u32, T)]) -> Option<T> {
+    keys.iter()
+        .find(|k| k.0 == 0)
+        .or_else(|| keys.first())
+        .map(|k| k.1)
+}
+
+/// `CharStartOutfit` InventoryType -> the `stand_gear` slot. Weapons, shields
+/// and slots with no body model (head/shoulders/neck/back/fingers) are dropped.
+fn start_outfit_slot(inv: u8) -> Option<usize> {
+    Some(match inv {
+        4 => 0,      // shirt
+        5 | 20 => 1, // chest / robe
+        6 => 2,      // waist
+        7 => 3,      // legs
+        8 => 4,      // feet
+        9 => 5,      // wrist
+        10 => 6,     // hands
+        19 => 7,     // tabard
+        _ => return None,
+    })
+}
+
+/// What stands on the glue stage this poll.
+#[derive(Default, Clone, Copy)]
+struct StandLook {
+    src: u8,
+    race: u8,
+    sex: u8,
+    skin: u8,
+    face: u8,
+    hair: u8,
+    hair_color: u8,
+    facial: u8,
+    gear: [u32; 8],
+    facing: f32,
 }
 
 #[no_mangle]
@@ -8113,9 +9036,12 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
     }
     let num = |i: usize, d: f32| f.get(i).and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
 
-    // GlueXML names a .mdx stem, the archives hold .m2 only (booth_probe).
+    // GlueXML names a.mdx stem, the archives hold.m2 only (booth_probe).
     let mut path = f[1].trim().to_string();
-    if path.get(path.len().saturating_sub(4)..).is_some_and(|e| e.eq_ignore_ascii_case(".mdx")) {
+    if path
+        .get(path.len().saturating_sub(4)..)
+        .is_some_and(|e| e.eq_ignore_ascii_case(".mdx"))
+    {
         path.truncate(path.len() - 4);
         path.push_str(".m2");
     }
@@ -8139,27 +9065,112 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
         _ => ([0.25, 0.06, 0.015], 1200.0), // MainMenu
     };
 
-    // camera0 by model path: the booth M2 is ~866KB decompressed, far too
-    // heavy to re-read from the MPQ on every poll (files are immutable).
+    // camera0 and the stage seat by model path: the booth M2 is ~866KB
+    // decompressed, far too heavy to re-read from the MPQ on every poll
+    // (files are immutable).
+    #[derive(Clone, Copy)]
+    struct SceneInfo {
+        cam: Option<[f32; 10]>,
+        seat: Option<([f32; 3], f32, f32)>,
+    }
     thread_local! {
-        static CAM_CACHE: std::cell::RefCell<HashMap<String, Option<[f32; 10]>>> =
+        static SCENE_CACHE: std::cell::RefCell<HashMap<String, Option<SceneInfo>>> =
             std::cell::RefCell::new(HashMap::new());
     }
-    let cam = CAM_CACHE.with(|cell| {
+    let info = SCENE_CACHE.with(|cell| {
         let mut cell = cell.borrow_mut();
         if !cell.contains_key(&path) {
-            let v = m2_bytes(w, &path)
-                .and_then(|b| benilla_formats::parse_m2_camera(&b, 0))
-                .map(|c| {
+            let v = m2_bytes(w, &path).map(|b| SceneInfo {
+                cam: benilla_formats::parse_m2_camera(&b, 0).map(|c| {
                     [
-                        c.position[0], c.position[1], c.position[2],
-                        c.target[0], c.target[1], c.target[2],
-                        c.roll, c.fov, c.near_clip, c.far_clip,
+                        c.position[0],
+                        c.position[1],
+                        c.position[2],
+                        c.target[0],
+                        c.target[1],
+                        c.target[2],
+                        c.roll,
+                        c.fov,
+                        c.near_clip,
+                        c.far_clip,
                     ]
-                });
+                }),
+                seat: stage_seat(&b),
+            });
             cell.insert(path.clone(), v);
         }
         cell.get(&path).copied().flatten()
+    });
+
+    // What stands on the glue stage: the select screen's selected roster row or
+    // the create screen's dress-up body. Login (ffx scene, no stage body) and
+    // any other pane report `stand_src = 0`.
+    let mut stand = StandLook::default();
+    BN_UI.with(|slot| {
+        let Ok(held) = slot.try_borrow() else { return };
+        let Some(s) = held.as_ref() else { return };
+        let Some(pane) = s.glue_scene() else { return };
+        if pane.create {
+            let Some(look) = s.glue_create_look() else {
+                return;
+            };
+            stand = StandLook {
+                src: 2,
+                race: look.race,
+                sex: look.sex,
+                skin: look.skin,
+                face: look.face,
+                hair: look.hair_style,
+                hair_color: look.hair_color,
+                facial: look.facial_hair,
+                gear: [0; 8],
+                facing: s.glue_create_facing(),
+            };
+            // The create body wears its class's CharStartOutfit (glue_booth).
+            let outfit = BN_MENU.with(|m| {
+                m.borrow()
+                    .catalogs
+                    .create
+                    .as_ref()
+                    .map(|c| c.start_outfit(look.race, look.class, look.sex).to_vec())
+                    .unwrap_or_default()
+            });
+            for it in outfit {
+                if let Some(slot) = start_outfit_slot(it.inv_type) {
+                    stand.gear[slot] = it.display_id;
+                }
+            }
+        } else if pane.select {
+            let Some(guid) = s.glue_standing_guid() else {
+                return;
+            };
+            let row =
+                net::with_chars(|rows| rows.iter().find(|r| r.guid == guid).copied()).flatten();
+            let Some(row) = row else { return };
+            stand = StandLook {
+                src: 1,
+                race: row.race,
+                sex: row.gender,
+                skin: row.skin,
+                face: row.face,
+                hair: row.hair_style,
+                hair_color: row.hair_color,
+                facial: row.facial_hair,
+                // CharEnum body slots: shirt, chest, waist, legs, feet, wrist,
+                // hands, tabard.
+                gear: [
+                    row.equip_display[3],
+                    row.equip_display[4],
+                    row.equip_display[5],
+                    row.equip_display[6],
+                    row.equip_display[7],
+                    row.equip_display[8],
+                    row.equip_display[9],
+                    row.equip_display[18],
+                ],
+                facing: s.glue_select_cells().facing,
+            };
+        }
     });
 
     // SAFETY: out points at a caller-owned BnBooth.
@@ -8172,7 +9183,7 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
         o.facing = num(6, 0.0);
         o.scale = num(7, 1.0);
         o.pos = [num(8, 0.0), num(9, 0.0), num(10, 0.0)];
-        if let Some(c) = cam {
+        if let Some(c) = info.and_then(|i| i.cam) {
             o.cam_eye = [c[0], c[1], c[2]];
             o.cam_target = [c[3], c[4], c[5]];
             o.cam_roll = c[6];
@@ -8183,6 +9194,26 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
         o.fog_rgb = fog_rgb;
         o.fog_near = 0.0;
         o.fog_far = fog_far;
+        o.stand_src = if stand.src != 0 && stand.race != 0 && stand.sex <= 1 {
+            stand.src
+        } else {
+            0
+        };
+        o.stand_race = stand.race;
+        o.stand_sex = stand.sex;
+        o.stand_skin = stand.skin;
+        o.stand_face = stand.face;
+        o.stand_hair = stand.hair;
+        o.stand_hair_color = stand.hair_color;
+        o.stand_facial = stand.facial;
+        o.stand_gear = stand.gear;
+        if let Some((pos, yaw, scale)) = info.and_then(|i| i.seat) {
+            o.stand_pos = pos;
+            o.stand_yaw = yaw + stand.facing;
+            o.stand_scale = scale;
+        } else {
+            o.stand_src = 0;
+        }
     }
     1
 }
@@ -8190,10 +9221,10 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
 /// The zone atmosphere at a WoW-space position (`x`/`y`/`z` in yards) on
 /// `map` (0 = Eastern Kingdoms, 1 = Kalimdor) at `time` half-minutes
 /// (1440 = noon), exactly as `LightCatalog::sample` resolves it for the
-/// reference client. Writes 26 floats:
-///   [0] fog end (yd), [1] fog start as a fraction of the end,
-///   [2..5] fog colour, [5..8] sun diffuse, [8..11] ambient,
-///   [11..26] the five sky-gradient stops, zenith to horizon.
+/// client. Writes 26 floats:
+/// [0] fog end (yd), [1] fog start as a fraction of the end,
+/// [2..5] fog colour, [5..8] sun diffuse, [8..11] ambient,
+/// [11..26] the five sky-gradient stops, zenith to horizon.
 /// Returns the float count written, 0 when the tables or the row are missing.
 #[no_mangle]
 pub extern "C" fn bn_light_sample(
@@ -8238,12 +9269,17 @@ pub extern "C" fn bn_light_sample(
 }
 
 /// One `Spell.dbc` display row as a TSV line:
-///   `id|name|rank|icon|school|power_type|mana_cost|duration_index|range_index|`
-///   `recovery_ms|category|category_recovery_ms|start_recovery_ms`
+/// `id|name|rank|icon|school|power_type|mana_cost|duration_index|range_index|`
+/// `recovery_ms|category|category_recovery_ms|start_recovery_ms`
 /// (`icon` is the BLP path without extension; empty rank for unranked rows).
 /// Returns the byte count written, 0 when the row is missing.
 #[no_mangle]
-pub extern "C" fn bn_spell_info(world: *mut BnWorld, spell_id: u32, out: *mut c_char, cap: u32) -> u32 {
+pub extern "C" fn bn_spell_info(
+    world: *mut BnWorld,
+    spell_id: u32,
+    out: *mut c_char,
+    cap: u32,
+) -> u32 {
     if world.is_null() || out.is_null() || cap == 0 || spell_id == 0 {
         return 0;
     }
@@ -8378,4 +9414,3 @@ pub extern "C" fn bn_minimap_tile_path(
     }
     n as u32
 }
-

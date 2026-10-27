@@ -4,7 +4,7 @@
 // windmill's sails) carry bone animation, but the host bakes every doodad
 // placement into its static, texture-grouped batch, so those props hold
 // their rest pose forever. This module exposes the rig of one model: its
-// submesh layout, the arm chain the reference arms (the loader-idle seed
+// submesh layout, the arm chain the client arms (the loader-idle seed
 // and the variations it re-rolls over) and the skinned pose of one
 // sequence at one time.
 //
@@ -13,10 +13,9 @@
 // originals), and the rig is keyed by model path, so it survives the tile
 // switches of the handle that holds one tile at a time.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use benilla_formats::{ModelAnimation, RenderSubmesh};
 
@@ -42,7 +41,7 @@ struct RigClip {
     start_ms: u32,
     end_ms: u32,
     duration_ms: u32,
-    /// The variation's weight in the reference's per-play roll (`M2Sequence+0x14`).
+    /// The variation's weight in the client's per-play roll (`M2Sequence+0x14`).
     frequency: u16,
     /// `(minReplay, maxReplay)`: the play count the window rolls.
     min_replay: u32,
@@ -57,8 +56,9 @@ struct Rig {
     /// The global-sequence durations, for the gseq bone tracks.
     global_seqs: Vec<u32>,
     /// The model's submeshes in the flat order `build_wmo_flat` bakes, so the
-    /// posed vertices line up with the host's static batch.
-    subs: Vec<RenderSubmesh>,
+    /// posed vertices line up with the host's static batch. Shared with the
+    /// parse cache (never a second copy).
+    subs: Arc<Vec<RenderSubmesh>>,
     /// The arm chain: every sequence of the idle id, in file order.
     clips: Vec<RigClip>,
     /// The idle animation id: the playable lookup's first row.
@@ -100,7 +100,6 @@ impl Rig {
     }
 
     /// The model's skinned pose at (sequence slot, absolute timeline ms).
-    ///
     /// Six floats per vertex: the position and the normal, both in the model's
     /// own UE axes (`(x, -y, z)`), in the flat submesh order the static batch
     /// uses. The host applies the placement matrix per placement.
@@ -118,7 +117,7 @@ impl Rig {
             })
             .collect();
         let mut out = Vec::with_capacity(self.vert_count() as usize * 6);
-        for sm in &self.subs {
+        for sm in self.subs.iter() {
             for i in 0..sm.positions.len() {
                 let p = sm.positions[i];
                 // fixCoordSystem: the vertex's local position in UE axes
@@ -128,7 +127,7 @@ impl Rig {
                 let weights = sm.weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
                 let total: f32 = weights.iter().sum();
 
-                // The reference model.cpp L730: v += mat * pos * w.
+                // The client model.cpp L730: v += mat * pos * w.
                 let mut pos = local;
                 if total > 1e-6 {
                     let mut acc = [0.0f32; 3];
@@ -194,11 +193,13 @@ fn apply_dir(m: &[f32; 16], v: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-// The model cache, keyed by path. The model files are immutable, so one
-// parse per path serves every tile and every frame.
-thread_local! {
-    static RIG_CACHE: RefCell<HashMap<String, Option<Arc<Rig>>>> =
-        RefCell::new(HashMap::new());
+// The rig cache, keyed by path and shared with the tile prefetch worker (which
+// parses a tile's prop rigs off the game thread before the build asks for
+// them). The model files are immutable, so one parse per path serves every
+// tile and every frame; a failed parse is cached as `None`.
+fn rig_cache() -> &'static Mutex<HashMap<String, Option<Arc<Rig>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Rig>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The directory part of a model path, the way `load_m2_mesh` derives it.
@@ -231,28 +232,19 @@ fn model_bytes(world: &BnWorld, path: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Parse one model's rig, or `None` when the path holds no M2.
-fn build_rig(world: &BnWorld, path: &str) -> Option<Rig> {
-    let bytes = model_bytes(world, path)?;
-    // The same submesh parse the static bake uses, so the flat vertex order
-    // matches the host's baked batch exactly. When the host has already
-    // loaded a placement of this model, the static bake's parse is reused:
-    // the model is parsed once, not once per path.
-    let subs = match world.doodad_models.get(path) {
-        Some(subs) => subs.clone(),
-        None => benilla_formats::parse_m2_render_submeshes(&bytes, parent_dir(path), &[]).ok()?,
-    };
-    let bones = crate::parse_m2_bones(&bytes)?;
-    let global_seqs = crate::parse_m2_global_sequences(&bytes);
-    let anims: Vec<ModelAnimation> = benilla_formats::parse_m2_animations(&bytes);
-    let playable = benilla_formats::parse_m2_playable_animation_lookup(&bytes).unwrap_or_default();
+/// Parse one model's rig from its bytes, or `None` when they hold no M2.
+fn build_rig_from_bytes(bytes: &[u8], subs: Arc<Vec<RenderSubmesh>>) -> Option<Rig> {
+    let bones = crate::parse_m2_bones(bytes)?;
+    let global_seqs = crate::parse_m2_global_sequences(bytes);
+    let anims: Vec<ModelAnimation> = benilla_formats::parse_m2_animations(bytes);
+    let playable = benilla_formats::parse_m2_playable_animation_lookup(bytes).unwrap_or_default();
 
     // The loader-idle seed's id: the playable lookup's first row (id 0 through
     // it), the way `ModelAnimations::idle_clip` resolves it.
     let idle_id = playable.first().map_or(0, |p| p.resolved_id);
 
     // The arm chain: every sequence of the idle id, in file order (the
-    // reference's variation chain). The seed is the first of them that is not
+    // client's variation chain). The seed is the first of them that is not
     // the bind pose (`ModelAnimations::first_seq`).
     let mut clips: Vec<RigClip> = Vec::new();
     let mut seed: Option<u32> = None;
@@ -279,43 +271,75 @@ fn build_rig(world: &BnWorld, path: &str) -> Option<Rig> {
         clips,
         idle_id,
         seed,
-        seq_count: crate::m2_anim_count(&bytes),
+        seq_count: crate::m2_anim_count(bytes),
     })
+}
+
+/// `build_rig_from_bytes` for the game thread: read the model the way the
+/// static bake does, then parse the rig over the same bytes.
+fn build_rig(world: &BnWorld, path: &str) -> Option<Rig> {
+    let bytes = model_bytes(world, path)?;
+    // The same submesh parse the static bake uses, so the flat vertex order
+    // matches the host's baked batch exactly. The shared cache holds it once
+    // the model has been placed anywhere in the world.
+    let subs = match crate::doodad_mesh_cached(path) {
+        Some(subs) => subs,
+        None => Arc::new(
+            benilla_formats::parse_m2_render_submeshes(&bytes, parent_dir(path), &[]).ok()?,
+        ),
+    };
+    build_rig_from_bytes(&bytes, subs)
+}
+
+/// Parse `path`'s rig on the calling thread (the tile prefetch worker, whose
+/// chain read `bytes`) unless the cache already holds it.
+pub(crate) fn rig_ensure_from_bytes(path: &str, bytes: &[u8], subs: Arc<Vec<RenderSubmesh>>) {
+    let key = crate::chain_model_path(path);
+    if rig_cache()
+        .lock()
+        .ok()
+        .is_some_and(|c| c.contains_key(&key))
+    {
+        return;
+    }
+    let built = build_rig_from_bytes(bytes, subs).map(Arc::new);
+    if let Ok(mut cache) = rig_cache().lock() {
+        cache.entry(key).or_insert(built);
+    }
 }
 
 /// The cached rig of `path`, parsed on first use.
 fn rig_for(world: &BnWorld, path: &str) -> Option<Arc<Rig>> {
-    let hit = RIG_CACHE.with(|cell| cell.borrow().get(path).cloned());
-    if let Some(found) = hit {
+    let key = crate::chain_model_path(path);
+    if let Some(found) = rig_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         return found;
     }
     let built = build_rig(world, path).map(Arc::new);
-    RIG_CACHE.with(|cell| {
-        let mut map = cell.borrow_mut();
-        map.insert(path.to_string(), built.clone());
-        built
-    })
+    if let Ok(mut cache) = rig_cache().lock() {
+        cache.insert(key, built.clone());
+    }
+    built
 }
 
 /// The rig table of `model_path`: a header, one row per submesh and one row
 /// per arm-chain clip, all u32.
 ///
-/// ```text
+/// `text
 /// header (12 u32)
-///   [0]  layout version
-///   [1]  flags: bit 0 = the model has a non-bind-pose seed, so it animates
-///   [2]  submesh count
-///   [3]  clip count (the arm chain)
-///   [4]  total vertex count (flat)
-///   [5]  total index count (flat)
-///   [6]  the idle animation id
-///   [7]  the seed clip's index in the chain (0xffffffff when there is none)
-///   [8]  bone count
-///   [9..12] reserved (0)
+/// [0] layout version
+/// [1] flags: bit 0 = the model has a non-bind-pose seed, so it animates
+/// [2] submesh count
+/// [3] clip count (the arm chain)
+/// [4] total vertex count (flat)
+/// [5] total index count (flat)
+/// [6] the idle animation id
+/// [7] the seed clip's index in the chain (0xffffffff when there is none)
+/// [8] bone count
+/// [9..12] reserved (0)
 /// per submesh (4 u32): vtx0, vtx_n, idx0, idx_n
 /// per clip (8 u32): seq_index, start_ms, end_ms, duration_ms, frequency,
-///                   min_replay, max_replay, looping
-/// ```
+/// min_replay, max_replay, looping
+/// `
 ///
 /// Returns the table's u32 length (0 when the path holds no model). The
 /// caller may pass `cap` below that: the table is filled as far as it fits
@@ -348,7 +372,11 @@ pub extern "C" fn bn_doodad_rig_info(
 
     let mut table: Vec<u32> = Vec::with_capacity(total);
     table.push(RIG_INFO_VERSION);
-    table.push(if rig.seed.is_some() { RIG_FLAG_ANIMATED } else { 0 });
+    table.push(if rig.seed.is_some() {
+        RIG_FLAG_ANIMATED
+    } else {
+        0
+    });
     table.push(sub_n as u32);
     table.push(clip_n as u32);
     table.push(rig.vert_count());
@@ -380,10 +408,10 @@ pub extern "C" fn bn_doodad_rig_info(
     total as u32
 }
 
-/// The weighted pick of an arm-chain clip, the reference's `pick_variation`
+/// The weighted pick of an arm-chain clip, the client's `pick_variation`
 /// walk over the sequences that share `anim_id`.
 ///
-/// `roll` is one `rand()` draw in `[0, 32767]`. Returns the clip's index in
+/// `roll` is one `rand` draw in `[0, 32767]`. Returns the clip's index in
 /// the chain published by [`bn_doodad_rig_info`], or `0xffffffff` when the
 /// model has no chain for `anim_id`.
 #[no_mangle]
@@ -407,7 +435,7 @@ pub extern "C" fn bn_doodad_rig_pick(
     if rig.idle_id as u32 != anim_id || rig.clips.is_empty() {
         return u32::MAX;
     }
-    // The reference's walk: subtract each variation's weight and stop at the
+    // The client's walk: subtract each variation's weight and stop at the
     // first that covers the roll; exhaustion keeps the head.
     let mut r = roll as i64;
     for (i, c) in rig.clips.iter().enumerate() {
@@ -466,11 +494,7 @@ pub extern "C" fn bn_doodad_rig_pose(
 ///
 /// Returns 1 on success, 0 when there is no active tile or no such doodad.
 #[no_mangle]
-pub extern "C" fn bn_doodad_placement(
-    world: *const BnWorld,
-    i: u32,
-    out: *mut f32,
-) -> u32 {
+pub extern "C" fn bn_doodad_placement(world: *const BnWorld, i: u32, out: *mut f32) -> u32 {
     if world.is_null() || out.is_null() {
         return 0;
     }
@@ -492,7 +516,16 @@ pub extern "C" fn bn_doodad_placement(
 
     // The rotation's columns, so the matrix multiplies a point the same way
     // `q_rot` does.
-    let col = |j: usize| crate::q_rot(qp, [if j == 0 { 1.0 } else { 0.0 }, if j == 1 { 1.0 } else { 0.0 }, if j == 2 { 1.0 } else { 0.0 }]);
+    let col = |j: usize| {
+        crate::q_rot(
+            qp,
+            [
+                if j == 0 { 1.0 } else { 0.0 },
+                if j == 1 { 1.0 } else { 0.0 },
+                if j == 2 { 1.0 } else { 0.0 },
+            ],
+        )
+    };
 
     let s = d.scale;
     let (cx, cy) = tile.center;

@@ -2,7 +2,9 @@
 use benilla::*;
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir.clone()).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -67,7 +69,10 @@ fn main() {
             maxy = maxy.max(v.y);
         }
         let in_range = vn == 0
-            || (minx.abs() <= 1700.0 && maxx.abs() <= 1700.0 && miny.abs() <= 1700.0 && maxy.abs() <= 1700.0);
+            || (minx.abs() <= 1700.0
+                && maxx.abs() <= 1700.0
+                && miny.abs() <= 1700.0
+                && maxy.abs() <= 1700.0);
         println!(
             "{map}_{x}_{z}: meshes={n} verts={vn} idx={ic} \
              water={} ocean={} magma={} bad={} wmos={wok}/{wn} bbox=({minx:.0},{miny:.0})..({maxx:.0},{maxy:.0})",

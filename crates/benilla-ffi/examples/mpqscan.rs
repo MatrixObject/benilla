@@ -28,11 +28,7 @@ fn main() {
             }
         };
         // Report which probe paths this archive contains.
-        let hits: Vec<&str> = probes
-            .iter()
-            .filter(|pp| a.contains(pp))
-            .cloned()
-            .collect();
+        let hits: Vec<&str> = probes.iter().filter(|pp| a.contains(pp)).cloned().collect();
         if !hits.is_empty() {
             println!("{f}: CONTAINS {hits:?}");
         } else {

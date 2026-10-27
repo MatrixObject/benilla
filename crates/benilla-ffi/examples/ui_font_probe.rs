@@ -16,9 +16,19 @@ fn raster(
     let (mut w, mut h) = (0u32, 0u32);
     let (mut ox, mut oy, mut pw, mut ph) = (0f32, 0f32, 0f32, 0f32);
     let n = bn_ui_text_bitmap(
-        world as *const _, cf.as_ptr(), size, outline, ct.as_ptr(),
-        buf.as_mut_ptr(), buf.len() as u32,
-        &mut w, &mut h, &mut ox, &mut oy, &mut pw, &mut ph,
+        world as *const _,
+        cf.as_ptr(),
+        size,
+        outline,
+        ct.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+        &mut w,
+        &mut h,
+        &mut ox,
+        &mut oy,
+        &mut pw,
+        &mut ph,
     );
     let lit = if n > 0 {
         buf[..n as usize].chunks(4).filter(|p| p[3] > 0).count()
@@ -29,9 +39,9 @@ fn raster(
 }
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string()
-    });
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r#"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data"#.to_string());
     let cdir = std::ffi::CString::new(data_dir).unwrap();
     let world = bn_init(cdir.as_ptr());
     if world.is_null() {
@@ -46,7 +56,12 @@ fn main() {
         ("Fonts\\FRIZQT__.TTF", px, 1, "Account: nezha"),
         ("Fonts\\FRIZQT__.TTF", px, 2, "THICK OUTLINE"),
         ("Fonts\\FRIZQT__.TTF", px, 1, "确定"), // CJK coverage
-        ("Fonts\\FRIZQT__.TTF", px, 1, "|cffffd200Quest ready|r: 确定"),
+        (
+            "Fonts\\FRIZQT__.TTF",
+            px,
+            1,
+            "|cffffd200Quest ready|r: 确定",
+        ),
         ("Fonts\\FRIZQT__.TTF", px, 0, "Line one\nLine two"),
         ("Fonts\\FZLBJW.TTF", px, 1, "确定连招"), // the glue menu's own CJK face
         ("", px, 1, "fallback face"),
@@ -56,7 +71,11 @@ fn main() {
     for &(font, size, outline, text) in cases {
         let (n, w, h, ox, oy, pw, ph, lit) = raster(world, font, size, outline, text);
         let expect_fail = size <= 0.5;
-        let ok = if expect_fail { n == 0 } else { n > 0 && lit > 0 };
+        let ok = if expect_fail {
+            n == 0
+        } else {
+            n > 0 && lit > 0
+        };
         if !ok {
             fail += 1;
         }
@@ -69,12 +88,11 @@ fn main() {
     }
 
     // CJK coverage: the standard text face must map the char to a real glyph,
-    // not .notdef (whose box would also light up pixels). A non-BMP codepoint
+    // not.notdef (whose box would also light up pixels). A non-BMP codepoint
     // is in no WoW 1.12 face, so its ink is the notdef box.
     {
         let (n1, _, _, _, _, _, _, lit1) = raster(world, "Fonts\\FZLBJW.TTF", px, 0, "确");
-        let (n2, _, _, _, _, _, _, lit2) =
-            raster(world, "Fonts\\FZLBJW.TTF", px, 0, "\u{20000}");
+        let (n2, _, _, _, _, _, _, lit2) = raster(world, "Fonts\\FZLBJW.TTF", px, 0, "\u{20000}");
         let ok = n1 > 0 && (n2 == 0 || lit1 > lit2 * 2);
         if !ok {
             fail += 1;
@@ -83,7 +101,7 @@ fn main() {
             "{} CJK glyph present in FZLBJW: 确 lit={lit1}, U+20000 lit={lit2}",
             if ok { "ok  " } else { "FAIL" }
         );
-        // FRIZQT is Latin-only (the reference has no glyph fallback either):
+        // FRIZQT is Latin-only (the client has no glyph fallback either):
         // its 确 is the notdef box, which the check documents rather than fails.
         let (_, _, _, _, _, _, _, friz) = raster(world, "Fonts\\FRIZQT__.TTF", px, 0, "确");
         println!("info FRIZQT__.TTF 确 lit={friz} (Latin-only face, expected notdef)");

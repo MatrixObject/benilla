@@ -1,16 +1,16 @@
 // WoW <-> UE5 coordinate-system conversion layer for benilla-ffi.
-//! All matrices are column-major (index = col*4+row), matching the reference
-//! Matrix::operator* application and the skin-blend apply().
+//! All matrices are column-major (index = col*4+row), matching the client
+//! Matrix::operator* application and the skin-blend apply.
 //!
 //! World-of-Warcraft 1.12.1 M2 geometry is left-handed, Y-up. Unreal Engine 5
-//! is left-handed, Z-up. The reference nezha model.cpp converts at the boundary
+//! is left-handed, Z-up. The client nezha model.cpp converts at the boundary
 //! with fixCoordSystem:
-//!   vector   (x, y, z)   -> (x, -y, z)     (Y-flip)
-//!   quaternion (x,y,z,w) -> (x, -y, z, w)  (Y-flip of the vector part)
-//!   scale    (x, y, z)   -> unchanged      (fixCoordSystem2 = identity)
+//! vector (x, y, z) -> (x, -y, z) (Y-flip)
+//! quaternion (x,y,z,w) -> (x, -y, z, w) (Y-flip of the vector part)
+//! scale (x, y, z) -> unchanged (fixCoordSystem2 = identity)
 //!
 //! Distance scale: 1 M2 world unit = 100 UE cm (Blizzard 1 yard = 3 units =
-//! 300 cm). The reference places actors via SetActorScale3D(gWorld->scale = 1)
+//! 300 cm). The client places actors via SetActorScale3D(gWorld->scale = 1)
 //! on world-unit coordinates, which is equivalent to multiplying model-space
 //! values by 100 before feeding UE.
 
@@ -40,10 +40,7 @@ pub struct Mat4 {
 impl Mat4 {
     pub const IDENTITY: Mat4 = Mat4 {
         m: [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ],
     };
 
@@ -94,7 +91,6 @@ impl Mat4 {
     }
 
     /// Column-major rotation matrix from a quaternion.
-    ///
     /// The classic row-major rotation values are transposed so that
     /// apply_point (column-major) transforms vectors correctly. This fixes the
     /// old row-major-into-column-major mix that twisted the limbs.
@@ -126,8 +122,8 @@ impl Mat4 {
     }
 
     /// Compose a pivot-center, translate, rotate, scale matrix exactly like
-    /// the reference Bone::calcMatrix (all post-multiplied):
-    ///   m = T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot)
+    /// the client Bone::calcMatrix (all post-multiplied):
+    /// m = T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot)
     pub fn bone_local(pivot: Vec3, trans: Vec3, rot: Quat, scale: Vec3) -> Mat4 {
         let mut m = Self::translation(pivot);
         m = Self::mul(&m, &Self::translation(trans));
@@ -150,7 +146,7 @@ impl Mat4 {
     }
 }
 
-/// The WoW -> UE5 conversion, mirroring the reference fixCoordSystem.
+/// The WoW -> UE5 conversion, mirroring the client fixCoordSystem.
 pub mod wow_to_ue {
     use super::*;
 
@@ -242,7 +238,7 @@ pub mod ue_to_wow {
     }
 }
 
-/// A quaternion slerp, matching the reference Quaternion::slerp.
+/// A quaternion slerp, matching the client Quaternion::slerp.
 pub fn quat_slerp(r: f32, a: Quat, b: Quat) -> Quat {
     let dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
     let abs_dot = dot.abs();
@@ -301,19 +297,32 @@ mod tests {
 
     #[test]
     fn vec_round_trip() {
-        let v = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+        let v = Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
         assert_eq!(ue_to_wow::vec(wow_to_ue::vec(v)), v);
     }
 
     #[test]
     fn quat_round_trip() {
-        let q = Quat { x: 0.1, y: 0.2, z: 0.3, w: 0.9 };
+        let q = Quat {
+            x: 0.1,
+            y: 0.2,
+            z: 0.3,
+            w: 0.9,
+        };
         assert_eq!(ue_to_wow::quat(wow_to_ue::quat(q)), q);
     }
 
     #[test]
     fn world_round_trip() {
-        let v = Vec3 { x: 0.7, y: -0.3, z: 1.4 };
+        let v = Vec3 {
+            x: 0.7,
+            y: -0.3,
+            z: 1.4,
+        };
         let w = wow_to_ue::to_world(v);
         let back = ue_to_wow::from_world(w);
         assert!((back.x - v.x).abs() < 1e-4, "x {} vs {}", back.x, v.x);
@@ -323,7 +332,11 @@ mod tests {
 
     #[test]
     fn unit_scale_is_100_cm() {
-        let one = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+        let one = Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
         let w = wow_to_ue::to_world(one);
         assert!((w.z - 100.0).abs() < 1e-4, "z={} (expected 100)", w.z);
         assert!((w.y - -100.0).abs() < 1e-4, "y={} (expected -100)", w.y);
@@ -334,42 +347,118 @@ mod tests {
         // Column-major rotation about +Z: send +Z to -X or +X (transpose of
         // row-major). The key property: the origin stays fixed and the columns
         // are orthonormal (it is a true rotation).
-        let m = Mat4::rotation(Quat { x: 0.0, y: 0.0, z: 0.5, w: 0.8660254 });
-        let origin = Mat4::apply_point(&m, Vec3 { x: 0.0, y: 0.0, z: 0.0 });
-        assert!(origin.x.abs() < 1e-6 && origin.y.abs() < 1e-6 && origin.z.abs() < 1e-6,
-                "origin moved to {:?}", origin);
+        let m = Mat4::rotation(Quat {
+            x: 0.0,
+            y: 0.0,
+            z: 0.5,
+            w: 0.8660254,
+        });
+        let origin = Mat4::apply_point(
+            &m,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        );
+        assert!(
+            origin.x.abs() < 1e-6 && origin.y.abs() < 1e-6 && origin.z.abs() < 1e-6,
+            "origin moved to {:?}",
+            origin
+        );
         // column 0 = (m[0], m[1], m[2]) should be a unit vector
         let c0 = [m.m[0], m.m[1], m.m[2]];
-        let len = (c0[0]*c0[0] + c0[1]*c0[1] + c0[2]*c0[2]).sqrt();
+        let len = (c0[0] * c0[0] + c0[1] * c0[1] + c0[2] * c0[2]).sqrt();
         assert!((len - 1.0).abs() < 1e-5, "col0 not unit: len={}", len);
         // A 90deg rotation sends a unit axis to another unit axis:
-        let p = Mat4::apply_point(&m, Vec3 { x: 0.0, y: 0.0, z: 1.0 });
-        let plen = (p.x*p.x + p.y*p.y + p.z*p.z).sqrt();
-        assert!((plen - 1.0).abs() < 1e-4, "|rot(Z)| != 1: {:?} len={}", p, plen);
+        let p = Mat4::apply_point(
+            &m,
+            Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+        );
+        let plen = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+        assert!(
+            (plen - 1.0).abs() < 1e-4,
+            "|rot(Z)| != 1: {:?} len={}",
+            p,
+            plen
+        );
     }
 
     #[test]
     fn bone_local_rest_is_identity() {
-        let p = Vec3 { x: 2.0, y: 3.0, z: 4.0 };
-        let zero = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
-        let one = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+        let p = Vec3 {
+            x: 2.0,
+            y: 3.0,
+            z: 4.0,
+        };
+        let zero = Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let one = Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
         // rest = trans 0, rot identity, scale 1 -> T(p)*T(0)*I*1*T(-p) = identity
-        let m = Mat4::bone_local(p, zero, Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }, one);
+        let m = Mat4::bone_local(
+            p,
+            zero,
+            Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            },
+            one,
+        );
         for i in 0..16 {
-            assert!((m.m[i] - Mat4::IDENTITY.m[i]).abs() < 1e-5, "i={} {}", i, m.m[i]);
+            assert!(
+                (m.m[i] - Mat4::IDENTITY.m[i]).abs() < 1e-5,
+                "i={} {}",
+                i,
+                m.m[i]
+            );
         }
     }
 
     #[test]
     fn bone_local_pivot_rotation_fixes_pivot() {
         // The pivot must map to itself under the composed bone matrix:
-        // T(p)*T(t)*R*S*T(-p) * p  =  T(p)*T(t)*R*S*0 (at rest t=0,s=1,R=I -> p).
+        // T(p)*T(t)*R*S*T(-p) * p = T(p)*T(t)*R*S*0 (at rest t=0,s=1,R=I -> p).
         // With a 90deg rotation about Y the pivot is still the fixed point of
         // the "rotate around pivot" part, but trans != 0 shifts it. Use t=0:
-        let p = Vec3 { x: 10.0, y: 0.0, z: 0.0 };
-        let zero = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
-        let one = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
-        let m = Mat4::bone_local(p, zero, Quat { x: 0.0, y: 0.5, z: 0.0, w: 0.8660254 }, one);
+        let p = Vec3 {
+            x: 10.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let zero = Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let one = Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+        let m = Mat4::bone_local(
+            p,
+            zero,
+            Quat {
+                x: 0.0,
+                y: 0.5,
+                z: 0.0,
+                w: 0.8660254,
+            },
+            one,
+        );
         let fixed = Mat4::apply_point(&m, p);
         assert!((fixed.x - p.x).abs() < 1e-4, "x {} vs {}", fixed.x, p.x);
         assert!((fixed.y - p.y).abs() < 1e-4, "y {} vs {}", fixed.y, p.y);

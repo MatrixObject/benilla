@@ -32,7 +32,10 @@ fn main() {
     }
 
     // Also try opening_file to get the real error for a likely path.
-    for p in ["world\\maps\\durotar\\durotar_0_0.adt", "terrain\\blp\\ground\\grass.blp"] {
+    for p in [
+        "world\\maps\\durotar\\durotar_0_0.adt",
+        "terrain\\blp\\ground\\grass.blp",
+    ] {
         match a.read_file(p) {
             Ok(b) => println!("READ OK {p}: {} bytes", b.len()),
             Err(e) => println!("READ ERR {p}: {e}"),

@@ -4,13 +4,14 @@
 // several streamed tiles resident must re-load each tile (full ADT re-parse)
 // just to sample one tile's animated submeshes. Measured: 27.7ms per tile per
 // frame - the whole frame budget at 4 resident tiles. This entry point keys
-// the already-cached per-model submesh list (BnWorld::doodad_models), which
-// survives tile switches, so sampling costs microseconds.
+// the already-cached per-model submesh list (the crate-wide doodad mesh
+// cache), which survives tile switches, so sampling costs microseconds.
 //
 // Deliberately a separate module: benilla-ffi's existing exports are left
 // untouched (the project rule is to grow the middleware, not patch originals).
 
 use std::ffi::c_char;
+use std::sync::Arc;
 
 use crate::BnWorld;
 
@@ -28,19 +29,10 @@ fn normalize_model(path: &str) -> String {
 }
 
 /// Submesh list for `model`, tolerating the path spellings the tile's MMDX
-/// uses (raw case, `.mdx`) vs the normalized path the host was given.
-fn model_subs<'a>(
-    w: &'a BnWorld,
-    model: &str,
-) -> Option<&'a Vec<benilla_formats::RenderSubmesh>> {
-    if let Some(subs) = w.doodad_models.get(model) {
-        return Some(subs);
-    }
-    let want = normalize_model(model);
-    w.doodad_models
-        .iter()
-        .find(|(key, _)| normalize_model(key) == want)
-        .map(|(_, subs)| subs)
+/// uses (raw case, `.mdx`) vs the normalized path the host was given. The
+/// parse lives in the crate-wide cache, so it survives tile switches.
+fn model_subs(model: &str) -> Option<Arc<Vec<benilla_formats::RenderSubmesh>>> {
+    crate::doodad_mesh_cached(model).or_else(|| crate::doodad_mesh_cached(&normalize_model(model)))
 }
 
 /// Material animation of `model`'s submesh `j` at `elapsed` seconds.
@@ -64,9 +56,13 @@ pub extern "C" fn bn_model_mat_anim(
     let Some(path) = crate::cstr_to_str(model) else {
         return 0;
     };
-    // SAFETY: caller owns a valid const handle.
-    let w = unsafe { &*world };
-    let Some(sm) = model_subs(w, path).and_then(|subs| subs.get(j as usize)) else {
+    // SAFETY: caller owns a valid const handle (only the liveness of the
+    // handle matters here; the parse is in the shared cache).
+    let _ = unsafe { &*world };
+    let Some(subs) = model_subs(path) else {
+        return 0;
+    };
+    let Some(sm) = subs.get(j as usize) else {
         return 0;
     };
     let band = elapsed as f32;

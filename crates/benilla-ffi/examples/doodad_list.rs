@@ -22,7 +22,10 @@ fn main() {
 
 unsafe fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let map = args.get(1).cloned().unwrap_or_else(|| "Azeroth".to_string());
+    let map = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "Azeroth".to_string());
 
     let dir = std::ffi::CString::new("I:\\WOW\\World of Warcraft 1.12.1.5875 zhCN\\Data").unwrap();
     let w = benilla::bn_init(dir.as_ptr());

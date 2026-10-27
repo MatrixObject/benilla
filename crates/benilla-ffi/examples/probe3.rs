@@ -37,7 +37,11 @@ fn main() {
                 continue;
             }
         };
-        let hits: Vec<&str> = probes.iter().filter(|pp| a.contains(*pp)).cloned().collect();
+        let hits: Vec<&str> = probes
+            .iter()
+            .filter(|pp| a.contains(*pp))
+            .cloned()
+            .collect();
         if !hits.is_empty() {
             println!("{f}:");
             for h in &hits {
