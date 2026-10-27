@@ -46,6 +46,9 @@ const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
 /// sits inside the body (the client's first-person cut is not modelled).
 const CAM_BOOM_MIN: f32 = 1.0;
+/// `benilla-world`'s `CAMERA_PROBE_RADIUS` (collision.rs): the camera's sweep
+/// sphere, which keeps the near plane out of the surface it stops at.
+const CAM_PROBE_RADIUS: f32 = 0.3;
 /// `cameraYawSmoothSpeed` default 180°/s: the smart follow's return rate.
 const FOLLOW_RATE: f32 = std::f32::consts::PI;
 /// `creature_anim::select::STRAFE_BLEND_RATE`: the body heading eases to the
@@ -685,6 +688,65 @@ fn ray_tri(o: [f32; 3], d: [f32; 3], t: &Tri) -> Option<f32> {
     (dist > 1.0e-4).then_some(dist)
 }
 
+/// Keep the nearer of two candidate hit distances, within `max`.
+fn keep_nearest(best: &mut Option<f32>, d: Option<f32>, max: f32) {
+    if let Some(d) = d {
+        if d <= max && best.map_or(true, |b| d < b) {
+            *best = Some(d);
+        }
+    }
+}
+
+/// Ray against a doodad's base box (an oriented, vertical slab): the ray
+/// length to the entry face, if it enters within the slab.
+fn ray_box(o: [f32; 3], d: [f32; 3], b: &DoodadCollider) -> Option<f32> {
+    let dx = o[0] - b.c[0];
+    let dy = o[1] - b.c[1];
+    let mut tmin = 0.0f32;
+    let mut tmax = f32::INFINITY;
+    let slab = |o: f32, d: f32, lo: f32, hi: f32, tmin: &mut f32, tmax: &mut f32| -> bool {
+        if d.abs() < 1.0e-6 {
+            return o >= lo && o <= hi;
+        }
+        let a = (lo - o) / d;
+        let c = (hi - o) / d;
+        *tmin = tmin.max(a.min(c));
+        *tmax = tmax.min(a.max(c));
+        *tmin <= *tmax
+    };
+    if !slab(
+        dx * b.ux[0] + dy * b.ux[1],
+        d[0] * b.ux[0] + d[1] * b.ux[1],
+        -b.hx,
+        b.hx,
+        &mut tmin,
+        &mut tmax,
+    ) {
+        return None;
+    }
+    if !slab(
+        dx * b.uy[0] + dy * b.uy[1],
+        d[0] * b.uy[0] + d[1] * b.uy[1],
+        -b.hy,
+        b.hy,
+        &mut tmin,
+        &mut tmax,
+    ) {
+        return None;
+    }
+    if !slab(
+        o[2] - b.c[2],
+        d[2],
+        0.0,
+        (b.top - b.c[2]).max(1.0e-4),
+        &mut tmin,
+        &mut tmax,
+    ) {
+        return None;
+    }
+    (tmin > 1.0e-4).then_some(tmin)
+}
+
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
 fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
     let [a, b, c] = t.v;
@@ -1222,18 +1284,13 @@ impl Player {
         [cp * cy, -cp * sy, sp]
     }
 
-    /// True when the boom may reach `p`: 0.3 yd clear of the floor.
-    fn boom_clear(&self, p: [f32; 3]) -> bool {
-        match self.ground(p[0], p[1], p[2]) {
-            Some((g, _)) => p[2] >= g + 0.3,
-            None => true,
-        }
-    }
-
-    /// Where the boom first enters a steep WMO face, if it does. Point probes
-    /// miss walls seen edge-on (a wall joining two samples falls between
-    /// them), so the segment is tested against the triangles itself.
-    fn boom_wall_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
+    /// Where the boom first meets something solid, `max` yards out. Every WMO
+    /// face counts, a roof exactly like a wall: leaving ceilings to a floor
+    /// probe let the eye rise through a roof (and through the city wall's
+    /// arch stones) instead of stopping under it. The terrain buckets and the
+    /// doodads' base boxes are solid the same way, so the camera's ray sweeps
+    /// one world, not just the building the player stands in.
+    fn boom_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
         let end = [
             pivot[0] + dir[0] * max,
             pivot[1] + dir[1] * max,
@@ -1249,14 +1306,10 @@ impl Player {
                         continue;
                     }
                     for t in &tile.wmo_cells[(gy * WMO_GRID + gx) as usize] {
-                        if t.n[2].abs() >= GROUND_COS {
-                            continue; // a floor, left to the ground probe
-                        }
-                        if let Some(d) = ray_tri(pivot, dir, t) {
-                            if d <= max && best.map_or(true, |b| d < b) {
-                                best = Some(d);
-                            }
-                        }
+                        keep_nearest(&mut best, ray_tri(pivot, dir, t), max);
+                    }
+                    for d in &tile.doodad_cells[(gy * WMO_GRID + gx) as usize] {
+                        keep_nearest(&mut best, ray_box(pivot, dir, d), max);
                     }
                 }
             }
@@ -1274,53 +1327,50 @@ impl Player {
             }
             // Border frame with the tile still loading: scan what is loaded.
             None => {
-                for (&(k0, k1), tile) in &self.tiles {
-                    scan(k0, k1, tile);
+                for (&(tx, ty), tile) in &self.tiles {
+                    scan(tx, ty, tile);
+                }
+            }
+        }
+        // Terrain: the chunks the segment's XY span crosses, in whichever
+        // tile owns them. A hillside stops the eye like a wall does.
+        let (c0x, c0y) = world_to_chunk(
+            pivot[0].clamp(-17066.0, 17066.0),
+            pivot[1].clamp(-17066.0, 17066.0),
+        );
+        let (c1x, c1y) = world_to_chunk(
+            end[0].clamp(-17066.0, 17066.0),
+            end[1].clamp(-17066.0, 17066.0),
+        );
+        for cy in c0y.min(c1y)..=c0y.max(c1y) {
+            for cx in c0x.min(c1x)..=c0x.max(c1x) {
+                let (tx, ty) = (cx / 16, cy / 16);
+                let Some(tile) = self.tiles.get(&(tx as i32, ty as i32)) else {
+                    continue;
+                };
+                let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+                for t in &tile.buckets[b] {
+                    keep_nearest(&mut best, ray_tri(pivot, dir, t), max);
                 }
             }
         }
         best
     }
 
-    /// The longest clear boom up to `max`: the wall the segment first enters
-    /// (less a 0.3 yd stand-off), then eight floor samples and a bisection for
-    /// the exact stand-off, floored at [`CAM_BOOM_MIN`] so the eye never ends
-    /// up inside the body.
+    /// The longest clear boom up to `max`: the first solid face along it, less
+    /// the probe's radius (`CAMERA_PROBE_RADIUS`), so the eye keeps clear of
+    /// the surface it stops at; floored at [`CAM_BOOM_MIN`] so the eye never
+    /// ends up inside the body.
     fn solid_boom(&self, pivot: [f32; 3], fwd: [f32; 3], max: f32) -> f32 {
         if max <= 0.0 {
             return 0.0;
         }
         let dir = [-fwd[0], -fwd[1], -fwd[2]];
-        let mut limit = max;
-        if let Some(t) = self.boom_wall_hit(pivot, dir, max) {
-            limit = (t - 0.3).max(0.0);
+        let floor = CAM_BOOM_MIN.min(max);
+        match self.boom_hit(pivot, dir, max) {
+            Some(t) => (t - CAM_PROBE_RADIUS).max(floor),
+            None => max,
         }
-        let at = |f: f32| {
-            [
-                pivot[0] + dir[0] * f,
-                pivot[1] + dir[1] * f,
-                pivot[2] + dir[2] * f,
-            ]
-        };
-        let mut prev = 0.0;
-        for i in 1..=8 {
-            let f = limit * i as f32 / 8.0;
-            if self.boom_clear(at(f)) {
-                prev = f;
-                continue;
-            }
-            let (mut lo, mut hi) = (prev, f);
-            for _ in 0..6 {
-                let mid = 0.5 * (lo + hi);
-                if self.boom_clear(at(mid)) {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            return lo.max(CAM_BOOM_MIN.min(max));
-        }
-        limit.max(CAM_BOOM_MIN.min(max))
     }
 
     /// The lowest upward-facing WMO surface over (x, y) between `floor` and
