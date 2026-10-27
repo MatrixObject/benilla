@@ -31,6 +31,24 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 const VOID_GUARD_DEPTH: f32 = 100.0;
 const GROUND_COS: f32 = 0.642_788;
 const STEP_UP_HEIGHT: f32 = 1.0;
+/// The step-vs-slide slope ratio, `[0x80c740]` (atan ≈ 61.6°): the foot cone's
+/// bevels rise `radius · ratio` from the foot, and the step-up certifies its
+/// landing `H · tan 50°` ahead (`benilla-app`'s `STEP_SLOPE_RATIO`).
+const STEP_SLOPE_RATIO: f32 = 1.849_399;
+/// The foot cone's height (yd): the solid is a cone below this and a box above
+/// it, so an edge inside the cone is ridden up its skirt instead of blocking
+/// (`0x631440`, `0x635c00`); a higher one takes the step-up. 0.616 yd with the
+/// placeholder capsule radius (`benilla-app`'s `FOOT_CONE_HEIGHT`).
+const FOOT_CONE_HEIGHT: f32 = CAPSULE_RADIUS * STEP_SLOPE_RATIO;
+/// The step-up's certify advance (yd): `H · tan 50°`, 1.1918 at `H` = 1. The
+/// reference sweeps this far along the travel to find the landing
+/// (`benilla-app`'s `STEP_UP_ADVANCE`).
+const STEP_UP_ADVANCE: f32 = STEP_UP_HEIGHT * 1.191_753_6;
+/// The step-down snap's fixed slack (yd), `[0x7ff9d0]` = 1/36: a descent
+/// reaches `travel · STEP_SLOPE_RATIO + slack` below the feet and settles only
+/// onto a floor inside it; anything deeper is a drop, not a step
+/// (`benilla-app`'s `STEP_SNAP_SLACK`).
+const STEP_SNAP_SLACK: f32 = 1.0 / 36.0;
 // The capsule the client traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
 // the probe below is a point at the feet plus the step window, which is the
 // same corridor for a walker on the floors this data ships.
@@ -1126,6 +1144,22 @@ impl Player {
         best
     }
 
+    /// The floor a step-up would land on, advanced `STEP_UP_ADVANCE` from
+    /// (`x`, `y`) along the travel: the reference's certify sweep (`0x636147`),
+    /// settled onto a walkable floor higher than the feet. `None` means the
+    /// steep face is a wall, not a step.
+    fn step_up_landing(&self, x: f32, y: f32, dirx: f32, diry: f32) -> Option<f32> {
+        if dirx == 0.0 && diry == 0.0 {
+            return None;
+        }
+        let (ax, ay) = (x + dirx * STEP_UP_ADVANCE, y + diry * STEP_UP_ADVANCE);
+        let (z, nz) = self.ground(ax, ay, self.pos[2] + STEP_UP_HEIGHT)?;
+        if nz < GROUND_COS {
+            return None; // only a standable floor certifies the step
+        }
+        (z - self.pos[2] > 0.05).then_some(z)
+    }
+
     /// The liquid surface over (x, y), the lowest of any stacked blocks
     /// so a stream over the sea reads as the
     /// stream). Magma and slime are swum in like water.
@@ -1639,15 +1673,29 @@ impl Player {
         // than a step above the feet blocks the axis; the other one slides.
         let step = [self.vel[0] * dt, self.vel[1] * dt];
         if step[0] != 0.0 || step[1] != 0.0 {
+            let len = (step[0] * step[0] + step[1] * step[1]).sqrt();
+            let (dirx, diry) = (step[0] / len, step[1] / len);
             let blocked = |dx: f32, dy: f32| -> bool {
                 let (nx, ny) = (self.pos[0] + dx, self.pos[1] + dy);
                 if self.wall_hit(nx, ny, self.pos[2]) {
                     return true;
                 }
-                match self.ground(nx, ny, self.pos[2] + STEP_UP_HEIGHT) {
-                    Some((z, nz)) => z > self.pos[2] + STEP_UP_HEIGHT - 1.0e-3 || nz < GROUND_COS,
-                    None => false,
+                let Some((z, nz)) = self.ground(nx, ny, self.pos[2] + STEP_UP_HEIGHT) else {
+                    return false;
+                };
+                let rise = z - self.pos[2];
+                if rise > STEP_UP_HEIGHT - 1.0e-3 {
+                    return true;
                 }
+                // A walkable face never blocks, and neither does a steep one at
+                // or under the feet: walking off a kerb follows its bevel down
+                // (`0x6367b0`'s snap, not the wall test).
+                if nz >= GROUND_COS || rise <= 0.0 {
+                    return false;
+                }
+                // A steep edge rising inside the foot cone is ridden up its
+                // skirt; a higher one must certify a step-up landing ahead.
+                rise > FOOT_CONE_HEIGHT && self.step_up_landing(nx, ny, dirx, diry).is_none()
             };
             if !blocked(step[0], step[1]) {
                 self.pos[0] += step[0];
@@ -1694,13 +1742,29 @@ impl Player {
             let prev_z = self.pos[2];
             self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
             self.pos[2] += self.vel[2] * dt;
+            // A step-down follows the surface only as far as the foot cone
+            // reaches this frame (`0x6367b0`: `travel · STEP_SLOPE_RATIO +
+            // 1/36`); a floor deeper than a step is a drop, and the body falls
+            // onto it. The one-frame snap buried the capsule in the face and
+            // the wall test then held it there.
+            let travel = ((self.pos[0] - feet[0]).powi(2) + (self.pos[1] - feet[1]).powi(2)).sqrt();
+            let cone = travel * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
             let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
             let found = self.ground(self.pos[0], self.pos[1], ceil);
             match found {
                 Some((z, _)) => {
                     self.void_time = 0.0;
-                    if self.pos[2] <= z || (self.grounded && self.pos[2] - z <= STEP_UP_HEIGHT) {
-                        self.pos[2] = z;
+                    let step_down = self.grounded && z <= prev_z && prev_z - z <= STEP_UP_HEIGHT;
+                    if self.pos[2] <= z || step_down {
+                        // A step-down follows the surface at the cone's slope,
+                        // one frame at a time, and only settles onto it once the
+                        // feet are close; a whole ledge at once buried the
+                        // capsule in the face.
+                        self.pos[2] = if self.pos[2] <= z {
+                            z
+                        } else {
+                            z.max(prev_z - cone)
+                        };
                         self.vel[2] = 0.0;
                         self.grounded = true;
                         self.last_ground = self.pos;
@@ -2309,6 +2373,172 @@ mod tests {
         assert!(p.cam_live < CAM_DIST_DEFAULT, "eased, not snapped");
     }
 
+    /// World x of the profiles' own x = 0; every profile is authored around it.
+    const PROFILE_X0: f32 = -8800.0;
+
+    /// A `(x, z)` profile extruded across y, the shape benilla-app's mover tests
+    /// build their kerbs from: each segment is a quad in the tile's WMO grid, so
+    /// `ground` and `wall_hit` see the same triangles the reference walks.
+    fn terrain_profile(profile: &[(f32, f32)]) -> TileCol {
+        let (tx, ty) = Player::tile_of(PROFILE_X0, -800.0);
+        let mut col = TileCol::new();
+        let mut add = |t: Tri| {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &t);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(t);
+                }
+            }
+        };
+        for w in profile.windows(2) {
+            let ((x0, z0), (x1, z1)) = (w[0], w[1]);
+            let (x0, x1) = (x0 + PROFILE_X0, x1 + PROFILE_X0);
+            add(Tri::new(
+                [x0, -900.0, z0],
+                [x1, -900.0, z1],
+                [x0, -700.0, z0],
+            ));
+            add(Tri::new(
+                [x1, -900.0, z1],
+                [x1, -700.0, z1],
+                [x0, -700.0, z0],
+            ));
+        }
+        col
+    }
+
+    /// Walk `frames` frames along the profile, reporting (feet z, x, grounded).
+    fn walk_profile(
+        profile: &[(f32, f32)],
+        start_x: f32,
+        yaw: f32,
+        frames: usize,
+    ) -> Vec<(f32, f32, bool)> {
+        let start_x = PROFILE_X0 + start_x;
+        let mut p = Player::new("Azeroth", start_x, -800.0);
+        p.tiles.insert(
+            Player::tile_of(p.pos[0], p.pos[1]),
+            terrain_profile(profile),
+        );
+        p.pos[2] = p.ground(start_x, -800.0, f32::MAX).map_or(0.0, |(z, _)| z);
+        p.grounded = true;
+        p.last_ground = p.pos;
+        p.yaw = yaw;
+        p.model_yaw = yaw;
+        p.input.forward = 1.0;
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            p.tick(1.0 / 60.0);
+            out.push((p.pos[2], p.pos[0], p.grounded));
+        }
+        out
+    }
+
+    /// A Stormwind Trade District kerb: a 0.28 yd sidewalk behind a ~61° bevel
+    /// (benilla-app's `world_with_kerb`).
+    const KERB: [(f32, f32); 4] = [(-2.0, 0.0), (0.29, 0.0), (0.446, 0.28), (3.0, 0.28)];
+    /// Booty Bay's 0.40 yd vertical riser onto a ~22° ramp (benilla-app's
+    /// `world_with_vertical_step`).
+    const RISER: [(f32, f32); 4] = [(-2.0, 0.0), (0.30, 0.0), (0.302, 0.40), (3.0, 1.48)];
+    /// A Stormwind step: a 0.91 yd top behind a 66° bevel (benilla-app's
+    /// `a_tall_step_behind_an_unwalkable_face_is_climbed`).
+    const TALL_STEP: [(f32, f32); 4] = [(-2.0, -0.02), (0.28, -0.02), (0.694, 0.91), (3.0, 0.91)];
+    /// A 66° face walked off at a run (benilla-app's steep-face descent).
+    const STEEP_DROP: [(f32, f32); 4] = [(-2.0, 0.0), (0.60, 0.0), (1.0, -0.91), (3.0, -0.91)];
+
+    #[test]
+    fn a_kerb_bevel_is_climbed_not_blocked() {
+        let frames = walk_profile(&KERB, -1.6, 0.0, 24);
+        println!("kerb up: {frames:?}");
+        assert!(
+            frames.iter().any(|f| f.0 > 0.27 && f.1 > PROFILE_X0 + 0.5),
+            "the body must reach the sidewalk past the bevel: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn stepping_off_a_kerb_follows_the_surface_down() {
+        let frames = walk_profile(&KERB, 1.6, std::f32::consts::PI, 45);
+        println!("kerb down: {frames:?}");
+        assert!(
+            frames.last().unwrap().0 < 0.05,
+            "the walk-off must reach the street: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_vertical_step_is_climbed_not_stalled() {
+        let frames = walk_profile(&RISER, -1.6, 0.0, 45);
+        println!("riser up: {frames:?}");
+        assert!(
+            frames.last().unwrap().0 > 0.40,
+            "the body must finish on the step: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_tall_step_behind_a_steep_face_is_climbed() {
+        let frames = walk_profile(&TALL_STEP, -1.6, 0.0, 24);
+        println!("tall step up: {frames:?}");
+        assert!(
+            frames.iter().any(|f| f.0 > 0.88 && f.1 > PROFILE_X0 + 0.7),
+            "the body must reach the 0.91 yd top: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_steep_face_is_walked_off_not_held() {
+        let frames = walk_profile(&STEEP_DROP, -0.8, 0.0, 40);
+        println!("steep drop: {frames:?}");
+        assert!(
+            frames.last().unwrap().0 < -0.85,
+            "the walk-off must descend the face: {frames:?}"
+        );
+    }
+
+    /// A 0.9 yd ledge on a bevel so steep it is a drop, not a slope.
+    const LEDGE: [(f32, f32); 4] = [(-2.0, 0.9), (0.0, 0.9), (0.05, 0.0), (3.0, 0.0)];
+
+    /// Walking off a ledge must not snap the feet the whole way down in one
+    /// frame - the capsule then wedges in the face and the body never moves
+    /// again. The reference follows the surface one cone's worth a frame
+    /// (`0x6367b0`), so the walk continues, and the same face is climbable
+    /// back: the "up but cannot get down" report.
+    #[test]
+    fn a_ledge_is_walked_off_and_climbed_back() {
+        let start_x = PROFILE_X0 - 1.0;
+        let mut p = Player::new("Azeroth", start_x, -800.0);
+        p.tiles
+            .insert(Player::tile_of(start_x, -800.0), terrain_profile(&LEDGE));
+        p.pos[2] = 0.9;
+        p.grounded = true;
+        p.last_ground = p.pos;
+        p.yaw = 0.0;
+        p.model_yaw = 0.0;
+        p.input.forward = 1.0;
+        for _ in 0..30 {
+            p.tick(1.0 / 60.0);
+        }
+        println!("ledge off: {:?} grounded={}", p.pos, p.grounded);
+        assert!(
+            p.pos[0] > PROFILE_X0 + 1.0,
+            "the walk must continue past the edge: {:?}",
+            p.pos
+        );
+        assert!(p.pos[2] < 0.05, "and reach the lower ground: {:?}", p.pos);
+        p.yaw = std::f32::consts::PI;
+        p.model_yaw = p.yaw;
+        for _ in 0..30 {
+            p.tick(1.0 / 60.0);
+        }
+        println!("ledge back: {:?} grounded={}", p.pos, p.grounded);
+        assert!(
+            p.pos[2] > 0.85,
+            "the same face must be climbable back: {:?}",
+            p.pos
+        );
+    }
+
     #[test]
     fn a_doodad_footprint_blocks_the_body() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
@@ -2599,7 +2829,14 @@ mod tests {
         let mut cache = HashMap::new();
         let chain = w.chain.as_mut().unwrap();
         for (&(k0, k1), t) in tiles.iter_mut() {
-            let built = build_wmo_collision(t, k0, k1, chain, &mut cache);
+            let built = build_wmo_collision_step(
+                t,
+                k0,
+                k1,
+                chain,
+                &mut cache,
+                std::time::Duration::from_secs(3600),
+            );
             println!("baked tile ({k0},{k1}) built={built}");
         }
         let mut p = Player::new("Azeroth", sx, sy);
