@@ -9225,6 +9225,31 @@ pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
     out.unwrap_or(0)
 }
 
+/// The window lost focus (WM_ACTIVATE's deactivate): the reference's `0x514490` clears the
+/// movement direction bits and sweeps the held-key latching, so a key held across an alt-tab
+/// never keeps the body walking or turning. Each latched key runs its up-half, as its release
+/// would have, and the stock UI's movement axes go back to the host. Returns 1 with a session.
+#[no_mangle]
+pub extern "C" fn bn_ui_focus_lost() -> u32 {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Releases run in latch order, before the feed's own clear, so a
+        // command's `runOnUp` body fires exactly once.
+        let latched: Vec<(String, String)> =
+            BN_LATCH.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        for (key, command) in latched {
+            BN_UI.with(|slot| {
+                if let Some(script) = slot.borrow_mut().as_mut() {
+                    let _ = script.execute_binding(&command, false);
+                    let _ = script.key_up(&key);
+                }
+            });
+        }
+        ui_feed::focus_lost();
+        1u32
+    }));
+    out.unwrap_or(0)
+}
+
 /// A typed character (UTF-8: "a", "5", "中") into the focused EditBox, or the
 /// char walk with no box. Returns 1 if consumed, 0 otherwise (or no session).
 #[no_mangle]

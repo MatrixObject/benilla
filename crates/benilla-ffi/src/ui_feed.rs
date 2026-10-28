@@ -1295,6 +1295,25 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     });
 }
 
+/// The OS window deactivate, the reference's `0x514490` (`and eax,0xfffff00f`, sole caller
+/// `0x493058` off the root's WM_ACTIVATE slot): the direction bits are cleared while the mouse
+/// pair and autorun survive. The host reports it when its viewport loses focus, so a movement
+/// key held across an alt-tab does not keep the body walking or turning.
+pub(crate) fn focus_lost() {
+    let world = WORLD.with(|w| w.get());
+    FEED.with(|f| {
+        let mut feed = f.borrow_mut();
+        if !feed.held.owned && !feed.held.any() {
+            return;
+        }
+        feed.held = HeldAxes::default();
+        // Both channels a held axis feeds: the body's local input and the
+        // movement the net layer reports to the server.
+        player::ui_move(world, 0.0, 0.0, 0.0, false);
+        net::ui_set_move(0.0, 0.0, 0.0, false);
+    });
+}
+
 /// Drain the interface's verbs into net commands and the middle layer's movement.
 pub(crate) fn intents(script: &mut UiScript) {
     if script.vm_kind() != VmKind::InGame {
