@@ -107,7 +107,7 @@ enum LootPick {
 }
 
 /// The scalar fields whose move fires a unit event, diffed against the previous push.
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 struct Watch {
     health: u32,
     max_health: u32,
@@ -121,6 +121,7 @@ struct Watch {
     reaction: u8,
     dead: bool,
     ghost: bool,
+    name: Option<String>,
 }
 
 impl From<&UnitState> for Watch {
@@ -138,6 +139,7 @@ impl From<&UnitState> for Watch {
             reaction: s.reaction,
             dead: s.dead,
             ghost: s.ghost,
+            name: s.name.clone(),
         }
     }
 }
@@ -162,10 +164,17 @@ struct Feed {
     money: u32,
     xp: (u32, u32),
     rest: (u8, u32, bool),
+    /// Whether the load's resting push has happened: `PlayerFrame_UpdateStatus`
+    /// (PlayerFrame.lua:181) hides the attack/rest icons only when an event
+    /// tells it, and without that first event they keep their XML default.
+    rest_pushed: bool,
     combo: (u8, u64),
     level: u32,
     selection: u64,
     combat: bool,
+    /// Auto-attack (`SMSG_ATTACKSTART`), which fires `PLAYER_ENTER_COMBAT` /
+    /// `PLAYER_LEAVE_COMBAT` - the same `PlayerFrame_UpdateStatus` input.
+    engaged: bool,
     dead: bool,
     ghost: bool,
     cast: Option<u32>,
@@ -238,10 +247,12 @@ impl Feed {
             money: 0,
             xp: (0, 0),
             rest: (0, 0, false),
+            rest_pushed: false,
             combo: (0, 0),
             level: 0,
             selection: 0,
             combat: false,
+            engaged: false,
             dead: false,
             ghost: false,
             cast: None,
@@ -587,6 +598,13 @@ fn fire_unit_diff(script: &mut UiScript, token: &str, old: &Watch, new: &Watch) 
     if old.reaction != new.reaction {
         fire(script, "UNIT_FACTION", vec![ev_str(token)]);
     }
+    // A name arrives after the unit: `SMSG_CREATURE_QUERY_RESPONSE` lands the
+    // record (name, rank, subtitle) that the target frame reads, and the
+    // reference fires both signals when it does (`names.rs`, `on_creature_name`).
+    if old.name != new.name {
+        fire(script, "UNIT_NAME_UPDATE", vec![ev_str(token)]);
+        fire(script, "UNIT_CLASSIFICATION_CHANGED", vec![ev_str(token)]);
+    }
 }
 
 impl Feed {
@@ -603,7 +621,11 @@ impl Feed {
         if changed {
             script.set_unit(token, state.clone());
         }
-        if !self.first && existed && state.is_some() {
+        // A token's first snapshot is news to the frames as much as a change is: the client
+        // fires `UNIT_HEALTH` and its siblings when a unit's fields become known, and the stock
+        // frames only learn their bar's max/value from that event (`PlayerFrame.lua:202`). The
+        // load's first pass skips *changes* from before the interface existed, not arrivals.
+        if state.is_some() && (!self.first || !existed) {
             fire_unit_diff(script, token, &slot.1, &watch);
         }
         slot.0 = state;
@@ -621,6 +643,7 @@ impl Feed {
         let party = net::ui_party();
         let giver = net::ui_giver();
         let selection = net::ui_selection();
+        let prev_selection = self.selection;
         self.selection = selection;
 
         let name_of = |guid: u64| -> Option<String> {
@@ -628,7 +651,7 @@ impl Feed {
                 if guid == self_guid {
                     net::ui_roster_name(guid)
                 } else {
-                    None
+                    net::ui_creature_name(guid)
                 }
             })
         };
@@ -694,6 +717,14 @@ impl Feed {
                 _ => ("party4", party_guids[3]),
             };
             self.push_unit(script, token, make(guid));
+        }
+
+        // The client signals `PLAYER_TARGET_CHANGED` from `SetSelection` (`0x4b7b02`); here the
+        // server's mirrored descriptor is the only news of a selection, and this pass is where it
+        // lands. Fired after the token snapshots above so the frame's handler reads the new unit
+        // (`TargetFrame.lua:37-56` shows the frame, and only this event ever does).
+        if selection != prev_selection {
+            fire(script, "PLAYER_TARGET_CHANGED", Vec::new());
         }
 
         // Units the tokens' `target` hops reach: their own snapshots let `targettargettarget`
@@ -795,11 +826,20 @@ impl Feed {
                 fields.player_rest_state_experience().unwrap_or(0),
                 fields.player_flags() & 0x20 != 0,
             );
-            if rest != self.rest {
+            if rest != self.rest || !self.rest_pushed {
+                let was_resting = self.rest.2;
                 script.set_rest_state(rest.0, rest.1, rest.2);
                 self.rest = rest;
                 if !self.first {
                     fire(script, "UPDATE_EXHAUSTION", Vec::new());
+                }
+                // The stock status icons (zzz, crossed swords) start shown in
+                // PlayerFrame.xml; `PlayerFrame_UpdateStatus` is what hides
+                // them, and it only runs on these events. The load's own push
+                // stands in for the client's login-time one.
+                if !self.rest_pushed || was_resting != rest.2 {
+                    self.rest_pushed = true;
+                    fire(script, "PLAYER_UPDATE_RESTING", Vec::new());
                 }
             }
         }
@@ -1272,6 +1312,23 @@ impl Feed {
             self.combat = combat;
         }
 
+        // Auto-attack's own edges (`SMSG_ATTACKSTART`/`ATTACKSTOP`): the stock
+        // `PlayerFrame_UpdateStatus` shows the red ring and the swords on
+        // `PLAYER_ENTER_COMBAT`, which the combat flag above never fires.
+        let engaged = net::ui_self_attacking();
+        if engaged != self.engaged {
+            self.engaged = engaged;
+            fire(
+                script,
+                if engaged {
+                    "PLAYER_ENTER_COMBAT"
+                } else {
+                    "PLAYER_LEAVE_COMBAT"
+                },
+                Vec::new(),
+            );
+        }
+
         // The melee refusal line, the reference's per-player tick `0x5ec950`:
         // shown only while an attack target stands (`[+0xc48]`), latched, and
         // repeated every four seconds by the latch itself. `DisplayError(0xd8)`/
@@ -1287,10 +1344,6 @@ impl Feed {
             }
         }
 
-        if net::ui_selection() != self.selection {
-            self.selection = net::ui_selection();
-            fire(script, "PLAYER_TARGET_CHANGED", Vec::new());
-        }
         let _ = dt;
     }
 
@@ -1791,6 +1844,12 @@ fn resolve_token(token: &str, guids: &UnitGuids) -> Option<u64> {
         guid = guids.held.get(&guid).copied().unwrap_or(0);
     }
     (guid != 0).then_some(guid)
+}
+
+/// The guid a unit token names right now, 0 when it names no live unit: the same resolver state
+/// the VM's own `UnitGUID` reads.
+pub(crate) fn token_guid(token: &str) -> u64 {
+    FEED.with(|f| resolve_token(token, &f.borrow().guids).unwrap_or(0))
 }
 
 /// `AttackTarget`'s toggle, `0x489b50` → `0x6131a0`, also the attack button's

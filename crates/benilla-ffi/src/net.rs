@@ -1360,6 +1360,17 @@ pub(crate) fn ui_creature(entry: u32) -> Option<CreatureTemplateLite> {
         .cloned()
 }
 
+/// A creature's name resolved through its guid's template entry: the client
+/// keeps creature names in a record cache keyed by entry, not a guid table
+/// (`NameCache::resolve_unit`), so `UnitName("target")` reads it as soon as
+/// `SMSG_CREATURE_QUERY_RESPONSE` answers - `UNKNOWNOBJECT` until then.
+pub(crate) fn ui_creature_name(guid: u64) -> Option<String> {
+    let entry = ui_unit(guid)?.fields.object_entry().filter(|&e| e != 0)?;
+    ui_creature(entry)
+        .map(|c| c.name)
+        .filter(|name| !name.is_empty())
+}
+
 pub(crate) fn ui_quests() -> HashMap<u32, QuestTemplateLite> {
     shared()
         .quests
@@ -4485,6 +4496,17 @@ pub extern "C" fn bn_net_player(out: *mut BnNetPlayer) -> u32 {
 #[no_mangle]
 pub extern "C" fn bn_net_self_guid() -> u64 {
     shared().self_guid.load(Ordering::SeqCst)
+}
+
+/// The guid a unit token names right now (`"player"`, `"target"`, `"party1"`, a `target` hop
+/// chain), 0 when it names no live unit. The interface's own resolver state answers it, so a host
+/// that bakes a unit's portrait finds the body the same way the frames do.
+#[no_mangle]
+pub extern "C" fn bn_net_token_guid(token: *const c_char) -> u64 {
+    let Some(token) = crate::cstr_to_str(token) else {
+        return 0;
+    };
+    crate::ui_feed::token_guid(token)
 }
 
 /// Number of objects currently tracked from the world stream.
