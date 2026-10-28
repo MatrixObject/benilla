@@ -87,6 +87,10 @@ mod exterior;
 
 mod ui_feed;
 
+// ---- The reference's registered CVars, for the VM the stock interface loads into ----
+
+mod cvar_defaults;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -7473,6 +7477,12 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         let Ok(mut script) = benilla_ui::script::UiScript::new() else {
             return 0u32;
         };
+        // The reference registers its whole console-var set before `UI_Init`
+        // (`0x490018`) walks the toc, and `GetCVar` raises on a name the table
+        // lacks (`0x842310`): `TextStatusBar.lua:47` reads `statusBarText` on
+        // every health-bar update, so one unseeded name aborts that tick's whole
+        // dispatch. Same rows the app's registry seeds into its own VM.
+        script.register_cvars(cvar_defaults::DEFAULTS.iter().copied());
         // `WTF\DefaultBindings.wtf`, set 0 (`0x4b62b0`), then set 1 live as a
         // first login's account set is.
         let defaults = chain
@@ -8613,6 +8623,9 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         let Ok(mut script) = UiScript::new_glue() else {
             return 0u32;
         };
+        // The engine registers every console var before either interface loads;
+        // the glue screens read `gxResolution`, `readEULA` and `movieSubtitle`.
+        script.register_cvars(cvar_defaults::DEFAULTS.iter().copied());
         // The agreements the login's first tests read; a returning player's
         // flags, so the menu is not parked on the ToU screen.
         for notice in GlueNotice::ALL {
@@ -8971,6 +8984,11 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
                 ui_feed::sync(script, elapsed);
             }
             script.tick(elapsed);
+            // This VM is the whole client: a Lua write lands in the table itself
+            // and no host registry mirrors it, so the queues a write reports to
+            // that registry are drained here rather than growing per write.
+            let _ = script.take_cvar_changes();
+            let _ = script.take_cvar_console_lines();
             if script.vm_kind() == benilla_ui::script::VmKind::InGame {
                 // The frame's verbs back out: action uses, casts, selection,
                 // loot, the death dialog, chat, and the movement bindings.
