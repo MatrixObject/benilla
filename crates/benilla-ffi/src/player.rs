@@ -81,9 +81,9 @@ const TURN_RATE_MOVING: f32 = 0.75;
 const FLY_SPEED: f32 = 30.0;
 
 // ---- the upper-body one-shots ----
-/// AnimationData ids: Death, AttackUnarmed and SpellCast.
+/// AnimationData ids: Death and SpellCast (the swing clip comes from the armed
+/// main hand: `net::self_swing_anim`, the reference's `swing_anim_main`).
 const ANIM_DEATH: u32 = 1;
-const ANIM_ATTACK_UNARMED: u32 = 16;
 const ANIM_SPELL_CAST: u32 = 53;
 /// The attack overlay's visible window (s), the unarmed clip's own length.
 const SWING_WINDOW: f32 = 0.7;
@@ -1943,7 +1943,7 @@ impl Player {
         let anim = if self.cast_active() {
             ANIM_SPELL_CAST
         } else if self.swing_active() {
-            ANIM_ATTACK_UNARMED
+            crate::net::self_swing_anim()
         } else {
             return (0, 0.0);
         };
@@ -1988,7 +1988,7 @@ impl Player {
                 return ANIM_SPELL_CAST;
             }
             if self.swing_active() {
-                return ANIM_ATTACK_UNARMED;
+                return crate::net::self_swing_anim();
             }
         }
         if !self.grounded {
@@ -2301,6 +2301,9 @@ pub extern "C" fn bn_player_attack(world: *mut BnWorld) -> u32 {
     if !p.grounded || p.mounted {
         return 0;
     }
+    // The clip the body swings: the equipped main hand's, the same table the
+    // server's attack latch resolves at `SMSG_ATTACKSTART`.
+    crate::net::refresh_self_swing_anim();
     p.attack_left = 0.7;
     1
 }

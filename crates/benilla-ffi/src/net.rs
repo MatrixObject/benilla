@@ -1140,6 +1140,11 @@ struct Shared {
     /// Whether our own guid is in melee auto-attack, from
     /// `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP`.
     self_attacking: AtomicU32,
+    /// Our body's main-hand swing clip ([`swing_anim_main`]), resolved when the
+    /// server starts our attack and again on a local swing press. The reference
+    /// re-reads the armed main hand at each swing; the weapon cannot change
+    /// without an equip, which stops and restarts the attack latch.
+    self_swing_anim: AtomicU32,
     /// Latest player pose fed by the host (UE pawn) so the world worker can
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
@@ -1235,6 +1240,7 @@ fn shared() -> &'static Shared {
         spirit_healer: AtomicU64::new(0),
         corpse_delay_ms: AtomicU32::new(0),
         self_attacking: AtomicU32::new(0),
+        self_swing_anim: AtomicU32::new(16),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -1398,6 +1404,19 @@ pub(crate) fn ui_corpse_delay_ms() -> u32 {
 /// Whether our own guid is in melee auto-attack (`SMSG_ATTACKSTART`).
 pub(crate) fn ui_self_attacking() -> bool {
     shared().self_attacking.load(Ordering::SeqCst) != 0
+}
+
+/// Our body's main-hand swing clip, resolved at the last attack start.
+pub(crate) fn self_swing_anim() -> u32 {
+    shared().self_swing_anim.load(Ordering::SeqCst)
+}
+
+/// Re-resolve [`self_swing_anim`] from the equipped main hand (the local swing
+/// press asks for it too, so a training swing is the equipped weapon's clip).
+pub(crate) fn refresh_self_swing_anim() {
+    let sh = shared();
+    let clip = u32::from(self_main_swing(sh));
+    sh.self_swing_anim.store(clip, Ordering::SeqCst);
 }
 
 /// Our own descriptor as the update carried it.
@@ -2822,6 +2841,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         ServerPacket::AttackStart { attacker, .. } => {
             if *attacker == sh.self_guid.load(Ordering::SeqCst) {
                 sh.self_attacking.store(1, Ordering::SeqCst);
+                let clip = u32::from(self_main_swing(sh));
+                sh.self_swing_anim.store(clip, Ordering::SeqCst);
             }
         }
         ServerPacket::AttackStop { attacker, .. } => {
@@ -4322,6 +4343,55 @@ pub extern "C" fn bn_net_unit_virtual_items(
     3
 }
 
+/// The AnimationData id of a main-hand melee swing for `guid`: the reference's `swing_anim_main`
+/// (benilla-app/src/creature_anim/select.rs) over the unit's `UNIT_VIRTUAL_ITEM_INFO` main hand,
+/// or, for our own body, the equipped main-hand item's template. 16 (AttackUnarmed) when no
+/// weapon template answers, which is the clip a bare fist plays.
+#[no_mangle]
+pub extern "C" fn bn_unit_swing_anim(guid: u64) -> u16 {
+    let sh = shared();
+    let (class, subclass) = if guid == sh.self_guid.load(Ordering::SeqCst) {
+        self_main_weapon(sh)
+    } else {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        units
+            .get(&guid)
+            .and_then(|r| r.fields.unit_virtual_item_info(0))
+            .map_or((0, 0), |(c, sc, _, _)| (u32::from(c), u32::from(sc)))
+    };
+    swing_anim_main(class, subclass)
+}
+
+/// The item class and subclass of our equipped main hand, (0, 0) while bare.
+fn self_main_weapon(sh: &Shared) -> (u32, u32) {
+    // INV_SLOT_MAINHAND = 15.
+    inventory_rows(sh)
+        .iter()
+        .find(|r| r.bag == BAG_EQUIPPED && r.slot == 15)
+        .map_or((0, 0), |r| (r.info.class, r.info.subclass))
+}
+
+fn self_main_swing(sh: &Shared) -> u16 {
+    let (class, subclass) = self_main_weapon(sh);
+    swing_anim_main(class, subclass)
+}
+
+/// [`bn_unit_swing_anim`]'s table: only class 2 (weapon) picks a weapon clip, by subclass — 1H
+/// axe/mace/sword/exotic/misc, 2H, polearm/staff/spear/fishing pole, dagger, everything else
+/// unarmed.
+fn swing_anim_main(class: u32, subclass: u32) -> u16 {
+    if class != 2 {
+        return 16;
+    }
+    match subclass {
+        0x0 | 0x4 | 0x7 | 0xb | 0xe => 17,
+        0x1 | 0x5 | 0x8 | 0xc => 18,
+        0x6 | 0xa | 0x11 | 0x14 => 19,
+        0xf => 85,
+        _ => 16,
+    }
+}
+
 /// One tracked object by guid (the host's target lookup: no sort, one hit).
 #[no_mangle]
 pub extern "C" fn bn_net_unit_by_guid(guid: u64, out: *mut BnNetUnit) -> u32 {
@@ -4580,4 +4650,24 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
     let row = item_info_row(entry, &templates);
     unsafe { *out = row };
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::swing_anim_main;
+
+    /// The same rows benilla-app's `select::tests` pins: the reference's `swing_anim_main` table,
+    /// so the host's swing clip is the one the real client plays for that weapon.
+    #[test]
+    fn swing_anim_main_matches_the_reference_table() {
+        assert_eq!(swing_anim_main(2, 7), 17); // 1H sword
+        assert_eq!(swing_anim_main(2, 5), 18); // 2H mace
+        assert_eq!(swing_anim_main(2, 0xa), 19); // staff
+        assert_eq!(swing_anim_main(2, 0x14), 19); // fishing pole
+        assert_eq!(swing_anim_main(2, 0xf), 85); // dagger stabs, not Attack1H
+        assert_eq!(swing_anim_main(2, 0xd), 16); // fist swings unarmed
+        assert_eq!(swing_anim_main(2, 2), 16); // bow in melee swings unarmed
+        assert_eq!(swing_anim_main(4, 6), 16); // non-weapon class
+        assert_eq!(swing_anim_main(0, 0), 16); // no virtual item at all
+    }
 }
