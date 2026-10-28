@@ -77,6 +77,10 @@ mod creature;
 
 mod held_item;
 
+// ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
+
+mod ghost;
+
 mod exterior;
 
 // ---- In-game interface feed: session state in, FrameXML model; verbs back out ----

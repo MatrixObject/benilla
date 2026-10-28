@@ -120,6 +120,9 @@ pub struct BnNetPlayer {
     pub mount: u32,
     pub combo: u8,
     pub dead: u8,
+    /// `PLAYER_FLAGS & 0x10`: released as a spirit. The reference's FFXDeath gate and the
+    /// body's CharProc nodes; `dead` alone also covers a corpse that has not released.
+    pub ghost: u8,
     /// Number of non-empty `PLAYER_QUEST_LOG` slots, and the slots themselves
     /// (`quest_state` is `QUEST_STATE_COMPLETE`/`FAIL`, 0 in progress).
     pub quest_count: u32,
@@ -189,6 +192,7 @@ impl Default for BnNetPlayer {
             mount: 0,
             combo: 0,
             dead: 0,
+            ghost: 0,
             quest_count: 0,
             quest_id: [0; 20],
             quest_state: [0; 20],
@@ -2706,6 +2710,7 @@ fn refresh_player(sh: &Shared) {
         // `0x605f30`: a ghost carries health 1, so `unit_is_dead` alone leaves
         // the death screen and Release Spirit unreachable.
         dead: f.is_dead_or_ghost() as u8,
+        ghost: f.player_is_ghost() as u8,
         stat: std::array::from_fn(|i| f.unit_stat(i as u8).unwrap_or(0)),
         armor: f.unit_resistance(0).unwrap_or(0),
         attack_power: f.unit_attack_power().unwrap_or(0),
