@@ -33,7 +33,9 @@ pub(super) fn load_wmo_areas(
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_assets::{AdtTile, WmoModel};
 
-use super::seed::{area_down_ray, down_ray_claim, down_ray_seeds, up_ray_claim, DownRayClaim};
+use benilla_cull::{area_down_ray, down_ray_claim, up_ray_claim, DownRayClaim};
+
+use super::down_ray_seeds;
 use super::{WmoPortalInstance, WmoRoom, WorldCamera, EXTERIOR, EXTERIOR_LIT};
 use crate::terrain_stream::{terrain_height_under, PropLobeLight, TerrainStreamer};
 
@@ -88,7 +90,7 @@ pub const INTERIOR_PROBE_HEIGHT: f32 = 1.7;
 
 /// Float-safety lift (yd) for the position-cast legs: feet rest on the floor plane, and a coplanar
 /// `z <= eye.z` test must not lose the floor to rounding.
-pub(crate) const POSITION_PROBE_LIFT: f32 = 0.1;
+pub(crate) use benilla_cull::POSITION_PROBE_LIFT;
 
 /// The zone-text indoor claim, the CGLight node's `[node+0x90]` bit 0 (`0x6a87f0`): the keys of
 /// the group owning the nearest face under the player (faces only, EXTERIOR excluded, terrain
@@ -276,7 +278,7 @@ pub(super) fn track_unit_interiors(
 /// The least reach (yd) of [`room_at`]'s second pass above a body's origin. A planted object's
 /// origin can sit under its floor (Orgrimmar's props, 0.45 to 1.16 yd); two yards covers that and
 /// reaches no storey above.
-pub(crate) const ROOM_UNDER_FLOOR_TOLERANCE: f32 = 2.0;
+pub(crate) use benilla_cull::ROOM_UNDER_FLOOR_TOLERANCE;
 
 /// The WMO room a world position stands in, by the faces-only ray; only on a miss, a second pass
 /// from `reach` higher finds a body whose origin sits below its floor.

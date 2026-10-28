@@ -564,7 +564,7 @@ fn wmo_outside_audit() {
                     &clip_from_world(eye, [eye[0], eye[1], eye[2] - 10.0]),
                     &Affine3A::IDENTITY,
                 );
-                let culled = exteriors.iter().any(|&e| !pvs[e]);
+                let culled = exteriors.iter().any(|&e| !pvs.visible[e]);
                 if culled {
                     shell_culled += 1;
                 }
@@ -763,7 +763,7 @@ fn wmo_pvs_audit() {
                             &Affine3A::IDENTITY,
                         );
                         samples += 1;
-                        if !pvs.get(gp).copied().unwrap_or(false) {
+                        if !pvs.visible.get(gp).copied().unwrap_or(false) {
                             violations.push((player, eye, gp, subject.seeds(eye).in_group));
                         }
                     }

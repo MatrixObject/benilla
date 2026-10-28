@@ -6,11 +6,11 @@ use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_formats::{load_tile_mesh, mcsh_shadowed_at, open_chain};
 
 use super::super::interior::footprint_sample;
-use super::super::seed::{area_down_ray, down_ray_claim};
 use super::super::EXTERIOR_LIT;
 use super::{
     floor_z_at, load_subject, reachable_spots, WmoModel, BLACKSMITH, EXTERIOR, GOLDSHIRE, WALK_STEP,
 };
+use benilla_cull::{area_down_ray, down_ray_claim};
 
 /// Dump a tile's WMO placements (model, uid, position), for pinning a new [`Site`]:
 /// `WOW_DUMP_TILE=map,x,y`, default Goldshire's `Azeroth,31,49`.

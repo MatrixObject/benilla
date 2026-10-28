@@ -3,7 +3,7 @@
 //! would recurse into this loader. The app builds the meshes, paced, as a city's thousands of
 //! batches would land in one frame.
 
-use crate::column_grid::ColumnGrid;
+use crate::{collision_tri_bounds, collision_tri_grids, ColumnGrid, WmoGroupNav};
 use std::sync::Arc;
 
 use benilla_formats::{
@@ -19,23 +19,6 @@ use bevy::prelude::*;
 use bevy::reflect::TypePath;
 
 use crate::model::ModelSubmesh;
-
-/// One WMO group's portal-cull data: MOGP flags (the flood defers on EXTERIOR `0x8`), the MOGI box
-/// and its slice of [`WmoModel::portal_refs`]; an unreadable group never floods.
-#[derive(Clone, Copy)]
-pub struct WmoGroupNav {
-    pub flags: u32,
-    pub bbox_min: [f32; 3],
-    pub bbox_max: [f32; 3],
-    pub ref_start: u16,
-    pub ref_count: u16,
-    /// The `WMOAreaTable.WMOGroupID` key, MOGP `uniqueID`; 0 when none.
-    pub area_table_id: u32,
-    /// MOGP fog indices (disk `+0x30`) into [`WmoModel::fogs`], for the fog selector (`0x69de20`).
-    pub fog_indices: [u8; 4],
-    /// MOGP `groupLiquid` (`0xf` = none): when set, the whole group reads submerged at every Z.
-    pub group_liquid: u32,
-}
 
 /// A loaded WMO building; `Default` is an empty test scaffold, never a loader product.
 #[derive(Asset, TypePath, Clone, Default)]
@@ -179,67 +162,6 @@ pub fn footprint_tri_grids(footprints: &[Option<FootprintTris>]) -> Vec<Option<C
             })
         })
         .collect()
-}
-
-/// Per-group column indexes over a per-group triangle set.
-pub fn collision_tri_grids(tris: &[Vec<[[f32; 3]; 3]>]) -> Vec<Option<ColumnGrid>> {
-    tris.iter()
-        .map(|group| {
-            ColumnGrid::build(group.len(), |i| {
-                let t = &group[i];
-                (
-                    [
-                        t[0][0].min(t[1][0]).min(t[2][0]),
-                        t[0][1].min(t[1][1]).min(t[2][1]),
-                    ],
-                    [
-                        t[0][0].max(t[1][0]).max(t[2][0]),
-                        t[0][1].max(t[1][1]).max(t[2][1]),
-                    ],
-                )
-            })
-        })
-        .collect()
-}
-
-/// Per-group AABBs of a per-group triangle set, and their union; shared with the down-ray tests.
-#[allow(clippy::type_complexity)]
-pub fn collision_tri_bounds(
-    tris: &[Vec<[[f32; 3]; 3]>],
-) -> (
-    Vec<Option<([f32; 3], [f32; 3])>>,
-    Option<([f32; 3], [f32; 3])>,
-) {
-    let per_group: Vec<Option<([f32; 3], [f32; 3])>> = tris
-        .iter()
-        .map(|group| {
-            let mut bounds: Option<([f32; 3], [f32; 3])> = None;
-            for tri in group {
-                for v in tri {
-                    let (min, max) = bounds.get_or_insert((*v, *v));
-                    for a in 0..3 {
-                        min[a] = min[a].min(v[a]);
-                        max[a] = max[a].max(v[a]);
-                    }
-                }
-            }
-            bounds
-        })
-        .collect();
-    let union = per_group.iter().flatten().fold(
-        None::<([f32; 3], [f32; 3])>,
-        |acc, (gmin, gmax)| match acc {
-            None => Some((*gmin, *gmax)),
-            Some((mut min, mut max)) => {
-                for a in 0..3 {
-                    min[a] = min[a].min(gmin[a]);
-                    max[a] = max[a].max(gmax[a]);
-                }
-                Some((min, max))
-            }
-        },
-    );
-    (per_group, union)
 }
 
 /// The ambient cap of `0x6a77e0`, in its fixed point: a colour whose max channel exceeds 96 scales

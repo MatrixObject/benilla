@@ -1,0 +1,15 @@
+[package]
+name = "benilla-cull"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The WMO portal cull (room pick, portal flood, exterior windows) and the column index it casts against, with no Bevy"
+
+[lints]
+workspace = true
+
+[dependencies]
+benilla-formats = { path = "../benilla-formats", default-features = false }
+# The same glam bevy 0.18 re-exports, so a placement's `Mat4`/`Affine3A` cross this boundary
+# unchanged and the cull never converts a matrix.
+glam = "0.30"

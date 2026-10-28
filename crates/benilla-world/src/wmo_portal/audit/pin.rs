@@ -5,12 +5,12 @@
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use bevy::math::{Mat4, Vec3};
 
-use super::super::seed::down_ray_claim;
 use super::super::EXTERIOR_LIT;
 use super::{
     load_subject, Site, BLACKSMITH, DARNASSUS, DEADMINES, EXTERIOR, FARGODEEP, GOLDSHIRE,
     IRONFORGE, SHADOWFANG, UNDERCITY,
 };
+use benilla_cull::down_ray_claim;
 
 /// The subjects `WOW_PIN_SITE` names: every [`Site`] the harness carries.
 const NAMED_SITES: &[(&str, Site)] = &[

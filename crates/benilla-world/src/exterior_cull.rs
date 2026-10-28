@@ -30,16 +30,25 @@
 //! here, so its submeshes are tested one by one, and a submesh outside a doorway's window drops
 //! where the reference draws the doodad whole. A body has a root and is tested once.
 
-use bevy::camera::primitives::{Aabb, Frustum};
+use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::VisibilitySystems;
 use bevy::prelude::*;
 
 use crate::view::WorldCamera;
-use crate::wmo_portal::{ExteriorWindows, Rect, WmoPvsSet};
+use crate::wmo_portal::{ExteriorWindows, WmoPvsSet};
 
-/// The open-world walk drops a window narrower than this in either axis: `0x682fa0` tests against
-/// `[0x8029d0]`, 0.01 of a 0..1 screen, which is 0.02 in NDC.
-const MIN_WINDOW_NDC: f32 = 0.02;
+/// The window volumes are `benilla_cull`'s, built by the same code that builds the building's own
+/// Pass 2: one copy of the clip-space rect and its plane extraction.
+pub(crate) use benilla_cull::{scene_window_frustum, Frustum};
+/// The un-gated builder and its width floor: exercised by the tests below, which pin the shapes
+/// the reference distinguishes (a full-screen window, a sliver Pass 2 still draws through).
+#[cfg(test)]
+pub(crate) use benilla_cull::{window_frustum, MIN_WINDOW_NDC};
+
+/// Bevy's `Aabb` as the cull's: the same box, in the crate the frustum math lives in.
+fn cull_aabb(a: &Aabb) -> benilla_cull::Aabb {
+    benilla_cull::Aabb::from_min_max(a.center - a.half_extents, a.center + a.half_extents)
+}
 
 /// Tag for exterior scene content, gated by the window worklist: ADT terrain cells, ADT doodad
 /// placements, the WDL far band, world WMO placements and open-world liquid, each on the drawn
@@ -96,37 +105,6 @@ impl Plugin for ExteriorCullPlugin {
     }
 }
 
-/// The sub-frustum for one NDC window rect, with no width gate: the reference builds one volume
-/// per window for both the open-world walk (the copy at `0xc7cb7c`, for `0x682fa0`) and the
-/// building's own Pass 2 (`0x682930`, for `0x6b3b20`), and only the walk rejects a narrow window
-/// ([`scene_window_frustum`]). The rect is a scale and offset on clip space with depth untouched,
-/// so the extracted planes bound the window at the camera's own near and far.
-pub(crate) fn window_frustum(rect: Rect, clip_from_world: &Mat4) -> Frustum {
-    let [x0, y0, x1, y1] = rect;
-    let (w, h) = (x1 - x0, y1 - y0);
-    // Column-major: `Mat4::from_cols` takes columns, so the `w`-column carries the offsets.
-    let rect_to_ndc = Mat4::from_cols(
-        Vec4::new(2.0 / w, 0.0, 0.0, 0.0),
-        Vec4::new(0.0, 2.0 / h, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, 1.0, 0.0),
-        Vec4::new(-(x0 + x1) / w, -(y0 + y1) / h, 0.0, 1.0),
-    );
-    Frustum::from_clip_from_world(&(rect_to_ndc * *clip_from_world))
-}
-
-/// [`window_frustum`] behind the open-world walk's entry gate: `0x682fa0` returns before touching a
-/// bucket unless both extents are `>= [0x8029d0]` (0.01 of the 0..1 screen, 0.02 NDC), so a
-/// narrower window draws no terrain, doodad, world WMO, liquid, far band or outdoor unit. The
-/// shared builder `0x682930` has no compares, and Pass 2's body `[0x6b3c73, 0x6b3d6f)` none on the
-/// rect, so a window too narrow for the open world still draws the building's own shell.
-pub(crate) fn scene_window_frustum(rect: Rect, clip_from_world: &Mat4) -> Option<Frustum> {
-    let [x0, y0, x1, y1] = rect;
-    if x1 - x0 < MIN_WINDOW_NDC || y1 - y0 < MIN_WINDOW_NDC {
-        return None;
-    }
-    Some(window_frustum(rect, clip_from_world))
-}
-
 /// This frame's exterior gate: the window worklist as clip volumes, built once and asked per
 /// object by [`apply_exterior_cull`] and by the owners that fold it into their own verdict
 /// (`model_render::visibility`, the particle and static-geometry culls).
@@ -169,9 +147,10 @@ impl ExteriorGate {
             (Self::Open, _) | (_, None) => true,
             (Self::Windows(frusta), Some(aabb)) => {
                 let world_from_local = gt.affine();
+                let aabb = cull_aabb(aabb);
                 frusta
                     .iter()
-                    .any(|f| f.intersects_obb(aabb, &world_from_local, true, true))
+                    .any(|f| f.intersects_obb(&aabb, &world_from_local, true, true))
             }
         }
     }
@@ -296,9 +275,10 @@ fn apply_exterior_cull(
         scene_window_frustum([-1.0, -1.0, 1.0, 1.0], &clip_from_world)
     });
     let in_view = |gt: &GlobalTransform, bound: &Aabb| {
+        let bound = cull_aabb(bound);
         full_view
             .as_ref()
-            .is_none_or(|f| f.intersects_obb(bound, &gt.affine(), true, true))
+            .is_none_or(|f| f.intersects_obb(&bound, &gt.affine(), true, true))
     };
     let (mut tested, mut hidden, mut unbounded) = (0usize, 0usize, 0usize);
     let (mut liquid, mut liquid_hidden) = (0usize, 0usize);
@@ -400,7 +380,10 @@ mod tests {
 
     /// A point admitted by a frustum? (A degenerate AABB at `p`, identity placement.)
     fn admits(f: &Frustum, p: Vec3) -> bool {
-        let aabb = Aabb::from_min_max(p - Vec3::splat(0.01), p + Vec3::splat(0.01));
+        let aabb = cull_aabb(&Aabb::from_min_max(
+            p - Vec3::splat(0.01),
+            p + Vec3::splat(0.01),
+        ));
         f.intersects_obb(&aabb, &Affine3A::IDENTITY, true, true)
     }
 
@@ -434,10 +417,10 @@ mod tests {
         let ground = Vec3::new(-200.0, -2.0, -200.0);
 
         const CELL: f32 = 33.333 / 2.0;
-        let cell = Aabb::from_min_max(
+        let cell = cull_aabb(&Aabb::from_min_max(
             ground - Vec3::new(CELL, 0.5, CELL),
             ground + Vec3::new(CELL, 0.5, CELL),
-        );
+        ));
         assert!(
             !f.intersects_obb(&cell, &Affine3A::IDENTITY, true, true),
             "an MCNK cell to the left must not come in through a doorway on the right"
@@ -445,7 +428,10 @@ mod tests {
 
         // The ADT tile containing that cell: the camera stands on it, so it spans the view.
         const TILE: f32 = 533.333 / 2.0;
-        let tile = Aabb::from_min_max(Vec3::new(-TILE, -2.5, -TILE), Vec3::new(TILE, -1.5, TILE));
+        let tile = cull_aabb(&Aabb::from_min_max(
+            Vec3::new(-TILE, -2.5, -TILE),
+            Vec3::new(TILE, -1.5, TILE),
+        ));
         assert!(
             f.intersects_obb(&tile, &Affine3A::IDENTITY, true, true),
             "a tile-sized box reaches the doorway's side of the view — it can never be culled, and \

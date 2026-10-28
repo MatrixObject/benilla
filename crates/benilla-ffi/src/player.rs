@@ -1070,6 +1070,38 @@ impl Player {
         best
     }
 
+    /// The terrain surface under (x, y): the ADT's own triangles, never a WMO
+    /// floor or a doodad's hull. The portal cull's seed races this against the
+    /// building floor (`0x6822a2`), so an interior under a hill stays inside
+    /// while one below the open ground is dropped.
+    pub(crate) fn terrain_z(&self, x: f32, y: f32) -> Option<f32> {
+        let (tx, ty) = Self::tile_of(x, y);
+        let mut best: Option<f32> = None;
+        let mut consider = |t: &Tri| {
+            if let Some(z) = t.height_at(x, y, f32::MAX) {
+                best = Some(best.map_or(z, |bz| bz.max(z)));
+            }
+        };
+        if let Some(tile) = self.tiles.get(&(tx, ty)) {
+            let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
+            let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+            for t in &tile.buckets[b] {
+                consider(t);
+            }
+        } else {
+            // Crossing a border before the neighbour finished loading (or off
+            // this body's tiles): every loaded bucket answers in world coords.
+            for tile in self.tiles.values() {
+                for bucket in &tile.buckets {
+                    for t in bucket {
+                        consider(t);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     /// The floor a step-up would land on, advanced `STEP_UP_ADVANCE` from
     /// (`x`, `y`) along the travel: the reference's certify sweep (`0x636147`),
     /// settled onto a walkable floor higher than the feet. `None` means the
@@ -2337,6 +2369,20 @@ pub extern "C" fn bn_player_state(world: *const BnWorld, out: *mut BnPlayerState
         *out = p.state();
     }
     1
+}
+
+/// The ADT terrain height under (x, y) in WoW yards, `NaN` where no tile answers: the portal
+/// cull's seed races this against the building floor (`0x6822a2`).
+#[no_mangle]
+pub extern "C" fn bn_terrain_wow_z(world: *const BnWorld, x: f32, y: f32) -> f32 {
+    if world.is_null() {
+        return f32::NAN;
+    }
+    let w = unsafe { &*world };
+    w.player
+        .as_ref()
+        .and_then(|p| p.terrain_z(x, y))
+        .unwrap_or(f32::NAN)
 }
 
 #[cfg(test)]

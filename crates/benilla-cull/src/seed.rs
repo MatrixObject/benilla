@@ -22,14 +22,12 @@
 //! blanks the whole building from a pocket floored only with DETAIL faces, as at the Deadmines
 //! entrance.
 
-use benilla_assets::column_grid::ColumnGrid;
-use benilla_assets::{WmoGroupNav, WmoModel, WmoPortalInfo, WmoPortalRef};
-pub use benilla_formats::triangle_z_at as floor_z_at;
-
-use super::{
-    point_in_poly_2d, portal_poly, EXTERIOR, MAX_FLOOR_DROP, NEAREST_TIE_EPS, PORTAL_NEAR_PARALLEL,
-    PORTAL_PLANE_SNAP,
+use crate::{
+    point_in_poly_2d, portal_poly, ColumnGrid, CullModel, WmoGroupNav, EXTERIOR, MAX_FLOOR_DROP,
+    NEAREST_TIE_EPS, PORTAL_NEAR_PARALLEL, PORTAL_PLANE_SNAP,
 };
+pub use benilla_formats::triangle_z_at as floor_z_at;
+use benilla_formats::{WmoPortalInfo, WmoPortalRef};
 
 /// The down-ray's verdict: the camera's group and, when the nearest crossing was a portal, the
 /// group across it, both flood roots (the containing-group set `0xc7cd88`). Outside, both are
@@ -37,19 +35,19 @@ use super::{
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct DownRaySeeds {
     pub in_group: Option<usize>,
-    pub(crate) across: Option<usize>,
+    pub across: Option<usize>,
 }
 
-/// [`down_ray_pick`] over the asset's stored pieces; `terrain_z` is in this model's local space.
-pub fn down_ray_seeds(model: &WmoModel, eye: [f32; 3], terrain_z: Option<f32>) -> DownRaySeeds {
+/// [`down_ray_pick`] over a model's stored pieces; `terrain_z` is in this model's local space.
+pub fn down_ray_seeds(model: &CullModel, eye: [f32; 3], terrain_z: Option<f32>) -> DownRaySeeds {
     down_ray_pick(
-        &model.group_collision_tris,
-        &model.group_collision_grids,
-        &model.group_camera_only_tris,
-        &model.group_nav,
-        &model.portal_vertices,
-        &model.portal_infos,
-        &model.portal_refs,
+        model.collision_tris,
+        model.collision_grids,
+        model.camera_only_tris,
+        model.nav,
+        model.portal_vertices,
+        model.portal_infos,
+        model.portal_refs,
         eye,
         terrain_z,
     )
@@ -220,7 +218,7 @@ const ZONE_RAY_LEN: f32 = 1000.0;
 ///
 /// The portal leg belongs to the camera's render seed alone: a doorway plane under the eye must
 /// not claim the interior. `None` is outdoors; [`down_ray_claim`] keeps an outdoor-class winner.
-pub(crate) fn area_down_ray(
+pub fn area_down_ray(
     tris: &[Vec<[[f32; 3]; 3]>],
     bounds: &[Option<([f32; 3], [f32; 3])>],
     grids: &[Option<ColumnGrid>],
@@ -236,18 +234,18 @@ pub(crate) fn area_down_ray(
 /// A position-cast ray's claim on one placement before the outdoor collapse: the winning face's
 /// group, its depth, and its outdoor class under the caller's mask.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DownRayClaim {
-    pub(crate) group: usize,
+pub struct DownRayClaim {
+    pub group: usize,
     /// Depth (yd) of the winning face along the cast. Placements are rigid, so depths compare
     /// across placements: the light chain's one global nearest hit.
-    pub(crate) depth: f32,
+    pub depth: f32,
     /// The winning group carries a flag in the caller's `outdoor_mask`.
-    pub(crate) outdoor: bool,
+    pub outdoor: bool,
 }
 
 /// [`area_down_ray`] without the outdoor collapse: the light chain tells an outdoor-class face (a
 /// deck) from open terrain.
-pub(crate) fn down_ray_claim(
+pub fn down_ray_claim(
     tris: &[Vec<[[f32; 3]; 3]>],
     bounds: &[Option<([f32; 3], [f32; 3])>],
     grids: &[Option<ColumnGrid>],
@@ -274,7 +272,7 @@ pub(crate) fn down_ray_claim(
 /// which can put a particle-heavy model's anchor 40 yd under its floor. The reference retries
 /// 1000 yd upward (`0x6a908d`, `0x6a9093`). No terrain race: a cast up from under a floor cannot
 /// lose to the ground below it.
-pub(crate) fn up_ray_claim(
+pub fn up_ray_claim(
     tris: &[Vec<[[f32; 3]; 3]>],
     bounds: &[Option<([f32; 3], [f32; 3])>],
     grids: &[Option<ColumnGrid>],
@@ -372,7 +370,7 @@ fn point_in_poly_dominant(verts: &[[f32; 3]], plane: [f32; 4], p: [f32; 3]) -> b
 }
 
 /// The two axes spanning a plane's dominant-axis projection (drop the normal's largest component).
-pub(super) fn dominant_axes(plane: [f32; 4]) -> (usize, usize) {
+pub(crate) fn dominant_axes(plane: [f32; 4]) -> (usize, usize) {
     let [nx, ny, nz, _] = plane;
     if nx.abs() >= ny.abs() && nx.abs() >= nz.abs() {
         (1, 2)
@@ -385,8 +383,8 @@ pub(super) fn dominant_axes(plane: [f32; 4]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{EXTERIOR, EXTERIOR_LIT};
     use super::*;
+    use crate::{EXTERIOR, EXTERIOR_LIT};
 
     fn nav(
         flags: u32,
@@ -423,7 +421,7 @@ mod tests {
     ) -> Option<usize> {
         down_ray_pick(
             tris,
-            &benilla_assets::collision_tri_grids(tris),
+            &crate::collision_tri_grids(tris),
             &[],
             nav,
             &[],
@@ -446,7 +444,7 @@ mod tests {
     ) -> DownRaySeeds {
         down_ray_pick(
             tris,
-            &benilla_assets::collision_tri_grids(tris),
+            &crate::collision_tri_grids(tris),
             &[],
             nav,
             portal_vertices,
@@ -682,8 +680,8 @@ mod tests {
         eye: [f32; 3],
         terrain_z: Option<f32>,
     ) -> Option<usize> {
-        let (bounds, _) = benilla_assets::collision_tri_bounds(tris);
-        let grids = benilla_assets::collision_tri_grids(tris);
+        let (bounds, _) = crate::collision_tri_bounds(tris);
+        let grids = crate::collision_tri_grids(tris);
         area_down_ray(tris, &bounds, &grids, nav, eye, terrain_z, EXTERIOR)
     }
 
@@ -693,8 +691,8 @@ mod tests {
     fn an_under_floor_origin_is_found_only_by_the_lifted_cast() {
         let floor = [quad(0.0, 20.0)];
         let nav = [nav(0, [-20.0, -20.0, 0.0], [20.0, 20.0, 0.0], 0, 0)];
-        let lift = super::super::interior::POSITION_PROBE_LIFT;
-        let tol = super::super::interior::ROOM_UNDER_FLOOR_TOLERANCE;
+        let lift = crate::POSITION_PROBE_LIFT;
+        let tol = crate::ROOM_UNDER_FLOOR_TOLERANCE;
         // Orgrimmar's measured burials, 1.16 yd the worst (bonfire 177026).
         for buried in [0.45_f32, 1.16] {
             let feet = -buried;
@@ -747,8 +745,8 @@ mod tests {
                 )
             })
             .collect();
-        let (bounds, _) = benilla_assets::collision_tri_bounds(&tris);
-        let grids = benilla_assets::collision_tri_grids(&tris);
+        let (bounds, _) = crate::collision_tri_bounds(&tris);
+        let grids = crate::collision_tri_grids(&tris);
         assert!(
             grids.iter().all(Option::is_some),
             "each storey must actually be indexed"
@@ -834,7 +832,7 @@ mod tests {
         // but outdoors on the unit-lighting law (`MOGI & 0x48`).
         let street = nav(EXTERIOR_LIT, [-10.0, -10.0, 0.0], [10.0, 10.0, 10.0], 0, 0);
         let tris = [quad(0.0, 10.0)];
-        let (bounds, _) = benilla_assets::collision_tri_bounds(&tris);
+        let (bounds, _) = crate::collision_tri_bounds(&tris);
         let eye = [0.0, 0.0, 1.0];
         assert_eq!(
             area_down_ray(&tris, &bounds, &[], &[street], eye, None, EXTERIOR),
@@ -863,7 +861,7 @@ mod tests {
         // (`0x6a908d`) finds the floor.
         let room = nav(0, [-10.0, -10.0, 0.0], [10.0, 10.0, 10.0], 0, 0);
         let tris = [quad(0.0, 10.0)]; // the chamber floor at z = 0
-        let (bounds, _) = benilla_assets::collision_tri_bounds(&tris);
+        let (bounds, _) = crate::collision_tri_bounds(&tris);
         let mask = EXTERIOR | EXTERIOR_LIT;
         let under = [0.0, 0.0, -40.0];
         assert_eq!(
@@ -898,7 +896,7 @@ mod tests {
             0,
         );
         let tris = [quad(5.0, 10.0)]; // the deck surface, 30-ish yd over terrain at z -25
-        let (bounds, _) = benilla_assets::collision_tri_bounds(&tris);
+        let (bounds, _) = crate::collision_tri_bounds(&tris);
         let mask = EXTERIOR | EXTERIOR_LIT;
         // On the deck, terrain far below: an outdoor claim, depth = probe − face.
         let c = down_ray_claim(

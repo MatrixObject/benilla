@@ -13,7 +13,6 @@ use bevy::asset::io::{
 use bevy::asset::AssetApp;
 use bevy::prelude::*;
 
-pub mod column_grid;
 pub mod coords;
 pub mod materials;
 pub mod minimap_grid;
@@ -54,8 +53,13 @@ pub use m2::{
 mod wmo;
 pub use benilla_formats::{WmoPortalInfo, WmoPortalRef};
 pub use wmo::{
-    cap96, collision_tri_bounds, collision_tri_grids, floor168, footprint_tri_bounds,
-    footprint_tri_grids, DoodadBase, WmoGroupNav, WmoModel, WmoModelLoader,
+    cap96, floor168, footprint_tri_bounds, footprint_tri_grids, DoodadBase, WmoModel,
+    WmoModelLoader,
+};
+// The portal-cull data and the column index live in `benilla-cull`, the one implementation the
+// renderer and the FFI host both run; re-exported here so the asset surface is unchanged.
+pub use benilla_cull::{
+    collision_tri_bounds, collision_tri_grids, column_grid, ColumnGrid, WmoGroupNav,
 };
 
 /// The asset-source id for MPQ-backed assets: load paths look like `mpq://World/Azeroth/foo.adt`.

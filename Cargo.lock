@@ -554,6 +554,7 @@ name = "benilla-assets"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "benilla-cull",
  "benilla-formats",
  "bevy",
  "image",
@@ -577,6 +578,14 @@ name = "benilla-bytes"
 version = "0.2.0"
 
 [[package]]
+name = "benilla-cull"
+version = "0.2.0"
+dependencies = [
+ "benilla-formats",
+ "glam 0.30.10",
+]
+
+[[package]]
 name = "benilla-dbc"
 version = "0.2.0"
 dependencies = [
@@ -590,12 +599,14 @@ dependencies = [
  "ab_glyph",
  "benilla-adt",
  "benilla-blp",
+ "benilla-cull",
  "benilla-formats",
  "benilla-m2",
  "benilla-mpq",
  "benilla-protocol",
  "benilla-ui",
  "benilla-wmo",
+ "glam 0.30.10",
 ]
 
 [[package]]
@@ -705,6 +716,7 @@ version = "0.2.0"
 dependencies = [
  "avian3d",
  "benilla-assets",
+ "benilla-cull",
  "benilla-formats",
  "benilla-wmo",
  "bevy",

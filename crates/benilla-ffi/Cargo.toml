@@ -19,6 +19,10 @@ benilla-blp = { path = "../benilla-blp" }
 # Read-only use of the official adapters (adt_to_tile_mesh, load_wmo, Chain).
 # default-features off: skip the `dev` feature (bakes source-tree paths).
 benilla-formats = { path = "../benilla-formats", default-features = false }
+# The one WMO portal cull the renderer runs (seed, flood, window frusta), Bevy-free.
+benilla-cull = { path = "../benilla-cull" }
+# The same glam benilla-cull is built on, so its matrices cross unchanged.
+glam = "0.30"
 # Stock WoW UI engine (FrameXML loader + Lua VM), read-only use for stage 3.
 benilla-ui = { path = "../benilla-ui" }
 # Wire protocol (SRP6 logon, realm list, world session) for the network

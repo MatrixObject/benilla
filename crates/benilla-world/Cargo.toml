@@ -19,6 +19,7 @@ dev = ["benilla-formats/dev", "benilla-assets/dev", "bevy/debug"]
 [dependencies]
 avian3d = "0.6"
 benilla-assets = { path = "../benilla-assets", default-features = false }
+benilla-cull = { path = "../benilla-cull" }
 benilla-formats = { path = "../benilla-formats", default-features = false }
 # No `benilla-protocol`: the engine renders a world and does not speak the protocol.
 # For the portal audit, which re-parses a WMO group to check its decode against the file.
