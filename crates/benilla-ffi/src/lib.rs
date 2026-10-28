@@ -6682,7 +6682,9 @@ const TEX_READY: u8 = 1;
 const TEX_FAILED: u8 = 2;
 
 /// Decoded RGBA8 kept per texture path, shared by the worker pool and the
-/// synchronous `bn_texture` fallback.
+/// synchronous `bn_texture` fallback. The whole authored level chain is kept:
+/// the 1.12 client uploads each stored BLP level and never regenerates one, so
+/// the host needs them all to build a real mip chain.
 struct TexEntry {
     status: u8,
 
@@ -6690,7 +6692,15 @@ struct TexEntry {
 
     height: u32,
 
-    rgba: Vec<u8>,
+    /// Level 0 first, as the BLP stores them (`level 0` is what `bn_texture` hands out).
+    mips: Vec<(u32, u32, Vec<u8>)>,
+}
+
+impl TexEntry {
+    /// Every level's bytes, what the cache budget counts.
+    fn bytes(&self) -> u64 {
+        self.mips.iter().map(|m| m.2.len() as u64).sum()
+    }
 }
 
 fn tex_pending_entry() -> TexEntry {
@@ -6698,7 +6708,7 @@ fn tex_pending_entry() -> TexEntry {
         status: TEX_PENDING,
         width: 0,
         height: 0,
-        rgba: Vec::new(),
+        mips: Vec::new(),
     }
 }
 
@@ -6707,16 +6717,16 @@ fn tex_failed_entry() -> TexEntry {
         status: TEX_FAILED,
         width: 0,
         height: 0,
-        rgba: Vec::new(),
+        mips: Vec::new(),
     }
 }
 
-fn tex_ready_entry(w: u32, h: u32, rgba: Vec<u8>) -> TexEntry {
+fn tex_ready_entry(w: u32, h: u32, mips: Vec<(u32, u32, Vec<u8>)>) -> TexEntry {
     TexEntry {
         status: TEX_READY,
         width: w,
         height: h,
-        rgba,
+        mips,
     }
 }
 
@@ -6757,9 +6767,9 @@ pub extern "C" fn bn_texture_stats(out4: *mut u32) -> u32 {
 }
 
 fn tex_insert(cache: &mut HashMap<String, TexEntry>, key: String, entry: TexEntry) {
-    let old = cache.get(&key).map(|e| e.rgba.len() as u64).unwrap_or(0);
+    let old = cache.get(&key).map(|e| e.bytes()).unwrap_or(0);
 
-    let add = entry.rgba.len() as u64;
+    let add = entry.bytes();
 
     // Replacing a pending/failed slot frees nothing, replacing a decoded one
     // returns its bytes; either way the counter stays on the live total.
@@ -6860,12 +6870,25 @@ fn read_texture_bytes_chain(chain: &mut benilla_formats::Chain, path: &str) -> O
     None
 }
 
-fn decode_blp_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let decoded = benilla_blp::decode(bytes).ok()?;
+fn decode_blp_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<(u32, u32, Vec<u8>)>)> {
+    let chain = benilla_formats::blp_bytes_to_mip_chain(bytes).ok()?;
 
-    let mip = decoded.mips.first()?;
+    let (width, height) = (chain.width, chain.height);
 
-    Some((mip.width, mip.height, mip.rgba.clone()))
+    let dims: Vec<(u32, u32)> = (0..chain.mips.len() as u32)
+        .map(|i| chain.mip_size(i))
+        .collect();
+
+    let mips: Vec<(u32, u32, Vec<u8>)> = chain
+        .mips
+        .into_iter()
+        .zip(dims)
+        .map(|(level, (w, h))| (w, h, level))
+        .collect();
+
+    mips.first()?;
+
+    Some((width, height, mips))
 }
 
 /// Some(Some(tex)) = decoded, Some(None) = known miss, None = unknown or
@@ -6874,7 +6897,9 @@ fn tex_lookup(key: &str) -> Option<Option<(u32, u32, Vec<u8>)>> {
     let cache = tex_cache().lock().ok()?;
 
     match cache.get(key) {
-        Some(e) if e.status == TEX_READY => Some(Some((e.width, e.height, e.rgba.clone()))),
+        Some(e) if e.status == TEX_READY => {
+            Some(e.mips.first().map(|m| (e.width, e.height, m.2.clone())))
+        }
 
         Some(e) if e.status == TEX_FAILED => Some(None),
 
@@ -6882,10 +6907,24 @@ fn tex_lookup(key: &str) -> Option<Option<(u32, u32, Vec<u8>)>> {
     }
 }
 
-fn tex_store(key: &str, value: Option<(u32, u32, Vec<u8>)>) {
+/// One authored level of a cached texture: `Some(Some(_))` decoded, `Some(None)`
+/// a known miss or no such level, `None` unknown or still pending.
+fn tex_lookup_level(key: &str, level: u32) -> Option<Option<(u32, u32, Vec<u8>)>> {
+    let cache = tex_cache().lock().ok()?;
+
+    match cache.get(key) {
+        Some(e) if e.status == TEX_READY => Some(e.mips.get(level as usize).cloned()),
+
+        Some(e) if e.status == TEX_FAILED => Some(None),
+
+        _ => None,
+    }
+}
+
+fn tex_store(key: &str, value: Option<(u32, u32, Vec<(u32, u32, Vec<u8>)>)>) {
     if let Ok(mut cache) = tex_cache().lock() {
         let entry = match value {
-            Some((w, h, rgba)) => tex_ready_entry(w, h, rgba),
+            Some((w, h, mips)) => tex_ready_entry(w, h, mips),
 
             None => tex_failed_entry(),
         };
@@ -6894,13 +6933,13 @@ fn tex_store(key: &str, value: Option<(u32, u32, Vec<u8>)>) {
     }
 }
 
-fn decode_texture_sync(w: &BnWorld, path: &str) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_texture_sync(w: &BnWorld, path: &str) -> Option<(u32, u32, Vec<(u32, u32, Vec<u8>)>)> {
     let bytes = read_texture_bytes(w, path)?;
 
     decode_blp_bytes(bytes.as_slice())
 }
 
-fn tex_decode_job(key: String, decoded: Option<(u32, u32, Vec<u8>)>) {
+fn tex_decode_job(key: String, decoded: Option<(u32, u32, Vec<(u32, u32, Vec<u8>)>)>) {
     if let Ok(mut cache) = tex_cache().lock() {
         // The synchronous path may have answered while this job waited.
         if cache.get(&key).is_some_and(|e| e.status != TEX_PENDING) {
@@ -6908,10 +6947,10 @@ fn tex_decode_job(key: String, decoded: Option<(u32, u32, Vec<u8>)>) {
         }
 
         let entry = match decoded {
-            Some((w, h, rgba)) => {
+            Some((w, h, mips)) => {
                 TEX_STAT_WORKER.fetch_add(1, Ordering::Relaxed);
 
-                tex_ready_entry(w, h, rgba)
+                tex_ready_entry(w, h, mips)
             }
 
             None => tex_failed_entry(),
@@ -7114,10 +7153,97 @@ pub extern "C" fn bn_texture(
 
             let v = decode_texture_sync(w, p);
 
-            tex_store(&key, v.clone());
+            let level0 = v.as_ref().and_then(|(_, _, mips)| {
+                mips.first().map(|m| (m.0, m.1, m.2.clone()))
+            });
 
-            match v {
+            tex_store(&key, v);
+
+            match level0 {
                 Some(v) => v,
+
+                None => return 0,
+            }
+        }
+    };
+
+    let (width, height, rgba) = decoded;
+
+    let need = width.saturating_mul(height).saturating_mul(4);
+
+    if need == 0 || need > cap {
+        return 0;
+    }
+
+    unsafe {
+        *out_width = width;
+
+        *out_height = height;
+
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), out_rgba, need as usize);
+    }
+
+    need
+}
+
+/// One authored mip level of a BLP, `level` 0 = full size, RGBA8. The 1.12
+/// client uploads the levels the file stores (`glCompressedTexImage2DARB` on
+/// each) and never regenerates them, so the host asks for the chain the BLP
+/// carries instead of filtering its own. Returns the level's byte count; 0
+/// when the texture, the level or the arguments are missing.
+#[no_mangle]
+pub extern "C" fn bn_texture_mip(
+    world: *const BnWorld,
+
+    internal_path: *const c_char,
+
+    level: u32,
+
+    out_width: *mut u32,
+
+    out_height: *mut u32,
+
+    out_rgba: *mut u8,
+
+    cap: u32,
+) -> u32 {
+    if world.is_null()
+        || internal_path.is_null()
+        || out_rgba.is_null()
+        || out_width.is_null()
+        || out_height.is_null()
+    {
+        return 0;
+    }
+
+    let Some(p) = cstr_to_str(internal_path) else {
+        return 0;
+    };
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    let key = tex_key(p);
+
+    let decoded = match tex_lookup_level(&key, level) {
+        Some(Some(level)) => level,
+
+        Some(None) => return 0,
+
+        None => {
+            let Some((width, height, mips)) = decode_texture_sync(w, p) else {
+                tex_store(&key, None);
+
+                return 0;
+            };
+
+            let out = mips.get(level as usize).cloned();
+
+            tex_store(&key, Some((width, height, mips)));
+
+            match out {
+                Some(level) => level,
 
                 None => return 0,
             }
