@@ -808,6 +808,12 @@ impl WorldSession {
         self.send(opcode::CMSG_ATTACKSWING, &messages::attack_swing(guid))
     }
 
+    /// Draw or stow (`CMSG_SETSHEATHED`): 0 stowed, 1 melee drawn, 2 ranged drawn, stored as
+    /// our `UNIT_FIELD_BYTES_2` sheath byte (the reference's setter `0x611cf0`).
+    pub fn set_sheathed(&mut self, state: u32) -> Result<()> {
+        self.send(opcode::CMSG_SETSHEATHED, &messages::set_sheathed(state))
+    }
+
     /// Set our target (`CMSG_SET_SELECTION`, full guid); the client selects before it casts.
     pub fn set_selection(&mut self, guid: u64) -> Result<()> {
         self.send(opcode::CMSG_SET_SELECTION, &messages::full_guid(guid))

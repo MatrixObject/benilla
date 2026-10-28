@@ -1915,6 +1915,10 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::Attack(guid)) => {
                     let _ = session.attack_swing(guid);
+                    // `start_attack_local`'s tail (`0x5ecd78`): a melee start snaps the
+                    // weapon out of its sheath, so our own `UNIT_FIELD_BYTES_2` sheath
+                    // byte reads drawn to everyone who sees us, not only the anim.
+                    let _ = session.set_sheathed(1);
                 }
                 Ok(Cmd::Target(guid)) => {
                     // The wire has no selection echo; record it here so the target
@@ -4341,6 +4345,22 @@ pub extern "C" fn bn_net_unit_virtual_items(
         }
     }
     3
+}
+
+/// A unit's `UNIT_FIELD_BYTES_2` sheath byte: 0 stowed, 1 melee drawn, 2 ranged
+/// drawn, or 0xFF while the object has not delivered that field. For our own
+/// body it is whatever we last sent in `CMSG_SETSHEATHED`, which the server
+/// echoes back (the reference's setter `0x611cf0`).
+#[no_mangle]
+pub extern "C" fn bn_net_unit_sheath(guid: u64) -> u32 {
+    let sh = shared();
+    let state = if guid == sh.self_guid.load(Ordering::SeqCst) {
+        ui_self_fields().and_then(|f| f.unit_sheath_state())
+    } else {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        units.get(&guid).and_then(|r| r.fields.unit_sheath_state())
+    };
+    state.map_or(0xFF, u32::from)
 }
 
 /// The AnimationData id of a main-hand melee swing for `guid`: the reference's `swing_anim_main`

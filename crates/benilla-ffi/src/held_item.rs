@@ -8,9 +8,11 @@
 //! the formats-level `ItemDisplayCatalog` and mirrors the app's `placement`
 //! rule for a creature's sheath byte.
 //!
-//! `bn_unit_held_item(world, display, inventory_type, slot, sheath, out_model,
-//! model_cap, out_texture, texture_cap)` returns `attach_id + 1` (0 = nothing
-//! to draw) and writes the `.m2` path plus the object-skin BLP basename.
+//! `bn_unit_held_item(world, display, inventory_type, slot, sheath, unit_sheath,
+//! out_model, model_cap, out_texture, texture_cap)` returns `attach_id + 1`
+//! (0 = nothing to draw) and writes the `.m2` path plus the object-skin BLP
+//! basename. `unit_sheath` is the unit's `UNIT_FIELD_BYTES_2` byte 0: a drawn
+//! melee (1) or ranged (2) unit holds its weapon, a stowed one (0) wears it.
 
 use std::ffi::c_char;
 
@@ -48,7 +50,11 @@ fn placement(slot: u32, inv_type: u32, item_sheath: u8, unit_sheath: u8) -> Opti
         }),
         0 | 1 => match item_sheath {
             1 => Some(if slot == 0 { BACK_RIGHT } else { BACK_LEFT }),
-            2 => Some(if slot == 0 { BACK_LOWER_MAIN } else { BACK_LOWER_OFF }),
+            2 => Some(if slot == 0 {
+                BACK_LOWER_MAIN
+            } else {
+                BACK_LOWER_OFF
+            }),
             3 => Some(if slot == 0 { HIP_MAIN } else { HIP_OFF }),
             4 => Some(SHIELD_BACK),
             _ => None,
@@ -78,6 +84,7 @@ pub extern "C" fn bn_unit_held_item(
     inventory_type: u32,
     slot: u32,
     sheath: u32,
+    unit_sheath: u32,
     out_model: *mut c_char,
     model_cap: u32,
     out_texture: *mut c_char,
@@ -94,10 +101,14 @@ pub extern "C" fn bn_unit_held_item(
     let Some(row) = w.item_display.as_ref().and_then(|c| c.get(display_id)) else {
         return 0;
     };
-    let Some(attach) = placement(slot, inventory_type, sheath as u8, 0) else {
+    let Some(attach) = placement(slot, inventory_type, sheath as u8, unit_sheath as u8) else {
         return 0;
     };
-    let dir = if inventory_type == 14 { "Shield" } else { "Weapon" };
+    let dir = if inventory_type == 14 {
+        "Shield"
+    } else {
+        "Weapon"
+    };
     let Some(model) = row.model[0].as_deref() else {
         return attach as u32 + 1;
     };
