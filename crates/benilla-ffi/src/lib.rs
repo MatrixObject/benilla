@@ -73,6 +73,10 @@ mod net;
 
 mod creature;
 
+// ---- A unit's virtual weapon slots -> attach point, item model and object skin ----
+
+mod held_item;
+
 mod exterior;
 
 // ---- In-game interface feed: session state in, FrameXML model; verbs back out ----
@@ -4894,6 +4898,152 @@ pub extern "C" fn bn_model_attachment_info(
         *out_pos.add(1) = qy;
 
         *out_pos.add(2) = qz;
+    }
+
+    1
+}
+
+/// The model-local matrix of attachment `attach_id` at a pose: 16 floats,
+/// row-major, the three axes then the translation, in UE axes.
+///
+/// The reference hangs a held item off its hand attachment (`0x47a0c0`): the
+/// item's root is the attachment's bone matrix carried to the attachment's
+/// authored point. A bone's global matrix maps a model-space rest point to its
+/// animated place (bones rotate about their pivots, so the rest global is the
+/// identity), which makes the transform simply `bone_global · T(attach_pos)`.
+/// `weight > 0` with `over_anim != u32::MAX` composes the masked two-clip rig
+/// the way [`bn_model_skinned_positions_masked`] does, so a weapon follows the
+/// torso layer its hand rides.
+#[no_mangle]
+
+pub extern "C" fn bn_model_attach_pose(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base_anim: u32,
+
+    base_ms: u32,
+
+    over_anim: u32,
+
+    over_ms: u32,
+
+    weight: f32,
+
+    attach_id: u32,
+
+    out: *mut f32,
+) -> u32 {
+    if world.is_null() || model_path.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let p = match cstr_to_str(model_path) {
+        Some(s) => s,
+
+        None => return 0,
+    };
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    let Some(rig) = m2_rig_cached(&w.archives, p) else {
+        return 0;
+    };
+
+    let bytes = rig.cached.bytes.as_slice();
+
+    let Some((count, ofs)) = m2_attachment_array(bytes) else {
+        return 0;
+    };
+
+    let mut found = None;
+
+    for i in 0..count {
+        let rec = ofs as usize + i as usize * 48;
+
+        let id = rd_u32(bytes, rec).unwrap_or(0);
+
+        if id == attach_id {
+            found = Some((
+                rd_u32(bytes, rec + 4).unwrap_or(0) as usize,
+                rd_f32(bytes, rec + 8).unwrap_or(0.0),
+                rd_f32(bytes, rec + 12).unwrap_or(0.0),
+                rd_f32(bytes, rec + 16).unwrap_or(0.0),
+            ));
+
+            break;
+        }
+    }
+
+    let Some((bone, px, py, pz)) = found else {
+        return 0;
+    };
+
+    let mats = if weight > 0.0 && over_anim != u32::MAX {
+        let upper = upper_subtree(&rig.bones, 4);
+
+        masked_bone_matrices(
+            &rig.bones,
+            &rig.global_seqs,
+            (base_anim as usize, base_ms, base_ms),
+            (over_anim as usize, over_ms, over_ms),
+            weight,
+            &upper,
+        )
+    } else {
+        (0..rig.bones.len())
+            .map(|i| {
+                bone_matrix_at(
+                    &rig.bones,
+                    base_anim as usize,
+                    base_ms,
+                    base_ms,
+                    &rig.global_seqs,
+                    i,
+                )
+            })
+            .collect()
+    };
+
+    let Some(m) = mats.get(bone) else {
+        return 0;
+    };
+
+    // fixCoordSystem on the authored point, as every export does.
+    let (ax, ay, az) = wow_vec_to_ue(px, py, pz);
+
+    let tx = m[0] * ax + m[1] * ay + m[2] * az + m[3];
+
+    let ty = m[4] * ax + m[5] * ay + m[6] * az + m[7];
+
+    let tz = m[8] * ax + m[9] * ay + m[10] * az + m[11];
+
+    // SAFETY: the caller passes room for 16 floats.
+    unsafe {
+        let o = std::slice::from_raw_parts_mut(out, 16);
+
+        o[0] = m[0];
+        o[1] = m[1];
+        o[2] = m[2];
+        o[3] = tx;
+
+        o[4] = m[4];
+        o[5] = m[5];
+        o[6] = m[6];
+        o[7] = ty;
+
+        o[8] = m[8];
+        o[9] = m[9];
+        o[10] = m[10];
+        o[11] = tz;
+
+        o[12] = 0.0;
+        o[13] = 0.0;
+        o[14] = 0.0;
+        o[15] = 1.0;
     }
 
     1
