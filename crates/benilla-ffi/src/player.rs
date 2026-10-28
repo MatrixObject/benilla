@@ -2385,6 +2385,36 @@ pub extern "C" fn bn_terrain_wow_z(world: *const BnWorld, x: f32, y: f32) -> f32
         .unwrap_or(f32::NAN)
 }
 
+/// The Z a body standing at (`x`, `y`) with its seat at `seat_z` ends at, in WoW yards, or `NaN`
+/// where the cast finds no floor and the seat stands. This is the reference's idle ground cast
+/// (`0x636dcd`-`0x636e45`) over this body's own surface set (ADT walking faces, WMO floors, doodad
+/// hulls): the ray starts 1/36 above the seat and reaches 1/36 + 4 yd down, one-sided. A creature
+/// behind a counter, on a dock or inside a building lands on that floor instead of the terrain
+/// below it, and a unit on a floor the set is missing (an upper storey, a balcony) holds the
+/// server's Z rather than falling to the ground under the building.
+#[no_mangle]
+pub extern "C" fn bn_ground_clamp_z(world: *const BnWorld, x: f32, y: f32, seat_z: f32) -> f32 {
+    if world.is_null() || !seat_z.is_finite() {
+        return f32::NAN;
+    }
+    let w = unsafe { &*world };
+    w.player
+        .as_ref()
+        .and_then(|p| ground_clamp(p, x, y, seat_z))
+        .unwrap_or(f32::NAN)
+}
+
+/// `ground_clamp_creatures`' idle arm (benilla-app/src/net/motion/spline.rs): one cast from
+/// `IDLE_UP_BAND` above the seat, reaching `IDLE_UP_BAND + GROUND_CLAMP_DOWN` down. The band is
+/// also the airborne gate, so nothing further below the seat answers.
+fn ground_clamp(p: &Player, x: f32, y: f32, seat_z: f32) -> Option<f32> {
+    const IDLE_UP_BAND: f32 = 1.0 / 36.0;
+    const GROUND_CLAMP_DOWN: f32 = 4.0;
+    p.ground(x, y, seat_z + IDLE_UP_BAND)
+        .map(|(z, _)| z)
+        .filter(|&z| z >= seat_z - GROUND_CLAMP_DOWN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2440,6 +2470,29 @@ mod tests {
         p.tiles.insert((tx, ty), col);
         assert!(!p.wall_hit(-8800.0, -800.0, 0.0), "a floor never blocks");
         assert_eq!(p.ground(-8800.0, -800.0, 100.0), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn a_floor_out_of_the_cast_s_band_holds_the_seat() {
+        // The idle cast reaches 4 yd below the seat and no further: a unit on a surface the
+        // collision set is missing holds the server's Z instead of falling to the ground.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let mut col = TileCol::new();
+        let floor = Tri::new(
+            [-8810.0, -810.0, 0.0],
+            [-8790.0, -810.0, 0.0],
+            [-8810.0, -790.0, 0.0],
+        );
+        let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &floor);
+        for ly in y0..=y1 {
+            for lx in x0..=x1 {
+                col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(floor);
+            }
+        }
+        p.tiles.insert((tx, ty), col);
+        assert_eq!(ground_clamp(&p, -8800.0, -800.0, 3.9), Some(0.0));
+        assert_eq!(ground_clamp(&p, -8800.0, -800.0, 5.0), None);
     }
 
     #[test]
