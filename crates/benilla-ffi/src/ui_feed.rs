@@ -23,9 +23,9 @@ use benilla_protocol::messages::ObjectFields;
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState, NearestMode,
-    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, ScriptValue, SelectionRequest,
-    SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase, UnitGuids,
-    UnitState, UnitTokenParse, VmKind, WornDisplay,
+    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, ScriptCall, ScriptValue,
+    SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript,
+    UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -540,6 +540,20 @@ fn ev_str(name: &str) -> ScriptValue {
 
 fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
     script.fire_event(event, args);
+}
+
+/// The stock error line for a key: `DisplayError` (`0x4945b0`) resolves the id through
+/// `GlobalStrings`, which is the player's own localized table, so read the VM's global
+/// and fall back to the key only when the chain lacks the row.
+fn fire_error(script: &mut UiScript, key: &str) {
+    let text = script
+        .lua()
+        .globals()
+        .get::<String>(key)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| key.to_string());
+    fire(script, "UI_ERROR_MESSAGE", vec![ScriptValue::Str(text)]);
 }
 
 /// Diff one token's snapshot and fire the field events its change implies, once each.
@@ -1258,6 +1272,21 @@ impl Feed {
             self.combat = combat;
         }
 
+        // The melee refusal line, the reference's per-player tick `0x5ec950`:
+        // shown only while an attack target stands (`[+0xc48]`), latched, and
+        // repeated every four seconds by the latch itself. `DisplayError(0xd8)`/
+        // `(0xd7)` land on the stock error frame through `UI_ERROR_MESSAGE`.
+        if net::ui_attack_target() != 0 {
+            if let Some(code) = net::take_due_swing_refusal() {
+                let key = if code == 1 {
+                    "ERR_BADATTACKPOS"
+                } else {
+                    "ERR_BADATTACKFACING"
+                };
+                fire_error(script, key);
+            }
+        }
+
         if net::ui_selection() != self.selection {
             self.selection = net::ui_selection();
             fire(script, "PLAYER_TARGET_CHANGED", Vec::new());
@@ -1467,7 +1496,11 @@ pub(crate) fn intents(script: &mut UiScript) {
         };
         match kind {
             0x00 if action == ATTACK_SPELL => {
-                let _ = net::send_cmd(Cmd::Attack(selection));
+                // `UseAction`'s Attack is TryCast's, so its gate came first and
+                // passes to the validator's pick (`0x6e4c90` → `0x6131a0`).
+                if use_.may_cast {
+                    attack_press(script, true);
+                }
             }
             0x00 => {
                 let _ = net::send_cmd(Cmd::Cast {
@@ -1519,13 +1552,13 @@ pub(crate) fn intents(script: &mut UiScript) {
         match request {
             SelectionRequest::Unit(token) => {
                 if let Some(guid) = resolve_token(&token, &guids) {
-                    let _ = net::send_cmd(Cmd::Target(guid));
+                    net::select(guid);
                 }
             }
             SelectionRequest::Assist(token) => {
                 if let Some(guid) = resolve_token(&token, &guids) {
                     let target = guids.held.get(&guid).copied().unwrap_or(0);
-                    let _ = net::send_cmd(Cmd::Target(target));
+                    net::select(target);
                 }
             }
             SelectionRequest::AssistByName(name) => {
@@ -1536,7 +1569,7 @@ pub(crate) fn intents(script: &mut UiScript) {
                     .find(|m| cstr(&m.name).eq_ignore_ascii_case(&name))
                 {
                     let target = guids.held.get(&member.guid).copied().unwrap_or(0);
-                    let _ = net::send_cmd(Cmd::Target(target));
+                    net::select(target);
                 }
             }
             SelectionRequest::LastEnemy => {}
@@ -1567,17 +1600,30 @@ pub(crate) fn intents(script: &mut UiScript) {
             }
         }
         if let Some((_, guid)) = best {
-            let _ = net::send_cmd(Cmd::Target(guid));
+            net::select(guid);
         }
     }
     for (mode, reverse) in script.take_target_nearest_requests() {
         if let Some(guid) = nearest_candidate(mode, reverse, selection) {
-            let _ = net::send_cmd(Cmd::Target(guid));
+            net::select(guid);
         }
     }
     if script.take_target_clear() {
-        let _ = net::send_cmd(Cmd::Target(0));
+        net::select(0);
     }
+
+    // `AttackTarget()` (`0x489b50`), the attack key and the target frame's attack
+    // button: the verb queues a call no other drain here takes, so the stock key
+    // did nothing. Applied after this frame's selections, so a `TargetUnit(…)`
+    // earlier in the same script is already the selection.
+    let mut keep = Vec::new();
+    for queued in script.take_queued_calls() {
+        match queued.call {
+            ScriptCall::AttackTarget { may_pick, .. } => attack_press(script, may_pick),
+            _ => keep.push(queued),
+        }
+    }
+    script.requeue_calls(keep);
 
     // Death dialog.
     for action in script.take_death_actions() {
@@ -1718,14 +1764,7 @@ pub(crate) fn intents(script: &mut UiScript) {
 
     // Engine refusals surface as the stock error frame's event.
     for key in script.take_ui_errors() {
-        let text = script
-            .lua()
-            .globals()
-            .get::<String>(key)
-            .ok()
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| key.to_string());
-        fire(script, "UI_ERROR_MESSAGE", vec![ScriptValue::Str(text)]);
+        fire_error(script, key);
     }
 }
 
@@ -1749,6 +1788,51 @@ fn resolve_token(token: &str, guids: &UnitGuids) -> Option<u64> {
         guid = guids.held.get(&guid).copied().unwrap_or(0);
     }
     (guid != 0).then_some(guid)
+}
+
+/// `AttackTarget`'s toggle, `0x489b50` → `0x6131a0`, also the attack button's
+/// `UseAction` slot (`0x6e4c90`). The validator picks first: the selection is kept
+/// unless it is empty or friendly toward us (`0x6130a3`), and only then, with the
+/// gate's tag 4, does the cycle commit a nearest enemy (`0x6130bc`). Then the
+/// toggle: swinging (`0x60ecb0`) stops, else the kept unit is swung at.
+fn attack_press(script: &mut UiScript, may_pick: bool) {
+    let mut target = net::ui_selection();
+    if may_pick && (target == 0 || !attack_keeps(target)) {
+        if let Some(guid) = nearest_candidate(NearestMode::Enemy, false, 0) {
+            target = guid;
+            net::select(guid);
+        }
+    }
+    if target == 0 {
+        // `0x6130d9`: the empty selection is the validator's one worded refusal.
+        fire_error(script, "ERR_NO_ATTACK_TARGET");
+        return;
+    }
+    if net::ui_self_attacking() {
+        net::stop_attack();
+    } else if attack_keeps(target) {
+        let _ = net::send_cmd(Cmd::Attack(target));
+    } else {
+        // The final gate's own reaction test (`0x61312e`): a friendly unit is
+        // refused with a line, and no swing goes out.
+        fire_error(script, "ERR_INVALID_ATTACK_TARGET");
+    }
+}
+
+/// `0x6130a3`: the actor's reaction to the held unit alone — friendly (4) is not
+/// kept, so the cycle runs instead; a unit that does not resolve is kept for the
+/// second resolve to refuse.
+fn attack_keeps(guid: u64) -> bool {
+    let Some(unit) = net::ui_unit(guid) else {
+        return true;
+    };
+    let (Some(t), Some(p)) = (
+        faction_template(&unit.fields),
+        net::ui_self_fields().as_ref().and_then(faction_template),
+    ) else {
+        return true;
+    };
+    t.reaction_toward(&p) != Reaction::Friendly
 }
 
 /// `TargetNearest*`: the next (or, reversed, previous) candidate in distance order from the body.

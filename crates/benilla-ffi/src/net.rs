@@ -884,6 +884,8 @@ pub(crate) enum Cmd {
     Enter(u64),
     Chat(String),
     Attack(u64),
+    /// `CMSG_ATTACKSTOP`: the auto-attack toggle's off arm (`0x6131a0`).
+    StopAttack,
     Target(u64),
     Loot(u64),
     /// `CMSG_AUTOSTORE_LOOT_ITEM`: take one loot-window row by slot.
@@ -1140,6 +1142,13 @@ struct Shared {
     /// Whether our own guid is in melee auto-attack, from
     /// `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP`.
     self_attacking: AtomicU32,
+    /// The guid our auto-attack was started on, 0 when none: `AttackTarget`'s
+    /// toggle needs it to tell "start" from "stop" (`0x6131a0`).
+    attack_target: AtomicU64,
+    /// The latched melee refusal (`0x5ecdb0`): code 1 out of range, 2 bad facing,
+    /// with the time its next line is due. A landed swing clears it (`0x5ea800`);
+    /// each shown line re-arms it four seconds later (`0x5ec9b6`).
+    swing_refusal: Mutex<Option<(u8, std::time::Instant)>>,
     /// Our body's main-hand swing clip ([`swing_anim_main`]), resolved when the
     /// server starts our attack and again on a local swing press. The reference
     /// re-reads the armed main hand at each swing; the weapon cannot change
@@ -1240,6 +1249,8 @@ fn shared() -> &'static Shared {
         spirit_healer: AtomicU64::new(0),
         corpse_delay_ms: AtomicU32::new(0),
         self_attacking: AtomicU32::new(0),
+        attack_target: AtomicU64::new(0),
+        swing_refusal: Mutex::new(None),
         self_swing_anim: AtomicU32::new(16),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
@@ -1404,6 +1415,57 @@ pub(crate) fn ui_corpse_delay_ms() -> u32 {
 /// Whether our own guid is in melee auto-attack (`SMSG_ATTACKSTART`).
 pub(crate) fn ui_self_attacking() -> bool {
     shared().self_attacking.load(Ordering::SeqCst) != 0
+}
+
+/// The guid we last started auto-attack on, 0 when none.
+pub(crate) fn ui_attack_target() -> u64 {
+    shared().attack_target.load(Ordering::SeqCst)
+}
+
+/// `SelectTarget` (`0x493540`): the selection is client memory, and `CMSG_SET_SELECTION`
+/// is only its wire echo, so record it at the call — a script's `TargetUnit(…)` followed by
+/// `AttackTarget()` then reads the new selection in the same frame.
+pub(crate) fn select(guid: u64) {
+    shared().selection.store(guid, Ordering::SeqCst);
+    let _ = send_cmd(Cmd::Target(guid));
+}
+
+/// `StopAttack` (`0x5ecac0`): clear our attack state at once and send `CMSG_ATTACKSTOP`
+/// only when we were attacking, the reference's own guard. The server's `SMSG_ATTACKSTOP`
+/// echo is then only confirmation.
+pub(crate) fn stop_attack() {
+    let sh = shared();
+    let engaged = sh.self_attacking.swap(0, Ordering::SeqCst) != 0;
+    sh.attack_target.store(0, Ordering::SeqCst);
+    if engaged {
+        let _ = send_cmd(Cmd::StopAttack);
+    }
+}
+
+/// Latch a melee refusal (`0x5ecdb0`): due now, so the next tick shows it.
+pub(crate) fn latch_swing_refusal(code: u8) {
+    let sh = shared();
+    *sh.swing_refusal.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((code, std::time::Instant::now()));
+}
+
+/// `0x5ecdb0(0)`: a landed swing clears the latch.
+pub(crate) fn clear_swing_refusal() {
+    let sh = shared();
+    *sh.swing_refusal.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The refusal line due now, re-armed four seconds later (`0x5ec950`/`0x5ec9b6`).
+pub(crate) fn take_due_swing_refusal() -> Option<u8> {
+    let sh = shared();
+    let mut latch = sh.swing_refusal.lock().unwrap_or_else(|e| e.into_inner());
+    let (code, due) = latch.as_mut()?;
+    let now = std::time::Instant::now();
+    if now < *due {
+        return None;
+    }
+    *due = now + std::time::Duration::from_millis(0xfa0);
+    Some(*code)
 }
 
 /// Our body's main-hand swing clip, resolved at the last attack start.
@@ -1915,10 +1977,15 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::Attack(guid)) => {
                     let _ = session.attack_swing(guid);
+                    sh.attack_target.store(guid, Ordering::SeqCst);
                     // `start_attack_local`'s tail (`0x5ecd78`): a melee start snaps the
                     // weapon out of its sheath, so our own `UNIT_FIELD_BYTES_2` sheath
                     // byte reads drawn to everyone who sees us, not only the anim.
                     let _ = session.set_sheathed(1);
+                }
+                Ok(Cmd::StopAttack) => {
+                    let _ = session.attack_stop();
+                    sh.attack_target.store(0, Ordering::SeqCst);
                 }
                 Ok(Cmd::Target(guid)) => {
                     // The wire has no selection echo; record it here so the target
@@ -2852,6 +2919,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         ServerPacket::AttackStop { attacker, .. } => {
             if *attacker == sh.self_guid.load(Ordering::SeqCst) {
                 sh.self_attacking.store(0, Ordering::SeqCst);
+                sh.attack_target.store(0, Ordering::SeqCst);
             }
         }
         ServerPacket::MessageChat(msg) => {
@@ -3013,6 +3081,11 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         // ---- combat feedback: the numbers the client floats over units ----
         ServerPacket::AttackerState(s) => {
+            // A landed swing is `0x5ea800`'s first act: `0x5ecdb0(0)`, the latch
+            // cleared, for our own guid only (`0x6259b6`).
+            if s.attacker == sh.self_guid.load(Ordering::SeqCst) {
+                clear_swing_refusal();
+            }
             // `displayed` is the client gate: a dodged or
             // parried on-next-swing ability gets neither log line nor number.
             if s.displayed() {
@@ -3053,8 +3126,18 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 AttackSwingError::BadFacing => 2,
                 AttackSwingError::DeadOrUnattackable => 3,
             };
+            // `0x625a8a`/`0x625aa1`: the two refusals that latch a line; the third
+            // arm only stops the attack (`0x625ab8`), no message.
+            if code == 3 {
+                stop_attack();
+            } else {
+                latch_swing_refusal(code);
+            }
             sh.event(format!("attack|error|{code}"));
         }
+        // `0x5e7dd0`, `SMSG_CANCEL_COMBAT`: the stop arm of the same family, byte
+        // for byte — the server forced our auto-attack off, silently.
+        ServerPacket::CancelCombat => stop_attack(),
         ServerPacket::XpGain(x) => {
             sh.event(format!("xp|{}|{}|{}", x.total, x.base, u8::from(x.kill)));
         }
@@ -4674,7 +4757,9 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::swing_anim_main;
+    use super::{
+        clear_swing_refusal, latch_swing_refusal, swing_anim_main, take_due_swing_refusal,
+    };
 
     /// The same rows benilla-app's `select::tests` pins: the reference's `swing_anim_main` table,
     /// so the host's swing clip is the one the real client plays for that weapon.
@@ -4689,5 +4774,18 @@ mod tests {
         assert_eq!(swing_anim_main(2, 2), 16); // bow in melee swings unarmed
         assert_eq!(swing_anim_main(4, 6), 16); // non-weapon class
         assert_eq!(swing_anim_main(0, 0), 16); // no virtual item at all
+    }
+
+    /// `0x5ec950`: a latched refusal is due at once, repeats only after the 4 s
+    /// re-arm (`0x5ec9b6`), and a landed swing clears it (`0x5ecdb0(0)`).
+    #[test]
+    fn a_refusal_line_shows_once_then_rearms() {
+        clear_swing_refusal();
+        assert_eq!(take_due_swing_refusal(), None);
+        latch_swing_refusal(2);
+        assert_eq!(take_due_swing_refusal(), Some(2));
+        assert_eq!(take_due_swing_refusal(), None, "re-armed four seconds out");
+        clear_swing_refusal();
+        assert_eq!(take_due_swing_refusal(), None);
     }
 }

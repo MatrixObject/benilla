@@ -814,6 +814,11 @@ impl WorldSession {
         self.send(opcode::CMSG_SETSHEATHED, &messages::set_sheathed(state))
     }
 
+    /// Stop melee auto-attack (`CMSG_ATTACKSTOP`, empty body).
+    pub fn attack_stop(&mut self) -> Result<()> {
+        self.send(opcode::CMSG_ATTACKSTOP, &[])
+    }
+
     /// Set our target (`CMSG_SET_SELECTION`, full guid); the client selects before it casts.
     pub fn set_selection(&mut self, guid: u64) -> Result<()> {
         self.send(opcode::CMSG_SET_SELECTION, &messages::full_guid(guid))
