@@ -23,9 +23,9 @@ use benilla_protocol::messages::ObjectFields;
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState, NearestMode,
-    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, ScriptCall, ScriptValue,
-    SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript,
-    UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
+    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall,
+    ScriptValue, SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView,
+    UiScript, UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -1493,6 +1493,14 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     let Some(own) = net::ui_self_fields() else {
         return;
     };
+    // The wire chat lines the network thread queued: fired here, where the VM lives, so the stock
+    // `ChatFrame_OnEvent` composes and prints them.
+    for (event, args) in net::take_chat_events() {
+        script.fire_event(&event, args);
+    }
+    // The gossip menu likewise shows itself here: the latch holds it until its greeting lands, so
+    // the stock `GossipFrame` opens with its greeting, options and quest rows in one go.
+    crate::gossip_vm::feed(script);
     CATS.with(|c| {
         let cats = c.borrow();
         // The questgiver marker sweep rides the UI tick, where the catalog and our own
@@ -1681,6 +1689,8 @@ pub(crate) fn intents(script: &mut UiScript) {
     }
     script.requeue_calls(keep);
 
+    giver_intents(script);
+
     // Death dialog.
     for action in script.take_death_actions() {
         match action {
@@ -1821,6 +1831,110 @@ pub(crate) fn intents(script: &mut UiScript) {
     // Engine refusals surface as the stock error frame's event.
     for key in script.take_ui_errors() {
         fire_error(script, key);
+    }
+}
+
+/// One quest row's packet: an active row (`SelectActiveQuest`, `0x501320`) is
+/// always a turn-in, and so is an available one flagged one-click (`0x5dbc13`
+/// stores the icon-0 flag, `0x5012db` reads it); anything else queries the panel.
+fn quest_row_cmd(npc: u64, quest: u32, icon: u32) -> Cmd {
+    if matches!(icon, 3 | 4) || icon == 0 {
+        Cmd::QuestComplete { npc, quest }
+    } else {
+        Cmd::GossipQuest { npc, quest }
+    }
+}
+
+/// The questgiver chain's Lua intents. The stock `GossipFrame` and `QuestFrame`
+/// queue one wire intent per click; the app's own systems drain them, and nothing
+/// on this path did, so a row click and the Accept/Continue/Complete buttons did
+/// nothing at all.
+fn giver_intents(script: &mut UiScript) {
+    // `CloseGossip` (`0x4e2b20`) is the close core with a zero guid and sends no packet.
+    crate::gossip_vm::drain_close(script);
+    let giver = net::ui_giver();
+    let npc = giver.npc;
+    if npc == 0 {
+        // No window open: take the queues so they do not grow, send nothing.
+        script.take_gossip_selects();
+        script.take_gossip_quest_selects();
+        script.take_quest_selects();
+        script.take_quest_actions();
+        return;
+    }
+    let rows: Vec<(u32, u32)> = giver
+        .quests
+        .iter()
+        .take(giver.quest_count as usize)
+        .map(|q| (q.quest_id, q.icon))
+        .collect();
+    // `SelectGossipOption` (`0x4e2320`): the 1-based row's wire index, refused while the
+    // greeting's query is still in flight (the latch at `[0xbbb670]`). A coded option is greyed,
+    // as its prompt (`GOSSIP_ENTER_CODE`, `0x4e237e`) is not built.
+    let gossip_npc = crate::gossip_vm::npc();
+    let pending = crate::gossip_vm::text_pending();
+    for pos in script.take_gossip_selects() {
+        if gossip_npc == 0 || pending {
+            continue;
+        }
+        if let Some(opt) = crate::gossip_vm::option_at(pos) {
+            if !opt.coded {
+                net::note(format!("giver|select|{gossip_npc:#x}|{}", opt.index));
+                let _ = net::send_cmd(Cmd::GossipSelect {
+                    npc: gossip_npc,
+                    index: opt.index,
+                });
+            }
+        }
+    }
+    // The gossip menu's quest rows are the whole list, in wire order.
+    for pos in script.take_gossip_quest_selects() {
+        if gossip_npc == 0 || pending {
+            continue;
+        }
+        if let Some(q) = crate::gossip_vm::quest_at(pos) {
+            net::note(format!("giver|quest-row|{gossip_npc:#x}|{}|{}", q.quest_id, q.icon));
+            let _ = net::send_cmd(quest_row_cmd(gossip_npc, q.quest_id, q.icon));
+        }
+    }
+    // The greeting panel shows the two pools apart, so its row index counts
+    // within the pool the click came from.
+    for sel in script.take_quest_selects() {
+        let pool: Vec<(u32, u32)> = rows
+            .iter()
+            .copied()
+            .filter(|&(_, icon)| matches!(icon, 3 | 4) == sel.active)
+            .collect();
+        if let Some(&(quest, icon)) = sel
+            .index
+            .checked_sub(1)
+            .and_then(|i| pool.get(i as usize))
+        {
+            net::note(format!("giver|quest-pick|{npc:#x}|{quest}|{icon}"));
+            let _ = net::send_cmd(quest_row_cmd(npc, quest, icon));
+        }
+    }
+    for action in script.take_quest_actions() {
+        let cmd = match action {
+            QuestAction::Accept => Cmd::QuestAccept {
+                npc,
+                quest: giver.quest_id,
+            },
+            QuestAction::Continue => Cmd::QuestRequestReward {
+                npc,
+                quest: giver.quest_id,
+            },
+            QuestAction::Reward(choice) => Cmd::QuestReward {
+                npc,
+                quest: giver.quest_id,
+                reward: choice,
+            },
+            // Decline re-opens the giver and Close tears the panel down; neither
+            // has a packet of its own here — the server's own reply closes the frame.
+            QuestAction::Decline | QuestAction::Close => continue,
+        };
+        net::note(format!("giver|action|{npc:#x}"));
+        let _ = net::send_cmd(cmd);
     }
 }
 

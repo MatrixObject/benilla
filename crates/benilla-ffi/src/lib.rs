@@ -81,6 +81,14 @@ mod held_item;
 
 mod quest_markers;
 
+// ---- The wire chat line as the stock UI's `CHAT_MSG_*` event ----
+
+mod chat_vm;
+
+// ---- The gossip menu: the text latch, the stock `GossipFrame`'s show, its selects ----
+
+mod gossip_vm;
+
 // ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
 
 mod ghost;
@@ -7580,9 +7588,18 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         return 0;
     };
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The faces must be local before the first measure: the VM asks inside
+        // the load, where no chain handle is in scope.
+        ui_font::preload_fonts(chain);
         let Ok(mut script) = benilla_ui::script::UiScript::new() else {
             return 0u32;
         };
+        // The reference answers `GetStringWidth` from its font engine inside the
+        // call that asked (`0x79e510` -> `0x772890`), so a `<OnLoad>` or a
+        // `GossipResize` that measures lays out against a real box. With no
+        // measurer every wrapped string is 0 tall and the stock frames stack
+        // their rows on top of each other.
+        script.set_text_measurer(Box::new(ui_font::VmMeasure));
         // The reference registers its whole console-var set before `UI_Init`
         // (`0x490018`) walks the toc, and `GetCVar` raises on a name the table
         // lacks (`0x842310`): `TextStatusBar.lua:47` reads `statusBarText` on
@@ -8797,6 +8814,7 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         let Ok(mut script) = UiScript::new_glue() else {
             return 0u32;
         };
+        script.set_text_measurer(Box::new(ui_font::VmMeasure));
         // The engine registers every console var before either interface loads;
         // the glue screens read `gxResolution`, `readEULA` and `movieSubtitle`.
         script.register_cvars(cvar_defaults::DEFAULTS.iter().copied());
@@ -8940,6 +8958,32 @@ pub extern "C" fn bn_ui_set_screen_size(w: f32, h: f32) -> u32 {
             let mut slot = slot.borrow_mut();
             match slot.as_mut() {
                 Some(script) => u32::from(script.set_screen_size(w, h)),
+                None => 0u32,
+            }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+/// Seat the host's pixel factor, `canvas height / 768`, for the VM's text
+/// measure. The measure steps glyphs at the drawn size and divides the factor
+/// back out, so a resize drops the stored metrics: a stale one truncates text
+/// that fits. Returns 1 when the measures were dropped.
+#[no_mangle]
+pub extern "C" fn bn_ui_set_seam(seam: f32) -> u32 {
+    let moved = seam > 0.0 && (ui_font::seam() - seam).abs() > 1e-4;
+    ui_font::set_seam(seam);
+    if !moved {
+        return 0;
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(script) => {
+                    script.invalidate_text_measures();
+                    1u32
+                }
                 None => 0u32,
             }
         })

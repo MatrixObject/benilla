@@ -138,7 +138,6 @@ pub(crate) fn shape(
 ) -> (Vec<ShapedLine>, Vec<f32>) {
     let size = size.max(1.0);
     let sf = font.as_scaled(PxScale::from(size));
-    let ascent = sf.ascent();
     let mut lines: Vec<ShapedLine> = Vec::new();
     let mut cur: ShapedLine = Vec::new();
     let mut pen = 0.0f32;
@@ -754,4 +753,58 @@ fn rasterize_rows(
         pw: pen_w,
         ph: pen_h,
     })
+}
+
+// ---- the VM's inline text measure ------------------------------------------
+
+thread_local! {
+    /// The host's pixel factor, `canvas height / 768`: the VM lays out in UI
+    /// units and the host rasterizes at units x seam. Glyph steps ceil to whole
+    /// pixels, so a measure answered at the unscaled size is not proportional
+    /// to the drawn one and the rows would overflow the box they were laid out
+    /// in.
+    static SEAM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Seat the host's pixel factor; a non-positive seam falls back to 1:1.
+pub fn set_seam(seam: f32) {
+    SEAM.with(|s| s.set(if seam > 0.0 { seam } else { 1.0 }));
+}
+
+/// The seam the measure answers under.
+pub fn seam() -> f32 {
+    SEAM.with(|s| s.get())
+}
+
+/// A FontString's drawn em: the one-to-one regime caps it at 32 units, a
+/// `SetTextHeight` size draws uncapped, and no size at all is the stock default.
+fn drawn_em(height: Option<f32>, text_height: Option<f32>) -> f32 {
+    match (text_height, height) {
+        (Some(t), _) => t,
+        (None, Some(h)) => h.min(32.0),
+        (None, None) => 12.0,
+    }
+}
+
+/// [`TextMeasure`] over this module's own [`measure`], so the layout box a
+/// FontString gets and the bitmap [`rasterize`] later returns come from one
+/// step law. Without it every wrapped string measures 0 tall, which is what
+/// makes `GossipResize` stack a giver's quest rows on top of its greeting.
+pub struct VmMeasure;
+
+impl benilla_ui::script::TextMeasure for VmMeasure {
+    fn measure(&mut self, req: &benilla_ui::script::MeasureRequest) -> (f32, f32, f32) {
+        let rs = seam() * req.scale;
+        let (w, h, natural) = measure(
+            req.font.as_deref(),
+            drawn_em(req.height, req.text_height) * rs,
+            req.outline as u32,
+            &req.text,
+            req.wrap_width.map(|x| x * rs),
+            req.non_space_wrap,
+            req.max_lines,
+            req.spacing * rs,
+        );
+        (w / rs, h / rs, natural / rs)
+    }
 }

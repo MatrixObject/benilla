@@ -33,6 +33,7 @@ use benilla_protocol::messages::{
 use benilla_protocol::motion::{monster_move_spline, Spline};
 use benilla_protocol::RealmInfo;
 use benilla_protocol::WorldSession;
+use benilla_ui::script::ScriptValue;
 
 /// Stage codes returned by `bn_net_status`.
 pub const ST_IDLE: u32 = 0;
@@ -918,6 +919,11 @@ pub(crate) enum Cmd {
         npc: u64,
         index: u32,
     },
+    /// `CMSG_NPC_TEXT_QUERY`: the greeting a gossip menu's `text_id` was latched on.
+    NpcTextQuery {
+        text_id: u32,
+        npc: u64,
+    },
     /// `CMSG_QUESTGIVER_QUERY_QUEST` from a gossip quest row.
     GossipQuest {
         npc: u64,
@@ -1135,6 +1141,8 @@ struct Shared {
     names: Mutex<HashMap<u64, String>>,
     /// Player guids a `CMSG_NAME_QUERY` was already sent for.
     names_asked: Mutex<HashSet<u64>>,
+    /// A wire chat line waiting to be fired as its `CHAT_MSG_*` event on the UI tick.
+    chat_events: Mutex<VecDeque<(String, Vec<ScriptValue>)>>,
     /// The pending resurrection offer's caster and its popup flags
     /// (`SMSG_RESURRECT_REQUEST`), 0 when none.
     resurrect_from: AtomicU64,
@@ -1259,6 +1267,7 @@ fn shared() -> &'static Shared {
         selection: AtomicU64::new(0),
         names: Mutex::new(HashMap::new()),
         names_asked: Mutex::new(HashSet::new()),
+        chat_events: Mutex::new(VecDeque::new()),
         resurrect_from: AtomicU64::new(0),
         resurrect_sickness: AtomicU32::new(0),
         resurrect_has_timer: AtomicU32::new(0),
@@ -1337,6 +1346,33 @@ pub(crate) fn ui_names() -> HashMap<u64, String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// Push one line onto the host's event queue (`bn_net_event`), for the middle layer's
+/// own signals: the drained UI intents, the errors the VM cannot show by itself.
+pub(crate) fn note(line: impl Into<String>) {
+    shared().event(line);
+}
+
+/// Queue a `CHAT_MSG_*` event the network thread read off the wire, for [`take_chat_events`] to
+/// fire on the UI tick. Bounded: a UI that is not draining cannot grow the queue without limit.
+pub(crate) fn push_chat_event(name: &'static str, args: Vec<ScriptValue>) {
+    let sh = shared();
+    let mut q = sh.chat_events.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 256 {
+        q.pop_front();
+    }
+    q.push_back((name.to_string(), args));
+}
+
+/// Drain every queued chat event; called from the UI tick, which owns the Lua VM.
+pub(crate) fn take_chat_events() -> Vec<(String, Vec<ScriptValue>)> {
+    let sh = shared();
+    let mut q = sh.chat_events.lock().unwrap_or_else(|e| e.into_inner());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    q.drain(..).collect()
 }
 
 /// The roster row's name for `guid` (our own character's name arrives this way).
@@ -1828,6 +1864,7 @@ fn worker(
             Ok(Cmd::Enter(guid)) => {
                 sh.self_guid.store(guid, Ordering::SeqCst);
                 sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                crate::gossip_vm::clear_session();
                 *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 sh.set(ST_ENTERING);
                 sh.event(format!("enter|{guid}"));
@@ -2145,6 +2182,12 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     let _ = session.send_body(
                         benilla_protocol::messages::opcode::CMSG_GOSSIP_SELECT_OPTION,
                         &benilla_protocol::messages::gossip_select_option(npc, index, None),
+                    );
+                }
+                Ok(Cmd::NpcTextQuery { text_id, npc }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_NPC_TEXT_QUERY,
+                        &benilla_protocol::messages::npc_text_query(text_id, npc),
                     );
                 }
                 Ok(Cmd::GossipQuest { npc, quest }) => {
@@ -3041,6 +3084,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .clone()
                 .unwrap_or_else(|| msg.sender_guid.to_string());
             sh.event(format!("chat|{}|{}|{}", msg.chat_type, who, msg.text));
+            // The same line as the stock UI's event: the FFI has no app chat router, so the
+            // VM's own `ChatFrame_OnEvent` prints it and owns the new-message indicator.
+            crate::chat_vm::enqueue(msg);
         }
         // The world stream is very chatty; object updates are the bulk, so they
         // are folded into the tracked table rather than echoed as events.
@@ -3402,10 +3448,11 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         ServerPacket::LootClearMoney => {
             sh.loot.lock().unwrap_or_else(|e| e.into_inner()).gold = 0;
         }
-        // Questgiver window. Gossip and the quest-list packet both open the
-        // menu; details/reward/progress replace it with a single quest, and a
-        // completed hand-in just closes it.
-        ServerPacket::GossipMessage { npc, quests, .. } => {
+        // Questgiver window. The gossip menu is the VM's own (`gossip_vm`): it latches open on this
+        // packet, queries the greeting it lacks, and shows the stock `GossipFrame` once the text
+        // lands — the reference's `0x4e26e0`. The `BnNetGiver` snapshot keeps feeding the host's
+        // quest panels and its `bn.Ui giver` probe.
+        ServerPacket::GossipMessage { npc, text_id, options, quests } => {
             let mut giver = BnNetGiver {
                 npc: *npc,
                 mode: 1,
@@ -3423,10 +3470,37 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             giver.quest_count = quests.len().min(giver.quests.len()) as u32;
             let count = giver.quest_count;
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            let gender = ui_unit(*npc)
+                .and_then(|u| u.fields.unit_gender())
+                .unwrap_or(0);
+            if crate::gossip_vm::open(
+                *npc,
+                *text_id,
+                options.clone(),
+                quests.clone(),
+                gender,
+            ) {
+                let _ = send_cmd(Cmd::NpcTextQuery {
+                    text_id: *text_id,
+                    npc: *npc,
+                });
+            }
             sh.event(format!("giver|open|{}|{}", npc, count));
+        }
+        ServerPacket::NpcText { text_id, blocks } => {
+            let open = crate::gossip_vm::npc();
+            let gender = if open == 0 {
+                0
+            } else {
+                ui_unit(open)
+                    .and_then(|u| u.fields.unit_gender())
+                    .unwrap_or(0)
+            };
+            crate::gossip_vm::text_arrived(*text_id, blocks.clone(), gender);
         }
         ServerPacket::GossipComplete => {
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            crate::gossip_vm::complete();
             sh.event("giver|close".to_string());
         }
         ServerPacket::QuestGiverQuestList(list) => {
