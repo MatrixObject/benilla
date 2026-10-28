@@ -77,6 +77,10 @@ mod creature;
 
 mod held_item;
 
+// ---- Overhead questgiver markers: the ask sweep and the status -> model table ----
+
+mod quest_markers;
+
 // ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
 
 mod ghost;
@@ -4588,6 +4592,89 @@ pub extern "C" fn bn_model_fill(
     ntri as u32
 }
 
+/// Per-vertex tint of an M2, in RGBA8, indexed like `bn_model_fill`'s vertices.
+///
+/// The reference draws a batch as `texel · M2Color · opacity`
+/// (`0x70c507`; benilla's `model_render` carries the tint in the vertex
+/// colour and the alpha in the fragment's). The UE material graphs multiply
+/// the texel by the vertex colour (`M_M2*` in `gen_bn_materials.py`), so a
+/// model served without one draws its additive shells at full strength - the
+/// quest marker's WHITE8X8 glow read as a solid white `!`.
+///
+/// rgb is the batch's `M2Color` first key (white when the batch names no
+/// colour, and dropped on Mod/Mod2x, which zero the tint term as benilla's
+/// `m2_batches` does). a is `colorAlpha · transparencyWeight`
+/// ([`m2_batch_static_alpha`]); a varying track is left at 1.0 here, the
+/// static case the seated marker and every untinted model need.
+///
+/// Returns the vertices written.
+#[no_mangle]
+pub extern "C" fn bn_model_vertex_tint(
+    world: *const BnWorld,
+    model_path: *const c_char,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || model_path.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(p) = cstr_to_str(model_path) else {
+        return 0;
+    };
+    // SAFETY: valid handle.
+    let w = unsafe { &*world };
+    let Some(cached) = m2_cached(&w.archives, p) else {
+        return 0;
+    };
+    let model = cached.format.model();
+    let nv = model.vertices.len().min(cap as usize);
+    if nv == 0 {
+        return 0;
+    }
+    // Untinted: the texel times 1.
+    for i in 0..nv {
+        // SAFETY: out has room for cap RGBA8 entries.
+        unsafe { std::ptr::write_bytes(out.add(i * 4), 0xFF, 4) };
+    }
+    let Some(skin) = cached.skin.as_ref() else {
+        return nv as u32;
+    };
+    let batches = skin.batches();
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let mut assigned = vec![false; nv];
+    for t in m2_emit_tris(model, skin) {
+        let Some(b) = batches.get(t.batch as usize) else {
+            continue;
+        };
+        let blend = m2_blend_class(model, b);
+        let rgb = if matches!(blend, 5 | 6) {
+            [1.0f32; 3]
+        } else {
+            model
+                .color_rgb_tracks
+                .get(b.color_index as usize)
+                .and_then(|tr| tr.keys.first())
+                .map_or([1.0f32; 3], |&(_, c)| c)
+        };
+        let a = m2_batch_static_alpha(model, b).unwrap_or(1.0);
+        for v in [t.a, t.b, t.c] {
+            let vi = v as usize;
+            if vi >= nv || assigned[vi] {
+                continue;
+            }
+            assigned[vi] = true;
+            // SAFETY: vi < nv <= cap.
+            unsafe {
+                *out.add(vi * 4) = byte(rgb[0]);
+                *out.add(vi * 4 + 1) = byte(rgb[1]);
+                *out.add(vi * 4 + 2) = byte(rgb[2]);
+                *out.add(vi * 4 + 3) = byte(a);
+            }
+        }
+    }
+    nv as u32
+}
+
 /// Count of M2 vertices. The UE renderer sizes its vertex buffer from this
 
 /// before calling `bn_model_fill`. Returns 0 on a non-M2 miss.
@@ -7157,9 +7244,9 @@ pub extern "C" fn bn_texture(
 
             let v = decode_texture_sync(w, p);
 
-            let level0 = v.as_ref().and_then(|(_, _, mips)| {
-                mips.first().map(|m| (m.0, m.1, m.2.clone()))
-            });
+            let level0 = v
+                .as_ref()
+                .and_then(|(_, _, mips)| mips.first().map(|m| (m.0, m.1, m.2.clone())));
 
             tex_store(&key, v);
 
