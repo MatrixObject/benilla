@@ -798,6 +798,11 @@ pub struct Player {
     /// Set when a tile's WMO floors are built: the spawn sits on the terrain
     /// under a city, so climb to the lowest walkable WMO floor over it.
     snap_pending: bool,
+    /// A server pose was adopted and the body has not settled on a floor since.
+    /// While the tile's WMO set is still folding, the room's floor is not in it
+    /// yet; the body holds the server's Z instead of dropping through the hole
+    /// the ADT leaves under an interior.
+    hold_pose: bool,
     /// Last feet position that stood on a floor. The void guard restores it if
     /// the body ever falls far below: a hole in the collision data must never
     /// drop the player out of the world.
@@ -848,6 +853,7 @@ impl Player {
             hulls: HashMap::new(),
             missing: Vec::new(),
             snap_pending: false,
+            hold_pose: false,
             last_ground: [x, y, 0.0],
             void_time: 0.0,
             fall_time: 0.0,
@@ -876,6 +882,7 @@ impl Player {
         self.grounded = false;
         self.swimming = false;
         self.snap_pending = false;
+        self.hold_pose = true;
         self.last_ground = pos;
         self.void_time = 0.0;
     }
@@ -951,14 +958,12 @@ impl Player {
         };
         let Some(chain) = chain.as_mut() else { return };
         if !t.wmo_ready {
-            if build_wmo_collision_step(
-                t,
-                tx,
-                ty,
-                chain,
-                cache,
-                std::time::Duration::from_millis(2),
-            ) {
+            let owed = t.wmo_inst < t.wmos.len();
+            build_wmo_collision_step(t, tx, ty, chain, cache, std::time::Duration::from_millis(2));
+            // The spawn snap is one decision, taken when the floor set is whole.
+            // Re-running it on every folded slice climbed a body placed inside a
+            // building onto its roof, one floor at a time.
+            if owed && t.wmo_inst >= t.wmos.len() {
                 self.snap_pending = true;
             }
         }
@@ -1068,6 +1073,20 @@ impl Player {
             }
         }
         best
+    }
+
+    /// Whether the tile under (x, y) still owes its WMO floor set.
+    /// `build_wmo_collision_step` folds a big model over many ticks (the
+    /// 4096-vertex transform slice binds), and the terrain under an interior
+    /// is holed in the ADT: until the fold finishes, a room's floor is not in
+    /// the set and the probe answers with whatever lies below the building.
+    /// A tile the archives lack never arrives, and is not owed.
+    fn floors_folding(&self, x: f32, y: f32) -> bool {
+        let k = Self::tile_of(x, y);
+        match self.tiles.get(&k) {
+            Some(t) => t.wmo_inst < t.wmos.len(),
+            None => !self.missing.contains(&k),
+        }
     }
 
     /// The terrain surface under (x, y): the ADT's own triangles, never a WMO
@@ -1498,11 +1517,21 @@ impl Player {
         }
         if self.snap_pending {
             self.snap_pending = false;
-            if let Some(z) = self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0) {
-                self.pos[2] = z;
-                self.vel[2] = 0.0;
-                self.grounded = true;
-                self.last_ground = self.pos;
+            // A body with a floor within a step under its feet is inside the
+            // building, not under it: the idle cast settles it onto that floor
+            // and the climb would take it to the next storey up.
+            let near = self
+                .ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                .is_some_and(|(z, _)| self.pos[2] - z <= STEP_UP_HEIGHT);
+            if !near {
+                if let Some(z) =
+                    self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0)
+                {
+                    self.pos[2] = z;
+                    self.vel[2] = 0.0;
+                    self.grounded = true;
+                    self.last_ground = self.pos;
+                }
             }
         }
         let feet = self.pos;
@@ -1751,61 +1780,80 @@ impl Player {
             let cone = travel * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
             let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
             let found = self.ground(self.pos[0], self.pos[1], ceil);
-            match found {
-                Some((z, _)) => {
-                    self.void_time = 0.0;
-                    let step_down = self.grounded && z <= prev_z && prev_z - z <= STEP_UP_HEIGHT;
-                    if self.pos[2] <= z || step_down {
-                        // A step-down follows the surface at the cone's slope,
-                        // one frame at a time, and only settles onto it once the
-                        // feet are close; a whole ledge at once buried the
-                        // capsule in the face.
-                        self.pos[2] = if self.pos[2] <= z {
-                            z
+            // A tile's WMO floor set folds over many ticks and the terrain under
+            // an interior is holed, so a body that walks into a room during the
+            // fold finds no floor (or only the ground far below it) and drops
+            // through a hole the data does not have. While the set is still
+            // owed, a standing body holds its seat - the rule `bn_ground_clamp_z`
+            // gives units - and `snap_pending` settles it on the baked floor.
+            let stale = (self.grounded || self.hold_pose)
+                && self.floors_folding(self.pos[0], self.pos[1])
+                && found.map_or(true, |(z, _)| prev_z - z > STEP_UP_HEIGHT);
+            if stale {
+                self.pos[2] = prev_z;
+                self.vel[2] = 0.0;
+                self.grounded = true;
+                self.last_ground = self.pos;
+                self.void_time = 0.0;
+            } else {
+                self.hold_pose = false;
+                match found {
+                    Some((z, _)) => {
+                        self.void_time = 0.0;
+                        let step_down =
+                            self.grounded && z <= prev_z && prev_z - z <= STEP_UP_HEIGHT;
+                        if self.pos[2] <= z || step_down {
+                            // A step-down follows the surface at the cone's slope,
+                            // one frame at a time, and only settles onto it once the
+                            // feet are close; a whole ledge at once buried the
+                            // capsule in the face.
+                            self.pos[2] = if self.pos[2] <= z {
+                                z
+                            } else {
+                                z.max(prev_z - cone)
+                            };
+                            self.vel[2] = 0.0;
+                            self.grounded = true;
+                            self.last_ground = self.pos;
                         } else {
-                            z.max(prev_z - cone)
-                        };
-                        self.vel[2] = 0.0;
-                        self.grounded = true;
-                        self.last_ground = self.pos;
-                    } else {
+                            self.grounded = false;
+                        }
+                    }
+                    None => {
+                        // No floor under the feet at all: a hole in the terrain
+                        // (a tunnel mouth), a tile that has not streamed in yet, or
+                        // a body that is already below the world. Never keep
+                        // falling forever - report the spot once and restore the
+                        // last floor when the fall is clearly out of the map.
                         self.grounded = false;
-                    }
-                }
-                None => {
-                    // No floor under the feet at all: a hole in the terrain
-                    // (a tunnel mouth), a tile that has not streamed in yet, or
-                    // a body that is already below the world. Never keep
-                    // falling forever - report the spot once and restore the
-                    // last floor when the fall is clearly out of the map.
-                    self.grounded = false;
-                    self.void_time += dt;
-                    if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
-                        let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
-                        let state = match self.tiles.get(&(tx, ty)) {
-                            None => "missing",
-                            Some(t) if t.wmo_ready => "ready",
-                            Some(_) => "loading",
-                        };
-                        eprintln!(
-                            "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
+                        self.void_time += dt;
+                        if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
+                            let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                            let state = match self.tiles.get(&(tx, ty)) {
+                                None => "missing",
+                                Some(t) if t.wmo_ready => "ready",
+                                Some(_) => "loading",
+                            };
+                            eprintln!(
+                                "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
                              {state} resident={}",
-                            self.pos[0],
-                            self.pos[1],
-                            self.pos[2],
-                            self.tiles.len()
-                        );
-                    }
-                    if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH {
-                        eprintln!(
+                                self.pos[0],
+                                self.pos[1],
+                                self.pos[2],
+                                self.tiles.len()
+                            );
+                        }
+                        if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH {
+                            eprintln!(
                             "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
                             self.pos[0], self.pos[1], self.pos[2],
                             self.last_ground[0], self.last_ground[1], self.last_ground[2]
                         );
-                        self.pos = self.last_ground;
-                        self.vel = [0.0; 3];
-                        self.grounded = true;
-                        self.void_time = 0.0;
+                            self.pos = self.last_ground;
+                            self.vel = [0.0; 3];
+                            self.grounded = true;
+                            self.void_time = 0.0;
+                        }
                     }
                 }
             }
@@ -2500,12 +2548,15 @@ mod tests {
 
     #[test]
     fn a_hole_in_the_collision_data_never_drops_the_body_out_of_the_world() {
-        // No geometry at all under the feet: the body falls, and the void guard
-        // restores the last real floor once it is clearly through the map.
+        // No geometry at all under the feet, in a tile whose set is complete:
+        // the body falls, and the void guard restores the last real floor once
+        // it is clearly through the map.
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         p.pos[2] = 10.0;
         p.last_ground = [p.pos[0], p.pos[1], 10.0];
         p.grounded = true;
+        p.tiles
+            .insert(Player::tile_of(p.pos[0], p.pos[1]), TileCol::new());
         let mut restored = false;
         for _ in 0..400 {
             p.tick(0.1);
@@ -2519,6 +2570,83 @@ mod tests {
             }
         }
         assert!(restored, "the void guard put the body back on the floor");
+    }
+
+    #[test]
+    fn a_room_whose_floor_set_is_still_folding_holds_the_body() {
+        // Walking into an interior before the tile's WMO fold finishes: the
+        // room's floor is not in the set yet and the terrain under it is holed,
+        // so the body holds its seat instead of dropping out of the room.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.pos[2] = 63.8;
+        p.last_ground = p.pos;
+        p.grounded = true;
+        let mut col = TileCol::new();
+        col.wmos.push(benilla_formats::WmoInstance {
+            model: "world\\wmo\\test\\room.wmo".to_string(),
+            position: [-8800.0, -800.0, 56.5],
+            rotation: [0.0; 3],
+            unique_id: 1,
+            doodad_set: 0,
+            name_set: 0,
+        });
+        p.tiles.insert(Player::tile_of(p.pos[0], p.pos[1]), col);
+        for _ in 0..100 {
+            p.tick(0.1);
+            assert!(
+                (p.pos[2] - 63.8).abs() < 1.0e-3,
+                "held the seat at {}",
+                p.pos[2]
+            );
+        }
+        assert!(p.grounded, "still standing");
+    }
+
+    #[test]
+    fn a_login_inside_a_room_holds_the_server_z_until_the_floor_set_bakes() {
+        // `set_server_pose` leaves the body airborne, and a fresh tile's WMO
+        // fold has not run: the room's floor is absent and the terrain under it
+        // is holed. The body holds the server's Z, then settles on the floor
+        // once the set bakes.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.set_server_pose([-8800.0, -800.0, 63.8], 0.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let mut col = TileCol::new();
+        col.wmos.push(benilla_formats::WmoInstance {
+            model: "world\\wmo\\test\\room.wmo".to_string(),
+            position: [-8800.0, -800.0, 56.5],
+            rotation: [0.0; 3],
+            unique_id: 1,
+            doodad_set: 0,
+            name_set: 0,
+        });
+        p.tiles.insert((tx, ty), col);
+        for _ in 0..50 {
+            p.tick(0.1);
+            assert!(
+                (p.pos[2] - 63.8).abs() < 1.0e-3,
+                "held the server Z at {}",
+                p.pos[2]
+            );
+        }
+        // The fold reaches the floor: the set is no longer owed, and the body
+        // settles onto the room's floor.
+        let floor = Tri::new(
+            [-8810.0, -810.0, 63.8],
+            [-8790.0, -810.0, 63.8],
+            [-8810.0, -790.0, 63.8],
+        );
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        col.wmo_inst = col.wmos.len();
+        let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &floor);
+        for ly in y0..=y1 {
+            for lx in x0..=x1 {
+                col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(floor);
+            }
+        }
+        p.tick(0.1);
+        assert!(p.grounded, "settled on the floor");
+        assert!((p.pos[2] - 63.8).abs() < 1.0e-3, "feet on it: {}", p.pos[2]);
     }
 
     #[test]
@@ -3055,15 +3183,33 @@ mod tests {
         let mut cache = HashMap::new();
         let chain = w.chain.as_mut().unwrap();
         for (&(k0, k1), t) in tiles.iter_mut() {
-            let built = build_wmo_collision_step(
-                t,
-                k0,
-                k1,
-                chain,
-                &mut cache,
-                std::time::Duration::from_secs(3600),
+            let mut built = false;
+            let mut steps = 0;
+            while t.wmo_inst < t.wmos.len() || !t.wmo_ready {
+                built |= build_wmo_collision_step(
+                    t,
+                    k0,
+                    k1,
+                    chain,
+                    &mut cache,
+                    std::time::Duration::from_secs(3600),
+                );
+                steps += 1;
+                if steps > 1000 {
+                    break;
+                }
+            }
+            println!(
+                "baked tile ({k0},{k1}) built={built} steps={steps} wmo={} ready={}",
+                t.wmos.len(),
+                t.wmo_ready
             );
-            println!("baked tile ({k0},{k1}) built={built}");
+        }
+        for (model, mesh) in cache.iter() {
+            if !mesh.indices.is_empty() {
+                continue;
+            }
+            println!("EMPTY collision {model}");
         }
         let mut p = Player::new("Azeroth", sx, sy);
         p.tiles = tiles;
@@ -3076,6 +3222,7 @@ mod tests {
             tile.buckets[b].len()
         );
         println!("collision z {:?}", p.ground(sx, sy, 1000.0));
+        println!("collision z ceil 64 {:?}", p.ground(sx, sy, 64.0));
         let mut hits: Vec<f32> = cell
             .map(|i| {
                 tile.wmo_cells[i as usize]
@@ -3087,16 +3234,19 @@ mod tests {
         hits.sort_by(|a, b| a.partial_cmp(b).unwrap());
         hits.dedup_by(|a, b| (*a - *b).abs() < 0.01);
         println!("wmo floors at the spot: {:?}", hits);
-        for gy in (-40..=40).step_by(4) {
-            let mut row = String::new();
-            for gx in (-40..=40).step_by(4) {
-                let z = p.ground(sx + gx as f32, sy + gy as f32, 1000.0);
-                row.push_str(&match z {
-                    Some((z, _)) => format!("{z:7.1}"),
-                    None => "   none".to_string(),
-                });
+        for ceil in [1000.0f32, 64.0] {
+            println!("raster ceil {ceil}");
+            for gy in (-40..=40).step_by(2) {
+                let mut row = String::new();
+                for gx in (-40..=40).step_by(2) {
+                    let z = p.ground(sx + gx as f32, sy + gy as f32, ceil);
+                    row.push_str(&match z {
+                        Some((z, _)) => format!("{z:7.1}"),
+                        None => "   none".to_string(),
+                    });
+                }
+                println!("y{gy:+04}: {row}");
             }
-            println!("y{gy:+04}: {row}");
         }
     }
 
