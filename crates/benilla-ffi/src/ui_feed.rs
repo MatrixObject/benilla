@@ -21,11 +21,11 @@ use benilla_formats::{
 };
 use benilla_protocol::messages::ObjectFields;
 use benilla_ui::script::{
-    ActionSlot, ActionState, AuraState, BindingInput, ChatSend, DeathAction, DeathUiState,
-    FiredInput, HeldInput, LootRow, LootState, NearestMode, PartyMemberInfo, PartyRequest,
-    PartyState, PlayerRecord, ScriptValue, SelectionRequest, SessionRequest, SpellBookState,
-    SpellSlotView, SpellTabView, UiScript, UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind,
-    WornDisplay,
+    ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
+    DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState, NearestMode,
+    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, ScriptValue, SelectionRequest,
+    SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase, UnitGuids,
+    UnitState, UnitTokenParse, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -180,6 +180,11 @@ struct Feed {
     loot_picks: Vec<LootPick>,
     party_key: Option<Vec<(u64, String)>>,
 
+    /// The bag containers last pushed, diffed per bag for `BAG_UPDATE`.
+    containers: HashMap<i64, ContainerState>,
+    /// The bag item in containers 1..=4, indexed `id - 1`: a change from nonzero is `BAG_CLOSED`.
+    bag_guids: [u64; 4],
+
     died_at: Option<f64>,
     corpse_ms: u32,
     corpse_at: Option<f64>,
@@ -249,6 +254,8 @@ impl Feed {
             loot_key: None,
             loot_picks: Vec::new(),
             party_key: None,
+            containers: HashMap::new(),
+            bag_guids: [0; 4],
             died_at: None,
             corpse_ms: 0,
             corpse_at: None,
@@ -269,6 +276,50 @@ fn cstr<const N: usize>(buf: &[std::ffi::c_char; N]) -> String {
 
 fn norm_icon(path: Option<String>) -> Option<String> {
     path.map(|p| p.replace('/', "\\"))
+}
+
+/// The client's quality colour escape for an item link, `0x52ad90` over the table at
+/// `0x854124` (>= 7 clamps to white).
+fn quality_color(quality: u32) -> &'static str {
+    match quality {
+        0 => "ff9d9d9d",
+        2 => "ff1eff00",
+        3 => "ff0070dd",
+        4 => "ffa335ee",
+        5 => "ffff8000",
+        6 => "ffe6cc80",
+        _ => "ffffffff",
+    }
+}
+
+/// One item hyperlink as `0x52adb0` builds it: colour, `|Hitem:…|h[Name]|h`, reset.
+fn item_link(item_id: u32, name: &str, quality: u32) -> String {
+    format!(
+        "|c{}|Hitem:{item_id}:0:0:0|h[{name}]|h|r",
+        quality_color(quality)
+    )
+}
+
+/// One occupied bag slot's view, off the item object and its template.
+fn container_slot(item: &net::BnNetInvItem, cats: Option<&Catalogs>) -> ContainerSlot {
+    let info = &item.info;
+    let name = cstr(&info.name);
+    ContainerSlot {
+        texture: cats
+            .and_then(|c| c.items.as_ref())
+            .and_then(|t| t.get(info.display_id))
+            .and_then(|d| norm_icon(d.icon.clone())),
+        count: item.count,
+        // `GetContainerItemInfo` reports quality only when `inventory_type` is nonzero
+        // (`0x4f9794`), else -1.
+        quality: (info.inventory_type != 0).then_some(info.quality),
+        inventory_type: info.inventory_type,
+        item_id: item.entry,
+        link: (!name.is_empty()).then(|| item_link(item.entry, &name, info.quality)),
+        guid: item.guid,
+        durability: (item.max_durability > 0).then_some((item.durability, item.max_durability)),
+        ..Default::default()
+    }
 }
 
 /// Build one unit's snapshot from a live descriptor.
@@ -739,7 +790,9 @@ impl Feed {
             }
         }
 
-        // Action bar.
+        // Action bar. The inventory snapshot is taken once: the bar's counts and the
+        // bag containers below read the same rows.
+        let inv = net::ui_inventory();
         let actions = net::ui_actions();
         if actions != self.actions {
             let keep: HashSet<u32> = actions
@@ -778,8 +831,7 @@ impl Feed {
                     _ => None,
                 };
                 let count = if kind == 0x80 {
-                    net::ui_inventory()
-                        .iter()
+                    inv.iter()
                         .filter(|i| i.entry == action)
                         .map(|i| i.count)
                         .sum()
@@ -877,8 +929,87 @@ impl Feed {
         }
 
         self.push_loot(script, cats);
+        self.push_containers(script, cats, &inv);
         self.push_party(script, &party, self_guid, &name_of);
         self.first = false;
+    }
+
+    /// Push the player's bag containers: the backpack (0) and each equipped bag (1..=4), the
+    /// snapshots `GetContainerNumSlots`/`GetContainerItemInfo`/`GetBagName` read. A bag with no
+    /// item in its slot is absent from the map, as the reference leaves it (`GetContainerNumSlots`
+    /// then answers 0), and a bag item leaving a slot closes its window and fires no `BAG_UPDATE`
+    /// (`0x4f92cc`).
+    fn push_containers(
+        &mut self,
+        script: &mut UiScript,
+        cats: Option<&Catalogs>,
+        inv: &[net::BnNetInvItem],
+    ) {
+        let bags = net::ui_bags();
+        let mut fresh: HashMap<i64, ContainerState> = HashMap::new();
+        let mut guids = [0u64; 4];
+        for &(id, num_slots, entry, guid) in &bags {
+            if (1..=4).contains(&id) {
+                guids[id as usize - 1] = guid;
+            }
+            let mut slots = HashMap::new();
+            for item in inv {
+                let row_bag = match item.bag {
+                    0 => 0,
+                    19..=22 => i64::from(item.bag) - 18,
+                    _ => continue,
+                };
+                if row_bag == id {
+                    slots.insert(u32::from(item.slot) + 1, container_slot(item, cats));
+                }
+            }
+            let name = if id == 0 {
+                Some("Backpack".to_string())
+            } else if entry != 0 {
+                let n = cstr(&net::ui_item_info(entry).name);
+                (!n.is_empty()).then_some(n)
+            } else {
+                None
+            };
+            fresh.insert(
+                id,
+                ContainerState {
+                    name,
+                    num_slots,
+                    slots,
+                },
+            );
+        }
+        let emptied: Vec<i64> = (0..4)
+            .filter(|&i| self.bag_guids[i] != 0 && guids[i] != self.bag_guids[i])
+            .map(|i| i as i64 + 1)
+            .collect();
+        self.bag_guids = guids;
+        for &id in &emptied {
+            fire(script, "BAG_CLOSED", vec![ScriptValue::Int(id)]);
+        }
+        let changed: Vec<i64> = fresh
+            .keys()
+            .chain(self.containers.keys())
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|id| fresh.get(id) != self.containers.get(id))
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        for &id in &changed {
+            script.set_container(id, fresh.get(&id).cloned());
+        }
+        self.containers = fresh;
+        if !self.first {
+            for &id in &changed {
+                if !emptied.contains(&id) {
+                    fire(script, "BAG_UPDATE", vec![ScriptValue::Int(id)]);
+                }
+            }
+        }
     }
 
     fn push_loot(&mut self, script: &mut UiScript, cats: Option<&Catalogs>) {

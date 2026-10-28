@@ -1433,6 +1433,44 @@ pub(crate) fn ui_inventory() -> Vec<BnNetInvItem> {
     inventory_rows(shared())
 }
 
+/// The player's own bag containers: the backpack (id 0, 16 slots, no bag item)
+/// then each equipped bag slot 19..=22 as containers 1..=4. `entry` is the bag
+/// item's template entry (0 for the backpack) and `guid` its item object, which
+/// the reference's watcher diffs to fire `BAG_CLOSED` (`0x4f923d`).
+pub(crate) fn ui_bags() -> Vec<(i64, u32, u32, u64)> {
+    let sh = shared();
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(i64, u32, u32, u64)> = Vec::new();
+    if self_guid == 0 {
+        return out;
+    }
+    let Some(player) = units.get(&self_guid) else {
+        return out;
+    };
+    let f = &player.fields;
+    out.push((0, 16, 0, 0));
+    for bag_slot in 19..23u8 {
+        let Some(guid) = f.player_inv_slot(bag_slot) else {
+            continue;
+        };
+        if guid == 0 {
+            continue;
+        }
+        let Some(rec) = units.get(&guid) else {
+            continue;
+        };
+        let n = rec.fields.container_num_slots().unwrap_or(0).min(36);
+        out.push((
+            i64::from(bag_slot) - 18,
+            n,
+            rec.fields.object_entry().unwrap_or(0),
+            guid,
+        ));
+    }
+    out
+}
+
 /// Every tracked object's guid, sorted.
 pub(crate) fn ui_unit_guids() -> Vec<u64> {
     let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
