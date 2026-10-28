@@ -24,7 +24,7 @@ type Catalog = benilla_formats::CreatureCatalog;
 /// The catalog costs a pass over three DBCs (~tens of ms), so keep the last
 /// Data dir's parse. A handle per process opens one Data dir, so this is a
 /// one-time cost in practice.
-fn catalog(world: &mut BnWorld) -> Option<Arc<Catalog>> {
+pub(crate) fn catalog(world: &mut BnWorld) -> Option<Arc<Catalog>> {
     static CAT: OnceLock<Mutex<Option<(String, Arc<Catalog>)>>> = OnceLock::new();
     let cell = CAT.get_or_init(|| Mutex::new(None));
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
@@ -41,7 +41,7 @@ fn catalog(world: &mut BnWorld) -> Option<Arc<Catalog>> {
 
 /// `CreatureModelData` names `.mdx`; the M2 reader (and `bn_model_fill`'s
 /// exact-path archive lookup) wants `.m2`.
-fn m2_path(path: &str) -> String {
+pub(crate) fn m2_path(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".mdx") || lower.ends_with(".mdl") {
         let mut s = path[..path.len() - 4].to_string();

@@ -217,7 +217,7 @@ fn parent_dir(path: &str) -> &str {
 /// leave the rig empty for the whole process (the failure is cached). The
 /// archives are registered in directory order, so which copy that is varies
 /// from run to run.
-fn model_bytes(world: &BnWorld, path: &str) -> Option<Vec<u8>> {
+pub(crate) fn model_bytes(world: &BnWorld, path: &str) -> Option<Vec<u8>> {
     for a in world.archives.iter().rev() {
         if !a.contains(path) {
             continue;

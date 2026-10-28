@@ -1274,7 +1274,7 @@ impl Player {
 
     /// The orbit's forward (up-positive pitch) in WoW axes: the eye sits at
     /// `pivot - fwd * boom`.
-    fn camera_fwd(&self) -> [f32; 3] {
+    pub(crate) fn camera_fwd(&self) -> [f32; 3] {
         let (sp, cp) = self.cam_pitch.sin_cos();
         let (sy, cy) = self.cam_yaw.sin_cos();
         [cp * cy, -cp * sy, sp]

@@ -1315,6 +1315,19 @@ pub(crate) struct UiUnitRec {
     pub facing: f32,
 }
 
+/// One tracked object's rendered feet: the same pose `bn_net_unit` answers, the live spline
+/// included. The dll's own per-frame world readers (the selection ring, the nameplates) seat on it
+/// so they never disagree with what the host is drawing.
+pub(crate) fn ui_unit_pose(guid: u64) -> Option<[f32; 3]> {
+    if guid == 0 {
+        return None;
+    }
+    let sh = shared();
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let rec = units.get(&guid)?;
+    Some(effective_pose(rec).0)
+}
+
 /// One tracked object by guid, cloned.
 pub(crate) fn ui_unit(guid: u64) -> Option<UiUnitRec> {
     if guid == 0 {

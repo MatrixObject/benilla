@@ -90,6 +90,10 @@ mod chat_vm;
 mod gossip_vm;
 mod quest_log_vm;
 
+// ---- The ground ring under the selected unit: footprint, fade and selector colour ----
+
+mod selection_ring;
+
 // ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
 
 mod ghost;
