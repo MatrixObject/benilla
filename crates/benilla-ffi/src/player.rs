@@ -80,6 +80,16 @@ const TURN_RATE_MOVING: f32 = 0.75;
 /// Roam-mode flight speed (yd/s): a zone tour without waiting on terrain.
 const FLY_SPEED: f32 = 30.0;
 
+// ---- the upper-body one-shots ----
+/// AnimationData ids: Death, AttackUnarmed and SpellCast.
+const ANIM_DEATH: u32 = 1;
+const ANIM_ATTACK_UNARMED: u32 = 16;
+const ANIM_SPELL_CAST: u32 = 53;
+/// The attack overlay's visible window (s), the unarmed clip's own length.
+const SWING_WINDOW: f32 = 0.7;
+/// The overlay's blend time constant (s): the vanilla masked layer's ease.
+const OVERLAY_BLEND: f32 = 0.12;
+
 // ---- camera pivot presets ----
 /// A scale-1 Human Male's framing pivot: standing 1.9002692, swimming
 /// 0.3882572 lower (`model_pivot_height`, `cam+0x124`).
@@ -139,8 +149,15 @@ pub struct BnPlayerState {
     /// 0/1.
     pub mounted: u32,
     /// AnimationData.dbc id to play (0 Stand, 4 Walk, 5 Run, 13 WalkBackwards,
-    /// 16 AttackUnarmed, 37 JumpStart, 40 Fall, 91 Mount).
+    /// 16 AttackUnarmed, 37 JumpStart, 40 Fall, 91 Mount). A one-shot action
+    /// the lower body cannot show (an attack or a cast while running) rides
+    /// the overlay instead.
     pub anim: u32,
+    /// The upper-body overlay's AnimationData id (16 attack, 53 cast), or 0
+    /// for none: the vanilla masked SpineLow subtree split.
+    pub overlay_anim: u32,
+    /// The overlay's blend weight, 0..1.
+    pub overlay_weight: f32,
 }
 
 /// Wrap an angle to (-π, π].
@@ -753,6 +770,25 @@ pub struct Player {
     cam_live: f32,
     mounted: bool,
     attack_left: f32,
+    /// The server's combat latch (`SMSG_ATTACKSTART` with no stop): the swing
+    /// cycle keeps repeating while set.
+    attacking: bool,
+    /// Seconds into the current weapon cycle; the attack overlay shows for the
+    /// first [`SWING_WINDOW`].
+    swing_phase: f32,
+    /// The live cast the server started for us: (spell, elapsed, duration).
+    cast: Option<(u32, f32, f32)>,
+    /// Our own descriptor reads dead: the Death anim, and no locomotion.
+    dead: bool,
+    /// The overlay's eased weight, 0..1.
+    overlay_weight: f32,
+    /// The stock UI's held movement (forward, strafe, turn) while a binding owns
+    /// the axes: `None` hands them back to the host's raw key state.
+    ui_input: Option<[f32; 3]>,
+    /// A `Jump()` binding's one-shot, spent on the next tick.
+    ui_jump: bool,
+    /// The walk toggle's state, `None` until a `ToggleRun()` binding sets it.
+    ui_walk: Option<bool>,
     tiles: HashMap<(i32, i32), TileCol>,
     /// Doodad collision hulls, parsed once per model path (`None` = the model
     /// ships no hull, like grass or a canopy).
@@ -800,6 +836,14 @@ impl Player {
             cam_live: CAM_DIST_DEFAULT,
             mounted: false,
             attack_left: 0.0,
+            attacking: false,
+            swing_phase: 0.0,
+            cast: None,
+            dead: false,
+            overlay_weight: 0.0,
+            ui_input: None,
+            ui_jump: false,
+            ui_walk: None,
             tiles: HashMap::new(),
             hulls: HashMap::new(),
             missing: Vec::new(),
@@ -1348,6 +1392,39 @@ impl Player {
         self.cam_live = self.cam_distance;
     }
 
+    /// Read the server's combat, cast and death state for our own guid, and
+    /// advance the swing cycle and the overlay's weight.
+    fn sample_server_state(&mut self, dt: f32) {
+        self.attacking = crate::net::ui_self_attacking();
+        self.cast = crate::net::ui_self_cast();
+        self.dead = crate::net::ui_self_fields().is_some_and(|f| f.unit_is_dead());
+        // One weapon cycle per swing (`BnNetPlayer.attack_time`); the overlay
+        // shows for the cycle's first window.
+        let period = crate::net::ui_player()
+            .map(|p| p.attack_time as f32 / 1000.0)
+            .unwrap_or(2.0)
+            .max(0.4);
+        if self.attacking && !self.mounted {
+            self.swing_phase = (self.swing_phase + dt) % period;
+        } else {
+            self.swing_phase = 0.0;
+        }
+        let want = if !self.dead
+            && !self.mounted
+            && self.grounded
+            && self.lower_body_committed()
+            && (self.cast_active() || self.swing_active())
+        {
+            1.0
+        } else {
+            0.0
+        };
+        self.overlay_weight += (want - self.overlay_weight) * (1.0 - (-dt / OVERLAY_BLEND).exp());
+        if self.overlay_weight < 0.01 {
+            self.overlay_weight = 0.0;
+        }
+    }
+
     /// One frame: integrate benilla's locomotion, resolve the floor, then place
     /// the camera. `dt` is clamped like the client's frame slice.
     fn tick(&mut self, dt: f32) {
@@ -1358,6 +1435,30 @@ impl Player {
         let dt = dt.clamp(0.0, 0.1);
         if dt <= 0.0 {
             return;
+        }
+        self.sample_server_state(dt);
+        if self.dead {
+            // A corpse neither walks nor jumps; the camera still follows.
+            self.input = Input::default();
+            self.vel = [0.0; 3];
+            self.attack_left = 0.0;
+            self.ui_jump = false;
+        } else {
+            // The stock UI's bindings own the movement axes while they hold one:
+            // the world frame runs their Start/Stop bodies, and the host's raw
+            // key state only fills in when none is held.
+            if let Some([forward, strafe, turn]) = self.ui_input {
+                self.input.forward = forward;
+                self.input.strafe = strafe;
+                self.input.turn = turn;
+            }
+            if let Some(walk) = self.ui_walk {
+                self.input.walk = walk;
+            }
+            if self.ui_jump {
+                self.input.jump = true;
+                self.ui_jump = false;
+            }
         }
         if self.fly {
             self.tick_fly(dt);
@@ -1778,7 +1879,49 @@ impl Player {
             (self.cam_pitch + dy * LOOK_SENSITIVITY).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
     }
 
+    /// Whether the lower body is committed to locomotion, the vanilla
+    /// `ROUTE_COMMITTED_MOVE` gate that masks a one-shot onto the upper body:
+    /// translating, turning, swimming or airborne.
+    fn lower_body_committed(&self) -> bool {
+        self.swimming
+            || !self.grounded
+            || self.input.forward.abs() > 0.01
+            || self.input.strafe.abs() > 0.01
+            || self.input.turn.abs() > 0.01
+            || (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt() > 0.1
+    }
+
+    /// The swing edge: the server's attack latch at the head of a weapon
+    /// cycle, or the host's local unarmed test press.
+    fn swing_active(&self) -> bool {
+        (self.attacking && self.swing_phase < SWING_WINDOW) || self.attack_left > 0.0
+    }
+
+    /// A cast with a cast time, still running.
+    fn cast_active(&self) -> bool {
+        matches!(self.cast, Some((_, elapsed, duration)) if duration > 0.0 && elapsed < duration)
+    }
+
+    /// The upper-body overlay `(anim, weight)`: a one-shot the committed lower
+    /// body cannot play full-body rides the masked spine subtree instead.
+    fn overlay(&self) -> (u32, f32) {
+        if self.dead || self.mounted || !self.grounded || !self.lower_body_committed() {
+            return (0, 0.0);
+        }
+        let anim = if self.cast_active() {
+            ANIM_SPELL_CAST
+        } else if self.swing_active() {
+            ANIM_ATTACK_UNARMED
+        } else {
+            return (0, 0.0);
+        };
+        (anim, self.overlay_weight)
+    }
+
     fn anim(&self) -> u32 {
+        if self.dead {
+            return ANIM_DEATH;
+        }
         if self.mounted {
             return 91; // Mount
         }
@@ -1806,8 +1949,15 @@ impl Player {
             }
             return 41;
         }
-        if self.attack_left > 0.0 {
-            return 16; // AttackUnarmed
+        // A one-shot with the legs free plays full-body; with them committed
+        // it moves to `overlay()` and the locomotion anim stays the base.
+        if !self.lower_body_committed() {
+            if self.cast_active() {
+                return ANIM_SPELL_CAST;
+            }
+            if self.swing_active() {
+                return ANIM_ATTACK_UNARMED;
+            }
         }
         if !self.grounded {
             return if self.vel[2] > 0.0 { 37 } else { 40 }; // JumpStart / Fall
@@ -1834,6 +1984,7 @@ impl Player {
 
     fn state(&self) -> BnPlayerState {
         let (eye, target) = self.camera();
+        let (overlay_anim, overlay_weight) = self.overlay();
         BnPlayerState {
             pos: self.pos,
             yaw: self.model_yaw,
@@ -1845,6 +1996,8 @@ impl Player {
             grounded: self.grounded as u32,
             mounted: self.mounted as u32,
             anim: self.anim(),
+            overlay_anim,
+            overlay_weight,
         }
     }
 }
@@ -2035,6 +2188,43 @@ pub extern "C" fn bn_player_input(
     p.input.walk = walk != 0;
     p.input.up = up;
     1
+}
+
+/// The stock UI's held movement axes, and whether a binding owns them at all:
+/// the world frame's `MoveForwardStart`/... bodies drive this instead of the
+/// host's raw key state, as the 1.12 bindings drive the real client.
+pub(crate) fn ui_move(world: *mut BnWorld, forward: f32, strafe: f32, turn: f32, held: bool) {
+    if let Some(p) = player_mut(world) {
+        p.ui_input = held.then_some([forward, strafe, turn]);
+    }
+}
+
+/// A `Jump()` binding's press: spent on the next locomotion tick.
+pub(crate) fn ui_jump(world: *mut BnWorld) {
+    if let Some(p) = player_mut(world) {
+        p.ui_jump = true;
+    }
+}
+
+/// A `ToggleRun()` binding's press: the walk flag the tick then holds.
+pub(crate) fn ui_toggle_walk(world: *mut BnWorld) {
+    if let Some(p) = player_mut(world) {
+        let next = !p.input.walk;
+        p.ui_walk = Some(next);
+        p.input.walk = next;
+    }
+}
+
+/// A `CameraZoomIn`/`CameraZoomOut` binding: positive notches pull the eye in.
+pub(crate) fn ui_zoom(world: *mut BnWorld, notches: f32) {
+    if let Some(p) = player_mut(world) {
+        p.cam_target_distance = (p.cam_target_distance - notches).clamp(0.0, CAM_DIST_DEFAULT);
+    }
+}
+
+/// The body's feet position, for the UI's nearest-unit picks.
+pub(crate) fn ui_pos(world: *mut BnWorld) -> Option<[f32; 3]> {
+    unsafe { world.as_ref() }.and_then(|w| w.player.as_ref().map(|p| p.pos))
 }
 
 /// Roam mode on/off: free flight for touring the map (no gravity, collision or

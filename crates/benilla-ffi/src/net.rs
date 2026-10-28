@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -390,23 +390,44 @@ impl Default for BnNetInvItem {
 /// One creature template from `SMSG_CREATURE_QUERY_RESPONSE`: the name and rank
 /// the target frame needs (elite/boss styling), plus the type word.
 #[derive(Clone)]
-struct CreatureTemplateLite {
-    name: String,
-    subname: String,
-    creature_type: u32,
-    rank: u32,
+pub(crate) struct CreatureTemplateLite {
+    pub(crate) name: String,
+    pub(crate) subname: String,
+    pub(crate) creature_type: u32,
+    pub(crate) rank: u32,
+    pub(crate) civilian: bool,
+    pub(crate) racial_leader: bool,
+}
+
+/// One quest objective from `SMSG_QUEST_QUERY_RESPONSE`: the template arrays the
+/// quest log's leaderboard reads.
+#[derive(Clone, Default)]
+pub(crate) struct QuestObjectiveLite {
+    /// A creature entry, else a GameObject entry with bit `0x8000_0000`.
+    pub creature_or_go: u32,
+    pub required_count: u32,
+    pub item_id: u32,
+    pub item_count: u32,
+    /// The objective's override text (empty when the name comes from the cache).
+    pub text: String,
 }
 
 /// One quest template from `SMSG_QUEST_QUERY_RESPONSE` (the quest log's detail
 /// view: the descriptors only carry ids and counters).
-struct QuestTemplateLite {
-    level: u32,
-    zone: i32,
-    money: i32,
-    flags: u32,
-    title: String,
-    objectives: String,
-    details: String,
+#[derive(Clone)]
+pub(crate) struct QuestTemplateLite {
+    pub level: u32,
+    pub zone: i32,
+    pub money: i32,
+    pub flags: u32,
+    pub title: String,
+    pub objectives: String,
+    pub details: String,
+    pub end_text: String,
+    pub src_item_id: u32,
+    pub objective_rows: Vec<QuestObjectiveLite>,
+    pub rewards: [(u32, u32); 4],
+    pub choices: [(u32, u32); 6],
 }
 
 /// One quest template as the host reads it (`bn_net_quest_info`).
@@ -855,7 +876,7 @@ fn apply_monster_move(
 }
 
 /// Commands the game thread hands to the session thread.
-enum Cmd {
+pub(crate) enum Cmd {
     Enter(u64),
     Chat(String),
     Attack(u64),
@@ -869,6 +890,52 @@ enum Cmd {
     LootRelease(u64),
     /// `CMSG_REPOP_REQUEST`: release the spirit after death.
     Repop,
+    /// `CMSG_RECLAIM_CORPSE`: come back at the corpse (the corpse guid is ignored).
+    ReclaimCorpse(u64),
+    /// `CMSG_RESURRECT_RESPONSE`: answer a resurrection offer.
+    ResurrectResponse {
+        caster: u64,
+        accept: bool,
+    },
+    /// `CMSG_SPIRIT_HEALER_ACTIVATE`: take the spirit healer's resurrection.
+    SpiritHealer(u64),
+    /// `CMSG_SELF_RES`: spend `PLAYER_SELF_RES_SPELL` (a soulstone, reincarnation).
+    SelfRes,
+    /// `CMSG_GOSSIP_SELECT_OPTION`: take gossip option `index` (0-based wire order).
+    GossipSelect {
+        npc: u64,
+        index: u32,
+    },
+    /// `CMSG_QUESTGIVER_QUERY_QUEST` from a gossip quest row.
+    GossipQuest {
+        npc: u64,
+        quest: u32,
+    },
+    /// `CMSG_QUESTLOG_REMOVE_QUEST`: abandon the quest in log slot `slot` (0-based).
+    QuestAbandon {
+        slot: u8,
+    },
+    /// `CMSG_SET_ACTION_BUTTON`: write (or clear, `packed == 0`) one bar slot.
+    SetAction {
+        slot: u8,
+        packed: u32,
+    },
+    /// `CMSG_SET_ACTIONBAR_TOGGLES`.
+    ActionBarToggles(u8),
+    /// `CMSG_TOGGLE_PVP`.
+    TogglePvp,
+    /// `CMSG_TOGGLE_HELM`.
+    ToggleHelm,
+    /// `CMSG_TOGGLE_CLOAK`.
+    ToggleCloak,
+    /// `CMSG_ITEM_QUERY_SINGLE` for a template the UI asked about.
+    ItemQuery(u32),
+    /// A chat line on any lane; `target` is the whisper target or channel name.
+    ChatKind {
+        kind: u32,
+        target: Option<String>,
+        msg: String,
+    },
     /// `CMSG_GOSSIP_HELLO`: open the NPC's gossip/quest menu.
     GiverHello(u64),
     /// `CMSG_QUESTGIVER_QUERY_QUEST`: the accept panel for one quest.
@@ -903,6 +970,10 @@ enum Cmd {
         spell: u32,
         target: u64,
     },
+    /// `CMSG_CANCEL_CAST`: stop the spell being cast (the id is informational).
+    CancelCast(u32),
+    /// `CMSG_CANCEL_AURA`: cancel one of our own buffs by spell id.
+    CancelAura(u32),
     /// `CMSG_USE_ITEM`: bag 0xFF = equipped slot; `spell` is the item spell slot.
     UseItem {
         bag: u8,
@@ -1045,6 +1116,26 @@ struct Shared {
     /// The last logon's SRP6 session key, so `RealmPick`'s world connect
     /// re-authenticates on the same key. All-zero when no logon completed.
     session_key: Mutex<[u8; 40]>,
+    /// The unit the local player picked (`CMSG_SET_SELECTION`). The server never
+    /// echoes a selection back, so without this the UI cannot show a target.
+    selection: AtomicU64,
+    /// Player names from `SMSG_NAME_QUERY_RESPONSE`, keyed by guid.
+    names: Mutex<HashMap<u64, String>>,
+    /// Player guids a `CMSG_NAME_QUERY` was already sent for.
+    names_asked: Mutex<HashSet<u64>>,
+    /// The pending resurrection offer's caster and its popup flags
+    /// (`SMSG_RESURRECT_REQUEST`), 0 when none.
+    resurrect_from: AtomicU64,
+    resurrect_sickness: AtomicU32,
+    resurrect_has_timer: AtomicU32,
+    /// The spirit healer asking to confirm the XP loss
+    /// (`SMSG_SPIRIT_HEALER_CONFIRM`), 0 when none.
+    spirit_healer: AtomicU64,
+    /// `SMSG_CORPSE_RECLAIM_DELAY` in ms, 0 until the server sends one.
+    corpse_delay_ms: AtomicU32,
+    /// Whether our own guid is in melee auto-attack, from
+    /// `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP`.
+    self_attacking: AtomicU32,
     /// Latest player pose fed by the host (UE pawn) so the world worker can
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
@@ -1131,6 +1222,15 @@ fn shared() -> &'static Shared {
         rename_reply: Mutex::new(None),
         creds: Mutex::new(None),
         session_key: Mutex::new([0u8; 40]),
+        selection: AtomicU64::new(0),
+        names: Mutex::new(HashMap::new()),
+        names_asked: Mutex::new(HashSet::new()),
+        resurrect_from: AtomicU64::new(0),
+        resurrect_sickness: AtomicU32::new(0),
+        resurrect_has_timer: AtomicU32::new(0),
+        spirit_healer: AtomicU64::new(0),
+        corpse_delay_ms: AtomicU32::new(0),
+        self_attacking: AtomicU32::new(0),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -1141,12 +1241,209 @@ fn commands() -> &'static Mutex<Option<Sender<Cmd>>> {
     CMD.get_or_init(|| Mutex::new(None))
 }
 
-fn send_cmd(cmd: Cmd) -> bool {
+pub(crate) fn send_cmd(cmd: Cmd) -> bool {
     let guard = commands().lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
         Some(tx) => tx.send(cmd).is_ok(),
         None => false,
     }
+}
+
+// ---- snapshots for the UI feed ----
+//
+// The UI feed runs on the game thread while the session thread keeps writing the
+// shared state, so every accessor clones what it needs under its own lock and
+// returns; no lock is held while the Lua VM runs.
+
+/// One tracked object as the unit frames need it.
+pub(crate) struct UiUnitRec {
+    pub kind: u8,
+    pub fields: ObjectFields,
+    pub pos: [f32; 3],
+    pub facing: f32,
+}
+
+/// One tracked object by guid, cloned.
+pub(crate) fn ui_unit(guid: u64) -> Option<UiUnitRec> {
+    if guid == 0 {
+        return None;
+    }
+    let sh = shared();
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let rec = units.get(&guid)?;
+    Some(UiUnitRec {
+        kind: rec.kind,
+        fields: rec.fields.clone(),
+        pos: rec.pos,
+        facing: rec.facing,
+    })
+}
+
+pub(crate) fn ui_self_guid() -> u64 {
+    shared().self_guid.load(Ordering::SeqCst)
+}
+
+pub(crate) fn ui_selection() -> u64 {
+    shared().selection.load(Ordering::SeqCst)
+}
+
+pub(crate) fn ui_player() -> Option<BnNetPlayer> {
+    *shared().player.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn ui_names() -> HashMap<u64, String> {
+    shared()
+        .names
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// The roster row's name for `guid` (our own character's name arrives this way).
+pub(crate) fn ui_roster_name(guid: u64) -> Option<String> {
+    with_chars(|rows| {
+        rows.iter().find(|c| c.guid == guid).map(|c| {
+            unsafe { CStr::from_ptr(c.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    })
+    .flatten()
+}
+
+pub(crate) fn ui_creature(entry: u32) -> Option<CreatureTemplateLite> {
+    shared()
+        .creatures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&entry)
+        .cloned()
+}
+
+pub(crate) fn ui_quests() -> HashMap<u32, QuestTemplateLite> {
+    shared()
+        .quests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(id, q)| (*id, q.clone()))
+        .collect()
+}
+
+pub(crate) fn ui_item_info(entry: u32) -> BnNetItemInfo {
+    let templates = shared()
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    item_info_row(entry, &templates)
+}
+
+pub(crate) fn ui_spells() -> Vec<u32> {
+    shared()
+        .spells
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(crate) fn ui_actions() -> Vec<(u8, u8, u32)> {
+    shared()
+        .actions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(crate) fn ui_loot() -> BnNetLoot {
+    *shared().loot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn ui_giver() -> BnNetGiver {
+    *shared().giver.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn ui_vendor() -> BnNetVendor {
+    *shared().vendor.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The pending resurrection offer, as the death dialog's state.
+pub(crate) struct UiResurrect {
+    pub caster: u64,
+    pub sickness: bool,
+    pub has_timer: bool,
+}
+
+pub(crate) fn ui_resurrect() -> Option<UiResurrect> {
+    let sh = shared();
+    let caster = sh.resurrect_from.load(Ordering::SeqCst);
+    (caster != 0).then(|| UiResurrect {
+        caster,
+        sickness: sh.resurrect_sickness.load(Ordering::SeqCst) != 0,
+        has_timer: sh.resurrect_has_timer.load(Ordering::SeqCst) != 0,
+    })
+}
+
+pub(crate) fn ui_spirit_healer() -> u64 {
+    shared().spirit_healer.load(Ordering::SeqCst)
+}
+
+pub(crate) fn ui_corpse_delay_ms() -> u32 {
+    shared().corpse_delay_ms.load(Ordering::SeqCst)
+}
+
+/// Whether our own guid is in melee auto-attack (`SMSG_ATTACKSTART`).
+pub(crate) fn ui_self_attacking() -> bool {
+    shared().self_attacking.load(Ordering::SeqCst) != 0
+}
+
+/// Our own descriptor as the update carried it.
+pub(crate) fn ui_self_fields() -> Option<ObjectFields> {
+    let guid = ui_self_guid();
+    ui_unit(guid).map(|u| u.fields)
+}
+
+/// Our own cast in flight: `(spell id, elapsed seconds, duration seconds)`,
+/// straight off the `SMSG_SPELL_START` the server sent.
+pub(crate) fn ui_self_cast() -> Option<(u32, f32, f32)> {
+    let guid = ui_self_guid();
+    if guid == 0 {
+        return None;
+    }
+    let sh = shared();
+    let casts = sh.casts.lock().unwrap_or_else(|e| e.into_inner());
+    let cast = casts.get(&guid)?;
+    Some((
+        cast.spell_id,
+        cast.started.elapsed().as_secs_f32(),
+        cast.duration_ms as f32 / 1000.0,
+    ))
+}
+
+/// The live group roster, cloned.
+pub(crate) fn ui_party() -> BnNetParty {
+    *shared().party.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Every occupied inventory slot, in client order.
+pub(crate) fn ui_inventory() -> Vec<BnNetInvItem> {
+    inventory_rows(shared())
+}
+
+/// Every tracked object's guid, sorted.
+pub(crate) fn ui_unit_guids() -> Vec<u64> {
+    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guids: Vec<u64> = units.keys().copied().collect();
+    guids.sort_unstable();
+    guids
+}
+
+/// Every tracked unit's `UNIT_FIELD_TARGET`, for the token resolver's chains.
+pub(crate) fn ui_held_targets() -> HashMap<u64, u64> {
+    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    units
+        .iter()
+        .filter_map(|(guid, rec)| rec.fields.unit_target().map(|t| (*guid, t)))
+        .collect()
 }
 
 fn copy_name<const N: usize>(dst: &mut [c_char; N], name: &str) {
@@ -1559,6 +1856,9 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     let _ = session.attack_swing(guid);
                 }
                 Ok(Cmd::Target(guid)) => {
+                    // The wire has no selection echo; record it here so the target
+                    // frame and `PLAYER_TARGET_CHANGED` can follow the pick.
+                    sh.selection.store(guid, Ordering::SeqCst);
                     let _ = session.set_selection(guid);
                 }
                 Ok(Cmd::Loot(guid)) => {
@@ -1576,6 +1876,70 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::Repop) => {
                     if let Err(e) = session.repop_request() {
                         sh.event(format!("error|repop|{e}"));
+                    }
+                }
+                Ok(Cmd::ReclaimCorpse(corpse)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_RECLAIM_CORPSE,
+                        &benilla_protocol::messages::reclaim_corpse(corpse),
+                    );
+                }
+                Ok(Cmd::ResurrectResponse { caster, accept }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_RESURRECT_RESPONSE,
+                        &benilla_protocol::messages::resurrect_response(caster, accept),
+                    );
+                    sh.resurrect_from.store(0, Ordering::SeqCst);
+                }
+                Ok(Cmd::SpiritHealer(npc)) => {
+                    let _ = session.spirit_healer_activate(npc);
+                    sh.spirit_healer.store(0, Ordering::SeqCst);
+                }
+                Ok(Cmd::SelfRes) => {
+                    let _ = session.self_res();
+                }
+                Ok(Cmd::GossipSelect { npc, index }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_GOSSIP_SELECT_OPTION,
+                        &benilla_protocol::messages::gossip_select_option(npc, index, None),
+                    );
+                }
+                Ok(Cmd::GossipQuest { npc, quest }) => {
+                    let _ = session.questgiver_query_quest(npc, quest);
+                }
+                Ok(Cmd::QuestAbandon { slot }) => {
+                    let _ = session.questlog_remove_quest(slot);
+                }
+                Ok(Cmd::SetAction { slot, packed }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_SET_ACTION_BUTTON,
+                        &benilla_protocol::messages::set_action_button(slot, packed),
+                    );
+                }
+                Ok(Cmd::ActionBarToggles(toggles)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_SET_ACTIONBAR_TOGGLES,
+                        &benilla_protocol::messages::set_actionbar_toggles(toggles),
+                    );
+                }
+                Ok(Cmd::TogglePvp) => {
+                    let _ =
+                        session.send_body(benilla_protocol::messages::opcode::CMSG_TOGGLE_PVP, &[]);
+                }
+                Ok(Cmd::ToggleHelm) => {
+                    let _ = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_TOGGLE_HELM, &[]);
+                }
+                Ok(Cmd::ToggleCloak) => {
+                    let _ = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_TOGGLE_CLOAK, &[]);
+                }
+                Ok(Cmd::ItemQuery(entry)) => {
+                    let _ = session.item_query(entry, 0);
+                }
+                Ok(Cmd::ChatKind { kind, target, msg }) => {
+                    if let Err(e) = session.send_chat_kind(kind, target.as_deref(), &msg) {
+                        sh.event(format!("error|chat|{e}"));
                     }
                 }
                 Ok(Cmd::GiverHello(npc)) => {
@@ -1611,6 +1975,18 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         )),
                         Err(e) => sh.event(format!("error|cast|{e}")),
                     }
+                }
+                Ok(Cmd::CancelCast(spell)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_CANCEL_CAST,
+                        &spell.to_le_bytes(),
+                    );
+                }
+                Ok(Cmd::CancelAura(spell)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_CANCEL_AURA,
+                        &spell.to_le_bytes(),
+                    );
                 }
                 Ok(Cmd::UseItem { bag, slot, spell }) => {
                     if let Err(e) = session.use_item(bag, slot, spell) {
@@ -1904,6 +2280,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 flush_item_queries(session, sh);
                 queue_self_quests(session, sh);
                 queue_creature_names(session, sh);
+                queue_player_names(session, sh);
             }
             Err(e) => {
                 // A read deadline is the normal quiet path; anything else ends
@@ -2081,9 +2458,35 @@ fn queue_creature_names(session: &mut WorldSession, sh: &Shared) {
     }
 }
 
+/// Ask the server for the names of the players in the stream window (the target
+/// frame's `UnitName`). Other players' descriptors carry no name, and the roster
+/// only names our own row. Two per packet, as for creatures.
+fn queue_player_names(session: &mut WorldSession, sh: &Shared) {
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let mut asked: Vec<u64> = Vec::new();
+    {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = sh.names_asked.lock().unwrap_or_else(|e| e.into_inner());
+        for (guid, rec) in units.iter() {
+            if rec.kind != 4 || *guid == self_guid {
+                continue;
+            }
+            if seen.insert(*guid) {
+                asked.push(*guid);
+                if asked.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+    for guid in asked {
+        let _ = session.name_query(guid);
+    }
+}
+
 /// Build the item info row for one entry (empty when the query has not
 /// answered yet).
-fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetItemInfo {
+pub(crate) fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetItemInfo {
     let mut row = BnNetItemInfo {
         entry,
         ..Default::default()
@@ -2108,7 +2511,7 @@ fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetIte
 
 /// Every occupied slot of the player's own inventory, in client order:
 /// equipment 0..18, backpack, then the four equipped bags.
-fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
+pub(crate) fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
     let self_guid = sh.self_guid.load(Ordering::SeqCst);
     let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
     let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
@@ -2236,10 +2639,11 @@ fn apply_object(obj: &Object, sh: &Shared) {
                 Some((v, o)) => ([v.x, v.y, v.z], o),
                 None => ([0.0; 3], 0.0),
             };
+            let kind = object_kind(*object_type);
             units.insert(
                 *guid,
                 UnitRec {
-                    kind: object_kind(*object_type),
+                    kind,
                     fields: mask.clone(),
                     pos,
                     facing,
@@ -2299,7 +2703,9 @@ fn refresh_player(sh: &Shared) {
         target: f.unit_target().unwrap_or(0),
         mount: f.unit_mount_display_id(),
         combo: f.player_combo_points().unwrap_or(0),
-        dead: f.unit_is_dead() as u8,
+        // `0x605f30`: a ghost carries health 1, so `unit_is_dead` alone leaves
+        // the death screen and Release Spirit unreachable.
+        dead: f.is_dead_or_ghost() as u8,
         stat: std::array::from_fn(|i| f.unit_stat(i as u8).unwrap_or(0)),
         armor: f.unit_resistance(0).unwrap_or(0),
         attack_power: f.unit_attack_power().unwrap_or(0),
@@ -2345,6 +2751,41 @@ fn refresh_player(sh: &Shared) {
 
 fn handle_packet(packet: &ServerPacket, sh: &Shared) {
     match packet {
+        // The unit frames' names: `CMSG_NAME_QUERY` is asked once per player guid
+        // (queue_player_names); an empty name is the server's unknown answer.
+        ServerPacket::NameQueryResponse { guid, name, .. } => {
+            if !name.is_empty() {
+                sh.names
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(*guid, name.clone());
+            }
+        }
+        // The death UI's inputs: the offer the DEATH/RESURRECT dialog answers,
+        // the spirit healer's confirm, the reclaim delay and our own combat latch.
+        ServerPacket::ResurrectRequest(r) => {
+            sh.resurrect_from.store(r.caster, Ordering::SeqCst);
+            sh.resurrect_sickness
+                .store(u32::from(r.sickness), Ordering::SeqCst);
+            sh.resurrect_has_timer
+                .store(u32::from(r.has_timer), Ordering::SeqCst);
+        }
+        ServerPacket::SpiritHealerConfirm { npc } => {
+            sh.spirit_healer.store(*npc, Ordering::SeqCst);
+        }
+        ServerPacket::CorpseReclaimDelay { delay_ms } => {
+            sh.corpse_delay_ms.store(*delay_ms, Ordering::SeqCst);
+        }
+        ServerPacket::AttackStart { attacker, .. } => {
+            if *attacker == sh.self_guid.load(Ordering::SeqCst) {
+                sh.self_attacking.store(1, Ordering::SeqCst);
+            }
+        }
+        ServerPacket::AttackStop { attacker, .. } => {
+            if *attacker == sh.self_guid.load(Ordering::SeqCst) {
+                sh.self_attacking.store(0, Ordering::SeqCst);
+            }
+        }
         ServerPacket::MessageChat(msg) => {
             // chat|<type>|<sender>|<text>: the host feeds its chat frame. Types
             // follow the client's ChatType ids (0x00 say, 0x0A system, ...).
@@ -2458,12 +2899,16 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     subname: i.subname.clone(),
                     creature_type: i.creature_type,
                     rank: i.rank,
+                    civilian: i.civilian,
+                    racial_leader: i.racial_leader,
                 },
                 None => CreatureTemplateLite {
                     name: String::new(),
                     subname: String::new(),
                     creature_type: 0,
                     rank: 0,
+                    civilian: false,
+                    racial_leader: false,
                 },
             };
             sh.creatures
@@ -2564,6 +3009,21 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     title: t.title.clone(),
                     objectives: t.objectives_text.clone(),
                     details: t.details.clone(),
+                    end_text: t.end_text.clone(),
+                    src_item_id: t.src_item_id,
+                    objective_rows: t
+                        .objectives
+                        .iter()
+                        .map(|o| QuestObjectiveLite {
+                            creature_or_go: o.creature_or_go,
+                            required_count: o.required_count,
+                            item_id: o.item_id,
+                            item_count: o.item_count,
+                            text: o.text.clone(),
+                        })
+                        .collect(),
+                    rewards: t.rewards,
+                    choices: t.choices,
                 },
             );
             // Pipes would break the host's field split; quest titles have none
@@ -3698,13 +4158,33 @@ pub extern "C" fn bn_net_set_pose(x: f32, y: f32, z: f32, yaw: f32) -> u32 {
 /// Positive turn = right, negative = left. The world worker uses these to
 /// drive the MSG_MOVE_START/STOP opcode edges vmangos requires — only
 /// heartbeats would leave the server stuck with FORWARD set forever.
+///
+/// While the stock UI's bindings hold a movement key (`ui_set_move`), the
+/// heartbeats follow the bindings and the host's raw key state is ignored, so
+/// the server sees exactly the axes the world frame started.
 #[no_mangle]
 pub extern "C" fn bn_net_set_input(forward: f32, strafe: f32, turn: f32) -> u32 {
+    if UI_MOVE.load(Ordering::SeqCst) {
+        return 1;
+    }
     *shared()
         .last_input
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = (forward, strafe, turn);
     1
+}
+
+/// The stock UI's held axes, written by the binding drain each frame:
+/// `held` marks a binding-owned axis, after which the host's per-frame
+/// `bn_net_set_input` no longer writes the heartbeat inputs.
+static UI_MOVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn ui_set_move(forward: f32, strafe: f32, turn: f32, held: bool) {
+    UI_MOVE.store(held, Ordering::SeqCst);
+    *shared()
+        .last_input
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = (forward, strafe, turn);
 }
 
 /// Fill `out` with the logged-in player's descriptor state. Returns 1 when a

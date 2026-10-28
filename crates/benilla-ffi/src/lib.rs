@@ -75,6 +75,10 @@ mod creature;
 
 mod exterior;
 
+// ---- In-game interface feed: session state in, FrameXML model; verbs back out ----
+
+mod ui_feed;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -5492,6 +5496,10 @@ fn mat4_mul(a: &BnMat4, b: &BnMat4) -> BnMat4 {
 /// A single M2 bone parsed from a 108-byte record.
 
 pub(crate) struct BnBone {
+    /// `keyBoneId` (record +0): 4 is SpineLow, the root of the upper-body
+    /// subtree the vanilla one-shots mask onto.
+    key_bone: u16,
+
     parent: i16,
 
     pivot: [f32; 3],
@@ -5520,6 +5528,8 @@ pub(crate) fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
         let rec = ofs as usize + i * 108;
 
         let parent = rd_u16(bytes, rec + 8)? as i16;
+
+        let key_bone = rd_u32(bytes, rec).unwrap_or(0) as u16;
 
         let mut px = rd_f32(bytes, rec + 96)?;
 
@@ -5550,6 +5560,7 @@ pub(crate) fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
         let scale = F32Track::parse(bytes, rec + 68, anim_count);
 
         out.push(BnBone {
+            key_bone,
             parent,
             pivot,
             trans,
@@ -5561,9 +5572,8 @@ pub(crate) fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
     Some(out)
 }
 
-/// Compute the model-space 4x4 matrix for bone `i` at (anim_index, time_ms).
-
-/// Mirrors the client's Bone::calcMatrix exactly:
+/// The bone's parent-relative matrix at (anim, time_ms), the client's
+/// Bone::calcMatrix without the hierarchy walk:
 
 /// m = T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot)
 
@@ -5573,7 +5583,7 @@ pub(crate) fn parse_m2_bones(bytes: &[u8]) -> Option<Vec<BnBone>> {
 
 /// UE axes (x, -y, z) at parse time; trans/quat are flipped here to match.
 
-pub(crate) fn bone_matrix_at(
+pub(crate) fn bone_local_matrix(
     bones: &[BnBone],
 
     anim: usize,
@@ -5650,20 +5660,168 @@ pub(crate) fn bone_matrix_at(
         m = mat4_mul(&m, &tneg);
     }
 
-    if b.parent >= 0 && (b.parent as usize) < bones.len() {
+    m
+}
+
+/// Compute the model-space 4x4 matrix for bone `i` at (anim_index, time_ms):
+/// the local matrix composed up the parent chain.
+pub(crate) fn bone_matrix_at(
+    bones: &[BnBone],
+
+    anim: usize,
+
+    time_ms: u32,
+
+    global_time_ms: u32,
+
+    global_seqs: &[u32],
+
+    i: usize,
+) -> BnMat4 {
+    let mut m = bone_local_matrix(bones, anim, time_ms, global_time_ms, global_seqs, i);
+
+    let parent = bones[i].parent;
+
+    if parent >= 0 && (parent as usize) < bones.len() {
         let pmat = bone_matrix_at(
             bones,
             anim,
             time_ms,
             global_time_ms,
             global_seqs,
-            b.parent as usize,
+            parent as usize,
         );
 
         m = mat4_mul(&pmat, &m);
     }
 
     m
+}
+
+/// The bones the upper-body mask covers: the bone whose `keyBoneId` is `key`
+/// (4, SpineLow) — or 6 (Head) for a model without a 4 — and every descendant.
+/// A one-shot posed on these alone is the vanilla `SpineLow` layer.
+pub(crate) fn upper_subtree(bones: &[BnBone], key: u16) -> Vec<bool> {
+    let mut mark = vec![false; bones.len()];
+
+    let Some(root) = bones
+        .iter()
+        .position(|b| b.key_bone == key)
+        .or_else(|| bones.iter().position(|b| b.key_bone == 6))
+    else {
+        return mark;
+    };
+
+    mark[root] = true;
+
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+
+        for i in 0..bones.len() {
+            let p = bones[i].parent;
+
+            if p >= 0 && (p as usize) < bones.len() && mark[p as usize] && !mark[i] {
+                mark[i] = true;
+
+                changed = true;
+            }
+        }
+    }
+
+    mark
+}
+
+/// Compose one global matrix per bone from local matrices, memoised per bone.
+fn compose_globals(
+    bones: &[BnBone],
+    locals: &[BnMat4],
+    i: usize,
+    memo: &mut [Option<BnMat4>],
+) -> BnMat4 {
+    if let Some(m) = memo[i] {
+        return m;
+    }
+
+    let parent = bones[i].parent;
+
+    let m = if parent >= 0 && (parent as usize) < bones.len() {
+        let pmat = compose_globals(bones, locals, parent as usize, memo);
+
+        mat4_mul(&pmat, &locals[i])
+    } else {
+        locals[i]
+    };
+
+    memo[i] = Some(m);
+
+    m
+}
+
+/// The masked rig: two clips' local matrices, the upper subtree taken from
+/// `over` and every other bone from `base`, then each global matrix eased from
+/// the base pose to that pose by `weight`.
+pub(crate) fn masked_bone_matrices(
+    bones: &[BnBone],
+
+    global_seqs: &[u32],
+
+    base: (usize, u32, u32),
+
+    over: (usize, u32, u32),
+
+    weight: f32,
+
+    upper: &[bool],
+) -> Vec<BnMat4> {
+    let n = bones.len();
+
+    let base_locals: Vec<BnMat4> = (0..n)
+        .map(|i| bone_local_matrix(bones, base.0, base.1, base.2, global_seqs, i))
+        .collect();
+
+    let over_locals: Vec<BnMat4> = (0..n)
+        .map(|i| bone_local_matrix(bones, over.0, over.1, over.2, global_seqs, i))
+        .collect();
+
+    let mut base_memo = vec![None; n];
+
+    let mut base_globals = Vec::with_capacity(n);
+
+    for i in 0..n {
+        base_globals.push(compose_globals(bones, &base_locals, i, &mut base_memo));
+    }
+
+    let mut over_used = base_locals.clone();
+
+    for i in 0..n {
+        if upper.get(i).copied().unwrap_or(false) {
+            over_used[i] = over_locals[i];
+        }
+    }
+
+    let mut over_memo = vec![None; n];
+
+    let w = weight.clamp(0.0, 1.0);
+
+    (0..n)
+        .map(|i| {
+            // Outside the subtree the two poses are identical, so the easing is
+            // a no-op there and exact inside it.
+            let over = compose_globals(bones, &over_used, i, &mut over_memo);
+
+            let mut m = base_globals[i];
+
+            if w > 0.0 {
+                for k in 0..16 {
+                    m[k] += (over[k] - base_globals[i][k]) * w;
+                }
+            }
+
+            m
+        })
+        .collect()
 }
 
 /// All bones' model-space 4x4 matrices at (anim, time_ms).
@@ -5775,6 +5933,35 @@ pub fn m2_skinned_positions_rig(
         .map(|i| bone_matrix_at(bones, anim, time_ms, global_time_ms, global_seqs, i))
         .collect();
 
+    skin_vertices(model, &mats)
+}
+
+/// Skinned vertices for a masked two-clip pose: `base` animates everything,
+/// `over` takes the upper-body subtree (key bone 4, SpineLow), and `weight`
+/// eases between the two.
+pub fn m2_skinned_positions_rig_masked(
+    model: &benilla_m2::M2Model,
+
+    global_seqs: &[u32],
+
+    bones: &[BnBone],
+
+    base: (usize, u32, u32),
+
+    over: (usize, u32, u32),
+
+    weight: f32,
+) -> Vec<[f32; 3]> {
+    let upper = upper_subtree(bones, 4);
+
+    let mats = masked_bone_matrices(bones, global_seqs, base, over, weight, &upper);
+
+    skin_vertices(model, &mats)
+}
+
+/// Blend the vertices through their 4 bone matrices: the reference
+/// model.cpp loop (`v += mat*pos * (w/255)`), in UE axes.
+fn skin_vertices(model: &benilla_m2::M2Model, mats: &[BnMat4]) -> Vec<[f32; 3]> {
     let apply = |m: &BnMat4, v: [f32; 3]| -> [f32; 3] {
         // ROW-MAJOR: out.x = m[0][0]*v0 + m[0][1]*v1 + m[0][2]*v2 + m[0][3]
 
@@ -6232,6 +6419,75 @@ pub extern "C" fn bn_model_skinned_positions(
         &rig.bones,
         anim_idx as usize,
         time_ms,
+    );
+
+    let n = verts.len().min(cap as usize);
+
+    for (i, v) in verts.iter().take(n).enumerate() {
+        unsafe {
+            *out.add(i * 3) = v[0];
+
+            *out.add(i * 3 + 1) = v[1];
+
+            *out.add(i * 3 + 2) = v[2];
+        }
+    }
+
+    n as u32
+}
+
+/// Skinned vertex positions in UE axes for a masked two-clip pose: the base
+/// anim drives the whole model, the overlay anim the upper-body subtree
+/// (`keyBoneId` 4, SpineLow), and `weight` eases between them. `out` must hold
+/// `vertex_count * 3` floats. Returns the number of vertices written.
+#[no_mangle]
+
+pub extern "C" fn bn_model_skinned_positions_masked(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base_anim: u32,
+
+    base_ms: u32,
+
+    over_anim: u32,
+
+    over_ms: u32,
+
+    weight: f32,
+
+    out: *mut f32,
+
+    cap: u32,
+) -> u32 {
+    if world.is_null() || model_path.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let p = match cstr_to_str(model_path) {
+        Some(s) => s,
+
+        None => return 0,
+    };
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    let rig = match m2_rig_cached(&w.archives, p) {
+        Some(r) => r,
+
+        None => return 0,
+    };
+
+    let verts = m2_skinned_positions_rig_masked(
+        rig.cached.format.model(),
+        &rig.global_seqs,
+        &rig.bones,
+        (base_anim as usize, base_ms, base_ms),
+        (over_anim as usize, over_ms, over_ms),
+        weight,
     );
 
     let n = verts.len().min(cap as usize);
@@ -6911,16 +7167,24 @@ const UI_DUMP_WALK_LUA: &str = r#"
     return table.concat(out, "\n")
 "#;
 
-/// Load the stock interface into a fresh in-game VM: every row of the chain's
-/// `Interface\FrameXML\FrameXML.toc`, in order (`.lua` runs as a chunk, `.xml`
-/// through the official loader). File and loader failures are tolerated and
-/// skipped. Returns the live frame count at load end, or 0 on failure.
+/// Load the stock interface into a fresh in-game VM: the chain's key sets first
+/// (stock `ActionButton_OnLoad` paints its hotkey corner from `GetBindingKey`),
+/// then every row of the chain's `Interface\FrameXML\FrameXML.toc`, in order
+/// (`.lua` runs as a chunk, `.xml` through the official loader), then the core
+/// `Interface\FrameXML\Bindings.xml` whose commands the key dispatch runs. File
+/// and loader failures are tolerated and skipped. Returns the live frame count
+/// at load end, or 0 on failure.
 #[no_mangle]
-pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
+pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
     if world.is_null() {
         return 0;
     }
-    // SAFETY: caller guarantees a valid exclusive handle for the call's span.
+    // The feed's catalogs need the chain mutably, so it binds the world first,
+    // in its own borrow scope, before this call takes the chain to read from.
+    ui_feed::attach(world);
+    // Latches name commands of the VM that made them; a new load clears them.
+    BN_LATCH.with(|l| l.borrow_mut().clear());
+    // SAFETY: caller guarantees a valid handle for the call's span.
     let w = unsafe { &*world };
     let Some(chain) = w.chain.as_ref() else {
         return 0;
@@ -6929,6 +7193,16 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
         let Ok(mut script) = benilla_ui::script::UiScript::new() else {
             return 0u32;
         };
+        // `WTF\DefaultBindings.wtf`, set 0 (`0x4b62b0`), then set 1 live as a
+        // first login's account set is.
+        let defaults = chain
+            .read(r"WTF\DefaultBindings.wtf")
+            .map(|bytes| {
+                benilla_ui::script::keybind::parse_bindings_wtf(&benilla_ui::source::decode(&bytes))
+            })
+            .unwrap_or_default();
+        script.set_default_bindings(defaults);
+        script.load_binding_set(1);
         let toc_bytes = chain
             .read(r"Interface\FrameXML\FrameXML.toc")
             .unwrap_or_default();
@@ -6968,13 +7242,28 @@ pub extern "C" fn bn_ui_load(world: *const BnWorld) -> u32 {
                 ),
             );
         }
+        // `UI_Init`'s next step after the toc walk (`0x490018`): the core's
+        // `Bindings.xml`, whose commands are the bodies key dispatch runs.
+        let mut bindings_loaded = 0;
+        match chain.read(r"Interface\FrameXML\Bindings.xml") {
+            Ok(bytes) => {
+                match benilla_ui::bindings_xml::parse(&benilla_ui::source::decode(&bytes)) {
+                    Ok(bindings) => {
+                        bindings_loaded = bindings.len();
+                        script.register_bindings(&bindings);
+                    }
+                    Err(e) => failures.push(format!("Interface\\FrameXML\\Bindings.xml: {e}")),
+                }
+            }
+            Err(_) => failures.push("Interface\\FrameXML\\Bindings.xml: not found".into()),
+        }
         let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
         // The load's last step is arming `PLAYER_LOGIN`;
         // `bn_ui_world_enter` spends it once the player is in the world.
         script.arm_player_login();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
         eprintln!(
-            "bn_ui_load: {} toc rows, {} failures, {frames} frames",
+            "bn_ui_load: {} toc rows, {bindings_loaded} bindings, {} failures, {frames} frames",
             rows,
             failures.len()
         );
@@ -8396,8 +8685,17 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
             };
             if script.vm_kind() == benilla_ui::script::VmKind::Glue {
                 sync_menu(script);
+            } else {
+                // Live session state in (unit tokens, money, actions, auras,
+                // loot, party, death), before the frame's OnUpdates read it.
+                ui_feed::sync(script, elapsed);
             }
             script.tick(elapsed);
+            if script.vm_kind() == benilla_ui::script::VmKind::InGame {
+                // The frame's verbs back out: action uses, casts, selection,
+                // loot, the death dialog, chat, and the movement bindings.
+                ui_feed::intents(script);
+            }
             for e in script.take_errors() {
                 eprintln!("bn_ui_tick: {e}");
             }
@@ -8505,13 +8803,62 @@ fn editbox_chord(key: &str, mods: u32) -> Option<benilla_ui::widget::EditAction>
     }
 }
 
+// The keys a binding press latched, with the command each runs on release. The
+// latch names a command of the VM that made it, so a reload clears it (the
+// reference keeps a held key running through `ReloadUI`; here it re-latches on
+// its next press).
+thread_local! {
+    static BN_LATCH: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The chord string a press makes: 1.12's `[ALT-][CTRL-][SHIFT-]<TOKEN>` prefix
+/// order (`Blizzard_BindingUI.lua:176-182`), the token upper-cased as the table
+/// stores letters.
+fn chord_of(name: &str, mods: u32) -> String {
+    let mut out = String::new();
+    if mods & 4 != 0 {
+        out.push_str("ALT-");
+    }
+    if mods & 2 != 0 {
+        out.push_str("CTRL-");
+    }
+    if mods & 1 != 0 {
+        out.push_str("SHIFT-");
+    }
+    out.push_str(&name.to_ascii_uppercase());
+    out
+}
+
+/// The one retry after an exact chord misses: the leftmost modifier dropped
+/// (ALT, then CTRL, then SHIFT) (`0x4b7990`), never a second time.
+fn chord_fallback(chord: &str) -> Option<&str> {
+    ["ALT-", "CTRL-", "SHIFT-"]
+        .iter()
+        .find_map(|p| chord.strip_prefix(p))
+}
+
+/// The command a press runs: its chord's, else the fallback chord's.
+fn resolve_binding(script: &benilla_ui::script::UiScript, name: &str, mods: u32) -> Option<String> {
+    let chord = chord_of(name, mods);
+    let keys = script.binding_keys();
+    if let Some((_, command)) = keys.iter().find(|(key, _)| *key == chord) {
+        return Some(command.clone());
+    }
+    let fallback = chord_fallback(&chord)?;
+    keys.iter()
+        .find(|(key, _)| key.as_str() == fallback)
+        .map(|(_, command)| command.clone())
+}
+
 /// Press or release a key by WoW name ("A", "ENTER", "LEFT", ...). `mods` is
 /// the chord state (bit0 Shift, bit1 Ctrl, bit2 Alt; for a modifier's own
 /// event include its own bit — the state after the event), `down` 1 = press.
 /// A press runs the key-down walk and, when it lands on an EditBox, our keymap
-/// applies the key's editing action (the client's host job). Returns the
-/// KeyWalk of a press (0 declined / 1 frame / 2 box), 1/0 taken for a release,
-/// 0 with no session.
+/// applies the key's editing action (the client's host job); a press the walk
+/// declines runs the world frame's binding here (the middle layer keeps the
+/// chord table, leaving the UE side a pure event forwarder). Returns 1 when a
+/// press ran a binding, the KeyWalk of a press otherwise (0 declined / 1 frame
+/// / 2 box), 1/0 taken for a release, 0 with no session.
 #[no_mangle]
 pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
     if key.is_null() {
@@ -8536,13 +8883,62 @@ pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
                         script.editbox_action(action);
                     }
                 }
-                match walk {
-                    benilla_ui::script::KeyWalk::Declined => 0u32,
-                    benilla_ui::script::KeyWalk::Frame => 1,
-                    benilla_ui::script::KeyWalk::Box => 2,
+                if walk != benilla_ui::script::KeyWalk::Declined {
+                    return match walk {
+                        benilla_ui::script::KeyWalk::Frame => 1,
+                        _ => 2,
+                    };
                 }
+                // A focused box owns the keyboard; an alt-arrow box leaves the
+                // arrows through, and every box declines PRINTSCREEN (`0x77b17f`).
+                let token = name.to_ascii_uppercase();
+                let arrow = matches!(token.as_str(), "LEFT" | "RIGHT" | "UP" | "DOWN");
+                let print = token == "PRINTSCREEN";
+                if script.has_keyboard_focus()
+                    && !print
+                    && !(arrow && script.editbox_alt_arrow_mode())
+                {
+                    return 0;
+                }
+                // A press for a key already latched is a repeat.
+                if BN_LATCH.with(|l| l.borrow().iter().any(|(k, _)| k == name)) {
+                    return 0;
+                }
+                let Some(command) = resolve_binding(script, name, mods) else {
+                    return 0;
+                };
+                // The world frame's key-down ran it, so its key-up and repeats
+                // are the world frame's (`0x483b70`).
+                script.note_world_key(name);
+                let _ = script.execute_binding(&command, true);
+                BN_LATCH.with(|l| l.borrow_mut().push((name.to_owned(), command)));
+                1
             } else {
-                u32::from(script.key_up(name).taken())
+                let latched = BN_LATCH.with(|l| {
+                    let mut l = l.borrow_mut();
+                    l.iter().position(|(k, _)| k == name).map(|i| l.remove(i))
+                });
+                if let Some((_, command)) = latched {
+                    // The up-half runs before the release reaches a frame, in
+                    // key order, and a focused box never eats a latched release.
+                    let _ = script.execute_binding(&command, false);
+                    let _ = script.key_up(name);
+                    return 1;
+                }
+                let up = script.key_up(name);
+                // An up alone (PRINTSCREEN on Windows, `VK_SNAPSHOT`) whose walk
+                // declines runs the chord as a press, with no latch since no
+                // release follows (`0x76603c`-`0x76604d`).
+                if up == benilla_ui::script::KeyUp::Walked(benilla_ui::script::KeyWalk::Declined)
+                    && !script.has_keyboard_focus()
+                {
+                    if let Some(command) = resolve_binding(script, name, mods) {
+                        script.note_world_key(name);
+                        let _ = script.execute_binding(&command, true);
+                        return 1;
+                    }
+                }
+                u32::from(up.taken())
             }
         })
     }));
