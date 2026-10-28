@@ -88,6 +88,7 @@ mod chat_vm;
 // ---- The gossip menu: the text latch, the stock `GossipFrame`'s show, its selects ----
 
 mod gossip_vm;
+mod quest_log_vm;
 
 // ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
 
@@ -9581,6 +9582,7 @@ pub extern "C" fn bn_ui_eval(code: *const c_char, buf: *mut c_char, cap: u32) ->
                         Ok(v) => Some(match v {
                             Value::Nil => String::new(),
                             Value::String(s) => s.to_string_lossy().to_string(),
+                            Value::Integer(n) => format!("{n}"),
                             Value::Number(n) => format!("{n}"),
                             Value::Boolean(b) if b => "true".to_string(),
                             Value::Boolean(_) => "false".to_string(),

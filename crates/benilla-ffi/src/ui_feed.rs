@@ -15,17 +15,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use benilla_formats::{
     load_chr_classes, load_chr_races, load_creature_type_table, load_faction_catalog,
-    load_item_display_catalog, load_race_pvp_teams, load_skill_line_catalog, load_spell_catalog,
-    ChrClasses, ChrRaces, CreatureTypeTable, FactionCatalog, FactionTemplate, ItemDisplayCatalog,
-    Reaction, SkillLineCatalog, SpellCatalog,
+    load_item_display_catalog, load_quest_header_names, load_quest_tag_names, load_race_pvp_teams,
+    load_skill_line_catalog, load_spell_catalog, ChrClasses, ChrRaces, CreatureTypeTable,
+    FactionCatalog, FactionTemplate, ItemDisplayCatalog, QuestHeaderNames, QuestTagNames, Reaction,
+    SkillLineCatalog, SpellCatalog,
 };
 use benilla_protocol::messages::ObjectFields;
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState, NearestMode,
-    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall,
-    ScriptValue, SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView,
-    UiScript, UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
+    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall, ScriptValue,
+    SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript,
+    UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -49,14 +50,18 @@ thread_local! {
 }
 
 /// Every client table the feed reads beside a descriptor, loaded once per UI load.
-struct Catalogs {
+pub(crate) struct Catalogs {
     races: Option<ChrRaces>,
     classes: Option<ChrClasses>,
     spells: Option<SpellCatalog>,
-    items: Option<ItemDisplayCatalog>,
+    pub(crate) items: Option<ItemDisplayCatalog>,
     factions: Option<FactionCatalog>,
     creature_types: Option<CreatureTypeTable>,
     skills: Option<SkillLineCatalog>,
+    /// `QuestHeaderList.dbc`: the `ZoneOrSort` id behind each quest-log group's title.
+    pub(crate) quest_headers: Option<QuestHeaderNames>,
+    /// `QuestInfo.dbc`: the bare tag word behind a quest-log row.
+    pub(crate) quest_tags: Option<QuestTagNames>,
     race_teams: HashMap<u8, i8>,
 }
 
@@ -71,6 +76,8 @@ impl Catalogs {
                 factions: None,
                 creature_types: None,
                 skills: None,
+                quest_headers: None,
+                quest_tags: None,
                 race_teams: HashMap::new(),
             };
         };
@@ -82,6 +89,8 @@ impl Catalogs {
             factions: load_faction_catalog(chain).ok(),
             creature_types: load_creature_type_table(chain).ok(),
             skills: load_skill_line_catalog(chain).ok(),
+            quest_headers: load_quest_header_names(chain).ok(),
+            quest_tags: load_quest_tag_names(chain).ok(),
             race_teams: load_race_pvp_teams(chain).unwrap_or_default(),
         }
     }
@@ -276,7 +285,7 @@ impl Feed {
     }
 }
 
-fn cstr<const N: usize>(buf: &[std::ffi::c_char; N]) -> String {
+pub(crate) fn cstr<const N: usize>(buf: &[std::ffi::c_char; N]) -> String {
     let bytes: Vec<u8> = buf
         .iter()
         .take_while(|&&c| c != 0)
@@ -304,10 +313,26 @@ fn quality_color(quality: u32) -> &'static str {
 }
 
 /// One item hyperlink as `0x52adb0` builds it: colour, `|Hitem:…|h[Name]|h`, reset.
-fn item_link(item_id: u32, name: &str, quality: u32) -> String {
+pub(crate) fn item_link(item_id: u32, name: &str, quality: u32) -> String {
     format!(
         "|c{}|Hitem:{item_id}:0:0:0|h[{name}]|h|r",
         quality_color(quality)
+    )
+}
+
+/// One template item's `(name, quality, icon)` off its `BnNetItemInfo` row and the display catalog;
+/// the name is `None` while the item query is still out.
+pub(crate) fn item_look(
+    info: &net::BnNetItemInfo,
+    cats: Option<&Catalogs>,
+) -> (Option<String>, u32, Option<String>) {
+    let name = cstr(&info.name);
+    (
+        (!name.is_empty()).then_some(name),
+        info.quality,
+        cats.and_then(|c| c.items.as_ref())
+            .and_then(|t| t.get(info.display_id))
+            .and_then(|d| norm_icon(d.icon.clone())),
     )
 }
 
@@ -1503,6 +1528,8 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     crate::gossip_vm::feed(script);
     CATS.with(|c| {
         let cats = c.borrow();
+        // The quest log likewise lists what this pushes: our slots whose template has landed.
+        crate::quest_log_vm::feed(script, cats.as_ref());
         // The questgiver marker sweep rides the UI tick, where the catalog and our own
         // descriptor meet (`crates/benilla-app/src/quest_markers`).
         crate::quest_markers::sweep(&own, cats.as_ref().and_then(|c| c.factions.as_ref()));
@@ -1893,7 +1920,10 @@ fn giver_intents(script: &mut UiScript) {
             continue;
         }
         if let Some(q) = crate::gossip_vm::quest_at(pos) {
-            net::note(format!("giver|quest-row|{gossip_npc:#x}|{}|{}", q.quest_id, q.icon));
+            net::note(format!(
+                "giver|quest-row|{gossip_npc:#x}|{}|{}",
+                q.quest_id, q.icon
+            ));
             let _ = net::send_cmd(quest_row_cmd(gossip_npc, q.quest_id, q.icon));
         }
     }
@@ -1905,11 +1935,7 @@ fn giver_intents(script: &mut UiScript) {
             .copied()
             .filter(|&(_, icon)| matches!(icon, 3 | 4) == sel.active)
             .collect();
-        if let Some(&(quest, icon)) = sel
-            .index
-            .checked_sub(1)
-            .and_then(|i| pool.get(i as usize))
-        {
+        if let Some(&(quest, icon)) = sel.index.checked_sub(1).and_then(|i| pool.get(i as usize)) {
             net::note(format!("giver|quest-pick|{npc:#x}|{quest}|{icon}"));
             let _ = net::send_cmd(quest_row_cmd(npc, quest, icon));
         }

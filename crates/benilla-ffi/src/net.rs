@@ -423,6 +423,8 @@ pub(crate) struct QuestObjectiveLite {
 pub(crate) struct QuestTemplateLite {
     pub level: u32,
     pub zone: i32,
+    /// `QuestInfo.dbc`'s row id, which the quest log's tag name resolves through.
+    pub quest_type: u32,
     pub money: i32,
     pub flags: u32,
     pub title: String,
@@ -430,6 +432,7 @@ pub(crate) struct QuestTemplateLite {
     pub details: String,
     pub end_text: String,
     pub src_item_id: u32,
+    pub reward_spell: u32,
     pub objective_rows: Vec<QuestObjectiveLite>,
     pub rewards: [(u32, u32); 4],
     pub choices: [(u32, u32); 6],
@@ -1865,6 +1868,7 @@ fn worker(
                 sh.self_guid.store(guid, Ordering::SeqCst);
                 sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 crate::gossip_vm::clear_session();
+                crate::quest_log_vm::clear_session();
                 *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 sh.set(ST_ENTERING);
                 sh.event(format!("enter|{guid}"));
@@ -3312,6 +3316,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 QuestTemplateLite {
                     level: t.level,
                     zone: t.zone_or_sort,
+                    quest_type: t.quest_type,
                     money: t.money,
                     flags: t.flags,
                     title: t.title.clone(),
@@ -3319,6 +3324,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     details: t.details.clone(),
                     end_text: t.end_text.clone(),
                     src_item_id: t.src_item_id,
+                    reward_spell: t.reward_spell,
                     objective_rows: t
                         .objectives
                         .iter()
@@ -3452,7 +3458,12 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         // packet, queries the greeting it lacks, and shows the stock `GossipFrame` once the text
         // lands — the reference's `0x4e26e0`. The `BnNetGiver` snapshot keeps feeding the host's
         // quest panels and its `bn.Ui giver` probe.
-        ServerPacket::GossipMessage { npc, text_id, options, quests } => {
+        ServerPacket::GossipMessage {
+            npc,
+            text_id,
+            options,
+            quests,
+        } => {
             let mut giver = BnNetGiver {
                 npc: *npc,
                 mode: 1,
@@ -3473,13 +3484,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             let gender = ui_unit(*npc)
                 .and_then(|u| u.fields.unit_gender())
                 .unwrap_or(0);
-            if crate::gossip_vm::open(
-                *npc,
-                *text_id,
-                options.clone(),
-                quests.clone(),
-                gender,
-            ) {
+            if crate::gossip_vm::open(*npc, *text_id, options.clone(), quests.clone(), gender) {
                 let _ = send_cmd(Cmd::NpcTextQuery {
                     text_id: *text_id,
                     npc: *npc,
