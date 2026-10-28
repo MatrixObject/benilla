@@ -1442,6 +1442,9 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     };
     CATS.with(|c| {
         let cats = c.borrow();
+        // The questgiver marker sweep rides the UI tick, where the catalog and our own
+        // descriptor meet (`crates/benilla-app/src/quest_markers`).
+        crate::quest_markers::sweep(&own, cats.as_ref().and_then(|c| c.factions.as_ref()));
         FEED.with(|f| {
             let mut feed = f.borrow_mut();
             feed.now += f64::from(dt);

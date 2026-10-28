@@ -884,6 +884,12 @@ pub(crate) enum Cmd {
     Enter(u64),
     Chat(String),
     Attack(u64),
+    /// `CMSG_QUESTGIVER_STATUS_QUERY` (`0x182`): the NPC's overhead `!`/`?`, asked by
+    /// `quest_markers::sweep` off the client's own rules.
+    QuestgiverStatusQuery(u64),
+    /// `CMSG_TAXINODE_STATUS_QUERY` (`0x1aa`): whether we know a flight master's node; the
+    /// green `!` follows an unknown one. Sent only from the per-unit re-gate (`0x6073e8`).
+    TaxiNodeStatusQuery(u64),
     /// `CMSG_ATTACKSTOP`: the auto-attack toggle's off arm (`0x6131a0`).
     StopAttack,
     Target(u64),
@@ -1154,6 +1160,16 @@ struct Shared {
     /// re-reads the armed main hand at each swing; the weapon cannot change
     /// without an equip, which stops and restarts the attack latch.
     self_swing_anim: AtomicU32,
+    /// The last `SMSG_QUESTGIVER_STATUS` per NPC guid: the overhead `!`/`?` the marker lane
+    /// draws. The server only ever answers a query (`QuestHandler.cpp:36-77`), so this holds the
+    /// answer to the client's own ask, mirroring benilla's `QuestGiver` store.
+    quest_status: Mutex<HashMap<u64, u32>>,
+    /// The last `SMSG_TAXINODE_STATUS` per flight master guid: `false` draws the green `!`.
+    taxi_known: Mutex<HashMap<u64, bool>>,
+    /// Bumped by the packets whose answers can move a marker without touching our descriptor
+    /// block (`SMSG_SET_FACTION_STANDING`, the quest-update packets, `SMSG_GROUP_LIST`); the
+    /// sweep re-asks every giver when it moves, the app's `QuestGiver::bump_reask`.
+    quest_epoch: AtomicU64,
     /// Latest player pose fed by the host (UE pawn) so the world worker can
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
@@ -1252,6 +1268,9 @@ fn shared() -> &'static Shared {
         attack_target: AtomicU64::new(0),
         swing_refusal: Mutex::new(None),
         self_swing_anim: AtomicU32::new(16),
+        quest_status: Mutex::new(HashMap::new()),
+        taxi_known: Mutex::new(HashMap::new()),
+        quest_epoch: AtomicU64::new(0),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -1567,6 +1586,66 @@ pub(crate) fn ui_held_targets() -> HashMap<u64, u64> {
         .iter()
         .filter_map(|(guid, rec)| rec.fields.unit_target().map(|t| (*guid, t)))
         .collect()
+}
+
+/// [`Shared::quest_status`]'s current answer for one guid.
+pub(crate) fn ui_quest_status(guid: u64) -> Option<u32> {
+    let statuses = shared()
+        .quest_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    statuses.get(&guid).copied()
+}
+
+/// [`Shared::taxi_known`]'s current answer for one guid (absent = no answer yet).
+pub(crate) fn ui_taxi_known(guid: u64) -> Option<bool> {
+    let known = shared()
+        .taxi_known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    known.get(&guid).copied()
+}
+
+/// The re-ask counter [`Shared::quest_epoch`].
+pub(crate) fn ui_quest_epoch() -> u64 {
+    shared().quest_epoch.load(Ordering::SeqCst)
+}
+
+/// Drop every cached `SMSG_QUESTGIVER_STATUS` / `SMSG_TAXINODE_STATUS` answer whose object has
+/// left the stream window, as the app's `QuestGiver::retain_statuses` does on its guid index.
+pub(crate) fn retain_quest_statuses(alive: &HashSet<u64>) {
+    let sh = shared();
+    sh.quest_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|guid, _| alive.contains(guid));
+    sh.taxi_known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|guid, _| alive.contains(guid));
+}
+
+/// Drop one guid's cached marker answers, the reference's teardown (`0x6073f0`): the quest status
+/// and the flight master's green share the one overhead slot, so both go together.
+pub(crate) fn clear_quest_status(guid: u64) {
+    let sh = shared();
+    sh.quest_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&guid);
+    sh.taxi_known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&guid);
+}
+
+/// Queue the two overhead-marker asks (`0x182` / `0x1aa`) for `npc`.
+pub(crate) fn send_quest_query(npc: u64) {
+    let _ = send_cmd(Cmd::QuestgiverStatusQuery(npc));
+}
+
+pub(crate) fn send_taxi_query(npc: u64) {
+    let _ = send_cmd(Cmd::TaxiNodeStatusQuery(npc));
 }
 
 fn copy_name<const N: usize>(dst: &mut [c_char; N], name: &str) {
@@ -1948,6 +2027,18 @@ fn roster(
 fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh: &Shared) {
     let _ = session.set_read_timeout(Some(std::time::Duration::from_millis(200)));
 
+    // A fresh world session owns fresh markers: the previous session's answers name objects that
+    // are gone, as the app's cached statuses die with their entities.
+    sh.quest_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    sh.taxi_known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
+
     // Client tick for MovementInfo timestamps: matches benilla-protocol's
     // `world::movement::client_uptime_ms` (pub(super), so we mirror it here).
     fn uptime_ms() -> u32 {
@@ -1986,6 +2077,15 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::StopAttack) => {
                     let _ = session.attack_stop();
                     sh.attack_target.store(0, Ordering::SeqCst);
+                }
+                Ok(Cmd::QuestgiverStatusQuery(npc)) => {
+                    let _ = session.questgiver_status_query(npc);
+                }
+                Ok(Cmd::TaxiNodeStatusQuery(npc)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_TAXINODE_STATUS_QUERY,
+                        &benilla_protocol::messages::taxi_node_status_query(npc),
+                    );
                 }
                 Ok(Cmd::Target(guid)) => {
                     // The wire has no selection echo; record it here so the target
@@ -3401,10 +3501,27 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         ServerPacket::QuestGiverComplete(c) => {
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            // A turn-in can move every giver's marker (`QuestGiver::bump_reask`).
+            sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
             sh.event(format!(
                 "giver|complete|{}|{}|{}",
                 c.quest_id, c.xp, c.money
             ));
+        }
+        // The overhead marker answers. `npc` is the queried guid; the sweep's re-ask rules
+        // decide when it is asked again, so this only stores the latest answer.
+        ServerPacket::QuestGiverStatus { npc, status } => {
+            sh.quest_status
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*npc, *status);
+        }
+        // The flight master's green `!` (`ui_taxi`'s `FlightMasterStatus`): absent means known.
+        ServerPacket::TaxiNodeStatus { guid, known } => {
+            sh.taxi_known
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*guid, *known);
         }
         ServerPacket::QuestGiverInvalid { .. } => {
             sh.event("giver|invalid".to_string());
@@ -3552,10 +3669,17 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         ServerPacket::LogoutComplete
         | ServerPacket::UpdateWorldState { .. }
-        | ServerPacket::QuestUpdateComplete { .. }
+        | ServerPacket::QuestLogFull => {
+            sh.event(format!("pkt|{}", packet.name()));
+        }
+        // Every packet whose answer to a giver can change without our own descriptor moving:
+        // the quest-log progress (`QuestGiver::bump_reask` in `ui_quest/net.rs`), a standing that
+        // feeds `SatisfyQuestReputation`, and a group roster (`ui_party/net.rs`).
+        ServerPacket::QuestUpdateComplete { .. }
         | ServerPacket::QuestUpdateAddKill { .. }
         | ServerPacket::QuestUpdateAddItem { .. }
-        | ServerPacket::QuestLogFull => {
+        | ServerPacket::SetFactionStanding { .. } => {
+            sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
             sh.event(format!("pkt|{}", packet.name()));
         }
         // ---- group / party ----
@@ -3637,6 +3761,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             }
             let n = party.count;
             drop(party);
+            // A new roster can open quest dialogs we could not see (`ui_party/net.rs`).
+            sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
             sh.event(format!("group|{n}"));
         }
         // A delta (or the asked-for _FULL form): patch only the present fields.
