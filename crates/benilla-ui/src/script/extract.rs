@@ -562,7 +562,14 @@ impl UiScript {
         quads
             .into_iter()
             .filter_map(|q| match (q.rect, q.content) {
-                (Some(r), QuadContent::Text { text: Some(t), color, .. }) => Some(MessageLineRow {
+                (
+                    Some(r),
+                    QuadContent::Text {
+                        text: Some(t),
+                        color,
+                        ..
+                    },
+                ) => Some(MessageLineRow {
                     left: r.left,
                     top: r.top,
                     right: r.right,

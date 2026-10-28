@@ -45,13 +45,11 @@ pub(super) fn recv_packet(
     let opcode = u16::from_le_bytes([header[2], header[3]]);
     let body_len = size.saturating_sub(2) as usize;
     let mut body = vec![0u8; body_len];
-    stream
-        .read_exact(&mut body)
-        .map_err(|e| {
-            anyhow::Error::new(e).context(format!(
-                "reading world body (opcode {opcode:#x}, {body_len} bytes)"
-            ))
-        })?;
+    stream.read_exact(&mut body).map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "reading world body (opcode {opcode:#x}, {body_len} bytes)"
+        ))
+    })?;
     messages::parse_server(opcode, &body).map_err(|e| {
         Unparsed {
             opcode,
