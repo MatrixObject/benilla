@@ -7467,6 +7467,25 @@ const UI_DUMP_DEFS_LUA: &str = r#"
             tostring(f:GetFrameLevel() or 0), num(f:GetLeft()), num(f:GetTop()),
             num(f:GetWidth()), num(f:GetHeight()),
             ratio(f:GetAlpha()) }, "\t"))
+        -- A StatusBar's fill is not its texture region's rect and colour: the
+        -- client draws the value's fraction of the bar texture (`0x782dd0`
+        -- sizes the quad from min/max/value) and tints it with the bar's own
+        -- colour (`0x78fc20` writes the region's vertex colour, which
+        -- GetVertexColor on the texture does not answer). The renderer needs
+        -- both, so they ride their own row: min, max, value, orientation and
+        -- the bar colour.
+        if f.IsObjectType and f:IsObjectType("StatusBar") then
+            local okv, v = pcall(function() return f:GetValue() end)
+            local okm, mn, mx = pcall(function() return f:GetMinMaxValues() end)
+            if okv and okm and type(v) == "number" and type(mx) == "number" then
+                local orient = "HORIZONTAL"
+                local oko, o = pcall(function() return f:GetOrientation() end)
+                if oko and type(o) == "string" then orient = o end
+                local colr = colour_str(function() return f:GetStatusBarColor() end)
+                table.insert(mine, table.concat({ "B", clean(f:GetName()), num(mn),
+                    num(mx), num(v), orient, colr }, "\t"))
+            end
+        end
         for _, r in ipairs({ f:GetRegions() }) do
             -- A hidden region draws nothing: button state textures and
             -- highlights are Show/Hide-swapped, so emitting them stacks the
@@ -7776,6 +7795,74 @@ pub extern "C" fn bn_ui_dump(buf: *mut c_char, cap: u32) -> u32 {
     };
     ui_dump_apply_caret(&mut text);
     let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// The paint state of each texture quad that no Lua getter answers, as TSV lines:
+/// `owner \t region \t left \t top \t width \t height \t portraitUnit \t circular \t fill r g b a`.
+/// The fill columns are blank when the quad has no `SetTexture(r,g,b,a)` fill.
+///
+/// The client's quad record carries these and its child getters do not: `GetVertexColor` answers
+/// the colour the fill *multiplies*, `GetTexture` the sentinel "Solid Texture" for a fill, and a
+/// `SetPortraitTexture` unit nothing at all. A host that paints the interface itself reads them
+/// here; `left/top/width/height` let it match an unnamed region too.
+#[no_mangle]
+pub extern "C" fn bn_ui_paint(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            let mut out = String::new();
+            for q in s.extract() {
+                let benilla_ui::script::QuadContent::Texture {
+                    ref color,
+                    circular,
+                    ref portrait_unit,
+                    ..
+                } = q.content
+                else {
+                    continue;
+                };
+                if color.is_none() && portrait_unit.is_none() {
+                    continue;
+                }
+                let owner = s.target_owner_name(q.target).unwrap_or_default();
+                let region = s.target_region_name(q.target).unwrap_or_default();
+                let (l, t, w, h) = q.rect.map_or((0.0, 0.0, 0.0, 0.0), |r| {
+                    (r.left, r.top, r.right - r.left, r.top - r.bottom)
+                });
+                // The row's own "\t{}\n" already separates this column, so the
+                // fill starts at its first value - an extra leading tab would
+                // push r into col 9 and leave col 8 empty, which is where the
+                // host reads r.
+                let fill = color.map_or_else(
+                    || "\t\t\t".to_string(),
+                    |c| format!("{:.2}\t{:.2}\t{:.2}\t{:.2}", c[0], c[1], c[2], c[3]),
+                );
+                out.push_str(&format!(
+                    "{owner}\t{region}\t{l:.1}\t{t:.1}\t{w:.1}\t{h:.1}\t{}\t{}\t{}\n",
+                    portrait_unit.as_deref().unwrap_or(""),
+                    if circular { 1 } else { 0 },
+                    fill,
+                ));
+            }
+            Some(out)
+        })
+    })) else {
+        return 0;
+    };
+    let Some(text) = text else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
         *buf.add(n) = 0;
@@ -9762,6 +9849,88 @@ fn stage_seat(m2: &[u8]) -> Option<([f32; 3], f32, f32)> {
         at = usize::try_from(skel.bones.get(i)?.parent).ok();
     }
     Some((a.position, yaw, scale))
+}
+
+/// One M2's authored camera record, the round portrait's view: benilla-app
+/// draws `cameraLookup[0]` verbatim (`portrait::framing::frame`, `0x713540`).
+/// Raw **WoW model space**, like `BnBooth::cam_eye` - the host maps
+/// (x, -y, z) × 100 exactly as it maps the model's own vertices.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BnModelCamera {
+    pub eye: [f32; 3],
+    pub target: [f32; 3],
+    pub roll: f32,
+    /// Diagonal radians; 0 = the model carries no such record.
+    pub fov: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+/// A model's authored portrait camera: `cameraLookup[0]` (`0x713540`), the
+/// record benilla-app's `portrait::framing::frame` draws a round portrait
+/// through (`0x524f60`). Returns 1 when a record was written, 0 for a missing
+/// model or a model with no camera. Cached per path: the M2 is up to a
+/// megabyte decompressed and archives are immutable.
+#[no_mangle]
+pub extern "C" fn bn_model_portrait_camera(
+    world: *mut BnWorld,
+    path: *const c_char,
+    out: *mut BnModelCamera,
+) -> u32 {
+    if world.is_null() || path.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(path) = cstr_to_str(path) else {
+        return 0;
+    };
+    // SAFETY: the caller passes the handle `bn_init` returned; `m2_bytes`
+    // only reads the archives behind it.
+    let w = unsafe { &*world };
+    thread_local! {
+        static CAM_CACHE: std::cell::RefCell<HashMap<String, Option<[f32; 10]>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = path.to_string();
+    let cam = CAM_CACHE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if let Some(hit) = cell.get(&key) {
+            return *hit;
+        }
+        let v = m2_bytes(w, path)
+            .and_then(|b| benilla_formats::parse_m2_portrait_camera(&b))
+            .map(|c| {
+                [
+                    c.position[0],
+                    c.position[1],
+                    c.position[2],
+                    c.target[0],
+                    c.target[1],
+                    c.target[2],
+                    c.roll,
+                    c.fov,
+                    c.near_clip,
+                    c.far_clip,
+                ]
+            });
+        cell.insert(key, v);
+        v
+    });
+    let Some(c) = cam else {
+        return 0;
+    };
+    // SAFETY: `out` was checked non-null and points at a caller-owned struct.
+    unsafe {
+        *out = BnModelCamera {
+            eye: [c[0], c[1], c[2]],
+            target: [c[3], c[4], c[5]],
+            roll: c[6],
+            fov: c[7],
+            near: c[8],
+            far: c[9],
+        };
+    }
+    1
 }
 
 /// A global-sequence channel's parked key: the stage bones sit at t = 0 and

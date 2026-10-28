@@ -41,6 +41,16 @@ impl UiScript {
         self.model_ref().arena.frame(frame)?.name.clone()
     }
 
+    /// A region's own name (`0x76c650`'s string), or `None` for an anonymous region or a frame
+    /// slot. The dump's region column and a host that keys its picture of the interface both
+    /// read it.
+    pub fn target_region_name(&self, target: ZTarget) -> Option<String> {
+        match target {
+            ZTarget::Region(rh) => self.model_ref().arena.region(rh)?.name.clone(),
+            ZTarget::Frame(_) => None,
+        }
+    }
+
     /// The name of the nearest named frame at or above `target`.
     pub fn target_owner_name(&self, target: ZTarget) -> Option<String> {
         let model = self.model_ref();
