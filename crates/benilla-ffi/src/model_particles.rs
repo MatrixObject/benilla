@@ -288,6 +288,18 @@ fn integrate(p0: [f32; 3], v0: [f32; 3], g: f32, drag: f32, t: f32) -> [f32; 3] 
     ]
 }
 
+/// Pose by a `crate::bone_matrix_at` row-major 3x4: a point takes the translation row, a
+/// vector only the rotation-and-scale 3x3, which is how the reference turns a birth velocity
+/// through the emitter matrix without dragging its origin along.
+fn pose(j: &[f32; 16], x: f32, y: f32, z: f32, point: bool) -> (f32, f32, f32) {
+    let t = if point { 1.0 } else { 0.0 };
+    (
+        j[0] * x + j[1] * y + j[2] * z + j[3] * t,
+        j[4] * x + j[5] * y + j[6] * z + j[7] * t,
+        j[8] * x + j[9] * y + j[10] * z + j[11] * t,
+    )
+}
+
 static TWINKLE: std::sync::OnceLock<[f32; 128]> = std::sync::OnceLock::new();
 
 fn twinkle_noise(speed: f32, age: f32, phase: u32) -> f32 {
@@ -409,18 +421,32 @@ pub extern "C" fn bn_model_particles(
             continue;
         }
         let g = now.gravity;
-        // The joint this emitter rides (record bone -1 = none, model space).
-        let joint = if def.bone != u16::MAX && (def.bone as usize) < m.bones.len() {
+        // The reference's two storage modes (`ParticleEmitterDef::model_space`, file flag 0x10):
+        // a world-mode emitter bakes each birth through the emitter matrix it has *at that
+        // instant* (`0x7b8b0f`, `0x7b8acf`) and integrates in world space from then on, so a
+        // moving bone leaves a trail of motes behind it; a model-mode emitter stores the birth
+        // locally and the draw re-applies the *live* matrix (`0x7b8aa5`, `0x7b3efb`), so its
+        // cloud rides the bone. Sampling the wrong one is what made the login booth's embers
+        // clump on the statues instead of hanging in the air they were born into.
+        let anchored = !def.model_space();
+        let joint_at = |ms: u32| -> Option<crate::BnMat4> {
+            if def.bone == u16::MAX || def.bone as usize >= m.bones.len() {
+                return None;
+            }
             Some(crate::bone_matrix_at(
                 &m.bones,
                 0,
-                time_ms.max(0.0) as u32,
+                ms,
                 0,
                 &[],
                 def.bone as usize,
             ))
-        } else {
-            None
+        };
+        // The emitter's own clock when the model was posed at `ms` (negative ages clamp to the
+        // first cycle, the same clock a looping clip replays).
+        let clock_at = |ms: f32| -> (f32, f64) {
+            let s = (ms * 0.001).max(0.0);
+            (s, f64::from(s))
         };
         for k in 0..count {
             total += 1;
@@ -433,13 +459,35 @@ pub extern "C" fn bn_model_particles(
             let age = u_age * life;
             let mut rng = mix_seed(k, epoch, ei as u32);
 
-            let (p0, dir) = emit_local(def, &now, &mut rng);
-            let speed = now.emission_speed * (1.0 + now.speed_variation * rand_s11(&mut rng));
+            // Every track is sampled on the frame the particle is born, not the frame it is
+            // drawn: the kernel, the speed and the lifetime all come from the birth clock.
+            let birth_ms = time_ms - age * 1000.0;
+            let (birth_s, birth_g) = clock_at(birth_ms);
+            let born = if anchored {
+                def.params.sample(Some(0), birth_s, birth_g)
+            } else {
+                now
+            };
+            let (p0, dir) = emit_local(def, &born, &mut rng);
+            let speed = born.emission_speed * (1.0 + born.speed_variation * rand_s11(&mut rng));
             let v0 = [dir[0] * speed, dir[1] * speed, dir[2] * speed];
-            // Integrate in UE axes, then pose the emitter-local cloud by its joint.
             let (p0x, p0y, p0z) = wow_vec_to_ue(p0[0], p0[1], p0[2]);
-            let (vx, vy, vz) = wow_vec_to_ue(v0[0], v0[1], v0[2]);
-            let local = integrate([p0x, p0y, p0z], [vx, vy, vz], g, def.drag, age);
+            let (vx0, vy0, vz0) = wow_vec_to_ue(v0[0], v0[1], v0[2]);
+            let (local, joint) = if anchored {
+                let j = joint_at(birth_ms.max(0.0) as u32);
+                let (bx, by, bz) = match j {
+                    Some(j) => pose(&j, p0x, p0y, p0z, true),
+                    None => (p0x, p0y, p0z),
+                };
+                let (ivx, ivy, ivz) = match j {
+                    Some(j) => pose(&j, vx0, vy0, vz0, false),
+                    None => (vx0, vy0, vz0),
+                };
+                (integrate([bx, by, bz], [ivx, ivy, ivz], g, def.drag, age), None)
+            } else {
+                let local = integrate([p0x, p0y, p0z], [vx0, vy0, vz0], g, def.drag, age);
+                (local, joint_at(time_ms.max(0.0) as u32))
+            };
 
             let ol = def.over_life.sample(u_age);
             let noise = twinkle_noise(def.twinkle_speed, age, rng & 0x7f);
@@ -459,11 +507,7 @@ pub extern "C" fn bn_model_particles(
                 spin = -spin;
             }
             let (qx, qy, qz) = match joint {
-                Some(j) => (
-                    j[0] * local[0] + j[1] * local[1] + j[2] * local[2] + j[3],
-                    j[4] * local[0] + j[5] * local[1] + j[6] * local[2] + j[7],
-                    j[8] * local[0] + j[9] * local[1] + j[10] * local[2] + j[11],
-                ),
+                Some(j) => pose(&j, local[0], local[1], local[2], true),
                 None => (local[0], local[1], local[2]),
             };
             // SAFETY: written < cap, so this index is inside `out`.

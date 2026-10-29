@@ -285,8 +285,12 @@ fn step_line(font: &FontArc, size: f32, thick: bool, s: &str) -> (f32, f32) {
 /// that fit (the break's whitespace dropping, the rest staying verbatim), or
 /// at the fitting glyph when `non_space_wrap` says there is no break
 /// opportunity — the line kernel's shape, priced by the same
-/// step law the draw lays with and fitting when the price is within the width
-/// rounded up to a whole pixel. A row always takes one char.
+/// extent [`measure`] reports for a row (the stepped pen up to the last glyph
+/// plus that glyph's raw advance), so a region the measurer sized to its text
+/// always holds that one row: pricing the fit with the stepped pen instead cut
+/// every exactly-sized label one glyph short, which stacked a two-glyph CJK
+/// button label vertically. Rounded up to a whole pixel as before.
+/// A row always takes one char.
 fn wrap_line(
     font: &FontArc,
     size: f32,
@@ -333,7 +337,9 @@ fn wrap_line(
                 step += sf.kern(p, id);
             }
             let step = step.ceil();
-            if pen + step > fit && end > start {
+            // The row's price is what `step_line` would report as its extent:
+            // the stepped pen up to this glyph plus this glyph's raw advance.
+            if pen + adv > fit && end > start {
                 break;
             }
             pen += step;
@@ -806,5 +812,46 @@ impl benilla_ui::script::TextMeasure for VmMeasure {
             req.spacing * rs,
         );
         (w / rs, h / rs, natural / rs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rasterize_wrapped;
+
+    const FACE: &str = r"Fonts\FZLBJW.TTF";
+
+    /// The login button's label: the measurer sized the region to this exact
+    /// two-glyph string, so the wrap must take it as one row. Priced by the
+    /// stepped pen it came out one glyph short and stacked the characters.
+    #[test]
+    fn a_label_sized_to_its_own_text_wraps_to_one_row() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let chain = benilla_formats::open_chain(&data).expect("open chain");
+        assert!(super::preload_fonts(&chain) > 0, "no fonts in the install");
+        let seam = 1.875;
+        let (w, _, _) = super::measure(Some(FACE), 16.0 * seam, 2, "登录", None, false, 0, 0.0);
+        let box_w = w / seam;
+        let bmp = rasterize_wrapped(&chain, FACE, 16.0 * seam, 2, "登录", box_w * seam, 0.0)
+            .expect("raster");
+        assert!(
+            bmp.ph < 16.0 * seam * 1.5,
+            "one row expected, pen box {} tall at {} px (box {:.1} VM units)",
+            bmp.ph,
+            16.0 * seam,
+            box_w
+        );
+    }
+
+    /// The tolerance is a fit test, not a licence to overflow: text twice the
+    /// width of its box still breaks into rows, which is how a Chinese quest
+    /// paragraph (no spaces to break at) reaches the player.
+    #[test]
+    fn a_long_cjk_paragraph_still_wraps() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let chain = benilla_formats::open_chain(&data).expect("open chain");
+        let text = "登录登录登录登录登录登录";
+        let bmp = rasterize_wrapped(&chain, FACE, 30.0, 2, text, 60.0, 0.0).expect("raster");
+        assert!(bmp.ph > 30.0 * 3.0, "{} rows expected", bmp.ph / 30.0);
     }
 }
