@@ -20,13 +20,13 @@ use benilla_formats::{
     FactionCatalog, FactionTemplate, ItemDisplayCatalog, QuestHeaderNames, QuestTagNames, Reaction,
     SkillLineCatalog, SpellCatalog,
 };
-use benilla_protocol::messages::ObjectFields;
+use benilla_protocol::messages::{ObjectFields, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST};
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
-    DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState, NearestMode,
-    PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall, ScriptValue,
-    SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript,
-    UnitBase, UnitGuids, UnitState, UnitTokenParse, VmKind, WornDisplay,
+    ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState,
+    NearestMode, PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall,
+    ScriptValue, SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView,
+    UiScript, UnitBase, UnitGuids, UnitState, UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -1615,9 +1615,10 @@ pub(crate) fn intents(script: &mut UiScript) {
             }
             0x80 => {
                 if let Some(item) = net::ui_inventory().iter().find(|i| i.entry == action) {
+                    let (bag, slot) = wire_pos(item.bag, item.slot);
                     let _ = net::send_cmd(Cmd::UseItem {
-                        bag: item.bag,
-                        slot: item.slot,
+                        bag,
+                        slot,
                         spell: 0,
                     });
                 }
@@ -1649,6 +1650,45 @@ pub(crate) fn intents(script: &mut UiScript) {
     }
     for spell in script.take_cancel_aura_requests() {
         let _ = net::send_cmd(Cmd::CancelAura(spell));
+    }
+
+    // The vendor window. `BuyMerchantItem(index)` names the 1-based row of the stock the host
+    // pushed with `bn_ui_push_merchant`, which is `SMSG_LIST_INVENTORY`'s own order, so the wire
+    // wants the entry that row carries and the guid of the vendor still open.
+    let vendor = net::ui_vendor();
+    for (index, quantity) in script.take_merchant_buys() {
+        if vendor.guid == 0 {
+            continue;
+        }
+        let Some(row) = vendor
+            .rows
+            .iter()
+            .take(vendor.count.min(128) as usize)
+            // Lua's row is its place in `SMSG_LIST_INVENTORY`'s order, so the row is taken by
+            // position; the wire buy then names that row's entry, never a slot.
+            .skip((index as usize).saturating_sub(1))
+            .next()
+            .filter(|r| index > 0 && r.entry != 0)
+        else {
+            net::note(format!("vendor: no row {index} to buy"));
+            continue;
+        };
+        // The stack count is a u8 on the wire.
+        let count = quantity.clamp(1, u32::from(u8::MAX)) as u8;
+        let _ = net::send_cmd(Cmd::VendorBuy {
+            vendor: vendor.guid,
+            entry: row.entry,
+            count,
+        });
+    }
+
+    // `CloseMerchant()` (`0x4fadf0`) sends no packet — but the open vendor is what makes a bag
+    // right-click a *sale*, so the close has to clear the middle layer's stock window as well as
+    // the VM's, or the window would be re-pushed from it on the next pass.
+    if script.take_merchant_close() {
+        net::ui_vendor_closed();
+        script.set_merchant(None);
+        fire(script, "MERCHANT_CLOSED", vec![]);
     }
 
     // Selections: tokens, by name, nearest, and the clear.
@@ -1725,6 +1765,10 @@ pub(crate) fn intents(script: &mut UiScript) {
     for queued in script.take_queued_calls() {
         match queued.call {
             ScriptCall::AttackTarget { may_pick, .. } => attack_press(script, may_pick),
+            // A bag-slot click. The VM has already run `0x4fa0e0`'s forks and locked the slot, so
+            // the arm it took picks the packet; the item is looked up by guid because the wire's
+            // (bag, slot) is not the Lua argument.
+            ScriptCall::UseContainerItem(use_) => container_use(&use_),
             _ => keep.push(queued),
         }
     }
@@ -2004,6 +2048,67 @@ fn resolve_token(token: &str, guids: &UnitGuids) -> Option<u64> {
 /// the VM's own `UnitGUID` reads.
 pub(crate) fn token_guid(token: &str) -> u64 {
     FEED.with(|f| resolve_token(token, &f.borrow().guids).unwrap_or(0))
+}
+
+/// The descriptor's `(bag, slot)` is the client's own addressing; the wire wants
+/// `Player::GetItemByPos`'s, where the backpack is not bag 0 but the player's array at
+/// 255/`SLOT_PACK_FIRST`..38. A worn item (255) and an item inside an equipped bag (that bag's
+/// player-array slot 19..22, with its inner slot) already carry the wire address.
+fn wire_pos(bag: u8, slot: u8) -> (u8, u8) {
+    if bag == 0 {
+        (BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST + slot)
+    } else {
+        (bag, slot)
+    }
+}
+
+/// `UseContainerItem` past its gates (`0x4fa0e0`): the arm the VM took chooses the packet, so the
+/// click behaves as the reference client's does — an equippable template auto-equips, a usable one
+/// fires its item spell, and a click on a vendor-open slot sells the stack.
+fn container_use(use_: &ContainerUse) {
+    if use_.asks {
+        // Bind-on-equip question: the item stays on the cursor under the popup, nothing sent.
+        return;
+    }
+    let Some(item) = net::ui_inventory()
+        .into_iter()
+        .find(|i| i.guid == use_.guid)
+    else {
+        net::note(format!(
+            "container: slot ({}, {}) has no item {} to send",
+            use_.bag, use_.slot, use_.guid
+        ));
+        return;
+    };
+    let (bag, slot) = wire_pos(item.bag, item.slot);
+    match use_.arm {
+        UseArm::Item(UseFork::Equip) => {
+            // The click's own packet, at the wire position the reference client uses. VMaNGOS 1.12
+            // answers this with `EQUIP_ERR_ITEM_NOT_FOUND` while naming the item it just resolved
+            // (probe 2026-10-29: `inv|fail|23|0|0x4000000000000016` for a pack item at 255/26), yet
+            // the same item equips over `CMSG_SWAP_INV_ITEM` 26->4 — the drag gesture's packet.
+            // The packet here stays the client's; the swap console is the host's equip instrument.
+            let _ = net::send_cmd(Cmd::AutoEquip { bag, slot });
+        }
+        UseArm::Item(_) if use_.may_cast => {
+            let _ = net::send_cmd(Cmd::UseItem {
+                bag,
+                slot,
+                spell: 0,
+            });
+        }
+        UseArm::Sell => {
+            let vendor = net::ui_vendor();
+            if vendor.guid != 0 {
+                let _ = net::send_cmd(Cmd::VendorSell {
+                    vendor: vendor.guid,
+                    item_guid: use_.guid,
+                    count: 0,
+                });
+            }
+        }
+        arm => net::note(format!("container: {arm:?} has no wire path yet")),
+    }
 }
 
 /// `AttackTarget`'s toggle, `0x489b50` → `0x6131a0`, also the attack button's

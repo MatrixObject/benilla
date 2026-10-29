@@ -1469,6 +1469,15 @@ pub(crate) fn ui_vendor() -> BnNetVendor {
     *shared().vendor.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `CloseMerchant()` (`0x4fadf0`) sends no packet, but the open vendor is what makes a bag
+/// right-click a *sale* — so the close has to clear the middle layer's stock window too, or the
+/// host would keep re-pushing its rows into a window the UI thinks is shut.
+pub(crate) fn ui_vendor_closed() {
+    let mut win = shared().vendor.lock().unwrap_or_else(|e| e.into_inner());
+    win.guid = 0;
+    win.count = 0;
+}
+
 /// The pending resurrection offer, as the death dialog's state.
 pub(crate) struct UiResurrect {
     pub caster: u64,
@@ -2441,6 +2450,19 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
         };
 
         if let Some((pos, yaw)) = pose {
+            // Our own body is client-authoritative: the server never relays our `MSG_MOVE_*` back,
+            // so the self record only holds the login pose. Without this the host's and the VM's
+            // distance tests measure from where we logged in, not where we stand.
+            let self_guid = sh.self_guid.load(Ordering::SeqCst);
+            if let Some(rec) = sh
+                .units
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&self_guid)
+            {
+                rec.pos = pos;
+                rec.facing = yaw;
+            }
             let forward = input.0;
             let strafe = input.1;
             let moving_fwd = forward > 0.1;
