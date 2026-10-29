@@ -20,14 +20,17 @@ use benilla_formats::{
     CreatureTypeTable, DurabilityTables, FactionCatalog, FactionTemplate, ItemDisplayCatalog,
     QuestHeaderNames, QuestTagNames, Reaction, SkillLineCatalog, SpellCatalog,
 };
-use benilla_protocol::messages::{ObjectFields, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST};
+use benilla_protocol::messages::{
+    ObjectFields, BAG_PLAYER_INVENTORY, SLOT_BAG_FIRST, SLOT_PACK_FIRST,
+};
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
-    ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState,
-    MerchantItem, MerchantState, NearestMode, PartyMemberInfo, PartyRequest, PartyState,
-    PlayerRecord, QuestAction, ScriptCall, ScriptValue, SelectionRequest, SessionRequest,
-    SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase, UnitGuids, UnitState,
-    UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
+    ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, InvSlotView, InventorySlots,
+    LootRow, LootState, MerchantItem, MerchantState, NearestMode, PartyMemberInfo, PartyRequest,
+    PartyState, PlayerRecord, QuestAction, ScriptCall, ScriptValue, SelectionRequest,
+    SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase,
+    UnitCombatStats, UnitGuids, UnitState, UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
+    EQUIPMENT_BAG,
 };
 
 use crate::net::{self, Cmd};
@@ -210,8 +213,14 @@ struct Feed {
 
     /// The bag containers last pushed, diffed per bag for `BAG_UPDATE`.
     containers: HashMap<i64, ContainerState>,
+    /// The last doll snapshot, so the push and its `UNIT_INVENTORY_CHANGED` ride a real change.
+    last_inv: Option<InventorySlots>,
+    /// The last stat sheet, so its events ride a real change.
+    last_stats: Option<UnitCombatStats>,
     /// The bag item in containers 1..=4, indexed `id - 1`: a change from nonzero is `BAG_CLOSED`.
     bag_guids: [u64; 4],
+    /// The seats the watchers last saw, whose change is the server releasing a moved item's lock.
+    last_seats: Seats,
 
     died_at: Option<f64>,
     corpse_ms: u32,
@@ -286,7 +295,10 @@ impl Feed {
             merchant_key: None,
             party_key: None,
             containers: HashMap::new(),
+            last_inv: None,
+            last_stats: None,
             bag_guids: [0; 4],
+            last_seats: Seats::new(),
             died_at: None,
             corpse_ms: 0,
             corpse_at: None,
@@ -372,8 +384,71 @@ pub(crate) fn item_look(
     )
 }
 
+/// The 1-based live inventory slots a template's `InventoryType` equips into, the static mask
+/// `IsValidForSlot` (`0x5da1d0`) reads; `benilla-app`'s `ui_items/mod.rs:869` `find_equip_slot`,
+/// which is vmangos' `Player::FindEquipSlot`. Without it every bag item looks like a misfit, so a
+/// drop on the doll takes the auto-equip arm instead of the swap and a `CursorCanGoInSlot`
+/// highlight never lights.
+fn find_equip_slot(inventory_type: u32, has_relic_slot: bool) -> Vec<u8> {
+    // Live-API ids: wire `EQUIPMENT_SLOT_*` + 1. Ammo is 0, loaded by entry with `CMSG_SET_AMMO`.
+    const AMMO: u8 = 0;
+    const HEAD: u8 = 1;
+    const NECK: u8 = 2;
+    const SHOULDERS: u8 = 3;
+    const BODY: u8 = 4;
+    const CHEST: u8 = 5;
+    const WAIST: u8 = 6;
+    const LEGS: u8 = 7;
+    const FEET: u8 = 8;
+    const WRISTS: u8 = 9;
+    const HANDS: u8 = 10;
+    const FINGER1: u8 = 11;
+    const FINGER2: u8 = 12;
+    const TRINKET1: u8 = 13;
+    const TRINKET2: u8 = 14;
+    const BACK: u8 = 15;
+    const MAINHAND: u8 = 16;
+    const OFFHAND: u8 = 17;
+    const RANGED: u8 = 18;
+    const TABARD: u8 = 19;
+    match inventory_type {
+        1 => vec![HEAD],
+        2 => vec![NECK],
+        3 => vec![SHOULDERS],
+        4 => vec![BODY],
+        5 | 20 => vec![CHEST],
+        6 => vec![WAIST],
+        7 => vec![LEGS],
+        8 => vec![FEET],
+        9 => vec![WRISTS],
+        10 => vec![HANDS],
+        11 => vec![FINGER1, FINGER2],
+        12 => vec![TRINKET1, TRINKET2],
+        13 => vec![MAINHAND, OFFHAND],
+        14 => vec![OFFHAND],
+        // The RANGED slot is the relic slot for Paladin, Shaman and Druid, so the ranged types and
+        // `INVTYPE_RELIC` (28) exclude each other.
+        15 if !has_relic_slot => vec![RANGED],
+        16 => vec![BACK],
+        17 => vec![MAINHAND],
+        18 => vec![20, 21, 22, 23],
+        19 => vec![TABARD],
+        21 => vec![MAINHAND],
+        22 | 23 => vec![OFFHAND],
+        24 => vec![AMMO],
+        25 | 26 if !has_relic_slot => vec![RANGED],
+        28 if has_relic_slot => vec![RANGED],
+        // NON_EQUIP (0), QUIVER (27) and anything past MAX_INVTYPE are not equippable.
+        _ => Vec::new(),
+    }
+}
+
 /// One occupied bag slot's view, off the item object and its template.
-fn container_slot(item: &net::BnNetInvItem, cats: Option<&Catalogs>) -> ContainerSlot {
+fn container_slot(
+    item: &net::BnNetInvItem,
+    cats: Option<&Catalogs>,
+    has_relic_slot: bool,
+) -> ContainerSlot {
     let info = &item.info;
     let name = cstr(&info.name);
     ContainerSlot {
@@ -386,10 +461,184 @@ fn container_slot(item: &net::BnNetInvItem, cats: Option<&Catalogs>) -> Containe
         // (`0x4f9794`), else -1.
         quality: (info.inventory_type != 0).then_some(info.quality),
         inventory_type: info.inventory_type,
+        equip_slots: find_equip_slot(info.inventory_type, has_relic_slot),
         item_id: item.entry,
         link: (!name.is_empty()).then(|| item_link(item.entry, &name, info.quality)),
         guid: item.guid,
         durability: (item.max_durability > 0).then_some((item.durability, item.max_durability)),
+        ..Default::default()
+    }
+}
+
+/// One worn slot's doll view, off the same row and template the bag containers read.
+///
+/// Deviation: the ffi's template cache carries no item flags, bonding, on-use spell or enchant
+/// slots, so those stay at the reference's unresolved values (`None`/0) — what the app shows for a
+/// template still in flight. The art, count, quality, name, link, durability and guid are complete.
+fn inv_slot_view(
+    item: &net::BnNetInvItem,
+    cats: Option<&Catalogs>,
+    has_relic_slot: bool,
+) -> InvSlotView {
+    let (name, quality, icon) = item_look(&item.info, cats);
+    InvSlotView {
+        item_id: item.entry,
+        icon,
+        count: item.count,
+        quality: quality as i32,
+        name: name.clone(),
+        durability: (item.max_durability > 0).then_some((item.durability, item.max_durability)),
+        link: name.map(|n| item_link(item.entry, &n, quality)),
+        guid: item.guid,
+        equip_slots: find_equip_slot(item.info.inventory_type, has_relic_slot),
+        ..Default::default()
+    }
+}
+
+/// The doll snapshot the stock `GetInventoryItem*` family reads. The live ids 1..=23 are the
+/// player-array seats one below their wire index (the app's `ui_items/mod.rs:90` `EQUIPMENT_BAG`
+/// arm), and the ffi's rows already carry that wire index, so this is the same addressing a
+/// bag→doll drag sends. Slot 0, ammo, is `PLAYER_FIELD_AMMO_ID`'s template-only pseudo-item, which
+/// the inventory rows do not carry, so it stays empty.
+fn inventory_slots(
+    inv: &[net::BnNetInvItem],
+    cats: Option<&Catalogs>,
+    has_relic_slot: bool,
+) -> InventorySlots {
+    let mut out: InventorySlots = Default::default();
+    for (live, slot) in out.iter_mut().enumerate().skip(1) {
+        *slot = inv
+            .iter()
+            .find(|r| r.bag == net::BAG_EQUIPPED && usize::from(r.slot) == live - 1)
+            .map(|r| inv_slot_view(r, cats, has_relic_slot));
+    }
+    out
+}
+
+/// The watched seats as the last pass saw them: the backpack (`bag` 0) and the player's own array
+/// (`BAG_EQUIPPED`) keyed by that field, a bag container's seats keyed by the bag item's guid — the
+/// reference's two array watchers (`0x4f8db0`, `0x5ddcf0`) and its container watcher (`0x4f912c`).
+type Seats = HashMap<(u64, u8), u64>;
+
+/// The seat watchers' unlocks between two looks: a seat whose guid changed unlocks the item that
+/// left it (`0x5ddd50`, `0x4f8e15`, `0x4f912c`); a seat that vanished releases only when it is the
+/// player's own, since a bag's seats go with it unseen. Sorted, so the release order is
+/// reproducible.
+///
+/// Deviation: the app watches the player's array through its descriptors, so it covers the bank
+/// (39-68) and keyring (81-112) seats too; this host's rows carry only the backpack, the equipped
+/// array and the equipped bags' contents, which is what a bag drag moves.
+fn seat_unlocks(
+    last: &mut Seats,
+    bags: &[(i64, u32, u32, u64)],
+    inv: &[net::BnNetInvItem],
+) -> Vec<u64> {
+    // The equipped bag in live slot `19..=22`, which owns the rows that name it as their `bag`.
+    let owner = |bag: u8| {
+        bags.iter()
+            .find(|&&(id, _, _, guid)| id == i64::from(bag) - 18 && guid != 0)
+            .map(|&(_, _, _, guid)| guid)
+    };
+    let mut now: Seats = HashMap::new();
+    for r in inv {
+        if r.guid == 0 {
+            continue;
+        }
+        let key = match r.bag {
+            0 | net::BAG_EQUIPPED => Some(u64::from(r.bag)),
+            19..=22 => owner(r.bag),
+            _ => None,
+        };
+        let Some(key) = key else { continue };
+        now.insert((key, r.slot), r.guid);
+    }
+    let mut out: Vec<u64> = last
+        .iter()
+        .filter_map(|(&seat, &old)| match now.get(&seat) {
+            Some(&new) => (new != old).then_some(old),
+            None => matches!(seat.0, 0 | 255).then_some(old),
+        })
+        .collect();
+    out.sort_unstable();
+    *last = now;
+    out
+}
+
+/// `ITEM_CLASS_WEAPON` and the wand subclass (`ui_char.rs:28,30`), the two template rows the stat
+/// sheet's off-hand and `HasWandEquipped` gates read.
+const ITEM_CLASS_WEAPON: u32 = 2;
+const SUBCLASS_WAND: u32 = 19;
+
+/// The doll's stat sheet, off our own descriptor — the app's `ui_char.rs:402` `unit_combat_stats`
+/// plus the player-only avoidance rows.
+///
+/// Deviation: the four weapon-skill pairs (`UnitAttackBothHands`, `UnitDefense`) need
+/// `PLAYER_FIELD_SKILL_LINE`, which this host does not stream, so they stay `(0, 0)`.
+fn combat_stats(f: &ObjectFields, inv: &[net::BnNetInvItem]) -> UnitCombatStats {
+    /// `0` counts as unstreamed, or `damage / speed` divides by zero (`ui_char.rs:398`).
+    fn base_swing(ms: Option<u32>) -> u32 {
+        ms.filter(|v| *v != 0).unwrap_or(2000)
+    }
+    let mut stats = [0i32; 5];
+    let mut stat_pos = [0i32; 5];
+    let mut stat_neg = [0i32; 5];
+    for i in 0..5u8 {
+        stats[usize::from(i)] = f.unit_stat(i).unwrap_or(0) as i32;
+        stat_pos[usize::from(i)] = f.player_posstat(i).unwrap_or(0);
+        stat_neg[usize::from(i)] = f.player_negstat(i).unwrap_or(0);
+    }
+    let mut resistances = [0i32; 7];
+    let mut resistance_pos = [0i32; 7];
+    let mut resistance_neg = [0i32; 7];
+    for i in 0..7u8 {
+        resistances[usize::from(i)] = f.unit_resistance(i).unwrap_or(0);
+        resistance_pos[usize::from(i)] = f.player_resistance_buff_pos(i).unwrap_or(0);
+        resistance_neg[usize::from(i)] = f.player_resistance_buff_neg(i).unwrap_or(0);
+    }
+    let (ap_pos, ap_neg) = f.unit_attack_power_mods();
+    let (rap_pos, rap_neg) = f.unit_ranged_attack_power_mods();
+    // The off hand counts only as a weapon (a shield does not swing), the ranged row's wand
+    // subclass gates `HasWandEquipped`. Live 17 and 18 are the wire seats 16 and 17.
+    let worn = |live: u8| {
+        inv.iter()
+            .find(|r| r.bag == net::BAG_EQUIPPED && r.slot == live - 1)
+    };
+    let weapon = |live: u8| {
+        worn(live)
+            .filter(|r| r.info.class == ITEM_CLASS_WEAPON)
+            .is_some()
+    };
+    UnitCombatStats {
+        stats,
+        stat_pos,
+        stat_neg,
+        resistances,
+        resistance_pos,
+        resistance_neg,
+        min_damage: f.unit_min_damage().unwrap_or(0.0),
+        max_damage: f.unit_max_damage().unwrap_or(0.0),
+        min_offhand_damage: f.unit_min_offhand_damage().unwrap_or(0.0),
+        max_offhand_damage: f.unit_max_offhand_damage().unwrap_or(0.0),
+        physical_bonus_pos: f.player_mod_damage_done_pos(0).unwrap_or(0),
+        physical_bonus_neg: f.player_mod_damage_done_neg(0).unwrap_or(0),
+        damage_percent: f.player_mod_damage_done_pct(0).unwrap_or(1.0),
+        main_attack_time_ms: base_swing(f.unit_base_attack_time(0)),
+        offhand_attack_time_ms: base_swing(f.unit_base_attack_time(1)),
+        attack_power: f.unit_attack_power().unwrap_or(0),
+        attack_power_pos: i32::from(ap_pos),
+        attack_power_neg: i32::from(ap_neg),
+        ranged_attack_power: f.unit_ranged_attack_power().unwrap_or(0),
+        ranged_attack_power_pos: i32::from(rap_pos),
+        ranged_attack_power_neg: i32::from(rap_neg),
+        ranged_attack_time_ms: base_swing(f.unit_ranged_attack_time()),
+        ranged_min_damage: f.unit_min_ranged_damage().unwrap_or(0.0),
+        ranged_max_damage: f.unit_max_ranged_damage().unwrap_or(0.0),
+        has_offhand: weapon(17),
+        has_wand: worn(18)
+            .is_some_and(|r| r.info.class == ITEM_CLASS_WEAPON && r.info.subclass == SUBCLASS_WAND),
+        dodge_percent: f.player_dodge_percentage().unwrap_or(0.0),
+        parry_percent: f.player_parry_percentage().unwrap_or(0.0),
+        block_percent: f.player_block_percentage().unwrap_or(0.0),
         ..Default::default()
     }
 }
@@ -1051,7 +1300,7 @@ impl Feed {
 
         self.push_loot(script, cats);
         self.push_merchant(script, cats);
-        self.push_containers(script, cats, &inv);
+        self.push_containers(script, cats, &inv, player);
         self.push_party(script, &party, self_guid, &name_of);
         self.first = false;
     }
@@ -1066,8 +1315,64 @@ impl Feed {
         script: &mut UiScript,
         cats: Option<&Catalogs>,
         inv: &[net::BnNetInvItem],
+        player: &Option<ObjectFields>,
     ) {
+        // The stat sheet rides the same pass, so the doll's rows and its numbers repaint together.
+        // Deviation: the reference fires one event per changed field id
+        // (`ui_unit/field_events.rs:185-204`); this host fires the sheet's whole set on any change
+        // of the snapshot, which repaints the same frames and costs one pass per real change.
+        if let Some(f) = player.as_ref() {
+            let stats = combat_stats(f, inv);
+            if self.last_stats.as_ref() != Some(&stats) {
+                self.last_stats = Some(stats.clone());
+                script.set_player_combat_stats(Some(stats));
+                if !self.first {
+                    for event in [
+                        "UNIT_STATS",
+                        "UNIT_RESISTANCES",
+                        "UNIT_DAMAGE",
+                        "UNIT_ATTACK_POWER",
+                        "UNIT_RANGED_ATTACK_POWER",
+                        "UNIT_ATTACK_SPEED",
+                        "UNIT_RANGEDDAMAGE",
+                        "PLAYER_DAMAGE_DONE_MODS",
+                    ] {
+                        fire(script, event, vec![ev_str("player")]);
+                    }
+                }
+            }
+        }
         let bags = net::ui_bags();
+        // The class's relic flag: the RANGED seat is a relic seat for Paladin, Shaman and Druid,
+        // which decides which inventory types name it (`ui_items/mod.rs:869`).
+        let has_relic_slot = player.as_ref().is_some_and(|f| {
+            f.unit_class().is_some_and(|c| {
+                cats.and_then(|x| x.classes.as_ref())
+                    .is_some_and(|t| t.has_relic_slot(u32::from(c)))
+            })
+        });
+        // The server's half of the item lock, ahead of every feed: the reference compares the
+        // incoming guid with the one still in the descriptor (`0x5ddd42`), so a handler reads the
+        // slot as it was. The cursor verbs lock what they move and only the server lifts it; with
+        // no drain here a swapped item stays locked and can never be picked up again.
+        for guid in seat_unlocks(&mut self.last_seats, &bags, inv) {
+            script.unlock_item(guid);
+        }
+        // The doll first: its getters read the snapshot, and the container pass below can return
+        // early on an unchanged bag. The app pushes the same pair under one `UNIT_INVENTORY_CHANGED`
+        // (`ui_char.rs:910-918`).
+        let inv_slots = inventory_slots(inv, cats, has_relic_slot);
+        if self.last_inv.as_ref() != Some(&inv_slots) {
+            self.last_inv = Some(inv_slots.clone());
+            script.set_inventory_slots(inv_slots);
+            if !self.first {
+                fire(
+                    script,
+                    "UNIT_INVENTORY_CHANGED",
+                    vec![ScriptValue::Str("player".to_string())],
+                );
+            }
+        }
         let mut fresh: HashMap<i64, ContainerState> = HashMap::new();
         let mut guids = [0u64; 4];
         for &(id, num_slots, entry, guid) in &bags {
@@ -1082,7 +1387,10 @@ impl Feed {
                     _ => continue,
                 };
                 if row_bag == id {
-                    slots.insert(u32::from(item.slot) + 1, container_slot(item, cats));
+                    slots.insert(
+                        u32::from(item.slot) + 1,
+                        container_slot(item, cats, has_relic_slot),
+                    );
                 }
             }
             let name = if id == 0 {
@@ -1926,6 +2234,8 @@ pub(crate) fn intents(script: &mut UiScript) {
     }
     script.requeue_calls(keep);
 
+    container_moves(script);
+
     giver_intents(script);
 
     // Death dialog.
@@ -2214,6 +2524,201 @@ fn wire_pos(bag: u8, slot: u8) -> (u8, u8) {
     }
 }
 
+/// The Lua container id a cursor verb queued is the client's own addressing; the wire wants
+/// `Player::GetItemByPos`'s. Ported with the reference's ranges
+/// (`benilla-app/src/ui_items/mod.rs:90`), bank and keyring sentinels included.
+fn lua_wire_pos(bag: i64, slot1: u32) -> Option<(u8, u8)> {
+    const PACK_SLOTS: u8 = 16;
+    const BANK_SLOTS: u8 = 24;
+    const KEYRING_SLOTS: u8 = 16;
+    const BANK_SLOT_FIRST: u8 = 39;
+    const BANK_BAG_SLOT_FIRST: u8 = 63;
+    const KEYRING_SLOT_FIRST: u8 = 81;
+    const BANK_CONTAINER: i64 = -1;
+    const BANK_BAG_ID_FIRST: i64 = 5;
+    const KEYRING_CONTAINER: i64 = -2;
+    let slot0 = u8::try_from(slot1.checked_sub(1)?).ok()?;
+    match bag {
+        0 if slot0 < PACK_SLOTS => Some((BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST + slot0)),
+        1..=4 if slot0 < 36 => Some((SLOT_BAG_FIRST + (bag as u8 - 1), slot0)),
+        BANK_CONTAINER if slot0 < BANK_SLOTS => {
+            Some((BAG_PLAYER_INVENTORY, BANK_SLOT_FIRST + slot0))
+        }
+        5..=10 if slot0 < 36 => {
+            Some((BANK_BAG_SLOT_FIRST + (bag - BANK_BAG_ID_FIRST) as u8, slot0))
+        }
+        KEYRING_CONTAINER if slot0 < KEYRING_SLOTS => {
+            Some((BAG_PLAYER_INVENTORY, KEYRING_SLOT_FIRST + slot0))
+        }
+        EQUIPMENT_BAG if (1..=23).contains(&slot1) || (64..=69).contains(&slot1) => {
+            Some((BAG_PLAYER_INVENTORY, slot0))
+        }
+        _ => None,
+    }
+}
+
+/// The inventory row at a wire position: the rows carry their own addressing, 255 (`BAG_EQUIPPED`)
+/// for worn equipment and 0 for the backpack, whose wire seats are `SLOT_PACK_FIRST`..
+fn inv_row_at(wire: (u8, u8)) -> Option<net::BnNetInvItem> {
+    net::ui_inventory().into_iter().find(|r| {
+        if wire.0 == BAG_PLAYER_INVENTORY {
+            if r.bag == BAG_PLAYER_INVENTORY || r.bag == net::BAG_EQUIPPED {
+                r.slot == wire.1
+            } else {
+                r.bag == 0 && wire.1 >= SLOT_PACK_FIRST && r.slot == wire.1 - SLOT_PACK_FIRST
+            }
+        } else {
+            r.bag == wire.0 && r.slot == wire.1
+        }
+    })
+}
+
+/// `ITEM_CLASS_PROJECTILE` (`benilla-app/src/ui_items/mod.rs:859`), the template class the
+/// auto-equip sender loads by entry instead of moving (`0x5e16ff`).
+const ITEM_CLASS_PROJECTILE: u32 = 6;
+
+/// The container drains the reference runs every frame (`ui_items/drain.rs`): the cursor verbs queue
+/// the intent and the drain only sends. A whole stack with both ends in the player's own array is
+/// `CMSG_SWAP_INV_ITEM`, anything crossing into a bag is `CMSG_SWAP_ITEM` (destination first,
+/// `Server/Packets/Item.cpp:30-36`), a split is `CMSG_SPLIT_ITEM` and `PutItemInBag` is
+/// `CMSG_AUTOSTORE_BAG_ITEM` with no seat, which the server picks.
+///
+/// The bind-on-equip deferral (`0x5e0c40`) is not ported: this host raises no `EQUIP_BIND_CONFIRM`
+/// popup, so a move into an equipment position equips straight away.
+fn container_moves(script: &mut UiScript) {
+    for mv in script.take_container_moves() {
+        let (Some(src), Some(dst)) = (
+            lua_wire_pos(mv.src_bag, mv.src_slot),
+            lua_wire_pos(mv.dst_bag, mv.dst_slot),
+        ) else {
+            net::note(format!("container move {mv:?} is not a wire position"));
+            continue;
+        };
+        match mv.count {
+            None if src.0 == BAG_PLAYER_INVENTORY && dst.0 == BAG_PLAYER_INVENTORY => {
+                net::note(format!(
+                    "ui_items: swap backpack lua {}→{} (wire 255 slot {}↔{})",
+                    mv.src_slot, mv.dst_slot, src.1, dst.1
+                ));
+                let _ = net::send_cmd(Cmd::SwapInv {
+                    src: src.1,
+                    dst: dst.1,
+                });
+            }
+            None => {
+                net::note(format!(
+                    "ui_items: swap whole-space lua {}/{}→{}/{} (wire {}/{})→({}/{})",
+                    mv.src_bag, mv.src_slot, mv.dst_bag, mv.dst_slot, src.0, src.1, dst.0, dst.1
+                ));
+                let _ = net::send_cmd(Cmd::SwapItem {
+                    dst_bag: dst.0,
+                    dst_slot: dst.1,
+                    src_bag: src.0,
+                    src_slot: src.1,
+                });
+            }
+            Some(n) => {
+                let count = n.min(u32::from(u8::MAX)) as u8;
+                net::note(format!(
+                    "ui_items: split lua {}/{}→{}/{} × {count} (wire {}/{})→({}/{})",
+                    mv.src_bag, mv.src_slot, mv.dst_bag, mv.dst_slot, src.0, src.1, dst.0, dst.1
+                ));
+                let _ = net::send_cmd(Cmd::SplitItem {
+                    src_bag: src.0,
+                    src_slot: src.1,
+                    dst_bag: dst.0,
+                    dst_slot: dst.1,
+                    count,
+                });
+            }
+        }
+    }
+    for a in script.take_bag_autostores() {
+        let (Some((src_bag, src_slot)), Some((dst_bag, _))) = (
+            lua_wire_pos(a.src_bag, a.src_slot),
+            lua_wire_pos(a.dst_bag, 1),
+        ) else {
+            net::note(format!("ui_items: bag autostore {a:?} out of range"));
+            continue;
+        };
+        match a.count {
+            None => {
+                net::note(format!(
+                    "ui_items: autostore lua {}/{} → bag {} (wire {src_bag}/{src_slot} → {dst_bag})",
+                    a.src_bag, a.src_slot, a.dst_bag
+                ));
+                let _ = net::send_cmd(Cmd::AutoStore {
+                    src_bag,
+                    src_slot,
+                    dst_bag,
+                });
+            }
+            Some(n) => {
+                let count = n.min(u32::from(u8::MAX)) as u8;
+                net::note(format!(
+                    "ui_items: autostore split lua {}/{} → bag {} × {count} (wire {src_bag}/{src_slot} → {dst_bag})",
+                    a.src_bag, a.src_slot, a.dst_bag
+                ));
+                let _ = net::send_cmd(Cmd::SplitItem {
+                    src_bag,
+                    src_slot,
+                    dst_bag,
+                    // The reference's literal for no destination slot.
+                    dst_slot: 0xFF,
+                    count,
+                });
+            }
+        }
+    }
+    for (bag, slot) in script.take_container_autoequips() {
+        let Some(wire) = lua_wire_pos(bag, slot) else {
+            continue;
+        };
+        match inv_row_at(wire).filter(|r| r.info.class == ITEM_CLASS_PROJECTILE) {
+            Some(ammo) => {
+                net::note(format!(
+                    "ui_items: autoequip lua {bag}/{slot} is ammo entry {} — loaded",
+                    ammo.entry
+                ));
+                let _ = net::send_cmd(Cmd::SetAmmo(ammo.entry));
+            }
+            None => {
+                net::note(format!(
+                    "ui_items: autoequip lua {bag}/{slot} (wire {}/{})",
+                    wire.0, wire.1
+                ));
+                let _ = net::send_cmd(Cmd::AutoEquip {
+                    bag: wire.0,
+                    slot: wire.1,
+                });
+            }
+        }
+    }
+    // A bind-on-equip question keeps the item on the cursor and sends nothing; taking the queue keeps
+    // it from growing while the popup is unimplemented.
+    let _ = script.take_container_equip_asks();
+    // `UseInventoryItem(id, onSelf)` — the doll's right-click — reaches the same `CGItem::Use` a bag
+    // click does (`0x4c7af0`), so it is the same `CMSG_USE_ITEM` at wire 255/(id-1). The app refuses
+    // ids outside 1..=19, the equipped-bag band and ammo having no use path (`ui_items/drain.rs:171`).
+    for id in script.take_inventory_uses() {
+        if !(1..=19).contains(&id) {
+            net::note(format!(
+                "ui_items: UseInventoryItem({id}) out of range — ignored"
+            ));
+            continue;
+        }
+        let slot = (id - 1) as u8;
+        net::note(format!(
+            "ui_items: use equipped item, lua slot {id} (wire 255/{slot})"
+        ));
+        let _ = net::send_cmd(Cmd::UseItem {
+            bag: BAG_PLAYER_INVENTORY,
+            slot,
+            spell: 0,
+        });
+    }
+}
+
 /// `UseContainerItem` past its gates (`0x4fa0e0`): the arm the VM took chooses the packet, so the
 /// click behaves as the reference client's does — an equippable template auto-equips, a usable one
 /// fires its item spell, and a click on a vendor-open slot sells the stack.
@@ -2306,6 +2811,23 @@ fn attack_keeps(guid: u64) -> bool {
         return true;
     };
     t.reaction_toward(&p) != Reaction::Friendly
+}
+
+/// The right click's attack fork (`cursor_mode.rs`'s `can_attack`, asked at `0x482680`): hostile
+/// toward us or we toward it, the same two-way test the enemy cycle uses. A faction that does not
+/// resolve is read as hostile, as the reference reads a data gap: no missing DBC row may cost the
+/// player their swing.
+pub(crate) fn attackable(guid: u64) -> bool {
+    let Some(unit) = net::ui_unit(guid) else {
+        return false;
+    };
+    let (Some(t), Some(p)) = (
+        faction_template(&unit.fields),
+        net::ui_self_fields().as_ref().and_then(faction_template),
+    ) else {
+        return true;
+    };
+    t.reaction_toward(&p) == Reaction::Hostile || p.reaction_toward(&t) == Reaction::Hostile
 }
 
 /// `TargetNearest*`: the next (or, reversed, previous) candidate in distance order from the body.

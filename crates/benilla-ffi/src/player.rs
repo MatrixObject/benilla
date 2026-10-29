@@ -60,7 +60,11 @@ const CAPSULE_HEIGHT: f32 = 2.027_777_7;
 
 // ---- camera ----
 const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
-const LOOK_SENSITIVITY: f32 = 0.028;
+/// `crates/benilla-app/src/player/camera.rs`'s `LOOK_SENSITIVITY`: radians of
+/// camera rotation per raw mouse unit at the default move speeds and `mousespeed`
+/// 1.0. The reference's law (`0x50fee0`) is `yaw_speed × Δx / 180` and
+/// `pitch_speed × Δy / 90`, which at the default 180 and 90 both land here.
+const LOOK_SENSITIVITY: f32 = 0.003;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom's deviation, for a wider view
 /// The shortest boom the collision probe will pull to: any closer and the eye
 /// sits inside the body (the client's first-person cut is not modelled).
@@ -2009,8 +2013,11 @@ impl Player {
             self.model_yaw = wrap_pi(self.model_yaw - turn);
         }
         self.cam_yaw = wrap_pi(self.cam_yaw + turn);
+        // `mouseInvertPitch` is off by default, so a downward drag gives a negative
+        // pitch and the view drops: `let d_pitch = -dy * pitch_rate`
+        // (`player/camera.rs`'s look rotation).
         self.cam_pitch =
-            (self.cam_pitch + dy * LOOK_SENSITIVITY).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
+            (self.cam_pitch - dy * LOOK_SENSITIVITY).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
     }
 
     /// Whether the lower body is committed to locomotion, the vanilla
@@ -2443,17 +2450,57 @@ pub(crate) fn ui_pos(world: *mut BnWorld) -> Option<[f32; 3]> {
     unsafe { world.as_ref() }.and_then(|w| w.player.as_ref().map(|p| p.pos))
 }
 
+/// The reference's up-edge click predicate (`0x514ae0`), as
+/// `crates/benilla-app/src/player/camera.rs` states it: a click is a release within
+/// 200 ms, or within 800 ms while the drag has asked for under 2.25° of yaw and
+/// 2.0° of pitch. Travel sums absolute motion per axis (`0x514400`), charged before
+/// any clamp, so a drag pinned at the pitch limit still spends the budget.
+const CLICK_FREE_WINDOW: f32 = 0.200;
+const CLICK_HOLD_CEILING: f32 = 0.800;
+const CLICK_YAW_TRAVEL: f32 = 2.25 * std::f32::consts::PI / 180.0;
+const CLICK_PITCH_TRAVEL: f32 = 2.0 * std::f32::consts::PI / 180.0;
+
+/// An undecided primary press: the reference's `[0xbe1148]` word, press time at
+/// `+0x14` and the two travel accumulators.
+#[derive(Clone, Copy)]
+struct PressGesture {
+    at: f32,
+    yaw_travel: f32,
+    pitch_travel: f32,
+}
+
+impl PressGesture {
+    fn new(at: f32) -> Self {
+        Self {
+            at,
+            yaw_travel: 0.0,
+            pitch_travel: 0.0,
+        }
+    }
+
+    fn is_click(&self, now: f32) -> bool {
+        let elapsed = now - self.at;
+        elapsed < CLICK_FREE_WINDOW
+            || (elapsed < CLICK_HOLD_CEILING
+                && self.yaw_travel < CLICK_YAW_TRAVEL
+                && self.pitch_travel < CLICK_PITCH_TRAVEL)
+    }
+}
+
 /// The mouse buttons the world owns, latched at the press
 /// (`crates/benilla-app/src/player/camera.rs`'s `WorldMouse`). 1.12 reads the
 /// `TURNORACTION` and `CAMERAORSELECTORMOVE` bindings through the world frame, and a press a UI
 /// frame captured never dispatches one: no look session, no turn channel. The world's down sets a
 /// held bit and that button's up clears it, so a frame appearing under the cursor cannot steal it.
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub(crate) struct WorldMouse {
     /// `[0]` the left button's, `[1]` the right's: held by the world right now.
     held: [bool; 2],
     /// `MouselookStart` holds the TurnOrAction channel (`0x514231`) with no button held.
     scripted: bool,
+    /// One undecided press per primary button, settled by its release
+    /// (`0x514ae0`): the world only picks what this says is a click.
+    clicks: [Option<PressGesture>; 2],
 }
 
 impl WorldMouse {
@@ -2471,25 +2518,57 @@ impl WorldMouse {
         self.held[1] || self.scripted
     }
 
+    /// Both primaries held: a chord, never a select (`0x514ac1`).
+    fn both(&self) -> bool {
+        self.turn() && self.held[0]
+    }
+
     /// One button edge. A down edge belongs to the world when no frame took it, or when a look
-    /// session already owns the cursor: a chord's second button is the world's too (`0x51481a`
-    /// refuses to arm a *pick* that way, which is the host's click gate, not this channel).
-    pub(crate) fn edge(&mut self, button: &str, down: bool, frame_took: bool) {
+    /// session already owns the cursor: a chord's second button is the world's too. The press
+    /// arms its click test unless the other channel is held (`0x51491f` engages, the release
+    /// decides), and the release answers with the settled click as `[1 << slot]`.
+    pub(crate) fn edge(&mut self, button: &str, down: bool, frame_took: bool, now: f32) -> u32 {
         let Some(i) = Self::slot(button) else {
-            return;
+            return 0;
         };
         if !down {
             self.held[i] = false;
-            return;
+            return match self.clicks[i].take() {
+                Some(gesture) if gesture.is_click(now) => 1 << i,
+                _ => 0,
+            };
         }
         if !frame_took || self.turn() || self.held[0] {
             self.held[i] = true;
         }
+        if self.both() {
+            self.clicks = [None, None];
+        } else {
+            // The other channel owns the gesture: a right press with left held and a
+            // left press on the turn channel each arm nothing (`0x514ac1`, `0x51481a`).
+            let other_held = if i == 1 { self.held[0] } else { self.turn() };
+            self.clicks[i] = (!frame_took && !other_held).then(|| PressGesture::new(now));
+        }
+        0
     }
 
-    /// `MouselookStart` (`on`) or `MouselookStop`: one channel, whoever set it, so a stop also
-    /// ends a right drag in flight, whose release then clears nothing.
-    pub(crate) fn mouselook(&mut self, on: bool) {
+    /// Charge this frame's travel to every undecided press (`0x514400`).
+    fn note_travel(&mut self, dx: f32, dy: f32) {
+        let (yaw, pitch) = (dx.abs() * LOOK_SENSITIVITY, dy.abs() * LOOK_SENSITIVITY);
+        for gesture in self.clicks.iter_mut().flatten() {
+            gesture.yaw_travel += yaw;
+            gesture.pitch_travel += pitch;
+        }
+    }
+
+    /// The TurnOrAction channel's rise or fall. A `MouselookStart`/`Stop` the VM ran (`disarm`)
+    /// also drops the undecided presses (`0x514810(0)` stores mode 0 unguarded), which is why a
+    /// stop's release and the button after it select nothing; the right button's own binding does
+    /// not, or a right click could never attack.
+    fn set_channel(&mut self, on: bool, disarm: bool) {
+        if disarm {
+            self.clicks = [None, None];
+        }
         if on {
             self.scripted = true;
         } else {
@@ -2500,7 +2579,18 @@ impl WorldMouse {
 }
 
 thread_local! {
-    static BN_LOOK: RefCell<WorldMouse> = const { RefCell::new(WorldMouse { held: [false; 2], scripted: false }) };
+    static BN_LOOK: RefCell<WorldMouse> = const { RefCell::new(WorldMouse {
+        held: [false; 2],
+        scripted: false,
+        clicks: [None; 2],
+    }) };
+    static BN_LOOK_AT: std::time::Instant = std::time::Instant::now();
+}
+
+/// Seconds since this thread's first look event, the clock the press predicate
+/// measures on (`GetTickCount` in the reference).
+fn look_now() -> f32 {
+    BN_LOOK_AT.with(|t| t.elapsed().as_secs_f32())
 }
 
 /// Whether a look session owns the cursor at all: the right button's channel or
@@ -2511,9 +2601,16 @@ pub(crate) fn look_session() -> bool {
 }
 
 /// A mouse button edge, from `bn_ui_mouse_button`: `frame_took` is that frame's verdict, the one
-/// thing that decides whether the world owns the press.
-pub(crate) fn ui_mouse_edge(button: &str, down: bool, frame_took: bool) {
-    BN_LOOK.with(|l| l.borrow_mut().edge(button, down, frame_took));
+/// thing that decides whether the world owns the press. The release answers with the click the
+/// reference's predicate settles: bit0 the left button's, bit1 the right's.
+pub(crate) fn ui_mouse_edge(button: &str, down: bool, frame_took: bool) -> u32 {
+    BN_LOOK.with(|l| l.borrow_mut().edge(button, down, frame_took, look_now()))
+}
+
+/// Charge this frame's pointer travel to the undecided presses, so a drag spends its click budget
+/// (`0x514400`) exactly as it spends the camera's rotation.
+pub(crate) fn note_travel(dx: f32, dy: f32) {
+    BN_LOOK.with(|l| l.borrow_mut().note_travel(dx, dy));
 }
 
 /// Whether the TurnOrAction channel is held: the drag turns the body, not just the camera.
@@ -2521,30 +2618,19 @@ pub(crate) fn look_turn() -> bool {
     BN_LOOK.with(|l| l.borrow().turn())
 }
 
-/// A `MouselookStart`/`TurnOrActionStart`'s channel: one bit, whoever set it, so a stop also
-/// ends a right drag in flight, whose release then clears nothing.
+/// The `TURNORACTION` binding's Start/Stop, which is the right button's own channel: it holds the
+/// channel without touching the undecided click, or a right click could never attack.
 pub(crate) fn ui_turn_held(on: bool) {
-    BN_LOOK.with(|l| l.borrow_mut().mouselook(on));
+    BN_LOOK.with(|l| l.borrow_mut().set_channel(on, false));
 }
 
 /// The `MouselookStart`/`Stop` calls the VM made since the last pass, applied in call order, and
 /// the channel's state handed to `IsMouselooking` for it to read.
 pub(crate) fn drive_mouselook(script: &mut benilla_ui::script::UiScript) {
     for on in script.take_mouselook_calls() {
-        BN_LOOK.with(|l| l.borrow_mut().mouselook(on));
+        BN_LOOK.with(|l| l.borrow_mut().set_channel(on, true));
     }
     script.set_turn_or_action_held(look_turn());
-}
-
-/// The world mouse's held buttons as bits: bit0 left, bit1 right. A click
-/// gesture arms only with the other button up (`target/mod.rs:217`), so the host
-/// reads the client's own state instead of tracking its own.
-#[no_mangle]
-pub extern "C" fn bn_player_mouse_held() -> u32 {
-    BN_LOOK.with(|l| {
-        let m = l.borrow();
-        u32::from(m.held[0]) | (u32::from(m.held[1]) << 1)
-    })
 }
 
 /// Roam mode on/off: free flight for touring the map (no gravity, collision or
@@ -2569,8 +2655,11 @@ pub extern "C" fn bn_player_fly(world: *mut BnWorld, on: u32) -> u32 {
 /// only orbits, leaving the aim (and WASD's basis) where it was.
 #[no_mangle]
 pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32) -> u32 {
-    // The host reports the pointer's delta every frame; only a look session the
-    // world owns moves anything.
+    // The host reports the pointer's travel every frame, in the pixels the law is
+    // measured in. It is charged to an undecided press before anything else, as the
+    // reference does: a drag spends its click budget whether or not it turns.
+    note_travel(dx, dy);
+    // Only a look session the world owns moves anything.
     if !look_session() {
         return 0;
     }
@@ -2579,6 +2668,15 @@ pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32) -> u32 
     // TurnOrAction bit turns the body, a left drag only orbits the camera.
     p.look(dx, dy, look_turn());
     1
+}
+
+/// Whether a look session owns the cursor right now. The host has no window
+/// grab, so it hides and pins the pointer for the session the way
+/// `engage_look`'s `take_cursor` does, and a drag that reaches the window edge
+/// keeps turning instead of stalling.
+#[no_mangle]
+pub extern "C" fn bn_player_look_session() -> u32 {
+    look_session() as u32
 }
 
 /// Wheel zoom: `notches` positive = closer (CameraZoomIn 1.0 per notch).

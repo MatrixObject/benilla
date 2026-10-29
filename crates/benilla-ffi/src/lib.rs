@@ -9343,9 +9343,13 @@ fn mouse_binding_key(button: &str) -> Option<&'static str> {
 /// `down` 1 = press, 0 = release.
 ///
 /// Returns the arms that took the event: bit0 a frame's click, bit1 the world
-/// frame's binding. A press binds only with the cursor over the world, since a
-/// frame owns its own clicks (`bindings.rs`'s mouse arm); a release always runs
-/// the latch's up-half, whatever was under the cursor when the press came.
+/// frame's binding, bit2 a left world click and bit3 a right one. A press binds
+/// only with the cursor over the world, since a frame owns its own clicks
+/// (`bindings.rs`'s mouse arm); a release always runs the latch's up-half, whatever
+/// was under the cursor when the press came. The two click bits are the reference's
+/// up-edge predicate (`0x514ae0`, `player/camera.rs`'s `PressGesture`): a press settles
+/// as a click only within 200 ms, or within 800 ms under 2.25° of yaw and 2.0° of pitch
+/// travel, so a drag or a chord selects nothing.
 #[no_mangle]
 pub extern "C" fn bn_ui_mouse_button(
     x: f32,
@@ -9368,8 +9372,9 @@ pub extern "C" fn bn_ui_mouse_button(
             };
             let taken = u32::from(script.mouse_button(x, y, name, down != 0));
             // The world's own channel: a press a frame captured starts no look session
-            // (`player/camera.rs`'s `WorldMouse`), so the drag turns nothing.
-            player::ui_mouse_edge(name, down != 0, taken != 0);
+            // (`player/camera.rs`'s `WorldMouse`), so the drag turns nothing. The release
+            // answers with the click that channel settled.
+            let taken = taken | (player::ui_mouse_edge(name, down != 0, taken != 0) << 2);
             let Some(key) = mouse_binding_key(name) else {
                 return taken;
             };

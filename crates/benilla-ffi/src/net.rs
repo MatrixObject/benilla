@@ -970,8 +970,11 @@ pub(crate) enum Cmd {
         target: Option<String>,
         msg: String,
     },
-    /// `CMSG_GOSSIP_HELLO`: open the NPC's gossip/quest menu.
+    /// `CMSG_QUESTGIVER_HELLO`: the quest menu of a unit flagged QUESTGIVER.
     GiverHello(u64),
+    /// `CMSG_GOSSIP_HELLO`: the gossip menu, which vmangos answers for any unit
+    /// carrying `UNIT_NPC_FLAGS` gossip (`QuestHandler.cpp:104`).
+    GossipHello(u64),
     /// `CMSG_QUESTGIVER_QUERY_QUEST`: the accept panel for one quest.
     QuestQueryGiver {
         npc: u64,
@@ -1024,6 +1027,30 @@ pub(crate) enum Cmd {
         src: u8,
         dst: u8,
     },
+    /// `CMSG_SWAP_ITEM`: one item between two wire positions. The wire takes the destination
+    /// first (`Server/Packets/Item.cpp:30-36`), which is why the fields are ordered so.
+    SwapItem {
+        dst_bag: u8,
+        dst_slot: u8,
+        src_bag: u8,
+        src_slot: u8,
+    },
+    /// `CMSG_SPLIT_ITEM`: `count` of the source stack into the destination slot.
+    SplitItem {
+        src_bag: u8,
+        src_slot: u8,
+        dst_bag: u8,
+        dst_slot: u8,
+        count: u8,
+    },
+    /// `CMSG_AUTOSTORE_BAG_ITEM`: put the item in a container, the server picking the seat.
+    AutoStore {
+        src_bag: u8,
+        src_slot: u8,
+        dst_bag: u8,
+    },
+    /// `CMSG_SET_AMMO`: load the ranged attack's ammo by template entry; it stays in its bag.
+    SetAmmo(u32),
     /// `CMSG_GROUP_INVITE`: invite a player by name.
     GroupInvite(String),
     /// `CMSG_GROUP_ACCEPT`: take the pending invite.
@@ -2288,6 +2315,12 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::GiverHello(npc)) => {
                     let _ = session.questgiver_hello(npc);
                 }
+                Ok(Cmd::GossipHello(npc)) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_GOSSIP_HELLO,
+                        &benilla_protocol::messages::gossip_hello(npc),
+                    );
+                }
                 Ok(Cmd::QuestQueryGiver { npc, quest }) => {
                     let _ = session.questgiver_query_quest(npc, quest);
                 }
@@ -2344,6 +2377,58 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 Ok(Cmd::SwapInv { src, dst }) => {
                     if let Err(e) = session.swap_inv_item(src, dst) {
                         sh.event(format!("error|swap|{e}"));
+                    }
+                }
+                Ok(Cmd::SwapItem {
+                    dst_bag,
+                    dst_slot,
+                    src_bag,
+                    src_slot,
+                }) => {
+                    let body =
+                        benilla_protocol::messages::swap_item(dst_bag, dst_slot, src_bag, src_slot);
+                    if let Err(e) =
+                        session.send_body(benilla_protocol::messages::opcode::CMSG_SWAP_ITEM, &body)
+                    {
+                        sh.event(format!("error|swap_item|{e}"));
+                    }
+                }
+                Ok(Cmd::SplitItem {
+                    src_bag,
+                    src_slot,
+                    dst_bag,
+                    dst_slot,
+                    count,
+                }) => {
+                    let body = benilla_protocol::messages::split_item(
+                        src_bag, src_slot, dst_bag, dst_slot, count,
+                    );
+                    if let Err(e) = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_SPLIT_ITEM, &body)
+                    {
+                        sh.event(format!("error|split_item|{e}"));
+                    }
+                }
+                Ok(Cmd::AutoStore {
+                    src_bag,
+                    src_slot,
+                    dst_bag,
+                }) => {
+                    let body =
+                        benilla_protocol::messages::auto_store_bag_item(src_bag, src_slot, dst_bag);
+                    if let Err(e) = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_AUTOSTORE_BAG_ITEM,
+                        &body,
+                    ) {
+                        sh.event(format!("error|autostore|{e}"));
+                    }
+                }
+                Ok(Cmd::SetAmmo(entry)) => {
+                    let body = benilla_protocol::messages::set_ammo(entry);
+                    if let Err(e) =
+                        session.send_body(benilla_protocol::messages::opcode::CMSG_SET_AMMO, &body)
+                    {
+                        sh.event(format!("error|set_ammo|{e}"));
                     }
                 }
                 Ok(Cmd::GroupInvite(name)) => {
@@ -4482,9 +4567,101 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             vendor: a,
             item_guid: 0,
         },
+        // 34 = gossip hello (a = npc): the menu of a unit with `UNIT_NPC_FLAGS`
+        // gossip, which the questgiver hello's quest list never fills.
+        34 => Cmd::GossipHello(a),
         _ => return 0,
     };
     send_cmd(cmd) as u32
+}
+
+/// `UNIT_NPC_FLAGS` (`cursor_mode.rs::npc_flags`), 1.12 numbering, for the arms this kernel can
+/// send. REPAIR (0x4000) is never consulted by the ladder (`0x5f0130`).
+mod npc_flags {
+    pub const GOSSIP: u32 = 0x1;
+    pub const QUESTGIVER: u32 = 0x2;
+    pub const VENDOR: u32 = 0x4;
+}
+
+/// The cached `SMSG_QUESTGIVER_STATUS` gate (`cursor_mode.rs::questgiver_has_quest`, `0x5df490`):
+/// a quest-less questgiver opens a frame of placeholder text, so its arm never fires.
+fn questgiver_has_quest(status: Option<u32>) -> bool {
+    use benilla_protocol::messages::dialog_status;
+    !matches!(
+        status,
+        None | Some(dialog_status::NONE) | Some(dialog_status::UNAVAILABLE)
+    )
+}
+
+/// The first-match-wins NPC-service ladder (`click.rs`'s `service_arm` over `0x5f0130`),
+/// projected onto the kinds this kernel sends: gossip `34`, questgiver `18`, vendor `28`. Bits 3
+/// and up have arms (taxi, trainer, bank, binder, stable) with no verb here; they are all higher
+/// than the three above, so first-match-wins over them is unchanged and they send nothing.
+fn service_send(npc_flags: u32, quest_status: Option<u32>) -> Option<u32> {
+    if npc_flags & npc_flags::GOSSIP != 0 {
+        Some(34)
+    } else if npc_flags & npc_flags::QUESTGIVER != 0 && questgiver_has_quest(quest_status) {
+        Some(18)
+    } else if npc_flags & npc_flags::VENDOR != 0 {
+        Some(28)
+    } else {
+        None
+    }
+}
+
+/// Queue one click command and answer with the `bn_net_send` kind the host logs it under, or 0
+/// when the session thread is not there to take it.
+fn queued(cmd: Cmd, kind: u32) -> u32 {
+    if send_cmd(cmd) {
+        kind
+    } else {
+        0
+    }
+}
+
+/// The world click's whole gesture on a picked object, which is the middle layer's decision, not
+/// the host's: `button` 0 = left, 1 = right, as the settled click of `bn_ui_mouse_button`'s bits 2
+/// and 3 reports it. The left button selects and nothing else (`0x493540`); the right one selects
+/// first (`0x492820`) and then runs the unit dispatcher's branch (`0x60bea0`): the loot fork for a
+/// corpse, `CanAttack` for anything hostile, else the service ladder.
+///
+/// Returns the `bn_net_send` kind queued for the branch (2 attack, 4 loot, 5 use, 18/28/34 a
+/// service hello), or 3 for a select alone. An unresolved faction is read as hostile, the way the
+/// reference reads a data gap: a missing DBC row must never cost the player their swing.
+#[no_mangle]
+pub extern "C" fn bn_net_unit_click(button: u32, guid: u64) -> u32 {
+    let Some(unit) = ui_unit(guid) else {
+        return 0;
+    };
+    if button == 0 {
+        return queued(Cmd::Target(guid), 3);
+    }
+    // A GameObject is used and never selected (`OnUse 0x5f8660`).
+    if unit.kind == 5 {
+        return queued(Cmd::GameObjUse(guid), 5);
+    }
+    // The click's entry selects first, whatever leg follows (`0x492820`).
+    send_cmd(Cmd::Target(guid));
+    // The dead fork (`0x60bf75`) is terminal and never reaches a service: a corpse with loot
+    // loots and one without does nothing - which is why a kill used to look like it dropped
+    // nothing. `UNIT_DYNFLAG_DEAD` is the body still in its death animation, not yet a corpse.
+    let dead = unit.fields.unit_is_dead();
+    if unit.kind == 7 || (dead && !unit.fields.unit_dynflag_dead() && unit.fields.unit_lootable()) {
+        return queued(Cmd::Loot(guid), 4);
+    }
+    if dead {
+        return 3;
+    }
+    if crate::ui_feed::attackable(guid) {
+        return queued(Cmd::Attack(guid), 2);
+    }
+    // The alive branch (`0x60c162`): `UNIT_NPC_FLAGS`, gated by the cached quest status.
+    match service_send(unit.fields.unit_npc_flags(), ui_quest_status(guid)) {
+        Some(34) => queued(Cmd::GossipHello(guid), 34),
+        Some(18) => queued(Cmd::GiverHello(guid), 18),
+        Some(28) => queued(Cmd::VendorList(guid), 28),
+        _ => 3,
+    }
 }
 
 /// The open loot window as the host draws it. Returns 1 while a window is open
