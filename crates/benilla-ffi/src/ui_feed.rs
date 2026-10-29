@@ -2129,6 +2129,68 @@ pub(crate) fn intents(script: &mut UiScript) {
         });
     }
 
+    // `PickupMerchantItem`'s sell arm (`0x4fb760`): our item dropped on the vendor window sells the
+    // whole stack, by item guid, so a drop on a seat that has since emptied sells nothing.
+    for (bag, slot) in script.take_merchant_cursor_sells() {
+        if vendor.guid == 0 {
+            continue;
+        }
+        let Some(row) = lua_wire_pos(bag, slot).and_then(inv_row_at) else {
+            net::note(format!(
+                "vendor: cursor sell on an empty slot ({bag}, {slot})"
+            ));
+            continue;
+        };
+        net::note(format!(
+            "vendor: sell lua ({bag}, {slot}) item {:x}",
+            row.guid
+        ));
+        let _ = net::send_cmd(Cmd::VendorSell {
+            vendor: vendor.guid,
+            item_guid: row.guid,
+            count: 0,
+        });
+    }
+    // A held vendor row dropped into a seat is `CMSG_BUY_ITEM_IN_SLOT` (`0x4c78fd`), count 1 as on
+    // all three of the reference's drop sites. The wire names the container: the player for a seat
+    // of their own array, the bag item for a real bag.
+    for (bag, slot, entry) in script.take_merchant_slot_buys() {
+        if vendor.guid == 0 {
+            continue;
+        }
+        let Some((bag_index, bag_slot)) = lua_wire_pos(bag, slot) else {
+            net::note(format!(
+                "vendor: slot buy into an unaddressable seat ({bag}, {slot})"
+            ));
+            continue;
+        };
+        let bag_guid = if bag_index == BAG_PLAYER_INVENTORY {
+            net::ui_self_guid()
+        } else {
+            net::ui_bags()
+                .into_iter()
+                .find(|&(id, _, _, _)| id == i64::from(bag_index) - 18)
+                .map(|(_, _, _, guid)| guid)
+                .unwrap_or(0)
+        };
+        if bag_guid == 0 {
+            net::note(format!(
+                "vendor: slot buy entry {entry} has no container for bag {bag}"
+            ));
+            continue;
+        }
+        net::note(format!(
+            "vendor: buy entry {entry} into lua ({bag}, {slot})"
+        ));
+        let _ = net::send_cmd(Cmd::VendorBuyInSlot {
+            vendor: vendor.guid,
+            entry,
+            bag_guid,
+            bag_slot,
+            count: 1,
+        });
+    }
+
     // `CloseMerchant()` (`0x4fadf0`) sends no packet — but the open vendor is what makes a bag
     // right-click a *sale*, so the close has to clear the middle layer's stock window as well as
     // the VM's, or the window would be re-pushed from it on the next pass.

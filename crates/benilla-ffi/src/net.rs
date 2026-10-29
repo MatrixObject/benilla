@@ -1074,6 +1074,15 @@ pub(crate) enum Cmd {
         item_guid: u64,
         count: u8,
     },
+    /// `CMSG_BUY_ITEM_IN_SLOT`: the merchant cursor's drop into a named seat — `bag_guid` is the
+    /// container's, or the player's own for the backpack and the equipment slots (`0x4c78fd`).
+    VendorBuyInSlot {
+        vendor: u64,
+        entry: u32,
+        bag_guid: u64,
+        bag_slot: u8,
+        count: u8,
+    },
     /// `CMSG_BUYBACK_ITEM`: buy back a previously sold item from the vendor.
     VendorBuyback {
         vendor: u64,
@@ -2477,6 +2486,19 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }) => {
                     if let Err(e) = session.sell_item(vendor, item_guid, count) {
                         sh.event(format!("error|vendor|sell|{e}"));
+                    }
+                }
+                Ok(Cmd::VendorBuyInSlot {
+                    vendor,
+                    entry,
+                    bag_guid,
+                    bag_slot,
+                    count,
+                }) => {
+                    if let Err(e) =
+                        session.buy_item_in_slot(vendor, entry, bag_guid, bag_slot, count)
+                    {
+                        sh.event(format!("error|vendor|buyslot|{e}"));
                     }
                 }
                 Ok(Cmd::VendorBuyback { vendor, slot }) => {
