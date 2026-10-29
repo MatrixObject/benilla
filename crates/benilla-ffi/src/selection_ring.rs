@@ -128,7 +128,10 @@ fn variant(
 
 /// One unit's `FactionTemplate.dbc` row, the way `ring_reaction` (`0x606530`) takes it: the
 /// descriptor names the template, and the comparator reads the two rows directly.
-fn template_of(factions: Option<&FactionCatalog>, f: &ObjectFields) -> Option<FactionTemplate> {
+pub(crate) fn template_of(
+    factions: Option<&FactionCatalog>,
+    f: &ObjectFields,
+) -> Option<FactionTemplate> {
     factions?.template(f.unit_faction_template()?).copied()
 }
 
@@ -332,7 +335,7 @@ pub extern "C" fn bn_selection_ring_verts(out: *mut BnEffectVertex, cap: u32) ->
 type FactionCatalogs = Option<(String, Arc<FactionCatalog>)>;
 
 /// `FactionTemplate.dbc`, parsed once per process off the handle's chain.
-fn factions(world: &mut BnWorld) -> Option<Arc<FactionCatalog>> {
+pub(crate) fn factions(world: &mut BnWorld) -> Option<Arc<FactionCatalog>> {
     static CACHE: OnceLock<Mutex<FactionCatalogs>> = OnceLock::new();
     let cell = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());

@@ -51,7 +51,7 @@ mod char_body;
 
 // ---- M2 particle emitters (glue backdrop flames / motes) ----
 
-mod model_particles;
+pub mod model_particles;
 
 // ---- Player locomotion, collision probe and third-person camera ----
 //
@@ -93,6 +93,11 @@ mod quest_log_vm;
 // ---- The ground ring under the selected unit: footprint, fade and selector colour ----
 
 mod selection_ring;
+
+// ---- The health-bar plate over a unit: its gate, its seat, and the widget layer's states ----
+
+mod nameplates;
+mod smart_rect;
 
 // ---- The ghost body's alpha factor and tint from spell 8326's state kit ----
 
@@ -7587,6 +7592,8 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
     ui_feed::attach(world);
     // Latches name commands of the VM that made them; a new load clears them.
     BN_LATCH.with(|l| l.borrow_mut().clear());
+    // The engine clears the nameplate toggles with the VM it loads.
+    nameplates::clear_bits();
     // SAFETY: caller guarantees a valid handle for the call's span.
     let w = unsafe { &*world };
     let Some(chain) = w.chain.as_ref() else {
@@ -8958,6 +8965,7 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
 /// when the root changed (a layout reflow is due), 0 without a session.
 #[no_mangle]
 pub extern "C" fn bn_ui_set_screen_size(w: f32, h: f32) -> u32 {
+    nameplates::set_root_units(w, h);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         BN_UI.with(|slot| {
             let mut slot = slot.borrow_mut();
@@ -8968,6 +8976,15 @@ pub extern "C" fn bn_ui_set_screen_size(w: f32, h: f32) -> u32 {
         })
     }));
     out.unwrap_or(0)
+}
+
+/// The camera's backbuffer, in device pixels. The nameplates project a world point through the cone
+/// the host actually renders, so they need the window the scene draws into, which the UI root's own
+/// rect ([`bn_ui_set_screen_size`]) is letterboxed inside. Returns 1.
+#[no_mangle]
+pub extern "C" fn bn_ui_set_viewport(w: f32, h: f32) -> u32 {
+    nameplates::set_screen_px(w, h);
+    1
 }
 
 /// Seat the host's pixel factor, `canvas height / 768`, for the VM's text
