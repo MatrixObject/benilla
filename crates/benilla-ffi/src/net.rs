@@ -311,6 +311,10 @@ struct ItemTemplate {
     subclass: u32,
     bag_family: u32,
     max_durability: u32,
+    /// `item_template.material`: the swing and draw sound's key.
+    material: u32,
+    /// `item_template.sheath`: where a stowed version of this item hangs.
+    sheath: u32,
 }
 
 /// `Bag` sentinel of an equipped-slot row: inventory slot 0..18 is the player's
@@ -3235,6 +3239,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                             subclass: info.subclass,
                             bag_family: info.bag_family,
                             max_durability: info.max_durability,
+                            material: info.material,
+                            sheath: info.sheath,
                         },
                     );
             }
@@ -4671,11 +4677,19 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
     1
 }
 
-/// One tracked unit's three virtual weapon slots: the `UNIT_VIRTUAL_ITEM_SLOT_DISPLAY`
-/// id, its `(class, subclass, material, inventory_type)` from `UNIT_VIRTUAL_ITEM_INFO`,
-/// and the sheath type. This is where a vanilla creature's weapons/offhand come from;
-/// benilla's own rule (`resolveplacement`) turns these into an
-/// attachment slot. Always writes 3 entries (a 0 display means "nothing there").
+/// The visible-item slots the three hands read from, in `WeaponAttackType` order
+/// (mainhand, offhand, ranged): the reference's `PLAYER_HELD_SLOTS`.
+const PLAYER_HELD_SLOTS: [u8; 3] = [15, 16, 17];
+
+/// One tracked unit's three weapon slots as `(display, class, subclass, material,
+/// inventory_type, sheath)` per hand. A creature's come from
+/// `UNIT_VIRTUAL_ITEM_SLOT_DISPLAY`/`UNIT_VIRTUAL_ITEM_INFO`, which the server only
+/// fills for units; a player's come from the worn entry in `PLAYER_VISIBLE_ITEM`
+/// resolved through its template, exactly the reference's pass 1
+/// (`benilla-app/src/entities/equipment/resolve.rs`: `EntityKind::Player =>
+/// player_visible_item_entry(PLAYER_HELD_SLOTS[slot])` then `templates.held(entry)`).
+/// benilla's own rule (`placement`) turns these into an attachment slot.
+/// Always writes 3 entries (a 0 display means "nothing there").
 #[no_mangle]
 pub extern "C" fn bn_net_unit_virtual_items(
     guid: u64,
@@ -4686,18 +4700,42 @@ pub extern "C" fn bn_net_unit_virtual_items(
     if out_displays.is_null() || out_info.is_null() || out_sheath.is_null() {
         return 0;
     }
-    let units = shared().units.lock().unwrap_or_else(|e| e.into_inner());
+    // The same lock order as `inventory_rows`: units, then templates.
+    let sh = shared();
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
     let Some(rec) = units.get(&guid) else {
         return 0;
     };
+    let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
     for slot in 0..3u8 {
         let s = slot as usize;
-        let disp = rec.fields.unit_virtual_item_display(slot).unwrap_or(0);
-        let (c, sc, m, it) = rec
-            .fields
-            .unit_virtual_item_info(slot)
-            .unwrap_or((0, 0, 0, 0));
-        let sheath = rec.fields.unit_virtual_item_sheath(slot).unwrap_or(0);
+        let (disp, (c, sc, m, it), sheath) = if rec.kind == 4 {
+            let entry = rec
+                .fields
+                .player_visible_item_entry(PLAYER_HELD_SLOTS[s])
+                .unwrap_or(0);
+            match templates.get(&entry) {
+                Some(t) => (
+                    t.display_id,
+                    (
+                        t.class as u8,
+                        t.subclass as u8,
+                        t.material as u8,
+                        t.inventory_type as u8,
+                    ),
+                    t.sheath as u8,
+                ),
+                None => (0, (0, 0, 0, 0), 0),
+            }
+        } else {
+            (
+                rec.fields.unit_virtual_item_display(slot).unwrap_or(0),
+                rec.fields
+                    .unit_virtual_item_info(slot)
+                    .unwrap_or((0, 0, 0, 0)),
+                rec.fields.unit_virtual_item_sheath(slot).unwrap_or(0),
+            )
+        };
         unsafe {
             *out_displays.add(s) = disp;
             *out_info.add(s * 4) = c;
