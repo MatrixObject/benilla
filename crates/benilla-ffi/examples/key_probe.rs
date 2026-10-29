@@ -128,8 +128,8 @@ fn main() {
         if let (Ok(x), Ok(y)) = (xs.parse::<f32>(), ys.parse::<f32>()) {
             bn_ui_mouse_move(x, y);
             let c2 = cstr("LeftButton");
-            bn_ui_mouse_button(x, y, c2.as_ptr(), 1);
-            bn_ui_mouse_button(x, y, c2.as_ptr(), 0);
+            bn_ui_mouse_button(x, y, c2.as_ptr(), 1, 0);
+            bn_ui_mouse_button(x, y, c2.as_ptr(), 0, 0);
             for (ch, key) in [("p", "P"), ("w", "W")] {
                 let (walk, _) = type_char(ch, key);
                 println!("   type {ch:?} into password: keywalk={walk}");

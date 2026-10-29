@@ -483,7 +483,10 @@ pub extern "C" fn bn_model_particles(
                     Some(j) => pose(&j, vx0, vy0, vz0, false),
                     None => (vx0, vy0, vz0),
                 };
-                (integrate([bx, by, bz], [ivx, ivy, ivz], g, def.drag, age), None)
+                (
+                    integrate([bx, by, bz], [ivx, ivy, ivz], g, def.drag, age),
+                    None,
+                )
             } else {
                 let local = integrate([p0x, p0y, p0z], [vx0, vy0, vz0], g, def.drag, age);
                 (local, joint_at(time_ms.max(0.0) as u32))

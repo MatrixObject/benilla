@@ -62,9 +62,9 @@ fn centre(frame: &str) -> Option<(f32, f32)> {
 
 fn press(x: f32, y: f32) -> (u32, u32) {
     let mv = bn_ui_mouse_move(x, y);
-    let dn = bn_ui_mouse_button(x, y, c"LeftButton".as_ptr(), 1);
+    let dn = bn_ui_mouse_button(x, y, c"LeftButton".as_ptr(), 1, 0);
     bn_ui_tick(0.05);
-    let up = bn_ui_mouse_button(x, y, c"LeftButton".as_ptr(), 0);
+    let up = bn_ui_mouse_button(x, y, c"LeftButton".as_ptr(), 0, 0);
     bn_ui_tick(0.05);
     println!("== press ({x:.1},{y:.1}): move={mv} down={dn} up={up}");
     (dn, up)

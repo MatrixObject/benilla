@@ -20,10 +20,7 @@ use std::collections::HashMap;
 
 use std::ffi::c_char;
 
-use benilla_ui::script::{
-    GossipMenu, GossipOptionView, GossipQuestRow, MerchantItem, MerchantState, QuestPanel,
-    QuestState,
-};
+use benilla_ui::script::{GossipMenu, GossipOptionView, GossipQuestRow, QuestPanel, QuestState};
 
 // ---- WoW <-> UE5 coordinate-system converter (single source of truth) ----
 
@@ -9328,11 +9325,35 @@ pub extern "C" fn bn_ui_mouse_move(x: f32, y: f32) -> u32 {
     out.unwrap_or(0)
 }
 
+/// The binding key a mouse button's chord uses: 1.12 names the buttons `BUTTON1`
+/// to `BUTTON5` (`IsValidBindingKeyString`'s `BUTTON` + digits arm, `0x846c04`).
+fn mouse_binding_key(button: &str) -> Option<&'static str> {
+    match button {
+        "LeftButton" => Some("BUTTON1"),
+        "RightButton" => Some("BUTTON2"),
+        "MiddleButton" => Some("BUTTON3"),
+        "Button4" => Some("BUTTON4"),
+        "Button5" => Some("BUTTON5"),
+        _ => None,
+    }
+}
+
 /// Press or release a mouse button at `(x, y)`; `button` is the WoW name
-/// ("LeftButton", ...), `down` 1 = press, 0 = release. Returns whether the UI
-/// consumed the event (0 without a session).
+/// ("LeftButton", ...), `mods` the chord bits (bit0 Shift, bit1 Ctrl, bit2 Alt),
+/// `down` 1 = press, 0 = release.
+///
+/// Returns the arms that took the event: bit0 a frame's click, bit1 the world
+/// frame's binding. A press binds only with the cursor over the world, since a
+/// frame owns its own clicks (`bindings.rs`'s mouse arm); a release always runs
+/// the latch's up-half, whatever was under the cursor when the press came.
 #[no_mangle]
-pub extern "C" fn bn_ui_mouse_button(x: f32, y: f32, button: *const c_char, down: u32) -> u32 {
+pub extern "C" fn bn_ui_mouse_button(
+    x: f32,
+    y: f32,
+    button: *const c_char,
+    down: u32,
+    mods: u32,
+) -> u32 {
     if button.is_null() {
         return 0;
     }
@@ -9342,10 +9363,113 @@ pub extern "C" fn bn_ui_mouse_button(x: f32, y: f32, button: *const c_char, down
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         BN_UI.with(|slot| {
             let mut slot = slot.borrow_mut();
-            match slot.as_mut() {
-                Some(script) => u32::from(script.mouse_button(x, y, name, down != 0)),
-                None => 0u32,
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let taken = u32::from(script.mouse_button(x, y, name, down != 0));
+            // The world's own channel: a press a frame captured starts no look session
+            // (`player/camera.rs`'s `WorldMouse`), so the drag turns nothing.
+            player::ui_mouse_edge(name, down != 0, taken != 0);
+            let Some(key) = mouse_binding_key(name) else {
+                return taken;
+            };
+            if down != 0 {
+                if taken != 0 {
+                    return taken;
+                }
+                if BN_LATCH.with(|l| l.borrow().iter().any(|(k, _)| k == key)) {
+                    return taken; // a repeat of a button already held
+                }
+                let Some(command) = resolve_binding(script, key, mods) else {
+                    return taken;
+                };
+                let _ = script.execute_binding(&command, true);
+                BN_LATCH.with(|l| l.borrow_mut().push((key.to_owned(), command)));
+                taken | 2
+            } else {
+                let latched = BN_LATCH.with(|l| {
+                    let mut l = l.borrow_mut();
+                    l.iter().position(|(k, _)| k == key).map(|i| l.remove(i))
+                });
+                if let Some((_, command)) = latched {
+                    let _ = script.execute_binding(&command, false);
+                }
+                taken
             }
+        })
+    }));
+    out.unwrap_or(0)
+}
+
+// The whole notches a stream of wheel travel has left, carrying the fraction
+// between events (`bindings.rs`'s `WheelNotches`): a reversal drops the carry,
+// since it starts a new gesture. Stock `ScrollFrameTemplate_OnMouseWheel` moves
+// half a pane per call, so it is fed the sign, never the raw delta.
+thread_local! {
+    static BN_WHEEL_CARRY: RefCell<f32> = const { RefCell::new(0.0) };
+}
+
+fn wheel_notches(lines: f32) -> i32 {
+    if lines == 0.0 || !lines.is_finite() {
+        return 0;
+    }
+    BN_WHEEL_CARRY.with(|c| {
+        let mut carry = c.borrow_mut();
+        if *carry != 0.0 && carry.signum() != lines.signum() {
+            *carry = 0.0;
+        }
+        *carry += lines;
+        let whole = carry.trunc();
+        *carry -= whole;
+        whole as i32
+    })
+}
+
+/// One wheel sweep at the cursor `(x, y)` (UI units, y up): `lines` is the
+/// platform's signed travel in mouse-wheel lines, `mods` the held chord bits.
+///
+/// Each whole notch walks the frames that took `EnableMouseWheel` (`0x7664f0`);
+/// one that reaches the world frame runs its `MOUSEWHEELUP`/`MOUSEWHEELDOWN`
+/// binding as a press and its release back to back, as `0x483d6f`/`0x483d82` do.
+/// Returns the notches run, 0 when a session is missing or none completed.
+#[no_mangle]
+pub extern "C" fn bn_ui_mouse_wheel(x: f32, y: f32, lines: f32, mods: u32) -> u32 {
+    let notches = wheel_notches(lines);
+    if notches == 0 {
+        return 0;
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(script) = slot.as_mut() else {
+                return 0u32;
+            };
+            let mut run = 0u32;
+            for _ in 0..notches.abs() {
+                let up = notches > 0;
+                let token = if up { "MOUSEWHEELUP" } else { "MOUSEWHEELDOWN" };
+                // The world slot only answers when its chord has a binding
+                // (`0x483d87` sums the two `ExecuteBinding` results), so a chord
+                // with none lets the sweep go on behind it.
+                let command = resolve_binding(script, token, mods);
+                match script.mouse_wheel_bound(x, y, if up { 1.0 } else { -1.0 }, command.is_some())
+                {
+                    benilla_ui::script::WheelWalk::World => {
+                        if let Some(command) = command {
+                            // One notch is a press and its release, back to back
+                            // (`0x483d6f` then `0x483d82`); a `runOnUp` body runs
+                            // both halves, a plain one's up leg is a no-op.
+                            let _ = script.execute_binding(&command, true);
+                            let _ = script.execute_binding(&command, false);
+                            run += 1;
+                        }
+                    }
+                    // A frame's `OnMouseWheel` took the notch; the walk stops there.
+                    benilla_ui::script::WheelWalk::Frame => run += 1,
+                    benilla_ui::script::WheelWalk::Declined => {}
+                }
+            }
+            run
         })
     }));
     out.unwrap_or(0)
@@ -9453,6 +9577,21 @@ fn resolve_binding(script: &benilla_ui::script::UiScript, name: &str, mods: u32)
         .map(|(_, command)| command.clone())
 }
 
+/// The client's ENTER hotkey, in FrameXML's own words: focus the chat box the
+/// user last used, which is `DEFAULT_CHAT_FRAME.editBox` when no other chat box
+/// holds a draft. A missing helper (an older or stripped chain) falls back to
+/// that box directly.
+fn focus_chat_box(script: &mut benilla_ui::script::UiScript) {
+    use benilla_ui::mlua::Value;
+    let _ = script.eval::<Value>(
+        "if ChatEdit_FocusActiveWindow then \
+             ChatEdit_FocusActiveWindow() \
+         elseif DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.editBox then \
+             DEFAULT_CHAT_FRAME.editBox:SetFocus() \
+         end",
+    );
+}
+
 /// Press or release a key by WoW name ("A", "ENTER", "LEFT", ...). `mods` is
 /// the chord state (bit0 Shift, bit1 Ctrl, bit2 Alt; for a modifier's own
 /// event include its own bit — the state after the event), `down` 1 = press.
@@ -9508,6 +9647,14 @@ pub extern "C" fn bn_ui_key(key: *const c_char, mods: u32, down: u32) -> u32 {
                     return 0;
                 }
                 let Some(command) = resolve_binding(script, name, mods) else {
+                    // ENTER carries no binding in 1.12's Bindings.xml: the client
+                    // handles it in its own key arm, which focuses the active chat
+                    // box. The stock box then owns typing and sends on its own
+                    // Enter (`ChatEdit_SendText`), so chat needs no host-side line.
+                    if token == "ENTER" && mods == 0 {
+                        focus_chat_box(script);
+                        return 1;
+                    }
                     return 0;
                 };
                 // The world frame's key-down ran it, so its key-up and repeats
@@ -9834,72 +9981,15 @@ pub extern "C" fn bn_ui_push_quest(
     out.unwrap_or(0)
 }
 
-/// Push the open merchant window into the VM's `UiScript` so benilla's stock
-/// `MerchantFrame` shows. `item_names`/`item_textures`/`item_prices`/
-/// `item_quantities`/`item_num_avail`/`item_ids` are parallel arrays.
+/// Close the open vendor list: the host's Escape, and `CloseMerchant()` (`0x4fadf0`) for
+/// anything that asks the VM. The middle layer's stock window goes, so the feed's next pass
+/// clears the VM's and fires `MERCHANT_CLOSED` - and a bag click stops reading as a sale.
+/// Returns 1 when a list was open.
 #[no_mangle]
-pub extern "C" fn bn_ui_push_merchant(
-    item_names: *const *const c_char,
-    item_textures: *const *const c_char,
-    item_prices: *const u32,
-    item_quantities: *const u32,
-    item_num_avail: *const i32,
-    item_ids: *const u32,
-    n_items: u32,
-    can_repair: u32,
-) -> u32 {
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        BN_UI.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let Some(script) = slot.as_mut() else {
-                return 0u32;
-            };
-            let cs = |p: *const c_char| {
-                if p.is_null() {
-                    None
-                } else {
-                    Some(
-                        unsafe { std::ffi::CStr::from_ptr(p) }
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                }
-            };
-            // A zero-item push clears the open vendor.
-            if n_items == 0 {
-                script.set_merchant(None);
-                return 1;
-            }
-            let mut items = Vec::new();
-            for i in 0..n_items as usize {
-                let name = unsafe { cs(*item_names.add(i)) };
-                let texture = unsafe { cs(*item_textures.add(i)) };
-                let price = unsafe { *item_prices.add(i) };
-                let quantity = unsafe { *item_quantities.add(i) };
-                let num_available = unsafe { *item_num_avail.add(i) };
-                let item_id = unsafe { *item_ids.add(i) };
-                items.push(MerchantItem {
-                    name,
-                    texture,
-                    price,
-                    quantity,
-                    num_available,
-                    item_id,
-                    stats: None,
-                    link: None,
-                    max_stack: None,
-                });
-            }
-            let state = MerchantState {
-                items,
-                buyback: Vec::new(),
-                can_repair: can_repair != 0,
-            };
-            script.set_merchant(Some(state));
-            1
-        })
-    }));
-    out.unwrap_or(0)
+pub extern "C" fn bn_net_vendor_close() -> u32 {
+    let opened = net::ui_vendor().guid != 0;
+    net::ui_vendor_closed();
+    u32::from(opened)
 }
 
 // ---- glue booth ----

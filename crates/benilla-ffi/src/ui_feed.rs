@@ -14,19 +14,20 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use benilla_formats::{
-    load_chr_classes, load_chr_races, load_creature_type_table, load_faction_catalog,
-    load_item_display_catalog, load_quest_header_names, load_quest_tag_names, load_race_pvp_teams,
-    load_skill_line_catalog, load_spell_catalog, ChrClasses, ChrRaces, CreatureTypeTable,
-    FactionCatalog, FactionTemplate, ItemDisplayCatalog, QuestHeaderNames, QuestTagNames, Reaction,
-    SkillLineCatalog, SpellCatalog,
+    load_chr_classes, load_chr_races, load_creature_type_table, load_durability_tables,
+    load_faction_catalog, load_item_display_catalog, load_quest_header_names, load_quest_tag_names,
+    load_race_pvp_teams, load_skill_line_catalog, load_spell_catalog, ChrClasses, ChrRaces,
+    CreatureTypeTable, DurabilityTables, FactionCatalog, FactionTemplate, ItemDisplayCatalog,
+    QuestHeaderNames, QuestTagNames, Reaction, SkillLineCatalog, SpellCatalog,
 };
 use benilla_protocol::messages::{ObjectFields, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST};
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, LootRow, LootState,
-    NearestMode, PartyMemberInfo, PartyRequest, PartyState, PlayerRecord, QuestAction, ScriptCall,
-    ScriptValue, SelectionRequest, SessionRequest, SpellBookState, SpellSlotView, SpellTabView,
-    UiScript, UnitBase, UnitGuids, UnitState, UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
+    MerchantItem, MerchantState, NearestMode, PartyMemberInfo, PartyRequest, PartyState,
+    PlayerRecord, QuestAction, ScriptCall, ScriptValue, SelectionRequest, SessionRequest,
+    SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase, UnitGuids, UnitState,
+    UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
 };
 
 use crate::net::{self, Cmd};
@@ -38,6 +39,8 @@ use crate::BnWorld;
 const GENERAL_TAB: &str = "General";
 /// `Ability_Kick`, the patch's General-tab face.
 const GENERAL_TAB_ICON: &str = "Interface\\Icons\\Ability_Kick";
+/// `UNIT_NPC_FLAG_REPAIR`, the bit `CanMerchantRepair` (`0x4fadb0`) tests.
+const NPC_FLAG_REPAIR: u32 = 0x4000;
 /// Melee auto-attack, the one spell `IsAttackAction` answers true for.
 const ATTACK_SPELL: u32 = 6603;
 /// The corpse-run window the server force-repops after.
@@ -62,6 +65,8 @@ pub(crate) struct Catalogs {
     pub(crate) quest_headers: Option<QuestHeaderNames>,
     /// `QuestInfo.dbc`: the bare tag word behind a quest-log row.
     pub(crate) quest_tags: Option<QuestTagNames>,
+    /// `DurabilityCosts.dbc` + `DurabilityQuality.dbc`: the vendor's repair price.
+    durability: Option<DurabilityTables>,
     race_teams: HashMap<u8, i8>,
 }
 
@@ -78,6 +83,7 @@ impl Catalogs {
                 skills: None,
                 quest_headers: None,
                 quest_tags: None,
+                durability: None,
                 race_teams: HashMap::new(),
             };
         };
@@ -91,6 +97,7 @@ impl Catalogs {
             skills: load_skill_line_catalog(chain).ok(),
             quest_headers: load_quest_header_names(chain).ok(),
             quest_tags: load_quest_tag_names(chain).ok(),
+            durability: load_durability_tables(chain).ok(),
             race_teams: load_race_pvp_teams(chain).unwrap_or_default(),
         }
     }
@@ -196,6 +203,9 @@ struct Feed {
     target_auras: (u64, Vec<(u32, u8, bool)>),
     loot_key: Option<(u64, u32, Vec<(u8, u8, u32, u32)>)>,
     loot_picks: Vec<LootPick>,
+    /// The vendor last pushed: its guid plus each listed row's `(entry, price,
+    /// remaining stock, per-buy count, template display id)`.
+    merchant_key: Option<(u64, Vec<(u32, u32, u32, u32, u32)>)>,
     party_key: Option<Vec<(u64, String)>>,
 
     /// The bag containers last pushed, diffed per bag for `BAG_UPDATE`.
@@ -221,8 +231,8 @@ struct HeldAxes {
     strafe_right: bool,
     turn_left: bool,
     turn_right: bool,
-    /// Whether any axis is a binding's: `false` hands movement back to the host.
-    owned: bool,
+    /// The `TURNORACTION` channel the right button's binding holds: the drag turns the body.
+    look: bool,
 }
 
 impl HeldAxes {
@@ -273,6 +283,7 @@ impl Feed {
             target_auras: (0, Vec::new()),
             loot_key: None,
             loot_picks: Vec::new(),
+            merchant_key: None,
             party_key: None,
             containers: HashMap::new(),
             bag_guids: [0; 4],
@@ -318,6 +329,31 @@ pub(crate) fn item_link(item_id: u32, name: &str, quality: u32) -> String {
         "|c{}|Hitem:{item_id}:0:0:0|h[{name}]|h|r",
         quality_color(quality)
     )
+}
+
+/// Every worn or carried item's repair cost summed (`0x4faf30` per item): the number
+/// `GetRepairAllCost` answers, so the merchant's repair button enables and prices itself.
+///
+/// Deviation: the vendor's reputation discount (`0x612b80`) is not fed here, so the price reads
+/// undiscounted. What the purse actually loses is the server's own answer.
+fn repair_all_cost(cats: Option<&Catalogs>) -> u32 {
+    let Some(tables) = cats.and_then(|c| c.durability.as_ref()) else {
+        return 0;
+    };
+    net::ui_inventory()
+        .into_iter()
+        .filter(|it| it.guid != 0 && it.max_durability > it.durability)
+        .map(|it| {
+            tables.repair_cost(
+                it.max_durability - it.durability,
+                it.info.item_level,
+                it.info.quality,
+                it.info.class,
+                it.info.subclass,
+                0.0,
+            )
+        })
+        .sum()
 }
 
 /// One template item's `(name, quality, icon)` off its `BnNetItemInfo` row and the display catalog;
@@ -1014,6 +1050,7 @@ impl Feed {
         }
 
         self.push_loot(script, cats);
+        self.push_merchant(script, cats);
         self.push_containers(script, cats, &inv);
         self.push_party(script, &party, self_guid, &name_of);
         self.first = false;
@@ -1172,9 +1209,104 @@ impl Feed {
         }));
         self.loot_key = key;
         self.loot_picks = picks;
-        if !was_open {
-            fire(script, "LOOT_OPENED", Vec::new());
+        // Stock `LootFrame.lua` reads its slots in the `LOOT_OPENED` handler, and the engine
+        // refreshes a taken row through `LootSlotCleared()`, a Lua global this VM has none of:
+        // re-firing the open event on every content change re-runs that same read, and the
+        // frame's own sound stays guarded because it is already shown.
+        fire(script, "LOOT_OPENED", Vec::new());
+    }
+
+    /// Feed the open vendor into the VM so its stock `MerchantFrame` shows the list — the same
+    /// shape [`Feed::push_loot`] runs: the middle layer owns the stock, the frame reads it, and a
+    /// row click queues `BuyMerchantItem`, which the drain turns into `CMSG_BUY_ITEM`.
+    ///
+    /// Rows stay positional: the drain resolves Lua's 1-based row against the wire list, so a row
+    /// whose template has not answered still holds its place rather than shifting its neighbours.
+    fn push_merchant(&mut self, script: &mut UiScript, cats: Option<&Catalogs>) {
+        let vendor = net::ui_vendor();
+        // The stock frame reads `GetRepairAllCost` on its own update, so the price rides every
+        // pass: a fight wears the gear without the vendor's list changing.
+        let can_repair = vendor.guid != 0
+            && net::ui_unit(vendor.guid)
+                .is_some_and(|u| u.fields.unit_npc_flags() & NPC_FLAG_REPAIR != 0);
+        if can_repair {
+            script.set_repair_all_cost(repair_all_cost(cats));
         }
+        let n = (vendor.count as usize).min(vendor.rows.len());
+        let key: Vec<(u32, u32, u32, u32, u32)> = vendor
+            .rows
+            .iter()
+            .take(n)
+            // The template's display id is 0 until `SMSG_ITEM_QUERY_SINGLE` answers, so its
+            // landing moves the key and the frame re-reads the row it could not name.
+            .map(|r| {
+                (
+                    r.entry,
+                    r.price,
+                    r.count,
+                    r.buy_count,
+                    net::ui_item_info(r.entry).display_id,
+                )
+            })
+            .collect();
+        let key = (vendor.guid != 0).then(|| (vendor.guid, key));
+        if key == self.merchant_key {
+            return;
+        }
+        let was_open = self.merchant_key.is_some();
+        self.merchant_key = key.clone();
+        let Some((_guid, _)) = key else {
+            if was_open {
+                script.set_merchant(None);
+                fire(script, "MERCHANT_CLOSED", Vec::new());
+            }
+            return;
+        };
+        let items: Vec<MerchantItem> = vendor
+            .rows
+            .iter()
+            .take(n)
+            .map(|r| {
+                let info = net::ui_item_info(r.entry);
+                let (name, quality, icon) = item_look(&info, cats);
+                // A vendor row whose item template carries no display id still has the one
+                // `SMSG_LIST_INVENTORY` sent for it.
+                let icon = icon.or_else(|| {
+                    cats.and_then(|c| c.items.as_ref())
+                        .and_then(|t| t.get(r.display_id))
+                        .and_then(|d| norm_icon(d.icon.clone()))
+                });
+                MerchantItem {
+                    name: name.clone(),
+                    texture: icon,
+                    price: r.price,
+                    quantity: r.buy_count.max(1),
+                    num_available: if r.count == u32::MAX {
+                        -1
+                    } else {
+                        r.count as i32
+                    },
+                    item_id: r.entry,
+                    stats: None,
+                    link: name.as_ref().map(|n| item_link(r.entry, n, quality)),
+                    max_stack: (info.stackable > 0).then_some(info.stackable),
+                }
+            })
+            .collect();
+        script.set_merchant(Some(MerchantState {
+            items,
+            buyback: Vec::new(),
+            can_repair,
+        }));
+        fire(
+            script,
+            if was_open {
+                "MERCHANT_UPDATE"
+            } else {
+                "MERCHANT_SHOW"
+            },
+            Vec::new(),
+        );
     }
 
     fn push_party(
@@ -1384,42 +1516,43 @@ impl Feed {
     }
 
     fn apply_binding_input(&mut self, world: *mut BnWorld, inputs: Vec<BindingInput>) {
-        let mut moving = false;
         for input in inputs {
             match input {
                 BindingInput::Start(HeldInput::MoveForward) => {
                     self.held.forward = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::MoveForward) => self.held.forward = false,
                 BindingInput::Start(HeldInput::MoveBackward) => {
                     self.held.backward = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::MoveBackward) => self.held.backward = false,
                 BindingInput::Start(HeldInput::StrafeLeft) => {
                     self.held.strafe_left = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::StrafeLeft) => self.held.strafe_left = false,
                 BindingInput::Start(HeldInput::StrafeRight) => {
                     self.held.strafe_right = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::StrafeRight) => self.held.strafe_right = false,
                 BindingInput::Start(HeldInput::TurnLeft) => {
                     self.held.turn_left = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::TurnLeft) => self.held.turn_left = false,
                 BindingInput::Start(HeldInput::TurnRight) => {
                     self.held.turn_right = true;
-                    moving = true;
                 }
                 BindingInput::Stop(HeldInput::TurnRight) => self.held.turn_right = false,
-                BindingInput::Start(HeldInput::TurnOrAction)
-                | BindingInput::Start(HeldInput::CameraOrSelectOrMove)
-                | BindingInput::Stop(HeldInput::TurnOrAction)
+                BindingInput::Start(HeldInput::TurnOrAction) => {
+                    self.held.look = true;
+                    player::ui_turn_held(true);
+                }
+                BindingInput::Stop(HeldInput::TurnOrAction) => {
+                    self.held.look = false;
+                    player::ui_turn_held(false);
+                }
+                // `CameraOrSelectOrMove` is the left button's bit (`0x514190`): KVM's move-to
+                // point, which the click gestures already cover. Nothing holds it here.
+                BindingInput::Start(HeldInput::CameraOrSelectOrMove)
                 | BindingInput::Stop(HeldInput::CameraOrSelectOrMove) => {}
                 BindingInput::Fire(FiredInput::Jump) => player::ui_jump(world),
                 BindingInput::Fire(FiredInput::ToggleRun) => player::ui_toggle_walk(world),
@@ -1430,15 +1563,12 @@ impl Feed {
                 | BindingInput::Fire(FiredInput::ToggleSheath) => {}
             }
         }
-        if !moving && !self.held.any() {
-            self.held.owned = false;
-        } else if moving {
-            self.held.owned = true;
-        }
+        // The bindings own the mover outright, as the reference's `BindingsState`
+        // does: this frame's axes are the held bits, and no raw key state mixes in.
         let (f, s, t) = self.held.axes();
-        player::ui_move(world, f, s, t, self.held.owned);
+        player::ui_move(world, f, s, t, true);
         // The heartbeat's turn axis reads right-positive, the body's left-positive.
-        net::ui_set_move(f, s, -t, self.held.owned);
+        net::ui_set_move(f, s, -t, true);
     }
 }
 
@@ -1568,14 +1698,20 @@ pub(crate) fn focus_lost() {
     let world = WORLD.with(|w| w.get());
     FEED.with(|f| {
         let mut feed = f.borrow_mut();
-        if !feed.held.owned && !feed.held.any() {
+        if !feed.held.any() {
             return;
         }
-        feed.held = HeldAxes::default();
+        // The mask keeps the mouse pair and autorun: only the direction bits die.
+        feed.held.forward = false;
+        feed.held.backward = false;
+        feed.held.strafe_left = false;
+        feed.held.strafe_right = false;
+        feed.held.turn_left = false;
+        feed.held.turn_right = false;
         // Both channels a held axis feeds: the body's local input and the
         // movement the net layer reports to the server.
-        player::ui_move(world, 0.0, 0.0, 0.0, false);
-        net::ui_set_move(0.0, 0.0, 0.0, false);
+        player::ui_move(world, 0.0, 0.0, 0.0, true);
+        net::ui_set_move(0.0, 0.0, 0.0, true);
     });
 }
 
@@ -1584,6 +1720,9 @@ pub(crate) fn intents(script: &mut UiScript) {
     if script.vm_kind() != VmKind::InGame {
         return;
     }
+    // The look channel the VM's `MouselookStart`/`Stop` calls just moved, read back
+    // into `IsMouselooking` before the frame's world input engages.
+    player::drive_mouselook(script);
     let world = WORLD.with(|w| w.get());
 
     let inputs = script.take_binding_input();
@@ -1652,9 +1791,9 @@ pub(crate) fn intents(script: &mut UiScript) {
         let _ = net::send_cmd(Cmd::CancelAura(spell));
     }
 
-    // The vendor window. `BuyMerchantItem(index)` names the 1-based row of the stock the host
-    // pushed with `bn_ui_push_merchant`, which is `SMSG_LIST_INVENTORY`'s own order, so the wire
-    // wants the entry that row carries and the guid of the vendor still open.
+    // The vendor window. `BuyMerchantItem(index)` names the 1-based row of the stock this feed
+    // pushed from [`net::ui_vendor`], so the wire wants the entry that row carries and the guid of
+    // the vendor still open.
     let vendor = net::ui_vendor();
     for (index, quantity) in script.take_merchant_buys() {
         if vendor.guid == 0 {
@@ -1689,6 +1828,19 @@ pub(crate) fn intents(script: &mut UiScript) {
         net::ui_vendor_closed();
         script.set_merchant(None);
         fire(script, "MERCHANT_CLOSED", vec![]);
+    }
+
+    // `RepairAllItems` (`0x4fbff0`) only arms behind the vendor's repair bit, so the drain needs no
+    // second test; a zero item guid is `CMSG_REPAIR_ITEM`'s repair-everything form, whose price and
+    // purse the server owns.
+    if script.take_repair_all() {
+        let vendor = net::ui_vendor().guid;
+        if vendor != 0 {
+            let _ = net::send_cmd(Cmd::VendorRepair {
+                vendor,
+                item_guid: 0,
+            });
+        }
     }
 
     // Selections: tokens, by name, nearest, and the clear.

@@ -12,6 +12,7 @@
 //! Player position is raw WoW world yards - the same space the ADT chunks and
 //! MODF placements use - so `(x, -y, z) * 100` is the UE transform.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
@@ -2090,7 +2091,11 @@ impl Player {
                     0
                 }
             };
-            self.land_left_s = if self.land_id != 0 { LAND_MS / 1000.0 } else { 0.0 };
+            self.land_left_s = if self.land_id != 0 {
+                LAND_MS / 1000.0
+            } else {
+                0.0
+            };
         }
         if airborne {
             self.airborne_s += dt;
@@ -2438,6 +2443,110 @@ pub(crate) fn ui_pos(world: *mut BnWorld) -> Option<[f32; 3]> {
     unsafe { world.as_ref() }.and_then(|w| w.player.as_ref().map(|p| p.pos))
 }
 
+/// The mouse buttons the world owns, latched at the press
+/// (`crates/benilla-app/src/player/camera.rs`'s `WorldMouse`). 1.12 reads the
+/// `TURNORACTION` and `CAMERAORSELECTORMOVE` bindings through the world frame, and a press a UI
+/// frame captured never dispatches one: no look session, no turn channel. The world's down sets a
+/// held bit and that button's up clears it, so a frame appearing under the cursor cannot steal it.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WorldMouse {
+    /// `[0]` the left button's, `[1]` the right's: held by the world right now.
+    held: [bool; 2],
+    /// `MouselookStart` holds the TurnOrAction channel (`0x514231`) with no button held.
+    scripted: bool,
+}
+
+impl WorldMouse {
+    fn slot(button: &str) -> Option<usize> {
+        match button {
+            "LeftButton" => Some(0),
+            "RightButton" => Some(1),
+            _ => None,
+        }
+    }
+
+    /// The TurnOrAction channel, `[InputControl+4] & 1`, which `IsMouselooking()` reads: the
+    /// world's right button, or a `MouselookStart` with none.
+    pub(crate) fn turn(&self) -> bool {
+        self.held[1] || self.scripted
+    }
+
+    /// One button edge. A down edge belongs to the world when no frame took it, or when a look
+    /// session already owns the cursor: a chord's second button is the world's too (`0x51481a`
+    /// refuses to arm a *pick* that way, which is the host's click gate, not this channel).
+    pub(crate) fn edge(&mut self, button: &str, down: bool, frame_took: bool) {
+        let Some(i) = Self::slot(button) else {
+            return;
+        };
+        if !down {
+            self.held[i] = false;
+            return;
+        }
+        if !frame_took || self.turn() || self.held[0] {
+            self.held[i] = true;
+        }
+    }
+
+    /// `MouselookStart` (`on`) or `MouselookStop`: one channel, whoever set it, so a stop also
+    /// ends a right drag in flight, whose release then clears nothing.
+    pub(crate) fn mouselook(&mut self, on: bool) {
+        if on {
+            self.scripted = true;
+        } else {
+            self.scripted = false;
+            self.held[1] = false;
+        }
+    }
+}
+
+thread_local! {
+    static BN_LOOK: RefCell<WorldMouse> = const { RefCell::new(WorldMouse { held: [false; 2], scripted: false }) };
+}
+
+/// Whether a look session owns the cursor at all: the right button's channel or
+/// a left drag the world took. With neither, the pointer belongs to the UI and a
+/// delta moves nothing.
+pub(crate) fn look_session() -> bool {
+    BN_LOOK.with(|l| l.borrow().turn() || l.borrow().held[0])
+}
+
+/// A mouse button edge, from `bn_ui_mouse_button`: `frame_took` is that frame's verdict, the one
+/// thing that decides whether the world owns the press.
+pub(crate) fn ui_mouse_edge(button: &str, down: bool, frame_took: bool) {
+    BN_LOOK.with(|l| l.borrow_mut().edge(button, down, frame_took));
+}
+
+/// Whether the TurnOrAction channel is held: the drag turns the body, not just the camera.
+pub(crate) fn look_turn() -> bool {
+    BN_LOOK.with(|l| l.borrow().turn())
+}
+
+/// A `MouselookStart`/`TurnOrActionStart`'s channel: one bit, whoever set it, so a stop also
+/// ends a right drag in flight, whose release then clears nothing.
+pub(crate) fn ui_turn_held(on: bool) {
+    BN_LOOK.with(|l| l.borrow_mut().mouselook(on));
+}
+
+/// The `MouselookStart`/`Stop` calls the VM made since the last pass, applied in call order, and
+/// the channel's state handed to `IsMouselooking` for it to read.
+pub(crate) fn drive_mouselook(script: &mut benilla_ui::script::UiScript) {
+    for on in script.take_mouselook_calls() {
+        BN_LOOK.with(|l| l.borrow_mut().mouselook(on));
+    }
+    script.set_turn_or_action_held(look_turn());
+}
+
+/// The world mouse's held buttons as bits: bit0 left, bit1 right. A click
+/// gesture arms only with the other button up (`target/mod.rs:217`), so the host
+/// reads the client's own state instead of tracking its own.
+#[no_mangle]
+pub extern "C" fn bn_player_mouse_held() -> u32 {
+    BN_LOOK.with(|l| {
+        let m = l.borrow();
+        u32::from(m.held[0]) | (u32::from(m.held[1]) << 1)
+    })
+}
+
 /// Roam mode on/off: free flight for touring the map (no gravity, collision or
 /// water). Returns 1 with the flag applied. Turning it off leaves the body to
 /// gravity from wherever it is, so the void guard still catches a bad drop.
@@ -2459,9 +2568,16 @@ pub extern "C" fn bn_player_fly(world: *mut BnWorld, on: u32) -> u32 {
 /// the camera, so the aim and the rendered body turn too. The left button
 /// only orbits, leaving the aim (and WASD's basis) where it was.
 #[no_mangle]
-pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32, turn_body: u32) -> u32 {
+pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32) -> u32 {
+    // The host reports the pointer's delta every frame; only a look session the
+    // world owns moves anything.
+    if !look_session() {
+        return 0;
+    }
     let Some(p) = player_mut(world) else { return 0 };
-    p.look(dx, dy, turn_body != 0);
+    // Which channel the drag runs on is the world mouse's, not the host's: the
+    // TurnOrAction bit turns the body, a left drag only orbits the camera.
+    p.look(dx, dy, look_turn());
     1
 }
 
@@ -2879,9 +2995,7 @@ mod tests {
         let flat = [(-2.0f32, 0.0f32), (60.0, 0.0)];
         p.tiles
             .insert(Player::tile_of(p.pos[0], p.pos[1]), terrain_profile(&flat));
-        p.pos[2] = p
-            .ground(p.pos[0], -800.0, f32::MAX)
-            .map_or(0.0, |(z, _)| z);
+        p.pos[2] = p.ground(p.pos[0], -800.0, f32::MAX).map_or(0.0, |(z, _)| z);
         p.grounded = true;
         p.last_ground = p.pos;
         p
@@ -2943,10 +3057,8 @@ mod tests {
         let mut p = player_on_flat();
         // A ledge at the profile's origin with an 8 yd drop behind it.
         let cliff = [(-2.0f32, 0.0f32), (0.0, 0.0), (0.002, -8.0), (60.0, -8.0)];
-        p.tiles.insert(
-            Player::tile_of(p.pos[0], p.pos[1]),
-            terrain_profile(&cliff),
-        );
+        p.tiles
+            .insert(Player::tile_of(p.pos[0], p.pos[1]), terrain_profile(&cliff));
         p.pos[2] = 0.0;
         p.grounded = true;
         p.last_ground = p.pos;
