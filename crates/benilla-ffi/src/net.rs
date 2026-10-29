@@ -2218,6 +2218,24 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         benilla_protocol::messages::opcode::CMSG_SET_ACTION_BUTTON,
                         &benilla_protocol::messages::set_action_button(slot, packed),
                     );
+                    // The bar is client-authoritative and the server never echoes the write, so the
+                    // snapshot the feed diffs takes it here (`ui_action/drain.rs`'s store write): a
+                    // dragged spell stays put through the next feed instead of being rolled back to
+                    // the login snapshot.
+                    let mut actions = sh.actions.lock().unwrap_or_else(|e| e.into_inner());
+                    let at = actions.iter().position(|(s, _, _)| *s == slot);
+                    if packed == 0 {
+                        if let Some(i) = at {
+                            actions.remove(i);
+                        }
+                    } else {
+                        let write = (slot, (packed >> 24) as u8, packed & 0x00ff_ffff);
+                        match at {
+                            Some(i) => actions[i] = write,
+                            None => actions.push(write),
+                        }
+                        actions.sort_by_key(|s| s.0);
+                    }
                 }
                 Ok(Cmd::ActionBarToggles(toggles)) => {
                     let _ = session.send_body(

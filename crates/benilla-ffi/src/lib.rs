@@ -8209,6 +8209,51 @@ pub extern "C" fn bn_ui_message_lines(frame: *const c_char, buf: *mut c_char, ca
     n as u32
 }
 
+/// The icon the cursor carries, as the extensionless BLP path the host draws at the pointer: the
+/// app's `payload_icon` (`0x523840` composites it to 32×32 and hands it to the OS cursor). The
+/// reference draws a drag in the engine, not in a frame, so it is in no dump row and no paint
+/// record; a host that paints the interface itself reads it here. 0, with `buf` emptied, when the
+/// cursor carries nothing or no icon resolves.
+#[no_mangle]
+pub extern "C" fn bn_ui_cursor_icon(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            use benilla_ui::script::CursorPayload;
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            match s.cursor_payload()? {
+                CursorPayload::Item(i) => i.texture,
+                CursorPayload::Spell(s) => s.texture,
+                CursorPayload::Action(a) => a.texture,
+                CursorPayload::Macro(m) => m.texture,
+                CursorPayload::PetAction(p) => p.texture,
+                // Mode 10: the stabled pet's family icon; a non-empty path gates the grab.
+                CursorPayload::StablePet(p) => Some(p.texture),
+                // Mode 2: the coin bitmap by magnitude, `GetCoinIcon`'s table.
+                CursorPayload::Money(m) => {
+                    Some(benilla_ui::script::coin_icon(i64::from(m.copper)).to_string())
+                }
+                // Mode 5: the vendor row's icon, which the reference resolves from its
+                // `ItemDisplayInfo` id (`0xb4d8ec`).
+                CursorPayload::Merchant(m) => m.texture,
+            }
+        })
+    }));
+    let Ok(Some(path)) = out else {
+        unsafe { *buf = 0 };
+        return 0;
+    };
+    let n = (path.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
 /// Shared body of [`bn_ui_text_bitmap`] / [`bn_ui_text_bitmap_wrap`]:
 /// rasterize one FontString and hand the host its metrics + RGBA. Metrics are
 /// written whenever the raster succeeds — including when `cap` is too small, so
@@ -9204,6 +9249,22 @@ fn sync_menu(script: &mut UiScript) {
     }
 }
 
+/// Surface one VM error where the host can read it. A dll has no console, so
+/// `eprintln!` from inside it reaches nobody but a debugger; and a handler that
+/// errors every tick would write the host log at frame rate, so each distinct
+/// line is noted once.
+fn note_vm_error(line: impl std::fmt::Display) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let line = line.to_string();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|s| *s == line) || seen.len() >= 256 {
+        return;
+    }
+    seen.push(line.clone());
+    drop(seen);
+    net::note(format!("ui: {line}"));
+}
+
 /// Advance the loaded UI (OnUpdate handlers, hover re-pick, queued events) and
 /// apply the menu host's pending ops (realm list, screen transitions, roster).
 /// `elapsed` is seconds since the last call. Returns 1 with a session, 0
@@ -9235,7 +9296,7 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
                 ui_feed::intents(script);
             }
             for e in script.take_errors() {
-                eprintln!("bn_ui_tick: {e}");
+                note_vm_error(format!("tick: {e}"));
             }
             1u32
         })
@@ -9617,7 +9678,7 @@ pub extern "C" fn bn_ui_eval(code: *const c_char, buf: *mut c_char, cap: u32) ->
                 };
                 // pcall'd handlers the eval's events ran (screen switches etc.)
                 for e in script.take_errors() {
-                    eprintln!("bn_ui_eval handler: {e}");
+                    note_vm_error(format!("eval: {e}"));
                 }
                 result
             })
