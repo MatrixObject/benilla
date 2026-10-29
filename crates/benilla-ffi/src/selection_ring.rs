@@ -11,11 +11,12 @@
 //!   the app's `RingState.verts` holds them.
 //!
 //! Two gaps, both from machinery the dll does not carry: the app rasterises the box against its
-//! collider scene (`0x6d7330`), which has no dll equivalent, so the answer is the box's own slice at
-//! the feet — the triangles the projector emits over flat ground, and a quad that clips into a slope
-//! elsewhere. And [`ring_rank`] is the template comparator alone (`0x606640`): the dll holds no
-//! reputation standings, so a rank-2 faction reads by its template reaction and the duel,
-//! contested-guard and party rungs of `0x6061e0` are not applied.
+//! collider scene (`0x6d7330`), clipping the square on the exact faces that cross it, while the dll
+//! samples the same surface set on a lattice over the square — so an edge or a wall inside the box
+//! leaves the mesh between the samples flat instead of cut. And [`ring_rank`] is the template
+//! comparator alone (`0x606640`): the dll holds no reputation standings, so a rank-2 faction reads
+//! by its template reaction and the duel, contested-guard and party rungs of `0x6061e0` are not
+//! applied.
 
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -213,28 +214,62 @@ fn ring_radius(world: &mut BnWorld, display_id: u32) -> f32 {
     radius
 }
 
-/// The ring's box (`0x608e00`): the texture square, yawed by the fade and sampled at the feet.
-/// Fan-unrolled as the projector emits it — six vertices, two triangles.
-fn ring_box(feet: [f32; 3], radius: f32, fade: f32, tint: [f32; 3]) -> Vec<BnEffectVertex> {
+/// The ring's box (`0x608e00`): the texture square, yawed by the fade, laid over the ground.
+///
+/// The app sends the square through its decal projector (`0x6d7330`), which clips it onto whatever
+/// surface crosses the box — two radii above and below the feet — and takes a vertex's alpha from
+/// how deep in the box it landed. The dll samples the same surfaces the mover's ground cast reads
+/// (`Player::ground`) on a 3×3-cell lattice over the square and keeps that alpha law: 16 lattice
+/// points, 18 quads' worth of fan-unrolled triangles. A point with no surface inside the box stays
+/// at the feet.
+fn ring_box(
+    feet: [f32; 3],
+    radius: f32,
+    fade: f32,
+    tint: [f32; 3],
+    ground: impl Fn(f32, f32) -> Option<f32>,
+) -> Vec<BnEffectVertex> {
+    const CELLS: usize = 3;
     let (sin, cos) = fade.sin_cos();
-    // The frame's axes in world WoW, the inverse of the projector's `in_frame` rotation:
-    // `x' → (cos, −sin)`, `z' → (sin, cos)`.
-    let vert = |sx: f32, sz: f32| BnEffectVertex {
-        pos: [
-            feet[0] + radius * (sx * cos + sz * sin),
-            feet[1] + radius * (sz * cos - sx * sin),
-            feet[2],
-        ],
-        uv: [(sx + 1.0) * 0.5, (sz + 1.0) * 0.5],
-        color: [tint[0], tint[1], tint[2], 1.0],
-    };
-    let (a, b, c, d) = (
-        vert(-1.0, -1.0),
-        vert(1.0, -1.0),
-        vert(1.0, 1.0),
-        vert(-1.0, 1.0),
-    );
-    vec![a, b, c, a, c, d]
+    // The box's own half-height, and the app's fade: full at the feet's level, gone two radii off it.
+    let vert = 2.0 * radius;
+    let mut lattice = [[BnEffectVertex::default(); CELLS + 1]; CELLS + 1];
+    for (i, row) in lattice.iter_mut().enumerate() {
+        let sx = -1.0 + 2.0 * (i as f32 / CELLS as f32);
+        for (j, cell) in row.iter_mut().enumerate() {
+            // The frame's axes in world WoW, the inverse of the projector's `in_frame` rotation:
+            // `x' → (cos, −sin)`, `z' → (sin, cos)`.
+            let sz = -1.0 + 2.0 * (j as f32 / CELLS as f32);
+            let x = feet[0] + radius * (sx * cos + sz * sin);
+            let y = feet[1] + radius * (sz * cos - sx * sin);
+            let z = ground(x, y)
+                .filter(|z| (feet[2] - vert..=feet[2] + vert).contains(z))
+                .unwrap_or(feet[2]);
+            *cell = BnEffectVertex {
+                pos: [x, y, z],
+                uv: [(sx + 1.0) * 0.5, (sz + 1.0) * 0.5],
+                color: [
+                    tint[0],
+                    tint[1],
+                    tint[2],
+                    ((vert - (z - feet[2]).abs()) / (1.5 * radius)).clamp(0.0, 1.0),
+                ],
+            };
+        }
+    }
+    let mut out = Vec::with_capacity(CELLS * CELLS * 6);
+    for i in 0..CELLS {
+        for j in 0..CELLS {
+            let (a, b, c, d) = (
+                lattice[i][j],
+                lattice[i + 1][j],
+                lattice[i + 1][j + 1],
+                lattice[i][j + 1],
+            );
+            out.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+    out
 }
 
 /// The ring under the selected unit: `1` with `out` filled and the vertices held for
@@ -287,12 +322,16 @@ pub extern "C" fn bn_selection_ring(world: *mut BnWorld, out: *mut BnSelectionRi
     let radius = ring_radius(w, display) * f.object_scale_x().unwrap_or(1.0).max(0.01);
     let fade = held_fade(w.player.as_ref().and_then(|p| fade_angle(p.camera_fwd())));
 
-    let box_verts = ring_box(
-        net::ui_unit_pose(guid).unwrap_or(unit.pos),
-        radius,
-        fade,
-        tint,
-    );
+    let feet = net::ui_unit_pose(guid).unwrap_or(unit.pos);
+    // The projector's box: the topmost surface at or below its roof. [`ring_box`] drops what lies
+    // below its floor, and holds the feet's level where the cast finds nothing.
+    let box_top = feet[2] + 2.0 * radius;
+    let box_verts = ring_box(feet, radius, fade, tint, |x, y| {
+        w.player
+            .as_ref()
+            .and_then(|p| p.ground(x, y, box_top))
+            .map(|(z, _)| z)
+    });
     let vert_count = box_verts.len() as u32;
     held_verts()
         .lock()
@@ -354,39 +393,66 @@ pub(crate) fn factions(world: &mut BnWorld) -> Option<Arc<FactionCatalog>> {
 mod tests {
     use super::*;
 
-    /// The box is the texture square: every corner sits one diagonal radius out, at the feet's own
-    /// height, and carries the full UV range. The fade turns the square without stretching it.
+    /// Over no ground the box is the texture square at the feet's own height: every vertex inside
+    /// the diagonal radius, at full alpha, and the four corners carry the full UV range.
     #[test]
     fn ring_box_is_the_yawed_texture_square() {
         for fade in [0.0f32, 0.7, -2.1] {
-            let v = ring_box([3.0, -4.0, 12.0], 2.0, fade, [1.0, 0.0, 0.0]);
-            assert_eq!(v.len(), 6);
+            let v = ring_box([3.0, -4.0, 12.0], 2.0, fade, [1.0, 0.0, 0.0], |_, _| None);
+            assert_eq!(v.len(), 54);
+            let corner = (2.0f32 * 2.0 * 2.0).sqrt();
             for vertex in &v {
                 let dx = vertex.pos[0] - 3.0;
                 let dy = vertex.pos[1] + 4.0;
-                assert!((dx.hypot(dy) - (2.0f32 * 2.0 * 2.0).sqrt()).abs() < 1e-4);
+                assert!(dx.hypot(dy) <= corner + 1e-4, "{vertex:?}");
                 assert_eq!(vertex.pos[2], 12.0);
                 assert!((0.0..=1.0).contains(&vertex.uv[0]));
                 assert!((0.0..=1.0).contains(&vertex.uv[1]));
                 assert_eq!(vertex.color, [1.0, 0.0, 0.0, 1.0]);
             }
-            assert_eq!(v[0].uv, [0.0, 0.0]);
-            assert_eq!(v[2].uv, [1.0, 1.0]);
-            // The fan repeats the square's first two corners.
-            assert_eq!(v[3].uv, v[0].uv);
-            assert_eq!(v[4].uv, v[2].uv);
+            for uv in [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] {
+                assert!(v.iter().any(|x| x.uv == uv), "no vertex at UV {:?}", uv);
+            }
         }
     }
 
-    /// A fade of 0 leaves the box axis-aligned: `x'` along world +X, `z'` along world +Y. The fan
-    /// repeats the square's first corner, so the fourth corner is its last vertex.
+    /// A fade of 0 leaves the box axis-aligned: `x'` along world +X, `z'` along world +Y. The first
+    /// triangle is the lattice's corner cell, so it opens at the square's own corner.
     #[test]
     fn zero_fade_keeps_the_box_axis_aligned() {
-        let v = ring_box([0.0, 0.0, 0.0], 1.0, 0.0, [0.0, 1.0, 0.0]);
+        let v = ring_box([0.0, 0.0, 0.0], 1.0, 0.0, [0.0, 1.0, 0.0], |_, _| None);
         assert_eq!(v[0].pos, [-1.0, -1.0, 0.0]);
-        assert_eq!(v[1].pos, [1.0, -1.0, 0.0]);
-        assert_eq!(v[2].pos, [1.0, 1.0, 0.0]);
-        assert_eq!(v[5].pos, [-1.0, 1.0, 0.0]);
+        assert!((v[1].pos[0] + 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(v[1].pos[1], -1.0);
+        assert!((v[2].pos[1] + 1.0 / 3.0).abs() < 1e-6);
+        assert!(v.iter().all(|x| x.pos[0] <= 1.0 && x.pos[0] >= -1.0));
+        assert!(v.iter().all(|x| x.pos[1] <= 1.0 && x.pos[1] >= -1.0));
+    }
+
+    /// The app's fade law rides on the sampled height: ground two radii under the feet is the box's
+    /// own floor and reads 0, a shelf inside the box keeps its colour and half its alpha.
+    #[test]
+    fn the_ring_fades_where_the_ground_drops_away() {
+        let v = ring_box([0.0, 0.0, 0.0], 1.0, 0.0, [0.0, 1.0, 0.0], |x, _| {
+            (x < 0.0).then_some(-2.0)
+        });
+        for vertex in &v {
+            let sunk = vertex.pos[0] < 0.0;
+            assert_eq!(vertex.pos[2], if sunk { -2.0 } else { 0.0 });
+            let a = if sunk { 0.0 } else { 1.0 };
+            assert!((vertex.color[3] - a).abs() < 1e-6, "{vertex:?}");
+        }
+        let one_radius_down = ring_box([0.0, 0.0, 0.0], 1.0, 0.0, [0.0, 1.0, 0.0], |_, _| {
+            Some(-1.0)
+        });
+        assert!(one_radius_down
+            .iter()
+            .all(|x| (x.color[3] - (2.0 - 1.0) / 1.5).abs() < 1e-6));
+        // Nothing inside the box's band: the vertex holds the feet, not the far surface.
+        let below = ring_box([0.0, 0.0, 0.0], 1.0, 0.0, [0.0, 1.0, 0.0], |_, _| {
+            Some(-9.0)
+        });
+        assert!(below.iter().all(|x| x.pos[2] == 0.0 && x.color[3] == 1.0));
     }
 
     /// Straight down has no ground-projected forward, so the caller keeps the last fade.

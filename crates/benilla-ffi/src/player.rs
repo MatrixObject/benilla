@@ -1078,7 +1078,7 @@ impl Player {
     }
 
     /// The highest walkable surface under (x, y) at or below `ceil`.
-    fn ground(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, f32)> {
+    pub(crate) fn ground(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, f32)> {
         let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<(f32, f32)> = None;
         let mut consider = |t: &Tri| {
