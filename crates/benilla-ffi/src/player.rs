@@ -127,6 +127,27 @@ const SWIM_DEPTH_FRAC: f32 = 0.75;
 /// The enter/leave band: hold between `0.75·h - 1/36` and `0.75·h`.
 const SWIM_HYSTERESIS: f32 = 1.0 / 36.0;
 
+// ---- airborne bracket (`player::arc` + `creature_anim::select`) ----
+/// The launch vertical speed above which an arc is a jump and not a step-off
+/// (`benilla-app`'s `JUMP_ARC_MIN_UP`, the split `0x60e480` makes).
+const JUMP_ARC_MIN_UP: f32 = 0.5;
+/// How far below the launch a jumped arc has to drop before the fall counts as
+/// far (`benilla-app`'s `FALL_FAR_DROP`, `[0x633240]`). A flat jump's arc comes
+/// back to within a hand-span of its takeoff, so it never latches: the whole
+/// jump stays in the Jump bracket and only a real descent takes the Fall clip.
+const FALL_FAR_DROP: f32 = 0.111_11;
+/// ... and for a step-off, the time airborne that does the same (`FALL_FAR_TIME`).
+const FALL_FAR_TIME: f32 = 0.5;
+/// JumpStart's authored length (ms). Every shipped player and mount M2 authors
+/// 833 for it (`HumanMale`, `OrcMale`, `RidingHorse` all read seq start/end at
+/// 833 through `bn_model_anim_by_id`), which is why a flat jump - 825 ms of arc -
+/// shows the launch pose through the whole flight.
+const JUMP_ENTER_MS: f32 = 833.0;
+/// The landing one-shot's authored length (ms): JumpEnd is 1000 on Human and on
+/// the mount (Orc authors 1500) and JumpLandRun 833 on Human, so one window fits
+/// the arcs the player actually sees.
+const LAND_MS: f32 = 1000.0;
+
 /// The state the host applies (plain C; yaw/pitch radians, positions yards).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -149,9 +170,9 @@ pub struct BnPlayerState {
     /// 0/1.
     pub mounted: u32,
     /// AnimationData.dbc id to play (0 Stand, 4 Walk, 5 Run, 13 WalkBackwards,
-    /// 16 AttackUnarmed, 37 JumpStart, 40 Fall, 91 Mount). A one-shot action
-    /// the lower body cannot show (an attack or a cast while running) rides
-    /// the overlay instead.
+    /// 16 AttackUnarmed, 37 JumpStart, 38 Jump, 39 JumpEnd, 40 Fall, 91 Mount,
+    /// 187 JumpLandRun). A one-shot action the lower body cannot show (an attack
+    /// or a cast while running) rides the overlay instead.
     pub anim: u32,
     /// The upper-body overlay's AnimationData id (16 attack, 53 cast), or 0
     /// for none: the vanilla masked SpineLow subtree split.
@@ -787,6 +808,26 @@ pub struct Player {
     ui_input: Option<[f32; 3]>,
     /// A `Jump()` binding's one-shot, spent on the next tick.
     ui_jump: bool,
+    // ---- the airborne arc and its animation bracket (`player::arc`) ----
+    /// Feet Z at the arc's launch (`StartFalling`'s `+0x7c`): the pre-step height,
+    /// so a flat jump's descent never reads as a far fall.
+    fall_start_z: f32,
+    /// The arc's launch vertical speed (`+0xa0`): the jump speed, or 0 for a
+    /// step-off, which is what splits the Jump bracket from a kept gait.
+    jump_zspeed: f32,
+    /// Seconds spent airborne on this arc.
+    airborne_s: f32,
+    /// The `FALLINGFAR` latch: `FALL_FAR_DROP` under the launch for a jumped arc,
+    /// `FALL_FAR_TIME` airborne for a step-off; only a landing clears it.
+    fall_far: bool,
+    /// Seconds of this arc inside JumpStart's clip; past it the Jump hang plays.
+    jump_t: f32,
+    /// An arc is running (its rising and falling edges).
+    airborne: bool,
+    /// The landing one-shot's id (`jump_land_pick`'s 39 or 187), 0 when none.
+    land_id: u32,
+    /// Seconds of it left to play.
+    land_left_s: f32,
     /// The walk toggle's state, `None` until a `ToggleRun()` binding sets it.
     ui_walk: Option<bool>,
     tiles: HashMap<(i32, i32), TileCol>,
@@ -848,6 +889,14 @@ impl Player {
             overlay_weight: 0.0,
             ui_input: None,
             ui_jump: false,
+            fall_start_z: 0.0,
+            jump_zspeed: 0.0,
+            airborne_s: 0.0,
+            fall_far: false,
+            jump_t: 0.0,
+            airborne: false,
+            land_id: 0,
+            land_left_s: 0.0,
             ui_walk: None,
             tiles: HashMap::new(),
             hulls: HashMap::new(),
@@ -1759,6 +1808,9 @@ impl Player {
             self.pos[2] = z;
             self.grounded = false;
             self.vel[2] = 0.0;
+            // Water ends the arc: the swim picks are their own clips and the
+            // bracket clock (`tick_arc`) does not run here.
+            self.airborne = false;
         } else {
             // Vertical: gravity then the floor probe (benilla's order).
             // The probe's ceiling has to cover the whole step, not just the
@@ -1860,6 +1912,7 @@ impl Player {
             if self.grounded {
                 self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
             }
+            self.tick_arc(dt, jump, prev_z);
             // Falling-trace: a body that drops through a city floor lands on the
             // terrain, where `ground` still answers - so the no-ground warning
             // never fires. Log the trajectory (with the tile's WMO cell count)
@@ -1913,7 +1966,7 @@ impl Player {
     /// preset above the feet (clamped by the water corridor), the eye on the
     /// orbit at the current pitch/yaw, at the boom length the collision probe
     /// settled on, clipped by the waterline.
-    fn camera(&self) -> ([f32; 3], [f32; 3]) {
+    pub(crate) fn camera(&self) -> ([f32; 3], [f32; 3]) {
         let pivot = self.camera_pivot();
         let fwd = self.camera_fwd();
         let mut dist = self.cam_live.min(self.cam_distance);
@@ -1998,6 +2051,68 @@ impl Player {
         (anim, self.overlay_weight)
     }
 
+    /// The airborne arc and its bracket clock, once per non-swim frame after the
+    /// mover has written `pos` and `grounded` (`player::arc::advance_airborne_arc`).
+    /// `launch_z` is the pre-step feet, the true takeoff height: the post-step one
+    /// would read a flat jump's descent as a far fall.
+    fn tick_arc(&mut self, dt: f32, jumped: bool, launch_z: f32) {
+        let airborne = !self.grounded;
+        // The arc starts at the launch, not only at the airborne edge: on broken
+        // ground a jump can land and relaunch within one frame.
+        if airborne && (!self.airborne || jumped) {
+            self.airborne = true;
+            self.airborne_s = 0.0;
+            self.jump_t = 0.0;
+            // `StartFalling`'s `+0xa0`: the jump speed for a launch, exactly 0 for
+            // a step-off, which is the split the selector makes.
+            self.jump_zspeed = if jumped { JUMP_SPEED } else { 0.0 };
+            self.fall_start_z = launch_z;
+            self.fall_far = false;
+            self.land_id = 0;
+            self.land_left_s = 0.0;
+        } else if !airborne && self.airborne {
+            self.airborne = false;
+            self.jump_zspeed = 0.0;
+            self.fall_far = false;
+            self.airborne_s = 0.0;
+            // Touchdown from a bracketed arc takes `jump_land_pick`'s one-shot
+            // (`0x602c60`): JumpEnd 39 stopped, JumpLandRun 187 running forward,
+            // nothing backpedaling or walking; an arc that kept its gait lands in it.
+            self.land_id = if jumped {
+                0
+            } else {
+                let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
+                if hs < 0.1 {
+                    39
+                } else if self.input.forward > 0.01 && !self.input.walk {
+                    187
+                } else {
+                    0
+                }
+            };
+            self.land_left_s = if self.land_id != 0 { LAND_MS / 1000.0 } else { 0.0 };
+        }
+        if airborne {
+            self.airborne_s += dt;
+            if self.jump_zspeed > JUMP_ARC_MIN_UP {
+                self.jump_t += dt;
+            }
+            // FALLINGFAR splits on the launch: a jump by the drop below its
+            // takeoff, a step-off by the time airborne. Only a landing clears it.
+            self.fall_far |= if self.jump_zspeed != 0.0 {
+                self.pos[2] <= self.fall_start_z - FALL_FAR_DROP
+            } else {
+                self.airborne_s >= FALL_FAR_TIME
+            };
+        } else if self.land_left_s > 0.0 {
+            self.land_left_s -= dt;
+            if self.land_left_s <= 0.0 {
+                self.land_id = 0;
+                self.land_left_s = 0.0;
+            }
+        }
+    }
+
     fn anim(&self) -> u32 {
         if self.dead {
             return ANIM_DEATH;
@@ -2039,8 +2154,24 @@ impl Player {
                 return crate::net::self_swing_anim();
             }
         }
-        if !self.grounded {
-            return if self.vel[2] > 0.0 { 37 } else { 40 }; // JumpStart / Fall
+        if self.airborne {
+            // `creature_anim::select::current_special`: the Fall loop plays only
+            // once the fall is far; a jumped arc stays in the Jump bracket for its
+            // whole arc - JumpStart (37) until that clip's authored length, then
+            // the Jump hang (38) - and a step-off that is not yet far keeps its
+            // gait (`0x5fd8e8`), so it falls through to the pick below.
+            if self.fall_far {
+                return 40;
+            }
+            if self.jump_zspeed > JUMP_ARC_MIN_UP {
+                return if self.jump_t * 1000.0 < JUMP_ENTER_MS {
+                    37
+                } else {
+                    38
+                };
+            }
+        } else if self.land_id != 0 {
+            return self.land_id;
         }
         let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
         if hs < 0.1 {
@@ -2740,6 +2871,109 @@ mod tests {
             ));
         }
         col
+    }
+
+    /// A body on a flat synthetic floor, standing at the profile's origin.
+    fn player_on_flat() -> Player {
+        let mut p = Player::new("Azeroth", PROFILE_X0, -800.0);
+        let flat = [(-2.0f32, 0.0f32), (60.0, 0.0)];
+        p.tiles
+            .insert(Player::tile_of(p.pos[0], p.pos[1]), terrain_profile(&flat));
+        p.pos[2] = p
+            .ground(p.pos[0], -800.0, f32::MAX)
+            .map_or(0.0, |(z, _)| z);
+        p.grounded = true;
+        p.last_ground = p.pos;
+        p
+    }
+
+    /// `player::arc` + `creature_anim::select::current_special`: a jump stays in
+    /// the Jump bracket for its whole arc, because a flat jump never drops
+    /// `FALL_FAR_DROP` below its takeoff and so never arms the Fall loop at all.
+    /// The arc is shorter than JumpStart's own clip (825 ms of 833), so the launch
+    /// pose plays through and the hang (38) only shows on a longer arc; touchdown
+    /// standing still takes JumpEnd (39), then the gait.
+    #[test]
+    fn a_flat_jump_plays_the_jump_bracket_not_the_fall_loop() {
+        let mut p = player_on_flat();
+        let z0 = p.pos[2];
+        let dt = 1.0 / 60.0;
+        p.input.jump = true;
+        p.tick(dt);
+        p.input.jump = false;
+        assert_eq!(p.anim(), 37, "JumpStart at the launch");
+        let mut ids: Vec<u32> = vec![p.anim()];
+        let mut apex = 0.0f32;
+        let mut frames = 1;
+        while p.airborne && frames < 200 {
+            p.tick(dt);
+            frames += 1;
+            apex = apex.max(p.pos[2] - z0);
+            if p.airborne {
+                ids.push(p.anim());
+            }
+        }
+        let air_s = frames as f32 * dt;
+        assert!(
+            ids.iter().all(|a| *a == 37 || *a == 38),
+            "a jump's own arc never takes the Fall loop: {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|a| *a == 37),
+            "the arc is shorter than JumpStart's clip, so the hang (38) waits for \
+             a longer one: {ids:?}"
+        );
+        assert!(
+            (apex - JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY)).abs() < 0.1,
+            "apex {apex:.3} yd over 0.825 s, not {air_s:.3} s"
+        );
+        assert!(
+            (air_s - 2.0 * JUMP_SPEED / GRAVITY).abs() < 0.1,
+            "airtime {air_s:.3} s"
+        );
+        assert_eq!(p.anim(), 39, "JumpEnd on touchdown");
+        p.land_id = 0;
+        assert_eq!(p.anim(), 0, "and then the gait, standing still");
+    }
+
+    /// A step-off is not a jump: no bracket, so the gait keeps playing, and Fall
+    /// (40) only after `FALL_FAR_TIME` airborne (`0x5fd8e8`, `[0x633240]`).
+    #[test]
+    fn a_step_off_keeps_its_gait_until_the_fall_is_far() {
+        let mut p = player_on_flat();
+        // A ledge at the profile's origin with an 8 yd drop behind it.
+        let cliff = [(-2.0f32, 0.0f32), (0.0, 0.0), (0.002, -8.0), (60.0, -8.0)];
+        p.tiles.insert(
+            Player::tile_of(p.pos[0], p.pos[1]),
+            terrain_profile(&cliff),
+        );
+        p.pos[2] = 0.0;
+        p.grounded = true;
+        p.last_ground = p.pos;
+        p.input.forward = 1.0;
+        p.yaw = 0.0;
+        p.model_yaw = 0.0;
+        let dt = 1.0 / 60.0;
+        let mut air = 0;
+        let mut at_the_edge = 0;
+        let mut after_the_latch = 0;
+        for _ in 0..200 {
+            p.tick(dt);
+            if p.grounded {
+                continue;
+            }
+            air += 1;
+            if air == 1 {
+                at_the_edge = p.anim();
+            }
+            if p.airborne_s > FALL_FAR_TIME + 0.02 {
+                after_the_latch = p.anim();
+                break;
+            }
+        }
+        assert!(air > 30, "the drop is long enough to pass the latch");
+        assert_eq!(at_the_edge, 5, "a step-off at a run keeps the Run clip");
+        assert_eq!(after_the_latch, 40, "the far fall takes the Fall loop");
     }
 
     /// Walk `frames` frames along the profile, reporting (feet z, x, grounded).
