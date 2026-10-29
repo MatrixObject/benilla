@@ -578,17 +578,23 @@ fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
     script.fire_event(event, args);
 }
 
-/// The stock error line for a key: `DisplayError` (`0x4945b0`) resolves the id through
-/// `GlobalStrings`, which is the player's own localized table, so read the VM's global
-/// and fall back to the key only when the chain lacks the row.
-fn fire_error(script: &mut UiScript, key: &str) {
-    let text = script
+/// One label off the player's own language pack: the `GlobalStrings` global FrameXML reads its
+/// text through (`TEXT(BACKPACK_TOOLTIP)` for the bag window), `None` when the chain's Lua has no
+/// such row. A middle-layer label is English in a Chinese install unless it comes from here.
+fn localized_label(script: &UiScript, key: &str) -> Option<String> {
+    script
         .lua()
         .globals()
         .get::<String>(key)
         .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| key.to_string());
+        .filter(|text| !text.is_empty())
+}
+
+/// The stock error line for a key: `DisplayError` (`0x4945b0`) resolves the id through
+/// `GlobalStrings`, which is the player's own localized table, so read the VM's global
+/// and fall back to the key only when the chain lacks the row.
+fn fire_error(script: &mut UiScript, key: &str) {
+    let text = localized_label(script, key).unwrap_or_else(|| key.to_string());
     fire(script, "UI_ERROR_MESSAGE", vec![ScriptValue::Str(text)]);
 }
 
@@ -1043,7 +1049,12 @@ impl Feed {
                 }
             }
             let name = if id == 0 {
-                Some("Backpack".to_string())
+                // "Backpack" is the enUS pack's own `BACKPACK_TOOLTIP` value, so it is the
+                // fallback only when the chain's Lua has no row.
+                Some(
+                    localized_label(script, "BACKPACK_TOOLTIP")
+                        .unwrap_or_else(|| "Backpack".to_string()),
+                )
             } else if entry != 0 {
                 let n = cstr(&net::ui_item_info(entry).name);
                 (!n.is_empty()).then_some(n)
@@ -1544,6 +1555,9 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
             }
         });
     });
+    // The plates seat on this frame's world and the stock `NAMEPLATES_ON` verbs, so they ride the
+    // same tick the feed does (`crates/benilla-app/src/vplates.rs`, across the boundary).
+    crate::nameplates::drive(WORLD.with(|w| w.get()), script);
 }
 
 /// The OS window deactivate, the reference's `0x514490` (`and eax,0xfffff00f`, sole caller
