@@ -260,6 +260,14 @@ pub struct BnNetUnit {
     /// is `SPLINEFLAG_RUNMODE` (clear = `MOVEFLAG_WALK_MODE`), and only the
     /// spline's live window plays a gait; once it ends the unit stands.
     pub anim: u32,
+    /// `UNIT_NPC_FLAGS`: the services this unit offers, in the 1.12 numbering
+    /// (`crates/benilla-app/src/target/cursor_mode.rs`): 0x1 gossip, 0x2 quest
+    /// giver, 0x4 vendor, 0x8 flightmaster, 0x80 innkeeper, 0x4000 repair. The
+    /// client gates `CanMerchantRepair` (`0x4fadb0`) on the repair bit and the
+    /// merchant window on the vendor bit. Past NPC-service range the server
+    /// refuses `CMSG_LIST_INVENTORY` with `SMSG_SELL_ITEM`/`CANT_FIND_VENDOR`
+    /// (vmangos "not found or you can't interact with him", 3D distance).
+    pub npc_flags: u32,
 }
 
 impl Default for BnNetUnit {
@@ -291,6 +299,7 @@ impl Default for BnNetUnit {
             creature_type: 0,
             name: [0; 64],
             anim: 0,
+            npc_flags: 0,
         }
     }
 }
@@ -4447,9 +4456,9 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
         // 28 = open the vendor's stock list (a = vendor guid); answers as
         // `vendor|open|...` on the event queue.
         // 29 = buy (a = vendor guid, b = entry | ((count-1) << 16), 1..256).
-        // 30 = sell whole stack (a = our item guid, b = vendor guid).
+        // 30 = sell whole stack (a = our item guid, at the open vendor).
         // 31 = buyback (a = vendor guid, b = absolute buyback slot 69..80).
-        // 32 = repair one item (a = item guid, b = vendor guid).
+        // 32 = repair one item (a = item guid, at the open vendor).
         // 33 = repair everything (a = vendor guid, b = 0).
         28 => Cmd::VendorList(a),
         29 => Cmd::VendorBuy {
@@ -4458,13 +4467,15 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             count: (((b >> 16) & 0xFF) as u8).max(1),
         },
         30 => Cmd::VendorSell {
-            vendor: b as u64,
+            // A sale only makes sense at the list that is open, and that guid is 64-bit: the
+            // u32 `b` cannot carry it, so the middle layer names its own open vendor.
+            vendor: ui_vendor().guid,
             item_guid: a,
             count: 0,
         },
         31 => Cmd::VendorBuyback { vendor: a, slot: b },
         32 => Cmd::VendorRepair {
-            vendor: b as u64,
+            vendor: ui_vendor().guid,
             item_guid: a,
         },
         33 => Cmd::VendorRepair {
@@ -4852,7 +4863,13 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
         guid,
         kind: rec.kind,
         level: f.unit_level().unwrap_or(0),
-        display_id: f.unit_displayid().unwrap_or(0),
+        // A gameobject's look never rides `UNIT_FIELD_DISPLAYID`: the reference
+        // reads `GAMEOBJECT_DISPLAYID` for kind 5 (`live_display.rs`).
+        display_id: if rec.kind == 5 {
+            f.gameobject_displayid().unwrap_or(0)
+        } else {
+            f.unit_displayid().unwrap_or(0)
+        },
         health: f.unit_health().unwrap_or(0),
         max_health: f.unit_max_health().unwrap_or(0),
         target: f.unit_target().unwrap_or(0),
@@ -4913,6 +4930,7 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
             }
             _ => 0,
         },
+        npc_flags: f.unit_npc_flags(),
     }
 }
 

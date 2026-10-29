@@ -73,6 +73,10 @@ mod net;
 
 mod creature;
 
+// ---- GameObjectDisplayInfo -> model path (a lootable object's look) ----
+
+mod gameobject;
+
 // ---- A unit's virtual weapon slots -> attach point, item model and object skin ----
 
 mod held_item;
