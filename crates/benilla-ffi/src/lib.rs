@@ -6124,7 +6124,16 @@ fn twist_pose(bones: &[BnBone], mats: &mut [BnMat4], spine: f32, head: f32) {
 
         let Some(m) = mats.get(root) else { continue };
 
-        let pivot = [m[3], m[7], m[11]];
+        // The bone's own pivot, posed: `W · p_rest`. The matrix's translation
+        // column is the bone's origin, not its pivot — for a bone whose matrix
+        // carries a walk/run displacement those differ by up to a third of a
+        // metre, and twisting about the origin shears the torso off the hips.
+        let p = bones[root].pivot;
+
+        let pivot = [
+            m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+            m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+        ];
 
         let sub = subtree_of(bones, root);
 
@@ -6212,6 +6221,144 @@ mod twist_tests {
 
     fn identity() -> BnMat4 {
         placed([0.0; 3])
+    }
+
+    fn bone_at(key: u16, parent: i16, pivot: [f32; 3]) -> BnBone {
+        BnBone {
+            pivot,
+            ..bone(key, parent)
+        }
+    }
+
+    /// A rig whose pivots sit away from each bone's matrix translation, the way
+    /// a real bone's do: SpineLow's matrix carries a 0.1 m walk displacement
+    /// while its pivot is 0.2 m out to the side.
+    fn off_center_rig() -> (Vec<BnBone>, Vec<BnMat4>) {
+        let bones = vec![
+            bone(0, -1),
+            bone_at(4, 0, [0.2, 0.0, 0.0]),
+            bone_at(6, 1, [0.0, 0.0, 0.1]),
+        ];
+        let mats = vec![
+            identity(),
+            placed([0.1, 0.05, 1.0]),
+            placed([0.5, 0.0, 2.0]),
+        ];
+        (bones, mats)
+    }
+
+    /// Where the bone's pivot sits in the posed model: `W · p_rest`.
+    fn posed_pivot(bones: &[BnBone], mats: &[BnMat4], i: usize) -> [f32; 3] {
+        let m = &mats[i];
+        let p = bones[i].pivot;
+        [
+            m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+            m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+            m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11],
+        ]
+    }
+
+    /// A point turned by a WoW yaw about `pivot` in the mirrored (UE) frame,
+    /// the same rotation `twist_pose` composes.
+    fn turned(v: [f32; 3], pivot: [f32; 3], yaw: f32) -> [f32; 3] {
+        let (s, c) = (-yaw).sin_cos();
+        let (x, y) = (v[0] - pivot[0], v[1] - pivot[1]);
+        [c * x - s * y + pivot[0], s * x + c * y + pivot[1], v[2]]
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        (a[0] - b[0]).abs() < 1.0e-5 && (a[1] - b[1]).abs() < 1.0e-5 && (a[2] - b[2]).abs() < 1.0e-5
+    }
+
+    /// The shares turn about the bones' pivots, not their matrix origins: a
+    /// bone whose matrix sits 0.1 m off its pivot must not slide when twisted.
+    #[test]
+    fn the_shares_turn_about_the_bones_pivots() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (bones, mut mats) = off_center_rig();
+        let spine = posed_pivot(&bones, &mats, 1);
+        let head = posed_pivot(&bones, &mats, 2);
+        twist_pose(&bones, &mut mats, FRAC_PI_2, FRAC_PI_4);
+        assert!(
+            close(posed_pivot(&bones, &mats, 1), spine),
+            "spine pivot slid: {:?} -> {:?}",
+            spine,
+            posed_pivot(&bones, &mats, 1)
+        );
+        // The head's pivot rides the spine's share and then holds under its
+        // own, which turns everything above it about the same point.
+        let after_spine = turned(head, spine, FRAC_PI_2);
+        assert!(
+            close(posed_pivot(&bones, &mats, 2), after_spine),
+            "head pivot: {:?} vs {:?}",
+            posed_pivot(&bones, &mats, 2),
+            after_spine
+        );
+    }
+
+    /// On a real rig mid-walk, the shares hold the bones' pivots. A walk
+    /// carries SpineLow's origin off its pivot, so a twist about the matrix
+    /// translation slides the whole torso; this is the regression for that.
+    #[test]
+    fn a_real_walk_twist_holds_the_bones_pivots() {
+        use std::f32::consts::FRAC_PI_4;
+
+        let data = benilla_formats::wow_data_or_skip!();
+
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+
+        let Ok(bytes) = chain.read_file(r"Character\Human\Male\HumanMale.m2") else {
+            return;
+        };
+
+        let fmt = benilla_m2::parse_m2(&mut std::io::Cursor::new(bytes.as_slice())).expect("parse");
+
+        let gs = parse_m2_global_sequences(&bytes);
+
+        let bones = parse_m2_bones(&bytes).expect("bones");
+
+        let walk = fmt.model().animation_lookup.get(4).copied().unwrap_or(0) as usize;
+
+        let mut mats: Vec<BnMat4> = (0..bones.len())
+            .map(|i| bone_matrix_at(&bones, walk, 200, 200, &gs, i))
+            .collect();
+
+        let Some(spine) = bones.iter().position(|b| b.key_bone == 4) else {
+            return;
+        };
+
+        let Some(head) = bones.iter().position(|b| b.key_bone == 6) else {
+            return;
+        };
+
+        let spine_at = posed_pivot(&bones, &mats, spine);
+
+        let head_at = posed_pivot(&bones, &mats, head);
+
+        assert!(
+            (mats[spine][3] - spine_at[0]).abs() > 1.0e-3
+                || (mats[spine][7] - spine_at[1]).abs() > 1.0e-3,
+            "a walk must carry the spine's origin off its pivot for this to mean anything"
+        );
+
+        twist_pose(&bones, &mut mats, FRAC_PI_4, FRAC_PI_4);
+
+        assert!(
+            close(posed_pivot(&bones, &mats, spine), spine_at),
+            "spine pivot slid: {:?} -> {:?}",
+            spine_at,
+            posed_pivot(&bones, &mats, spine)
+        );
+
+        assert!(
+            close(
+                posed_pivot(&bones, &mats, head),
+                turned(head_at, spine_at, FRAC_PI_4)
+            ),
+            "head pivot: {:?} vs {:?}",
+            posed_pivot(&bones, &mats, head),
+            turned(head_at, spine_at, FRAC_PI_4)
+        );
     }
 
     #[test]
