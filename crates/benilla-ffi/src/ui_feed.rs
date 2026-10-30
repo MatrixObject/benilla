@@ -119,10 +119,49 @@ pub(crate) fn attach(world: *mut BnWorld) {
 }
 
 /// One row of the loot window: where its take goes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LootPick {
     Coin,
     Item(u8),
+}
+
+/// The open loot window as the stock frame reads it: a layout fixed at open (`LootFrame.lua:22-37`,
+/// `GetNumLootItems` read once at `:132`), where a taken row keeps its place as a `None` gap and the
+/// stock handler hides that button in place (`LootFrame.lua:80`).
+struct LootWindow {
+    guid: u64,
+    /// Whether a coin row leads; fixed at open from the response's gold (`LootState::open`).
+    coin: bool,
+    /// Each wire row's slot, in response order.
+    slots: Vec<u8>,
+    /// The 1-based layout row's take target, a gap included.
+    picks: Vec<Option<LootPick>>,
+    /// The cells last pushed, for the change edge: `None` before the first push.
+    last: Option<Vec<Option<LootRow>>>,
+    /// `LOOT_OPENED` has fired, which waits for every template (`0x4c1e9f`).
+    opened: bool,
+    /// The emptied window's release was sent; the server's answer closes it (`0x4c2a70` → `0x48f200`).
+    released: bool,
+}
+
+/// The 1-based layout's take targets for one pass: the coin row while the pile is there, then each
+/// fixed wire slot still in the response. A taken row keeps a `None` gap, so the rows below it do
+/// not move and a click on the gap sends nothing.
+fn loot_picks(window: &LootWindow, wire: &net::BnNetLoot) -> Vec<Option<LootPick>> {
+    let live = |slot: u8| {
+        wire.items
+            .iter()
+            .take(wire.count as usize)
+            .any(|i| i.slot == slot)
+    };
+    let mut picks = Vec::with_capacity(window.slots.len() + 1);
+    if window.coin {
+        picks.push((wire.gold > 0).then_some(LootPick::Coin));
+    }
+    for &slot in &window.slots {
+        picks.push(live(slot).then_some(LootPick::Item(slot)));
+    }
+    picks
 }
 
 /// The scalar fields whose move fires a unit event, diffed against the previous push.
@@ -204,8 +243,8 @@ struct Feed {
     action_states: HashMap<u32, ActionState>,
     auras: Vec<(u32, u8, bool)>,
     target_auras: (u64, Vec<(u32, u8, bool)>),
-    loot_key: Option<(u64, u32, Vec<(u8, u8, u32, u32)>)>,
-    loot_picks: Vec<LootPick>,
+    /// The open loot window's fixed layout, `None` while closed.
+    loot: Option<LootWindow>,
     /// The vendor last pushed: its guid plus each listed row's `(entry, price,
     /// remaining stock, per-buy count, template display id)`.
     merchant_key: Option<(u64, Vec<(u32, u32, u32, u32, u32)>)>,
@@ -296,8 +335,7 @@ impl Feed {
             action_states: HashMap::new(),
             auras: Vec::new(),
             target_auras: (0, Vec::new()),
-            loot_key: None,
-            loot_picks: Vec::new(),
+            loot: None,
             merchant_key: None,
             party_key: None,
             containers: HashMap::new(),
@@ -325,6 +363,27 @@ pub(crate) fn cstr<const N: usize>(buf: &[std::ffi::c_char; N]) -> String {
 
 fn norm_icon(path: Option<String>) -> Option<String> {
     path.map(|p| p.replace('/', "\\"))
+}
+
+/// The coin row's text (`ui_loot`'s `format_money`): 1.12's `GOLD`, `SILVER` and `COPPER`
+/// (`GlobalStrings.lua:2025`, `:3465`, `:865`), read off the player's own pack so a Chinese
+/// install reads Chinese, with the enUS word only when the chain lacks the row.
+fn money_text(script: &UiScript, copper: u32) -> String {
+    let word = |key: &str, fallback: &str| {
+        localized_label(script, key).unwrap_or_else(|| fallback.to_string())
+    };
+    let (g, s, c) = (copper / 10000, (copper % 10000) / 100, copper % 100);
+    let mut parts: Vec<String> = Vec::new();
+    if g > 0 {
+        parts.push(format!("{g} {}", word("GOLD", "Gold")));
+    }
+    if s > 0 {
+        parts.push(format!("{s} {}", word("SILVER", "Silver")));
+    }
+    if c > 0 || parts.is_empty() {
+        parts.push(format!("{c} {}", word("COPPER", "Copper")));
+    }
+    parts.join(" ")
 }
 
 /// The client's quality colour escape for an item link, `0x52ad90` over the table at
@@ -1454,49 +1513,64 @@ impl Feed {
     }
 
     fn push_loot(&mut self, script: &mut UiScript, cats: Option<&Catalogs>) {
-        let loot = net::ui_loot();
-        let open = loot.guid != 0;
-        let key = open.then(|| {
-            let items: Vec<(u8, u8, u32, u32)> = loot
-                .items
-                .iter()
-                .take(loot.count as usize)
-                .map(|i| (i.slot, i.slot_type, i.item_id, i.count))
-                .collect();
-            (loot.guid, loot.gold, items)
-        });
-        if key == self.loot_key {
-            return;
-        }
-        let was_open = self.loot_key.is_some();
-        if !open {
-            if was_open {
+        let wire = net::ui_loot();
+        if wire.guid == 0 {
+            if self.loot.take().is_some() {
                 script.set_loot(None);
                 fire(script, "LOOT_CLOSED", Vec::new());
             }
-            self.loot_key = None;
-            self.loot_picks.clear();
             return;
         }
-        let mut rows: Vec<Option<LootRow>> = Vec::new();
-        let mut picks: Vec<LootPick> = Vec::new();
-        if loot.gold > 0 {
-            rows.push(Some(LootRow {
-                name: None,
-                texture: None,
-                quantity: 1,
-                quality: None,
+        // A response for another source replaces the window: its layout is fixed at open, so each
+        // window keeps its own guid and row order (`0x5ebc35` tears the old one down first).
+        let fresh = self.loot.as_ref().is_none_or(|w| w.guid != wire.guid);
+        if fresh {
+            let replaced = self.loot.replace(LootWindow {
+                guid: wire.guid,
+                coin: wire.gold > 0,
+                slots: wire
+                    .items
+                    .iter()
+                    .take(wire.count as usize)
+                    .map(|i| i.slot)
+                    .collect(),
+                picks: Vec::new(),
+                last: None,
+                opened: false,
+                released: false,
+            });
+            if replaced.is_some() {
+                script.set_loot(None);
+                fire(script, "LOOT_CLOSED", Vec::new());
+            }
+        }
+        let window = self.loot.as_mut().expect("the window was just ensured");
+        let items: Vec<&net::BnNetLootItem> = wire.items.iter().take(wire.count as usize).collect();
+        let mut rows: Vec<Option<LootRow>> = Vec::with_capacity(window.slots.len() + 1);
+        let picks = loot_picks(window, &wire);
+        window.picks = picks;
+        if window.coin {
+            // The coin row's own guard (`0x4c22e0`): taken, it is a gap like any other row.
+            let live = wire.gold > 0;
+            rows.push(live.then(|| LootRow {
+                name: Some(money_text(script, wire.gold)),
+                texture: Some(benilla_ui::script::coin_icon(i64::from(wire.gold)).to_string()),
+                // `0x4c22e0` returns before the record read (`0x4c22fd`).
+                quantity: 0,
+                quality: Some(0),
                 is_coin: true,
                 item_id: 0,
                 link: None,
                 random_property_id: 0,
             }));
-            picks.push(LootPick::Coin);
         }
-        for item in loot.items.iter().take(loot.count as usize) {
-            if item.slot_type == 3 {
-                continue; // locked: no row until it opens
-            }
+        for &slot in &window.slots {
+            let Some(item) = items.iter().find(|i| i.slot == slot) else {
+                // Taken: the row keeps its place and answers the cleared sentinel (`0x4c2435`),
+                // which the stock `LootFrame_Update` hides in place (`LootFrame.lua:80`).
+                rows.push(None);
+                continue;
+            };
             let info = net::ui_item_info(item.item_id);
             let name: String = cstr(&info.name);
             let texture = cats
@@ -1513,21 +1587,53 @@ impl Feed {
                 link: None,
                 random_property_id: 0,
             }));
-            picks.push(LootPick::Item(item.slot));
         }
-        script.set_loot(Some(LootState {
-            rows,
-            fishing: false,
-            master_candidates: Vec::new(),
-            source_unit: net::ui_unit(loot.guid).is_some_and(|u| u.kind == 7),
-        }));
-        self.loot_key = key;
-        self.loot_picks = picks;
-        // Stock `LootFrame.lua` reads its slots in the `LOOT_OPENED` handler, and the engine
-        // refreshes a taken row through `LootSlotCleared()`, a Lua global this VM has none of:
-        // re-firing the open event on every content change re-runs that same read, and the
-        // frame's own sound stays guarded because it is already shown.
-        fire(script, "LOOT_OPENED", Vec::new());
+        // The copier fires nothing while a query is pending (`0x4c1e9f`); the cache callback
+        // `0x4c2ac0` fires `LOOT_OPENED` at the last answer. Deviation: an entry the server
+        // answered with no record releases its row, where the reference's callback returns and
+        // the window never opens.
+        let pending = rows.iter().flatten().any(|r| {
+            !r.is_coin && r.item_id != 0 && r.name.is_none() && !net::ui_item_unknown(r.item_id)
+        });
+        let before = window.last.clone();
+        if window.last.as_ref() != Some(&rows) {
+            script.set_loot(Some(LootState {
+                rows: rows.clone(),
+                fishing: false,
+                master_candidates: Vec::new(),
+                source_unit: net::ui_unit(wire.guid).is_some_and(|u| u.kind == 7),
+            }));
+            window.last = Some(rows.clone());
+        }
+        // An emptied window releases itself (`0x4c2a70` → `0x48f200`); vmangos does not, so the
+        // server's answer to this release closes the window. Empty at open stays open.
+        let emptied = !rows.is_empty()
+            && rows.iter().all(Option::is_none)
+            && before
+                .as_ref()
+                .is_some_and(|b| b.iter().any(Option::is_some));
+        if emptied && !window.released {
+            window.released = true;
+            let _ = net::send_cmd(Cmd::LootRelease(window.guid));
+        }
+        if !window.opened {
+            if !pending {
+                window.opened = true;
+                fire(script, "LOOT_OPENED", Vec::new());
+            }
+        } else if let Some(was) = &before {
+            // One `LOOT_SLOT_CLEARED` per row that went, with its 1-based row: the stock handler
+            // hides that button and pages down when the page empties (`LootFrame.lua:22-50`).
+            for (i, old) in was.iter().enumerate() {
+                if old.is_some() && rows.get(i).is_none_or(Option::is_none) {
+                    fire(
+                        script,
+                        "LOOT_SLOT_CLEARED",
+                        vec![ScriptValue::Int(i as i64 + 1)],
+                    );
+                }
+            }
+        }
     }
 
     /// Feed the open vendor into the VM so its stock `MerchantFrame` shows the list — the same
@@ -2336,15 +2442,25 @@ pub(crate) fn intents(script: &mut UiScript) {
         }
     }
 
-    // Loot: picks map to the coin pile or a wire slot, through the layout the push built.
-    let picks = FEED.with(|f| f.borrow().loot_picks.clone());
+    // Loot: picks map to the coin pile or a wire slot, through the layout the push built; a
+    // taken row's gap carries no pick, so a click on it sends nothing.
+    let picks = FEED.with(|f| {
+        f.borrow()
+            .loot
+            .as_ref()
+            .map(|w| w.picks.clone())
+            .unwrap_or_default()
+    });
     for slot in script.take_loot_picks() {
-        match picks.get(slot as usize - 1) {
+        match slot
+            .checked_sub(1)
+            .and_then(|i| picks.get(i as usize).copied().flatten())
+        {
             Some(LootPick::Coin) => {
                 let _ = net::send_cmd(Cmd::LootMoney);
             }
             Some(LootPick::Item(wire)) => {
-                let _ = net::send_cmd(Cmd::LootItem(*wire));
+                let _ = net::send_cmd(Cmd::LootItem(wire));
             }
             None => {}
         }
@@ -2762,6 +2878,26 @@ fn container_moves(script: &mut UiScript) {
             }
         }
     }
+    // `DeleteCursorItem` (`0x4897b0`) queues the item it dropped and relocks it (`0x4898bc`) with
+    // no reply; the verb's Lua container resolves to the wire position and a 0 count is the whole
+    // stack (`ui_items/drain.rs:741`).
+    for (bag, slot, count) in script.take_container_destroys() {
+        let Some((bag_index, wire_slot)) = lua_wire_pos(bag, slot) else {
+            net::note(format!(
+                "ui_items: destroy lua {bag}/{slot} is not a wire position"
+            ));
+            continue;
+        };
+        let count = count.min(u32::from(u8::MAX)) as u8;
+        net::note(format!(
+            "ui_items: destroy lua {bag}/{slot} × {count} (wire {bag_index}/{wire_slot})"
+        ));
+        let _ = net::send_cmd(Cmd::DestroyItem {
+            bag: bag_index,
+            slot: wire_slot,
+            count,
+        });
+    }
     // A bind-on-equip question keeps the item on the cursor and sends nothing; taking the queue keeps
     // it from growing while the popup is unimplemented.
     let _ = script.take_container_equip_asks();
@@ -2974,7 +3110,9 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
 
 #[cfg(test)]
 mod tests {
-    use super::HeldAxes;
+    use super::{loot_picks, money_text, HeldAxes, LootPick, LootWindow};
+    use crate::net::BnNetLoot;
+    use benilla_ui::script::UiScript;
 
     #[test]
     fn a_and_d_turn_until_the_look_channel_is_held() {
@@ -2991,5 +3129,77 @@ mod tests {
         held.strafe_right = true;
         assert_eq!(held.axes(true), (0.0, 1.0, 0.0), "D strafes right");
         assert_eq!(held.axes(false), (0.0, 1.0, 0.0), "Q/E strafe either way");
+    }
+
+    fn window() -> LootWindow {
+        LootWindow {
+            guid: 7,
+            coin: true,
+            slots: vec![0, 1, 2],
+            picks: Vec::new(),
+            last: None,
+            opened: false,
+            released: false,
+        }
+    }
+
+    fn wire(gold: u32, slots: &[u8]) -> BnNetLoot {
+        let mut wire = BnNetLoot {
+            guid: 7,
+            gold,
+            ..Default::default()
+        };
+        for &slot in slots {
+            wire.items[wire.count as usize].slot = slot;
+            wire.items[wire.count as usize].item_id = 100 + u32::from(slot);
+            wire.count += 1;
+        }
+        wire
+    }
+
+    /// The window's rows hold still: a taken row is a gap at its own place, so the rows below it
+    /// keep their indices and `GetNumLootItems` (`LootFrame.lua:132`) never moves.
+    #[test]
+    fn a_taken_row_keeps_its_place_in_the_layout() {
+        let w = window();
+        assert_eq!(
+            loot_picks(&w, &wire(45, &[0, 1, 2])),
+            vec![
+                Some(LootPick::Coin),
+                Some(LootPick::Item(0)),
+                Some(LootPick::Item(1)),
+                Some(LootPick::Item(2))
+            ]
+        );
+        // The middle row taken: its slot is gone from the response, the layout is not.
+        assert_eq!(
+            loot_picks(&w, &wire(45, &[0, 2])),
+            vec![
+                Some(LootPick::Coin),
+                Some(LootPick::Item(0)),
+                None,
+                Some(LootPick::Item(2))
+            ]
+        );
+        // Coin taken last, every item gone: four gaps, not a shorter list.
+        assert_eq!(loot_picks(&w, &wire(0, &[])), vec![None, None, None, None]);
+        let mut no_coin = window();
+        no_coin.coin = false;
+        assert_eq!(
+            loot_picks(&no_coin, &wire(45, &[])),
+            vec![None, None, None],
+            "a window opened without gold has no coin row"
+        );
+    }
+
+    /// The coin row's words come off the player's own `GlobalStrings`; a bare VM has none, so the
+    /// enUS words stand in (`ui_loot`'s `format_money`).
+    #[test]
+    fn the_coin_row_reads_money_words() {
+        let script = UiScript::new().unwrap();
+        assert_eq!(money_text(&script, 0), "0 Copper");
+        assert_eq!(money_text(&script, 45), "45 Copper");
+        assert_eq!(money_text(&script, 12345), "1 Gold 23 Silver 45 Copper");
+        assert_eq!(money_text(&script, 20000), "2 Gold");
     }
 }

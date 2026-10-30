@@ -1049,6 +1049,13 @@ pub(crate) enum Cmd {
         src_slot: u8,
         dst_bag: u8,
     },
+    /// `CMSG_DESTROYITEM`: `DeleteCursorItem`'s item at a wire position; `count` 0 is the whole
+    /// stack and the server sends no reply.
+    DestroyItem {
+        bag: u8,
+        slot: u8,
+        count: u8,
+    },
     /// `CMSG_SET_AMMO`: load the ranged attack's ammo by template entry; it stays in its bag.
     SetAmmo(u32),
     /// `CMSG_GROUP_INVITE`: invite a player by name.
@@ -1140,6 +1147,8 @@ struct Shared {
     item_queue: Mutex<Vec<u32>>,
     /// Full templates from the query answers, keyed by entry.
     item_templates: Mutex<HashMap<u32, ItemTemplate>>,
+    /// Entries the server answered with no record, so a row can stop waiting on its template.
+    item_unknown: Mutex<HashSet<u32>>,
     /// Quest log templates, keyed by quest id.
     quests: Mutex<HashMap<u32, QuestTemplateLite>>,
     /// Quest ids already asked for (the log re-sends descriptors constantly).
@@ -1296,6 +1305,7 @@ fn shared() -> &'static Shared {
         item_asked: Mutex::new(HashSet::new()),
         item_queue: Mutex::new(Vec::new()),
         item_templates: Mutex::new(HashMap::new()),
+        item_unknown: Mutex::new(HashSet::new()),
         quests: Mutex::new(HashMap::new()),
         quest_asked: Mutex::new(HashSet::new()),
         spells: Mutex::new(Vec::new()),
@@ -1488,6 +1498,16 @@ pub(crate) fn ui_item_info(entry: u32) -> BnNetItemInfo {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     item_info_row(entry, &templates)
+}
+
+/// Whether the server answered an item query for this entry with no record; such a row stops
+/// waiting on its template (`ui_loot`'s failed-query deviation).
+pub(crate) fn ui_item_unknown(entry: u32) -> bool {
+    shared()
+        .item_unknown
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&entry)
 }
 
 pub(crate) fn ui_spells() -> Vec<u32> {
@@ -2438,6 +2458,14 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                         sh.event(format!("error|autostore|{e}"));
                     }
                 }
+                Ok(Cmd::DestroyItem { bag, slot, count }) => {
+                    let body = benilla_protocol::messages::destroy_item(bag, slot, count);
+                    if let Err(e) = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_DESTROYITEM, &body)
+                    {
+                        sh.event(format!("error|destroy_item|{e}"));
+                    }
+                }
                 Ok(Cmd::SetAmmo(entry)) => {
                     let body = benilla_protocol::messages::set_ammo(entry);
                     if let Err(e) =
@@ -3365,6 +3393,11 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                             sheath: info.sheath,
                         },
                     );
+            } else {
+                sh.item_unknown
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(*entry);
             }
         }
         // Creature templates: the target frame's name, rank (elite/boss) and
