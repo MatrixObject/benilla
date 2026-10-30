@@ -120,6 +120,12 @@ pub(crate) fn attach(world: *mut BnWorld) {
     CATS.with(|c| *c.borrow_mut() = Some(cats));
 }
 
+/// The world the UI session is attached to (null before [`attach`]), for the lanes that read
+/// assets beside the VM: the model facts and the item-push cards.
+pub(crate) fn world_ptr() -> *mut BnWorld {
+    WORLD.with(|w| w.get())
+}
+
 /// One row of the loot window: where its take goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LootPick {
@@ -224,7 +230,7 @@ struct Feed {
 
     name: Option<String>,
     money: u32,
-    xp: (u32, u32),
+    xp: Option<(u32, u32)>,
     rest: (u8, u32, bool),
     /// Whether the load's resting push has happened: `PlayerFrame_UpdateStatus`
     /// (PlayerFrame.lua:181) hides the attack/rest icons only when an event
@@ -322,7 +328,7 @@ impl Feed {
             chain_guids: Vec::new(),
             name: None,
             money: 0,
-            xp: (0, 0),
+            xp: None,
             rest: (0, 0, false),
             rest_pushed: false,
             combo: (0, 0),
@@ -1130,10 +1136,14 @@ impl Feed {
                     fire(script, "PLAYER_MONEY", Vec::new());
                 }
             }
-            if (p.xp, p.next_xp) != self.xp {
+            let xp = (p.xp, p.next_xp);
+            if self.xp != Some(xp) {
                 script.set_player_xp(p.xp, p.next_xp);
-                self.xp = (p.xp, p.next_xp);
-                if !self.first {
+                // The pair's first sight is an arrival, like a unit token's first snapshot:
+                // `MainMenuExpBar` paints 0/0 at OnLoad and only `PLAYER_XP_UPDATE` repaints it.
+                let arrived = self.xp.is_none();
+                self.xp = Some(xp);
+                if arrived || !self.first {
                     fire(script, "PLAYER_XP_UPDATE", vec![ev_str("player")]);
                 }
             }
@@ -2056,6 +2066,19 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     let Some(own) = net::ui_self_fields() else {
         return;
     };
+    // The model files the interface's panes named with no facts yet. The stock UI's only such
+    // ask is the bag buttons' `ItemAnimTemplate` card: its pane sizes from the file's box and
+    // seeds its Stand arm once the facts land, and the HUD poses the icon from the same file.
+    let wanted = script.model_facts_wanted();
+    if !wanted.is_empty() {
+        if let Some(world) = unsafe { world_ptr().as_ref() } {
+            for key in wanted {
+                if let Some(facts) = crate::ui_cards::facts_for(world, &key) {
+                    script.set_model_facts(&key, facts);
+                }
+            }
+        }
+    }
     // The wire chat lines the network thread queued: fired here, where the VM lives, so the stock
     // `ChatFrame_OnEvent` composes and prints them.
     for (event, args) in net::take_chat_events() {
@@ -2066,6 +2089,9 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     crate::gossip_vm::feed(script);
     CATS.with(|c| {
         let cats = c.borrow();
+        // The bag buttons' item animation: `ITEM_PUSH` fires once the pushed item's template has
+        // landed, as `OnItemPush` defers from its item cache.
+        crate::ui_cards::drain_item_pushes(script, cats.as_ref());
         // The quest log likewise lists what this pushes: our slots whose template has landed.
         crate::quest_log_vm::feed(script, cats.as_ref());
         // The questgiver marker sweep rides the UI tick, where the catalog and our own

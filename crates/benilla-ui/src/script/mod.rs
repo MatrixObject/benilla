@@ -258,7 +258,7 @@ pub use guild::{
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
-pub use modelframe::{CharacterPaneFrame, ModelPaneFrame};
+pub use modelframe::{CharacterPaneFrame, ModelCardPane, ModelPaneFrame};
 pub use petition::{
     validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
@@ -825,6 +825,19 @@ impl UiScript {
         // The implicit rects are in layout units, which follow the aspect.
         self.reapply_implicit_rects();
         true
+    }
+
+    /// The screen-root rect's size in root units, `(width, height)`; the model panes' layout unit
+    /// follows its aspect ([`Self::model_layout_unit`]).
+    pub fn screen_size(&self) -> (f32, f32) {
+        let model = self.model_ref();
+        (model.screen.width(), model.screen.height())
+    }
+
+    /// The model panes' layout unit, `768 · √(a²+1)` for the screen aspect `a` ([`Model::layout_unit`]):
+    /// what `SetPosition` and the panes' implicit rects are measured in.
+    pub fn model_layout_unit(&self) -> f32 {
+        self.model_ref().layout_unit()
     }
 
     /// Push the modifier state behind `IsShiftKeyDown`/`IsControlKeyDown`/`IsAltKeyDown`; the app

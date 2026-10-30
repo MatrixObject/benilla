@@ -192,6 +192,11 @@ pub struct BnPlayerState {
     pub overlay_anim: u32,
     /// The overlay's blend weight, 0..1.
     pub overlay_weight: f32,
+    /// How far into the one-shot the overlay is, ms. A locomotion request
+    /// mid-swing moves the clip to the torso at its elapsed position
+    /// (`driver::transplant_up`, `0x5fe919`), so the swing finishes there
+    /// instead of restarting from its first frame.
+    pub overlay_anim_ms: u32,
 }
 
 /// Wrap an angle to (-π, π].
@@ -2129,20 +2134,29 @@ impl Player {
         matches!(self.cast, Some((_, elapsed, duration)) if duration > 0.0 && elapsed < duration)
     }
 
-    /// The upper-body overlay `(anim, weight)`: a one-shot the committed lower
-    /// body cannot play full-body rides the masked spine subtree instead.
-    fn overlay(&self) -> (u32, f32) {
+    /// The upper-body overlay `(anim, weight, elapsed)`: a one-shot the
+    /// committed lower body cannot play full-body rides the masked spine
+    /// subtree instead, resumed at `elapsed` seconds into the clip. The clock
+    /// is the one that drove the whole-body clip (the swing's phase into the
+    /// weapon cycle, the cast's elapsed, or the local press's spent window), so
+    /// the torso picks the swing up where the legs interrupted it.
+    fn overlay(&self) -> (u32, f32, f32) {
         if self.dead || self.mounted || !self.grounded || !self.lower_body_committed() {
-            return (0, 0.0);
+            return (0, 0.0, 0.0);
         }
-        let anim = if self.cast_active() {
-            ANIM_SPELL_CAST
+        let (anim, elapsed) = if self.cast_active() {
+            (ANIM_SPELL_CAST, self.cast.map_or(0.0, |(_, e, _)| e))
         } else if self.swing_active() {
-            crate::net::self_swing_anim()
+            let elapsed = if self.attacking && self.swing_phase < SWING_WINDOW {
+                self.swing_phase
+            } else {
+                (SWING_WINDOW - self.attack_left).max(0.0)
+            };
+            (crate::net::self_swing_anim(), elapsed)
         } else {
-            return (0, 0.0);
+            return (0, 0.0, 0.0);
         };
-        (anim, self.overlay_weight)
+        (anim, self.overlay_weight, elapsed)
     }
 
     /// The airborne arc and its bracket clock, once per non-swim frame after the
@@ -2309,7 +2323,7 @@ impl Player {
 
     fn state(&self) -> BnPlayerState {
         let (eye, target) = self.camera();
-        let (overlay_anim, overlay_weight) = self.overlay();
+        let (overlay_anim, overlay_weight, overlay_elapsed) = self.overlay();
         BnPlayerState {
             pos: self.pos,
             yaw: self.model_yaw,
@@ -2325,6 +2339,7 @@ impl Player {
             anim: self.anim(),
             overlay_anim,
             overlay_weight,
+            overlay_anim_ms: (overlay_elapsed * 1000.0) as u32,
         }
     }
 }
@@ -3327,6 +3342,47 @@ mod tests {
         assert_eq!(p.anim(), 39, "JumpEnd on touchdown");
         p.land_id = 0;
         assert_eq!(p.anim(), 0, "and then the gait, standing still");
+    }
+
+    /// The transplant (`creature_anim::driver::transplant_up`, `0x5fe919`): a
+    /// locomotion request mid-swing moves the clip onto the torso at its id,
+    /// rate and elapsed position with no cross-fade, so the swing finishes
+    /// there instead of restarting from its first frame.
+    #[test]
+    fn a_swing_moved_to_the_torso_resumes_where_it_played() {
+        let mut p = player_on_flat();
+        let dt = 0.1;
+        p.attack_left = SWING_WINDOW;
+        for _ in 0..3 {
+            p.tick(dt);
+        }
+        assert_eq!(
+            p.anim(),
+            crate::net::self_swing_anim(),
+            "the free-legged body plays the swing whole"
+        );
+        assert_eq!(p.overlay().0, 0, "and needs no torso layer");
+        // The legs take a walk request mid-swing: the clip moves to the torso.
+        p.input.forward = 1.0;
+        p.tick(dt);
+        let (id, weight, elapsed) = p.overlay();
+        assert_eq!(
+            id,
+            crate::net::self_swing_anim(),
+            "the swing rides the torso"
+        );
+        assert!(weight > 0.0, "and is armed: {weight}");
+        let spent = SWING_WINDOW - p.attack_left;
+        assert!(spent > 0.3, "the swing had played before the walk: {spent}");
+        assert!(
+            (elapsed - spent).abs() < 1.0e-4,
+            "resumed where it played ({elapsed} vs {spent}), not from the top"
+        );
+        assert_eq!(
+            p.state().overlay_anim_ms,
+            (spent * 1000.0) as u32,
+            "the host reads the same position in ms"
+        );
     }
 
     /// A step-off is not a jump: no bracket, so the gait keeps playing, and Fall

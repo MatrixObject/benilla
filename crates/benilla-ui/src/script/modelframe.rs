@@ -845,6 +845,58 @@ impl crate::script::UiScript {
         self.model_ref().model_facts.contains_key(&model_key(path))
     }
 
+    /// The icon-card panes: every visible plain `Model` drawing an icon-slot file orthographically,
+    /// with the texture `ReplaceIconTexture` gave it. The stock bag buttons' `ItemAnimTemplate`
+    /// cards are the whole population; the host projects the card's quad from the file itself, so
+    /// this row carries the pane (rect, yaw, scale, play head), never the file's geometry.
+    pub fn visible_model_cards(&self) -> Vec<ModelCardPane> {
+        let model = self.model_ref();
+        model
+            .arena
+            .model_kinds()
+            .iter()
+            .filter_map(|&h| {
+                let f = model.arena.frame(h)?;
+                if !f.effective_visible {
+                    return None;
+                }
+                let KindState::Model(m) = &f.kind_state else {
+                    return None;
+                };
+                let path = m.path.as_deref()?;
+                let facts = model.model_facts.get(&model_key(path))?;
+                // The card lane is the NULL camera's: a perspective pane frames its file with the
+                // file's own camera, and a character pane draws a built copy, not a file pane.
+                if m.character.is_some()
+                    || m.ffx
+                    || m.camera_pending.is_some()
+                    || m.camera.is_some()
+                {
+                    return None;
+                }
+                let icon = m.icon.clone()?;
+                let rect = model.resolved.get(&h).copied()?;
+                if rect.width() <= 0.0 || rect.height() <= 0.0 {
+                    return None;
+                }
+                Some(ModelCardPane {
+                    handle: h,
+                    clock_ms: m.clock_ms,
+                    rect,
+                    path: path.to_string(),
+                    icon,
+                    // The widget's own alpha (`0x76d120`), as the app's tile request carries it.
+                    alpha: f.alpha,
+                    scale: f.effective_scale,
+                    model_scale: m.scale,
+                    position: m.position,
+                    facing: m.facing,
+                    play: m.play_head(facts),
+                })
+            })
+            .collect()
+    }
+
     /// The paint list: every visible model pane whose file's facts are known, with its clock and
     /// play head, in the arena's registry order, which is stable across frames.
     pub fn visible_model_panes(&self) -> Vec<ModelPaneFrame> {
@@ -910,6 +962,33 @@ pub struct ModelPaneFrame {
     pub handle: crate::widget::FrameHandle,
     /// The pane's scene clock in ms, which also drives the file's global sequences.
     pub clock_ms: u64,
+    /// The armed sequence's play head; `None` draws the rest pose.
+    pub play: Option<crate::widget::ModelPlayHead>,
+}
+
+/// One row of [`crate::script::UiScript::visible_model_cards`]: a visible icon-slot pane and the
+/// scene state the host projects its card from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelCardPane {
+    pub handle: crate::widget::FrameHandle,
+    /// The pane's scene clock in ms, for the file's global sequences and the play head's base.
+    pub clock_ms: u64,
+    /// The pane's resolved rect in root units (y up), the model root's origin corner.
+    pub rect: crate::layout::Rect,
+    /// `SetModel`'s path as written (`.mdx`); the host reads the shipped `.m2` beside it.
+    pub path: String,
+    /// `ReplaceIconTexture`'s texture, the card's face.
+    pub icon: String,
+    /// The frame's own alpha, times the sampled material alpha.
+    pub alpha: f32,
+    /// The frame's effective scale, which multiplies both the model and `SetPosition`.
+    pub scale: f32,
+    /// `SetModelScale`.
+    pub model_scale: f32,
+    /// `SetPosition`, in layout units.
+    pub position: (f32, f32, f32),
+    /// `SetFacing`, a counter-clockwise yaw about model +Z.
+    pub facing: f32,
     /// The armed sequence's play head; `None` draws the rest pose.
     pub play: Option<crate::widget::ModelPlayHead>,
 }

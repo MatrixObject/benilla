@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
-    AttackSwingError, CastOutcome, CharCreateReq, MonsterMoveFacing, Object, ObjectFields,
-    ObjectType, ServerPacket, SLOT_PACK_FIRST,
+    AttackSwingError, AttackerState, CastOutcome, CharCreateReq, MonsterMoveFacing, Object,
+    ObjectFields, ObjectType, ServerPacket, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST,
 };
 // The server-authored path walk: benilla's own sampler, shared with the Bevy client.
 use benilla_protocol::motion::{monster_move_spline, Spline};
@@ -268,6 +268,10 @@ pub struct BnNetUnit {
     /// refuses `CMSG_LIST_INVENTORY` with `SMSG_SELL_ITEM`/`CANT_FIND_VENDOR`
     /// (vmangos "not found or you can't interact with him", 3D distance).
     pub npc_flags: u32,
+    /// A dead unit whose `UNIT_DYNAMIC_FLAGS` bit 0 is set: the corpse still holds
+    /// loot, so the reference's corpse sparkle is armed (`0x5d6e30`/`0x600640`,
+    /// "HARDCODED Loot Art" at attach `0x13`) until the server clears the bit.
+    pub lootable: u8,
 }
 
 impl Default for BnNetUnit {
@@ -300,6 +304,7 @@ impl Default for BnNetUnit {
             name: [0; 64],
             anim: 0,
             npc_flags: 0,
+            lootable: 0,
         }
     }
 }
@@ -418,6 +423,9 @@ pub(crate) struct CreatureTemplateLite {
     pub(crate) rank: u32,
     pub(crate) civilian: bool,
     pub(crate) racial_leader: bool,
+    /// `CreatureTemplate` `type_flags`; bit 0x8 is `DO_NOT_PLAY_WOUND_ANIM`, which refuses the
+    /// wound flinch and the parry (`0x60ea9f`, `0x60ec1f`).
+    pub(crate) type_flags: u32,
 }
 
 /// One quest objective from `SMSG_QUEST_QUERY_RESPONSE`: the template arrays the
@@ -1128,6 +1136,38 @@ pub(crate) enum Cmd {
     Logout,
 }
 
+/// `ITEM_PUSH`'s bag selector: the reference's `bag` byte is the 1.12 wire bag (255 = the backpack,
+/// 19..=22 an equipped bag), and `ITEM_PUSH` numbers the bar buttons 0..=23 (`0x491bb5`).
+const ITEM_PUSH_KEYRING: i64 = -2;
+/// The wire slots `OnItemPush` treats as the keyring (`0x491bc3`/`0x491bc8`, 0x51..=0x70), the
+/// descriptor's full 32 positions (`ui_loot`'s `PUSH_KEYRING_SLOTS`).
+const PUSH_KEYRING_SLOTS: std::ops::RangeInclusive<u32> = 81..=112;
+
+/// `ITEM_PUSH`'s `arg1`, as `ui_loot::push_container` builds it: a wire bag other than 255 gives
+/// `bag + 1` (20..=23, the ids the bar buttons carry), a keyring slot `-2`, anything else 0, the
+/// backpack.
+fn push_container(bag: u8, slot: u32) -> i64 {
+    if bag != BAG_PLAYER_INVENTORY {
+        return i64::from(bag) + 1;
+    }
+    if PUSH_KEYRING_SLOTS.contains(&slot) {
+        return ITEM_PUSH_KEYRING;
+    }
+    0
+}
+
+/// A `SMSG_ITEM_PUSH_RESULT` for our own character waiting on its item template, so the UI tick
+/// can fire `ITEM_PUSH` with the icon path. `OnItemPush 0x491a60` defers the event the same way: on
+/// a cache miss (`0x491a93`) it re-enters from the item-cache callback (`0x491ee0`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingItemPush {
+    pub entry: u32,
+    /// `ITEM_PUSH`'s `arg1`, see [`push_container`].
+    pub container: i64,
+    /// Frames the UI tick has waited for the template, the reference's callback with no timeout.
+    pub tries: u16,
+}
+
 struct Shared {
     status: AtomicU32,
     /// The guid handed to `player_login`; `UpdateObject` entries for it feed
@@ -1142,6 +1182,9 @@ struct Shared {
     /// Every tracked object in the stream window (the client's own object
     /// manager, reduced to what the FFI exposes).
     units: Mutex<HashMap<u64, UnitRec>>,
+    /// Units auto-attacking, from `SMSG_ATTACKSTART` to `SMSG_ATTACKSTOP`: the reference's
+    /// `[unit+0xc48]`, which picks the victim's CombatWound over StandWound (`0x60ea70`).
+    engaged: Mutex<HashSet<u64>>,
     player: Mutex<Option<BnNetPlayer>>,
     /// Worn-item entry -> `ItemDisplayInfo` id, filled from the server's
     /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` (1.12 ships no Item.dbc, so this
@@ -1214,6 +1257,9 @@ struct Shared {
     names_asked: Mutex<HashSet<u64>>,
     /// A wire chat line waiting to be fired as its `CHAT_MSG_*` event on the UI tick.
     chat_events: Mutex<VecDeque<(String, Vec<ScriptValue>)>>,
+    /// Our own pushes waiting on their item templates, in wire order: `ITEM_PUSH` fires once the
+    /// icon is resolvable, so the stock bag buttons animate when the server says the item landed.
+    item_pushes: Mutex<VecDeque<PendingItemPush>>,
     /// The pending resurrection offer's caster and its popup flags
     /// (`SMSG_RESURRECT_REQUEST`), 0 when none.
     resurrect_from: AtomicU64,
@@ -1310,6 +1356,7 @@ fn shared() -> &'static Shared {
         events: Mutex::new(VecDeque::new()),
         chars: Mutex::new(Vec::new()),
         units: Mutex::new(HashMap::new()),
+        engaged: Mutex::new(HashSet::new()),
         player: Mutex::new(None),
         item_displays: Mutex::new(HashMap::new()),
         item_asked: Mutex::new(HashSet::new()),
@@ -1341,6 +1388,7 @@ fn shared() -> &'static Shared {
         names: Mutex::new(HashMap::new()),
         names_asked: Mutex::new(HashSet::new()),
         chat_events: Mutex::new(VecDeque::new()),
+        item_pushes: Mutex::new(VecDeque::new()),
         resurrect_from: AtomicU64::new(0),
         resurrect_sickness: AtomicU32::new(0),
         resurrect_has_timer: AtomicU32::new(0),
@@ -1459,6 +1507,29 @@ pub(crate) fn take_chat_events() -> Vec<(String, Vec<ScriptValue>)> {
         return Vec::new();
     }
     q.drain(..).collect()
+}
+
+/// Drain the pushes waiting on their item templates, in wire order.
+pub(crate) fn take_item_pushes() -> Vec<PendingItemPush> {
+    let sh = shared();
+    let mut q = sh.item_pushes.lock().unwrap_or_else(|e| e.into_inner());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    q.drain(..).collect()
+}
+
+/// Put back the pushes still waiting, in front of anything queued since, keeping wire order.
+pub(crate) fn keep_item_pushes(mut still: Vec<PendingItemPush>) {
+    if still.is_empty() {
+        return;
+    }
+    still.reverse();
+    let sh = shared();
+    let mut q = sh.item_pushes.lock().unwrap_or_else(|e| e.into_inner());
+    for p in still {
+        q.push_front(p);
+    }
 }
 
 /// The roster row's name for `guid` (our own character's name arrives this way).
@@ -1666,8 +1737,22 @@ pub(crate) fn self_swing_anim() -> u32 {
 /// press asks for it too, so a training swing is the equipped weapon's clip).
 pub(crate) fn refresh_self_swing_anim() {
     let sh = shared();
-    let clip = u32::from(self_main_swing(sh));
-    sh.self_swing_anim.store(clip, Ordering::SeqCst);
+    store_self_swing_anim(sh, self_main_swing(sh));
+}
+
+/// Store the resolved clip; a change is announced with the inputs that decided
+/// it, so a swing that drops to unarmed under a drawn weapon names its own
+/// cause in the host log (`swing|self|<clip>|<entry>|<class>|<subclass>`).
+fn store_self_swing_anim(sh: &Shared, clip: u16) {
+    let clip = u32::from(clip);
+    if sh.self_swing_anim.swap(clip, Ordering::SeqCst) == clip {
+        return;
+    }
+    let hand = self_main_hand(sh);
+    sh.event(format!(
+        "swing|self|{}|{}|{}|{}",
+        clip, hand.worn, hand.class, hand.subclass
+    ));
 }
 
 /// Our own descriptor as the update carried it.
@@ -3452,6 +3537,9 @@ fn refresh_player(sh: &Shared) {
     // changed); make sure their templates are asked for.
     queue_self_items(f, &units, sh);
     drop(units);
+    // The clip follows the worn main hand, not the last attack: an equip, an
+    // unequip or a lost item object lands here before the next hit.
+    store_self_swing_anim(sh, self_main_swing(sh));
     *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
 }
 
@@ -3483,13 +3571,20 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             sh.corpse_delay_ms.store(*delay_ms, Ordering::SeqCst);
         }
         ServerPacket::AttackStart { attacker, .. } => {
+            sh.engaged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*attacker);
             if *attacker == sh.self_guid.load(Ordering::SeqCst) {
                 sh.self_attacking.store(1, Ordering::SeqCst);
-                let clip = u32::from(self_main_swing(sh));
-                sh.self_swing_anim.store(clip, Ordering::SeqCst);
+                store_self_swing_anim(sh, self_main_swing(sh));
             }
         }
         ServerPacket::AttackStop { attacker, .. } => {
+            sh.engaged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(attacker);
             if *attacker == sh.self_guid.load(Ordering::SeqCst) {
                 sh.self_attacking.store(0, Ordering::SeqCst);
                 sh.attack_target.store(0, Ordering::SeqCst);
@@ -3621,6 +3716,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     rank: i.rank,
                     civilian: i.civilian,
                     racial_leader: i.racial_leader,
+                    type_flags: i.type_flags,
                 },
                 None => CreatureTemplateLite {
                     name: String::new(),
@@ -3629,6 +3725,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     rank: 0,
                     civilian: false,
                     racial_leader: false,
+                    type_flags: 0,
                 },
             };
             sh.creatures
@@ -3637,8 +3734,35 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .insert(*entry, row);
         }
         // The "You receive …" line; `bag`/`slot` locate the new row so the host
-        // can refresh an inventory panel.
+        // can refresh an inventory panel. Our own push also arms the stock bag
+        // buttons' item animation: `OnItemPush`'s guid gate (`0x491b56`/`0x491b61`)
+        // keeps another player's push out of the interface (the line is unguarded
+        // and prints either way).
         ServerPacket::ItemPushResult(p) => {
+            let me = sh.self_guid.load(Ordering::SeqCst);
+            if me != 0 && p.player_guid == me {
+                let entry = p.item_entry;
+                let fresh = sh
+                    .item_asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(entry);
+                if fresh {
+                    sh.item_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(entry);
+                }
+                let mut q = sh.item_pushes.lock().unwrap_or_else(|e| e.into_inner());
+                if q.len() >= 64 {
+                    q.pop_front();
+                }
+                q.push_back(PendingItemPush {
+                    entry,
+                    container: push_container(p.bag_slot, p.item_slot),
+                    tries: 0,
+                });
+            }
             sh.event(format!(
                 "item|push|{}|{}|{}|{}|{}|{}",
                 p.item_entry,
@@ -3677,6 +3801,25 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                     "dmg|melee|{}|{}|{}|{}|{}|{}|{}",
                     s.victim, s.attacker, s.damage, s.victim_state, s.hit_info, s.absorb, s.resist
                 ));
+                // The victim's reaction clip (`0x60ea70`, defense through `$CPP` `0x624a01`),
+                // and the melee spurt's side/size for the host's particle child (`0x624530`).
+                if let Some((anim, full_body)) = victim_reaction(sh, s) {
+                    sh.event(format!(
+                        "react|{}|{}|{}",
+                        s.victim,
+                        anim,
+                        u8::from(full_body)
+                    ));
+                }
+                if let Some((display, attach, large)) = melee_blood(sh, s) {
+                    sh.event(format!(
+                        "fx|blood|{}|{}|{}|{}",
+                        s.victim,
+                        display,
+                        attach,
+                        u8::from(large)
+                    ));
+                }
             }
         }
         ServerPacket::SpellDamageLog(s) => {
@@ -5234,14 +5377,15 @@ pub extern "C" fn bn_net_unit_sheath(guid: u64) -> u32 {
 
 /// The AnimationData id of a main-hand melee swing for `guid`: the reference's `swing_anim_main`
 /// (benilla-app/src/creature_anim/select.rs) over the unit's `UNIT_VIRTUAL_ITEM_INFO` main hand,
-/// or, for our own body, the equipped main-hand item's template. 16 (AttackUnarmed) when no
-/// weapon template answers, which is the clip a bare fist plays.
+/// or, for our own body, the worn `PLAYER_VISIBLE_ITEM` entry's template. 16 (AttackUnarmed) when
+/// no weapon template answers, which is the clip a bare fist plays.
 #[no_mangle]
 pub extern "C" fn bn_unit_swing_anim(guid: u64) -> u16 {
     let sh = shared();
-    let (class, subclass) = if guid == sh.self_guid.load(Ordering::SeqCst) {
-        self_main_weapon(sh)
-    } else {
+    if guid == sh.self_guid.load(Ordering::SeqCst) {
+        return self_main_swing(sh);
+    }
+    let (class, subclass) = {
         let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
         units
             .get(&guid)
@@ -5251,18 +5395,61 @@ pub extern "C" fn bn_unit_swing_anim(guid: u64) -> u16 {
     swing_anim_main(class, subclass)
 }
 
-/// The item class and subclass of our equipped main hand, (0, 0) while bare.
-fn self_main_weapon(sh: &Shared) -> (u32, u32) {
-    // INV_SLOT_MAINHAND = 15.
-    inventory_rows(sh)
-        .iter()
-        .find(|r| r.bag == BAG_EQUIPPED && r.slot == 15)
-        .map_or((0, 0), |r| (r.info.class, r.info.subclass))
+/// The equipped main hand as the swing clip reads it.
+#[derive(Clone, Copy, Default)]
+struct MainHand {
+    /// The worn entry `PLAYER_VISIBLE_ITEM_1_0`, the field the held weapon's
+    /// model is resolved from; 0 while nothing is worn.
+    worn: u32,
+    class: u32,
+    subclass: u32,
+}
+
+/// The main hand's class and subclass, (0, 0) while bare. The worn entry
+/// answers first: it is what the held model is drawn from, and it outlives the
+/// equipped item's own update object, which the stream can drop mid-fight -
+/// reading the clip off that object left a drawn weapon swinging unarmed. The
+/// item object's row is the fallback for a body whose fields have not carried
+/// the worn entry yet.
+fn self_main_hand(sh: &Shared) -> MainHand {
+    let guid = sh.self_guid.load(Ordering::SeqCst);
+    let worn = if guid == 0 {
+        None
+    } else {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        units
+            .get(&guid)
+            .and_then(|r| r.fields.player_visible_item_entry(PLAYER_HELD_SLOTS[0]))
+    };
+    let worn_class = worn.and_then(|entry| {
+        let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
+        templates.get(&entry).map(|t| (t.class, t.subclass))
+    });
+    let row_class = if worn_class.is_none() {
+        // INV_SLOT_MAINHAND = 15.
+        inventory_rows(sh)
+            .iter()
+            .find(|r| r.bag == BAG_EQUIPPED && r.slot == 15)
+            .map(|r| (r.info.class, r.info.subclass))
+    } else {
+        None
+    };
+    let (class, subclass) = main_hand_class(worn_class, row_class);
+    MainHand {
+        worn: worn.unwrap_or(0),
+        class,
+        subclass,
+    }
+}
+
+/// The worn entry wins over the equipped item object's row.
+fn main_hand_class(worn: Option<(u32, u32)>, row: Option<(u32, u32)>) -> (u32, u32) {
+    worn.or(row).unwrap_or((0, 0))
 }
 
 fn self_main_swing(sh: &Shared) -> u16 {
-    let (class, subclass) = self_main_weapon(sh);
-    swing_anim_main(class, subclass)
+    let hand = self_main_hand(sh);
+    swing_anim_main(hand.class, hand.subclass)
 }
 
 /// [`bn_unit_swing_anim`]'s table: only class 2 (weapon) picks a weapon clip, by subclass — 1H
@@ -5294,6 +5481,168 @@ pub extern "C" fn bn_net_unit_by_guid(guid: u64, out: *mut BnNetUnit) -> u32 {
     let row = unit_row(guid, rec);
     unsafe { *out = row };
     1
+}
+
+/// The unit's own gait off the server's spline: a live spline plays Run when it carried
+/// `SPLINEFLAG_RUNMODE`, else Walk; a finished spline stands (AnimationData 0).
+fn spline_gait(rec: &UnitRec) -> u32 {
+    match rec.spline.as_ref() {
+        Some(s) if s.running(std::time::Instant::now()) => {
+            if s.run_mode {
+                5
+            } else {
+                4
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// `CreatureTemplate.type_flags` bit that refuses the wound flinch and the parry (`0x6125f0`).
+const DO_NOT_PLAY_WOUND_ANIM: u32 = 0x8;
+
+/// The victim's defense reaction (`$CPP`, `0x624a01` → `0x60ec00`): dodge, shield block, and a
+/// parry picked by the mainhand's subclass through the LUT at `0x60ec98`, bailing with no clip on
+/// anything else (`0x60ec3a`). `None` for a state that carries no defense.
+fn defense_anim(victim_state: u32, main: Option<(u8, u8)>) -> Option<u16> {
+    match victim_state {
+        2 | 8 => Some(30), // DODGE / DEFLECTS → Dodge
+        5 => Some(24),     // BLOCKS → ShieldBlock
+        3 => match main {
+            Some((2, sub)) => match sub {
+                0 | 4 | 7 | 0xb | 0xe | 0xf => Some(21), // 1H family, misc, dagger
+                1 | 5 | 8 | 0xc => Some(22),             // 2H family
+                6 | 0xa | 0x11 => Some(23),              // polearm, staff, spear
+                0xd => Some(20),                         // fist → ParryUnarmed
+                _ => None,
+            },
+            _ => None, // empty or non-weapon mainhand: bail
+        },
+        _ => None,
+    }
+}
+
+/// The victim's wound flinch (`0x60ea70`), by severity and engagement alone: a crit (`HitInfo &
+/// 0x80`) CombatCritical, an engaged victim CombatWound, else StandWound.
+fn wound_anim(hit_info: u32, engaged: bool) -> u16 {
+    if hit_info & 0x80 != 0 {
+        10
+    } else if engaged {
+        9
+    } else {
+        8
+    }
+}
+
+/// Whether the wound takes the full body rather than the upper body (`0x60eae8`, `0x60eb9a`):
+/// a ready stance under it, or StandWound on a unit that is neither moving nor mounted. The FFI
+/// carries no ready stance (only the spline's gait), so the first clause cannot fire here.
+fn wound_full_body(id: u16, base_anim: u32, moving: bool, mounted: bool) -> bool {
+    matches!(base_anim, 25..=29) || (id == 8 && !mounted && !moving)
+}
+
+/// The victim's mainhand weapon `(class, subclass)` as the parry LUT reads it: a player's worn
+/// entry through its template, a creature's `UNIT_VIRTUAL_ITEM_INFO[0]`.
+fn victim_mainhand(sh: &Shared, guid: u64) -> Option<(u8, u8)> {
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let rec = units.get(&guid)?;
+    if rec.kind == 4 {
+        let entry = rec.fields.player_visible_item_entry(15).unwrap_or(0);
+        let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
+        let t = templates.get(&entry)?;
+        Some((t.class as u8, t.subclass as u8))
+    } else {
+        rec.fields
+            .unit_virtual_item_info(0)
+            .filter(|&(class, _, _, _)| class != 0)
+            .map(|(class, sub, _, _)| (class, sub))
+    }
+}
+
+/// The one reaction clip a melee swing asks of its victim: the defense arm first (a defended hit
+/// never flinches, `0x624552`), else the wound flinch, with the full-body choice. `None` when the
+/// victim is dead, the template refuses it, or the swing dealt no damage.
+fn victim_reaction(sh: &Shared, s: &AttackerState) -> Option<(u16, bool)> {
+    let engaged = sh
+        .engaged
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&s.victim);
+    let (entry, base_anim, moving, mounted) = {
+        let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+        let rec = units.get(&s.victim)?;
+        // `0x624552`: a lootable corpse shows neither the flinch nor the spurt.
+        if rec.fields.unit_is_dead() || rec.fields.unit_lootable() {
+            return None;
+        }
+        let entry = rec
+            .fields
+            .raw_fields()
+            .find(|(index, _)| *index == 3)
+            .map(|(_, value)| value)
+            .unwrap_or(0);
+        let gait = spline_gait(rec);
+        (
+            entry,
+            gait,
+            gait != 0,
+            rec.fields.unit_mount_display_id() != 0,
+        )
+    };
+    let no_wound = sh
+        .creatures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&entry)
+        .is_some_and(|t| t.type_flags & DO_NOT_PLAY_WOUND_ANIM != 0);
+    if let Some(anim) = defense_anim(s.victim_state, victim_mainhand(sh, s.victim)) {
+        // The flag refuses only the parry (`0x60ec1f`); dodge and block are ungated.
+        if s.victim_state == 3 && no_wound {
+            return None;
+        }
+        // `0x60ec00` goes through the unit's animation request, whose mask rule
+        // (`0x5fe6a1`) puts an upper-body id on the key bone only while the unit turns,
+        // moves or is not standing: a still, unmounted victim takes the whole body.
+        return Some((anim, !moving && !mounted));
+    }
+    if !matches!(s.victim_state, 1 | 4) || s.damage == 0 || no_wound {
+        return None;
+    }
+    let id = wound_anim(s.hit_info, engaged);
+    Some((id, wound_full_body(id, base_anim, moving, mounted)))
+}
+
+/// The melee spurt's inputs (`0x624530` → `0x625010`): the client's gate (`HitInfo & 0x2`,
+/// damage, victim state 1 or 4), front/back by where the attacker stands, and the crushing
+/// `0x2000` bit for the large row. Returns `(display id, attach 15 front / 16 back, large)`.
+fn melee_blood(sh: &Shared, s: &AttackerState) -> Option<(i32, u8, bool)> {
+    if s.hit_info & 0x2 == 0 || s.damage == 0 || !matches!(s.victim_state, 1 | 4) {
+        return None;
+    }
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let victim = units.get(&s.victim)?;
+    if victim.fields.unit_lootable() {
+        return None;
+    }
+    let display = victim.fields.unit_displayid().unwrap_or(0);
+    if display == 0 {
+        return None;
+    }
+    // The sign of `victimForward · (attackerPos − victimPos)`; an unresolved attacker counts
+    // as front, as the app's `blood.rs` does.
+    let (vpos, facing) = effective_pose(victim);
+    let front = units
+        .get(&s.attacker)
+        .map(|a| {
+            let (apos, _) = effective_pose(a);
+            facing.cos() * (apos[0] - vpos[0]) + facing.sin() * (apos[1] - vpos[1]) >= 0.0
+        })
+        .unwrap_or(true);
+    Some((
+        display,
+        if front { 15 } else { 16 },
+        s.hit_info & 0x2000 != 0,
+    ))
 }
 
 fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
@@ -5377,16 +5726,11 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
         // the spline's duration is over the unit has arrived and stands. This is
         // the same source the Bevy client's gait picker reads (`Spline::speed`
         // exists for it), so the host only mirrors an id, it never guesses one.
-        anim: match rec.spline.as_ref() {
-            Some(s) if s.running(std::time::Instant::now()) => {
-                if s.run_mode {
-                    5
-                } else {
-                    4
-                }
-            }
-            _ => 0,
-        },
+        // A dead unit whose dynamic flags still carry bit 0 (lootable, `0x600680`'s
+        // input): the corpse sparkle lives until the server clears the bit after
+        // the loot is emptied.
+        lootable: (f.unit_is_dead() && f.unit_lootable()) as u8,
+        anim: spline_gait(rec),
         npc_flags: f.unit_npc_flags(),
     }
 }
@@ -5551,9 +5895,9 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_equip_slots, clear_swing_refusal, equip_destination, find_equip_slot,
-        latch_swing_refusal, row_pos_for_wire, swing_anim_main, take_due_swing_refusal,
-        BAG_EQUIPPED,
+        auto_equip_slots, clear_swing_refusal, defense_anim, equip_destination, find_equip_slot,
+        latch_swing_refusal, main_hand_class, row_pos_for_wire, swing_anim_main,
+        take_due_swing_refusal, wound_anim, wound_full_body, BAG_EQUIPPED,
     };
 
     /// A one-handed weapon reaches the off hand only for a dual wielder, as
@@ -5616,6 +5960,17 @@ mod tests {
         assert_eq!(swing_anim_main(0, 0), 16); // no virtual item at all
     }
 
+    /// The clip rides the worn entry, so a drawn weapon whose own update object
+    /// left the stream still swings Attack1H; only a body with no worn entry
+    /// falls back to the item object's row.
+    #[test]
+    fn the_swing_clip_follows_the_worn_entry() {
+        assert_eq!(main_hand_class(Some((2, 7)), None), (2, 7));
+        assert_eq!(main_hand_class(None, Some((2, 5))), (2, 5));
+        assert_eq!(main_hand_class(Some((2, 7)), Some((4, 0))), (2, 7));
+        assert_eq!(main_hand_class(None, None), (0, 0));
+    }
+
     /// `0x5ec950`: a latched refusal is due at once, repeats only after the 4 s
     /// re-arm (`0x5ec9b6`), and a landed swing clears it (`0x5ecdb0(0)`).
     #[test]
@@ -5627,5 +5982,41 @@ mod tests {
         assert_eq!(take_due_swing_refusal(), None, "re-armed four seconds out");
         clear_swing_refusal();
         assert_eq!(take_due_swing_refusal(), None);
+    }
+
+    /// The victim's defense clip (`0x60ec00`): dodge and deflect, shield block, and the
+    /// parry chosen from the mainhand subclass through the LUT at `0x60ec98`.
+    #[test]
+    fn a_defended_hit_plays_its_own_reaction() {
+        assert_eq!(defense_anim(2, None), Some(30)); // DODGE
+        assert_eq!(defense_anim(8, None), Some(30)); // DEFLECTS
+        assert_eq!(defense_anim(5, None), Some(24)); // BLOCKS
+        assert_eq!(defense_anim(3, Some((2, 7))), Some(21)); // 1H sword parries
+        assert_eq!(defense_anim(3, Some((2, 5))), Some(22)); // 2H mace
+        assert_eq!(defense_anim(3, Some((2, 6))), Some(23)); // staff
+        assert_eq!(defense_anim(3, Some((2, 0xd))), Some(20)); // fist: ParryUnarmed
+        assert_eq!(defense_anim(3, Some((4, 6))), None); // not a weapon: no clip
+        assert_eq!(defense_anim(3, None), None);
+        assert_eq!(defense_anim(1, None), None); // a landed hit carries no defense
+    }
+
+    /// The wound flinch (`0x60ea70`) is picked by severity alone: a crit, an engaged victim,
+    /// else the standing wound.
+    #[test]
+    fn the_wound_flinch_follows_severity_and_engagement() {
+        assert_eq!(wound_anim(0x80, false), 10); // CombatCritical
+        assert_eq!(wound_anim(0, true), 9); // CombatWound
+        assert_eq!(wound_anim(0, false), 8); // StandWound
+    }
+
+    /// The full-body choice (`0x60eb9a`): StandWound takes the whole body only on a unit that
+    /// stands still and is not mounted; the moving wound clips are upper-body only.
+    #[test]
+    fn only_a_still_standing_wound_takes_the_whole_body() {
+        assert!(wound_full_body(8, 0, false, false));
+        assert!(!wound_full_body(8, 4, true, false)); // walking
+        assert!(!wound_full_body(8, 0, false, true)); // mounted
+        assert!(!wound_full_body(9, 0, false, false)); // CombatWound stays upper-body
+        assert!(wound_full_body(9, 27, false, false)); // a ready stance takes it all
     }
 }

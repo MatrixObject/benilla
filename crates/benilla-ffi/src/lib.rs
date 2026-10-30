@@ -104,11 +104,19 @@ mod smart_rect;
 
 mod ghost;
 
+// ---- The melee spurt and corpse sparkle models: hardcoded effects resolved off the chain ----
+
+mod fx;
+
 mod exterior;
 
 // ---- In-game interface feed: session state in, FrameXML model; verbs back out ----
 
 mod ui_feed;
+
+// ---- The bag buttons' item-push cards: the icon quad posed for the host's 2D pass ----
+
+mod ui_cards;
 
 // ---- The reference's registered CVars, for the VM the stock interface loads into ----
 
@@ -7746,6 +7754,10 @@ pub extern "C" fn bn_ui_world_enter() -> u32 {
                     ],
                 );
             }
+            // The world's first snapshot ahead of the cascade, so the login handlers read
+            // real values (the app's `ui_unit` push order); the XP pair's arrival fires
+            // `PLAYER_XP_UPDATE`, which is the only thing that paints `MainMenuExpBar`.
+            crate::ui_feed::sync(script, 0.0);
             script.fire_world_enter();
             1
         })
@@ -7901,6 +7913,28 @@ pub extern "C" fn bn_ui_paint(buf: *mut c_char, cap: u32) -> u32 {
         return 0;
     };
     let Some(text) = text else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// The bag buttons' item-push cards, posed at this frame's play head, as TSV: one row per batch,
+/// `alpha \t texture \t triangles \t x y u v \t …` in root units (y up). Each triangle's three
+/// corners follow the file's index order, so a host paints them as textured triangles with the
+/// dump's seam and offsets. Empty when no card shows; the stock card is the `ITEM_PUSH`
+/// animation `ItemAnimTemplate` plays (`Interface\ItemAnimations\ForcedBackpackItem.mdx`).
+#[no_mangle]
+pub extern "C" fn bn_ui_model_cards(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ui_cards::rows)) else {
         return 0;
     };
     let n = (text.len() as u64).min(cap as u64 - 1) as usize;

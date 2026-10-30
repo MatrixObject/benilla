@@ -52,7 +52,7 @@ pub(crate) fn m2_path(path: &str) -> String {
     }
 }
 
-fn copy_out(text: &str, out: *mut c_char, cap: u32) -> u32 {
+pub(crate) fn copy_out(text: &str, out: *mut c_char, cap: u32) -> u32 {
     if out.is_null() || cap == 0 {
         return 0;
     }
