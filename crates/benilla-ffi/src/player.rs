@@ -82,6 +82,10 @@ const STRAFE_BLEND_RATE: f32 = 17.26;
 const TURN_RATE: f32 = std::f32::consts::PI;
 /// `TURN_RATE_MOVING`: the scale while translating or falling.
 const TURN_RATE_MOVING: f32 = 0.75;
+/// Once steering stops, the standing body closes on the aim at
+/// `turnRate × 8` rad/s, clamped to the gap (`0x607ed0`); while steering,
+/// only the 90° ceiling moves it (`0x60818a`-`0x6081bf`).
+const STATIONARY_CHASE_RATE: f32 = 8.0;
 /// Roam-mode flight speed (yd/s): a zone tour without waiting on terrain.
 const FLY_SPEED: f32 = 30.0;
 
@@ -204,6 +208,13 @@ pub struct BnPlayerState {
     /// spine share is 0 and only the head turns.
     pub twist_spine: f32,
     pub twist_head: f32,
+    /// The aim the body chases, radians: [`Self::yaw`] plus the gap the twist
+    /// spends. Readback for probes, never applied.
+    pub aim_yaw: f32,
+    /// The camera's own heading, radians (the smart follow's channel).
+    pub cam_yaw: f32,
+    /// The held axes this frame (forward, strafe, turn), readback for probes.
+    pub axes: [f32; 3],
 }
 
 /// Wrap an angle to (-π, π].
@@ -263,6 +274,29 @@ fn twist_shares(gap: f32) -> (f32, f32) {
 fn armed_twist_shares(gap: f32, mounted: bool) -> (f32, f32) {
     let (spine, head) = twist_shares(gap);
     (if mounted { 0.0 } else { spine }, head)
+}
+
+/// The standing body's own turn for one frame (`player/gait.rs`'s stationary
+/// chase, `0x60818a`-`0x6081bf`): while the aim is steered the body holds a
+/// 90° ceiling and only the excess moves it; once the steer stops it sweeps
+/// onto the aim at [`STATIONARY_CHASE_RATE`] times the mover's turn rate,
+/// never past the gap. `delta` is `wrap(aim − body)`.
+fn stationary_chase_step(delta: f32, steering: bool, dt: f32) -> f32 {
+    use std::f32::consts::FRAC_PI_2;
+    let mut step = (delta.abs() - FRAC_PI_2).max(0.0);
+    if !steering {
+        step += dt * TURN_RATE * STATIONARY_CHASE_RATE;
+    }
+    step.min(delta.abs()).copysign(delta)
+}
+
+/// Ease the rendered yaw toward `aim + offset` through the aim-relative
+/// offset, which swings round the front where the shortest arc ties at the
+/// ±90° strafe flip (`creature_anim::select::ease_strafe_yaw`).
+fn ease_strafe_yaw(current_yaw: f32, aim: f32, offset: f32, dt: f32) -> f32 {
+    let cur = wrap_pi(current_yaw - aim);
+    let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
+    wrap_pi(aim + eased)
 }
 
 /// The strafe body offset from the aim (`creature_anim::select::strafe_body_offset`):
@@ -911,6 +945,14 @@ pub struct Player {
     /// A mouse button was held for a look drag this frame: the smart follow
     /// must not fight the drag by swinging the camera back behind the body.
     look_active: bool,
+    /// The drag that owns the body this frame: the TurnOrAction channel (right
+    /// button or `MouselookStart`), the reference's `mouselook`. Together with
+    /// a keyboard turn it is the `steering` the standing chase freezes on.
+    look_steer: bool,
+    /// The body's own turn this frame (WoW yaw radians, left-positive), from
+    /// the standing chase; 0 unless standing. The shuffle animation keys on
+    /// it (`0x5fd3f0`), not on the turn keys.
+    body_turn_step: f32,
 }
 
 impl Player {
@@ -964,6 +1006,8 @@ impl Player {
             fall_time: 0.0,
             fly: false,
             look_active: false,
+            look_steer: false,
+            body_turn_step: 0.0,
         }
     }
 
@@ -1511,7 +1555,6 @@ impl Player {
         if turn != 0.0 {
             let d = turn * TURN_RATE * TURN_RATE_MOVING * dt;
             self.yaw = wrap_pi(self.yaw + d);
-            self.model_yaw = wrap_pi(self.model_yaw + d);
             self.cam_yaw = wrap_pi(self.cam_yaw - d);
         }
         let (sy, cy) = self.yaw.sin_cos();
@@ -1531,11 +1574,15 @@ impl Player {
         self.surface = None;
         self.void_time = 0.0;
         self.fall_time = 0.0;
-        // Body: the aim plus the same strafe counter-twist as walking.
+        // Body: the aim plus the walking side-step swing; a level flight
+        // otherwise faces where it flies.
         let offset = strafe_body_offset(forward, strafe);
-        let cur = wrap_pi(self.model_yaw - self.yaw);
-        let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
-        self.model_yaw = wrap_pi(self.yaw + eased);
+        if offset != 0.0 {
+            self.model_yaw = ease_strafe_yaw(self.model_yaw, self.yaw, offset, dt);
+        } else {
+            self.model_yaw = self.yaw;
+        }
+        self.body_turn_step = 0.0;
         // Smart follow behind the aim, as on the ground.
         if forward.abs() + strafe.abs() > 0.01 {
             let target = wrap_pi(-self.yaw);
@@ -1595,6 +1642,8 @@ impl Player {
         // on every frame, including frames with no pointer delta.
         let looking = self.look_active;
         self.look_active = false;
+        let look_steer = self.look_steer;
+        self.look_steer = false;
         let dt = dt.clamp(0.0, 0.1);
         if dt <= 0.0 {
             return;
@@ -1704,8 +1753,10 @@ impl Player {
 
         // The 1.12 control model: A/D turn the character unless the
         // right mouse button is held, when the host reports them as strafe. A
-        // keyboard turn is left-positive and carries the body and the camera
-        // rigidly (`camera`); translating or falling scales it by 0.75.
+        // keyboard turn is left-positive and carries the aim and the camera
+        // rigidly (`camera`); the rendered body is the standing chase's and
+        // lags behind (`player/gait.rs`); translating or falling scales the
+        // turn by 0.75.
         let turn = self.input.turn.clamp(-1.0, 1.0);
         if turn != 0.0 {
             let rate = TURN_RATE
@@ -1716,7 +1767,6 @@ impl Player {
                 };
             let d = turn * rate * dt;
             self.yaw = wrap_pi(self.yaw + d);
-            self.model_yaw = wrap_pi(self.model_yaw + d);
             self.cam_yaw = wrap_pi(self.cam_yaw - d);
         }
 
@@ -1793,20 +1843,6 @@ impl Player {
             }
             self.vel[0] = dir[0] * speed;
             self.vel[1] = dir[1] * speed;
-        }
-
-        // The rendered body eases to the aim plus the strafe counter-twist
-        // (`creature_anim::select::strafe_body_offset`): ±π/2 for a pure
-        // strafe, ±π/4 with forward or back, mirrored while backpedaling. A
-        // swimmer faces its aim outright (`player/gait.rs`), the stroke's own
-        // clips carrying the sideways motion.
-        if self.swimming {
-            self.model_yaw = self.yaw;
-        } else {
-            let offset = strafe_body_offset(forward, strafe);
-            let cur = wrap_pi(self.model_yaw - self.yaw);
-            let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
-            self.model_yaw = wrap_pi(self.yaw + eased);
         }
 
         // Smart follow (`cameraSmoothStyle` default): while the character is
@@ -2074,6 +2110,33 @@ impl Player {
             }
         }
 
+        // The rendered body heading (`player/gait.rs`'s `drive_body_heading`,
+        // the `0x607ed0` tail): a swimmer faces its aim; a strafing body
+        // eases to the aim plus the side-step offset (±π/2 pure, ±π/4
+        // diagonal, mirrored backpedaling); forward/back travel and a fall
+        // snap it; standing, it holds a 90° ceiling behind a steered aim and
+        // sweeps onto it at 8× the turn rate once the steer stops. Run after
+        // the floor resolve, on this frame's airborne state, as the reference
+        // does.
+        let strafe_offset = strafe_body_offset(forward, strafe);
+        if self.swimming {
+            self.model_yaw = self.yaw;
+            self.body_turn_step = 0.0;
+        } else if strafe_offset != 0.0 {
+            self.model_yaw = ease_strafe_yaw(self.model_yaw, self.yaw, strafe_offset, dt);
+            self.body_turn_step = 0.0;
+        } else if forward.abs() > 0.01 || strafe.abs() > 0.01 || !self.grounded {
+            self.model_yaw = self.yaw;
+            self.body_turn_step = 0.0;
+        } else {
+            self.body_turn_step = stationary_chase_step(
+                wrap_pi(self.yaw - self.model_yaw),
+                turn != 0.0 || look_steer,
+                dt,
+            );
+            self.model_yaw = wrap_pi(self.model_yaw + self.body_turn_step);
+        }
+
         self.attack_left = (self.attack_left - dt).max(0.0);
 
         // Zoom glide (`camera_zoom`: constant 8.33 yd/s toward the target).
@@ -2121,19 +2184,20 @@ impl Player {
 
     /// Mouse look: `dx`/`dy` are raw pointer counts (`LOOK_SENSITIVITY` rad
     /// each). Called every frame a button is held, so a still drag latches
-    /// `look_active`. With
-    /// `turn_body` the aim and the rendered body turn with the camera, as
-    /// `camera` does on the right button; otherwise only the orbit moves.
+    /// `look_active`. With `turn_body` the aim turns with the camera, as
+    /// `camera` does on the turn-and-action button; the rendered body is the
+    /// standing chase's to move (`player/gait.rs`), so it lags here. Without
+    /// it only the orbit moves.
     fn look(&mut self, dx: f32, dy: f32, turn_body: bool) {
         // The button is held this frame (the host calls even for a zero
         // delta), so the smart follow yields to the drag.
         self.look_active = true;
+        self.look_steer = turn_body;
         let turn = dx * LOOK_SENSITIVITY;
         if turn_body {
             // `cam_yaw` is UE yaw, the mirror of the WoW aim: the same turn
-            // has the opposite sign, so the camera stays locked to the body.
+            // has the opposite sign, so the camera stays locked to the aim.
             self.yaw = wrap_pi(self.yaw - turn);
-            self.model_yaw = wrap_pi(self.model_yaw - turn);
         }
         self.cam_yaw = wrap_pi(self.cam_yaw + turn);
         // `mouseInvertPitch` is off by default, so a downward drag gives a negative
@@ -2335,11 +2399,14 @@ impl Player {
         }
         let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
         if hs < 0.1 {
-            // Turning in place plays the shuffle (11 left, 12 right).
-            if turning > 0.0 {
+            // Turning in place plays the shuffle (11 left, 12 right), keyed on
+            // the body's own rotation (`0x5fd3f0`), not the turn keys: the
+            // body is planted below the 90° ceiling, and the release sweep
+            // keeps shuffling until it lands on the aim.
+            if self.body_turn_step > 1.0e-5 {
                 return 11;
             }
-            if turning < 0.0 {
+            if self.body_turn_step < -1.0e-5 {
                 return 12;
             }
             return 0; // Stand
@@ -2376,6 +2443,9 @@ impl Player {
             overlay_anim_ms: (overlay_elapsed * 1000.0) as u32,
             twist_spine,
             twist_head,
+            aim_yaw: self.yaw,
+            cam_yaw: self.cam_yaw,
+            axes: [self.input.forward, self.input.strafe, self.input.turn],
         }
     }
 }
@@ -3675,8 +3745,8 @@ mod tests {
     }
 
     #[test]
-    fn right_drag_turns_the_aim_with_the_camera() {
-        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+    fn right_drag_turns_the_aim_and_the_body_lags() {
+        let mut p = player_on_flat();
         p.look(100.0, 0.0, true);
         let turn = 100.0 * LOOK_SENSITIVITY;
         assert!(
@@ -3688,9 +3758,16 @@ mod tests {
             "the aim is the mirror of cam_yaw"
         );
         assert!(
-            (p.model_yaw + turn).abs() < 1.0e-5,
-            "the body turns at once"
+            p.model_yaw.abs() < 1.0e-6,
+            "the look does not turn the body"
         );
+        // Under the 90° ceiling a steering frame leaves the body planted.
+        p.tick(1.0 / 60.0);
+        assert!(
+            p.model_yaw.abs() < 1.0e-6,
+            "the body holds while the aim is steered"
+        );
+        assert_eq!(p.anim(), 0, "and does not shuffle below the ceiling");
         // The Smart follow sees the camera already behind, so it does not move.
         let target = wrap_pi(-p.yaw);
         assert!(wrap_pi(target - p.cam_yaw).abs() < 1.0e-5);
@@ -3706,29 +3783,91 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_turn_carries_the_aim_the_body_and_the_camera() {
-        let mut p = Player::new("Azeroth", -8800.0, -800.0);
-        p.grounded = true;
+    fn keyboard_turn_carries_the_aim_and_the_camera_but_the_body_holds() {
+        let mut p = player_on_flat();
         p.input.turn = 1.0;
         p.tick(0.1);
         let d = TURN_RATE * 0.1;
         assert!((p.yaw - d).abs() < 1.0e-5, "turning left grows the WoW yaw");
-        assert!((p.model_yaw - d).abs() < 1.0e-5, "the body turns with it");
+        assert!(
+            p.model_yaw.abs() < 1.0e-6,
+            "the body is planted below the ceiling"
+        );
         assert!((p.cam_yaw + d).abs() < 1.0e-5, "the camera mirrors the yaw");
         // The smart follow sees the camera already behind.
         assert!(wrap_pi(wrap_pi(-p.yaw) - p.cam_yaw).abs() < 1.0e-5);
     }
 
     #[test]
-    fn turning_in_place_shuffles_and_a_turn_in_water_is_the_swim_idle() {
-        let mut p = Player::new("Azeroth", -8800.0, -800.0);
-        p.grounded = true;
+    fn the_standing_chase_freezes_below_the_ceiling_and_sweeps_on_release() {
+        use std::f32::consts::FRAC_PI_2;
+        // Below the ceiling a steer moves the body not at all.
+        assert_eq!(stationary_chase_step(0.5, true, 0.05), 0.0);
+        // Past it, only the excess moves it, leaving a 90° trail.
+        let step = stationary_chase_step(2.0, true, 0.05);
+        assert!((step - (2.0 - FRAC_PI_2)).abs() < 1.0e-6);
+        // A released 90° gap closes at 8× the turn rate, clamped to the gap.
+        let step = stationary_chase_step(FRAC_PI_2, false, 0.01);
+        assert!((step - 0.01 * TURN_RATE * STATIONARY_CHASE_RATE).abs() < 1.0e-6);
+        assert_eq!(stationary_chase_step(0.05, false, 1.0), 0.05);
+        // Turning right mirrors it.
+        assert!(stationary_chase_step(-2.0, true, 0.05) < 0.0);
+        assert!(stationary_chase_step(-FRAC_PI_2, false, 0.01) < 0.0);
+    }
+
+    #[test]
+    fn a_standing_turn_holds_the_ninety_degree_ceiling_then_sweeps_back() {
+        use std::f32::consts::FRAC_PI_2;
+        let mut p = player_on_flat();
         p.input.turn = 1.0;
-        assert_eq!(p.anim(), 11, "ShuffleLeft");
-        p.input.turn = -1.0;
-        assert_eq!(p.anim(), 12, "ShuffleRight");
-        p.swimming = true;
-        assert_eq!(p.anim(), 41, "SwimIdle");
+        for _ in 0..15 {
+            p.tick(0.05); // 0.75 s at π rad/s: the aim passes the ceiling
+        }
+        let gap = wrap_pi(p.yaw - p.model_yaw);
+        assert!(
+            (gap.abs() - FRAC_PI_2).abs() < 1.0e-4,
+            "the body trails the aim by exactly 90°: {gap}"
+        );
+        assert_eq!(p.anim(), 11, "the body following its ceiling shuffles left");
+        // Release: no key, no look. The body sweeps onto the aim at 8× the
+        // turn rate and keeps shuffling although nothing is held.
+        let held = p.model_yaw;
+        p.input.turn = 0.0;
+        p.tick(0.01);
+        let step = 0.01 * TURN_RATE * STATIONARY_CHASE_RATE;
+        assert!(
+            (wrap_pi(p.model_yaw - held) - step).abs() < 1.0e-4,
+            "the sweep runs at 8× the turn rate"
+        );
+        assert_eq!(p.anim(), 11, "and still shuffles mid-sweep");
+        for _ in 0..20 {
+            p.tick(0.01);
+        }
+        assert!(
+            wrap_pi(p.yaw - p.model_yaw).abs() < 1.0e-5,
+            "the body lands on the aim"
+        );
+        assert_eq!(p.anim(), 0, "then stands");
+    }
+
+    #[test]
+    fn turning_in_place_shuffles_once_the_body_moves_and_a_turn_in_water_is_the_swim_idle() {
+        let mut p = player_on_flat();
+        p.input.turn = 1.0;
+        p.tick(0.05);
+        assert_eq!(p.anim(), 0, "the planted body does not shuffle");
+        for _ in 0..15 {
+            p.tick(0.05);
+        }
+        assert_eq!(p.anim(), 11, "ShuffleLeft once the ceiling moves it");
+        let mut q = player_on_flat();
+        q.input.turn = -1.0;
+        for _ in 0..15 {
+            q.tick(0.05);
+        }
+        assert_eq!(q.anim(), 12, "ShuffleRight");
+        q.swimming = true;
+        assert_eq!(q.anim(), 41, "SwimIdle");
     }
 
     #[test]
