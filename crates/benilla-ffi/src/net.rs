@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
     AttackSwingError, CastOutcome, CharCreateReq, MonsterMoveFacing, Object, ObjectFields,
-    ObjectType, ServerPacket,
+    ObjectType, ServerPacket, SLOT_PACK_FIRST,
 };
 // The server-authored path walk: benilla's own sampler, shared with the Bevy client.
 use benilla_protocol::motion::{monster_move_spline, Spline};
@@ -1019,6 +1019,8 @@ pub(crate) enum Cmd {
     },
     /// Auto-equip the item at this wire position. Sent as `CMSG_AUTOEQUIP_ITEM`'s equivalent swap
     /// (see the dispatch arm): this server refuses that packet, so the destination is picked here.
+    /// The bag byte is the wire's: 0xFF for the player's own array (equipment 0..18, pack 23..38),
+    /// 19..22 for a worn bag's contents.
     AutoEquip {
         bag: u8,
         slot: u8,
@@ -3128,15 +3130,53 @@ fn equip_destination(candidates: &[u8], worn: impl Fn(u8) -> bool) -> Option<u8>
         .or_else(|| candidates.first().copied())
 }
 
+/// Vanilla's Dual Wield passive (`SPELL_EFFECT_DUAL_WIELD`, `spell_template` effect 40): the
+/// server's `m_canDualWield` is set by it, and an offhand weapon without it is refused.
+const DUAL_WIELD_SPELL: u32 = 674;
+
+/// The seats an auto-equip may send an item to: the client's own `InventoryType` map, narrowed
+/// where the server is stricter. `Player::FindEquipSlot` walks `GetAllowedEquipSlots`, which
+/// offers the off hand for `INVTYPE_WEAPON` only to a dual wielder (`Objects/Item.cpp:624-633`)
+/// and refuses the offhand equip otherwise (`Player.cpp:9915`).
+fn auto_equip_slots(inventory_type: u32, has_relic_slot: bool, can_dual_wield: bool) -> Vec<u8> {
+    const INVTYPE_WEAPON: u32 = 13;
+    const MAINHAND: u8 = 16;
+    let mut slots = find_equip_slot(inventory_type, has_relic_slot);
+    if inventory_type == INVTYPE_WEAPON && !can_dual_wield {
+        slots.retain(|&s| s == MAINHAND);
+    }
+    slots
+}
+
+/// The inventory row's own addressing for a wire position: rows carry 255 (`BAG_EQUIPPED`) for
+/// worn equipment and 0 for the backpack, whose wire seats start at `SLOT_PACK_FIRST` (23) in the
+/// player's array. A worn bag's contents (19..22) already match.
+fn row_pos_for_wire(bag: u8, slot: u8) -> (u8, u8) {
+    if bag == BAG_EQUIPPED && slot >= SLOT_PACK_FIRST {
+        (0, slot - SLOT_PACK_FIRST)
+    } else {
+        (bag, slot)
+    }
+}
+
 /// The live slot an `AutoEquip` command sends its item to (0 is the ammo seat, loaded by entry
 /// rather than moved) and the entry that names it. `None` when the row is not there or its
 /// template names no slot, so the caller can keep the client's own packet.
 fn equip_target(sh: &Shared, bag: u8, slot: u8) -> Option<(u8, u32)> {
     let rows = inventory_rows(sh);
-    let row = rows.iter().find(|r| r.bag == bag && r.slot == slot)?;
-    let candidates = find_equip_slot(
+    let (row_bag, row_slot) = row_pos_for_wire(bag, slot);
+    let row = rows
+        .iter()
+        .find(|r| r.bag == row_bag && r.slot == row_slot)?;
+    let can_dual_wield = sh
+        .spells
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&DUAL_WIELD_SPELL);
+    let candidates = auto_equip_slots(
         row.info.inventory_type,
         sh.relic_slot.load(Ordering::Relaxed),
+        can_dual_wield,
     );
     let live = equip_destination(&candidates, |live| {
         live != 0
@@ -4690,10 +4730,20 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             slot: (b & 0xff) as u8,
             spell: (a & 0xff) as u8,
         },
-        12 => Cmd::AutoEquip {
-            bag: ((b >> 8) & 0xff) as u8,
-            slot: (b & 0xff) as u8,
-        },
+        // The host names a backpack item bag 0 slot 0..15, the row's own addressing; the
+        // command speaks the wire's player array, where those seats are 255/23..38.
+        12 => {
+            let bag = ((b >> 8) & 0xff) as u8;
+            let slot = (b & 0xff) as u8;
+            if bag == 0 {
+                Cmd::AutoEquip {
+                    bag: BAG_EQUIPPED,
+                    slot: SLOT_PACK_FIRST + slot,
+                }
+            } else {
+                Cmd::AutoEquip { bag, slot }
+            }
+        }
         13 => Cmd::SwapInv {
             src: (a & 0xff) as u8,
             dst: (b & 0xff) as u8,
@@ -5473,9 +5523,30 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_swing_refusal, equip_destination, find_equip_slot, latch_swing_refusal,
-        swing_anim_main, take_due_swing_refusal,
+        auto_equip_slots, clear_swing_refusal, equip_destination, find_equip_slot,
+        latch_swing_refusal, row_pos_for_wire, swing_anim_main, take_due_swing_refusal,
+        BAG_EQUIPPED,
     };
+
+    /// A one-handed weapon reaches the off hand only for a dual wielder, as
+    /// `Player::FindEquipSlot` gives it; every other type keeps the client's own map.
+    #[test]
+    fn an_offhand_weapon_needs_dual_wield() {
+        assert_eq!(auto_equip_slots(13, false, true), vec![16, 17]);
+        assert_eq!(auto_equip_slots(13, false, false), vec![16]);
+        assert_eq!(auto_equip_slots(17, false, false), vec![16]);
+        assert_eq!(auto_equip_slots(14, false, false), vec![17]);
+    }
+
+    /// The wire seat a player-array source names maps back to the row: worn 0..18 stays, the
+    /// backpack's 23..38 is row bag 0 slot 0..15, and a worn bag's own slot is unchanged.
+    #[test]
+    fn a_wire_position_maps_back_to_its_row() {
+        assert_eq!(row_pos_for_wire(BAG_EQUIPPED, 4), (BAG_EQUIPPED, 4));
+        assert_eq!(row_pos_for_wire(BAG_EQUIPPED, 23), (0, 0));
+        assert_eq!(row_pos_for_wire(BAG_EQUIPPED, 38), (0, 15));
+        assert_eq!(row_pos_for_wire(19, 3), (19, 3));
+    }
 
     /// A failed `CMSG_AUTOEQUIP_ITEM` becomes a swap to this slot: the first empty candidate of
     /// the template's mask, the first when every candidate is worn, and the ammo seat (live 0)
