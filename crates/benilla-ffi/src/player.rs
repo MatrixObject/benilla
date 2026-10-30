@@ -1764,7 +1764,19 @@ impl Player {
                     return true;
                 }
                 let Some((z, nz)) = self.ground(nx, ny, self.pos[2] + STEP_UP_HEIGHT) else {
-                    return false;
+                    // Nothing within reach at the destination. If the terrain
+                    // there stands above the step reach, it is a face too steep
+                    // to climb and the body must not enter it: walking it in
+                    // sinks the capsule under the surface, where `ground` finds
+                    // no floor above the feet and the body drops out of the
+                    // world. Impassable chunks add a fence for the same reason
+                    // (`0x6aae2a`); walkable steep faces are stopped here, the
+                    // way the reference's slope test stops them. A destination
+                    // over a drop answers below the feet instead, so walking off
+                    // a cliff still falls.
+                    return self
+                        .terrain_z(nx, ny)
+                        .is_some_and(|t| t > self.pos[2] + STEP_UP_HEIGHT);
                 };
                 let rise = z - self.pos[2];
                 if rise > STEP_UP_HEIGHT - 1.0e-3 {
@@ -1900,13 +1912,38 @@ impl Player {
                                 self.tiles.len()
                             );
                         }
-                        if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH {
+                        if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH
+                            // A tile whose floor set is complete (or will never
+                            // arrive) holds every surface it will ever have: a
+                            // body with nothing under it there is out of the
+                            // world, and the 100-yd plunge only makes the exit
+                            // longer.
+                            || (self.void_time > 0.5
+                                && !self.floors_folding(self.pos[0], self.pos[1]))
+                        {
+                            // The last seat may itself be in the void - a login
+                            // pose saved under the terrain by a client that had
+                            // already left the map - so restore onto a floor
+                            // that is still real there, not blindly there.
+                            let seat = self
+                                .ground(
+                                    self.last_ground[0],
+                                    self.last_ground[1],
+                                    self.last_ground[2] + STEP_UP_HEIGHT,
+                                )
+                                .or_else(|| {
+                                    self.ground(self.last_ground[0], self.last_ground[1], f32::MAX)
+                                })
+                                .map_or(self.last_ground, |(z, _)| {
+                                    [self.last_ground[0], self.last_ground[1], z]
+                                });
                             eprintln!(
                             "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
                             self.pos[0], self.pos[1], self.pos[2],
-                            self.last_ground[0], self.last_ground[1], self.last_ground[2]
+                            seat[0], seat[1], seat[2]
                         );
-                            self.pos = self.last_ground;
+                            self.pos = seat;
+                            self.last_ground = seat;
                             self.vel = [0.0; 3];
                             self.grounded = true;
                             self.void_time = 0.0;
@@ -2917,6 +2954,53 @@ mod tests {
         assert!(restored, "the void guard put the body back on the floor");
     }
 
+    #[test]
+    fn a_body_under_the_terrain_walks_no_deeper_and_is_lifted_out() {
+        // The logged Goldshire fall (`run_qm24.txt`): the body walked Crystal
+        // Lake's bed with the surface more than a step over its head, then met
+        // the rising shore and fell out of the map. A body in that state must
+        // not walk further into the hill, and the guard must put it back on the
+        // real surface instead of restoring it into the void.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let (cx, cy) = world_to_chunk(p.pos[0], p.pos[1]);
+        let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+        let mut col = TileCol::new();
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, 0.0],
+            [-8780.0, -820.0, 0.0],
+            [-8780.0, -780.0, 0.0],
+        ));
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, 0.0],
+            [-8780.0, -780.0, 0.0],
+            [-8820.0, -780.0, 0.0],
+        ));
+        p.tiles.insert((tx, ty), col);
+        p.pos[2] = -2.5; // more than a step under the surface
+        p.grounded = false;
+        p.last_ground = [p.pos[0], p.pos[1], 0.0];
+        p.yaw = 0.0;
+        p.model_yaw = 0.0;
+        p.input.forward = 1.0;
+        for _ in 0..30 {
+            p.tick(1.0 / 60.0);
+        }
+        assert!(
+            (p.pos[0] + 8800.0).abs() < 0.01,
+            "the surface over the head is a wall, not a slope to walk into: {}",
+            p.pos[0]
+        );
+        for _ in 0..120 {
+            p.tick(1.0 / 60.0);
+        }
+        assert!(p.grounded, "the guard restored the body");
+        assert!(
+            (p.pos[2] - 0.0).abs() < 1.0e-3,
+            "onto the surface, not into the void: {}",
+            p.pos[2]
+        );
+    }
     #[test]
     fn a_room_whose_floor_set_is_still_folding_holds_the_body() {
         // Walking into an interior before the tile's WMO fold finishes: the
@@ -3973,5 +4057,69 @@ mod tests {
         assert!(blocked_props > 0, "a hulled prop must stop the body");
         assert_eq!(bare_wrong, 0, "a hull-less prop is never solid");
         crate::bn_shutdown(w);
+    }
+
+    /// The logged fall south of Goldshire (`run_qm24.txt`): the body walked
+    /// into Crystal Lake, kept walking its bed under the surface, met the
+    /// rising far shore where no floor answered above the feet and dropped out
+    /// of the map. The swim latch must carry it instead: from the logged
+    /// north-shore heartbeat at (-9404.8, -114.1) the body swims the logged
+    /// heading, wades out on the far bank and never leaves the surface.
+    #[test]
+    fn swimming_carries_the_body_across_crystal_lake() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        assert!(!archives.is_empty(), "the install's MPQs open");
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+
+        let mut p = Player::new("Azeroth", -9404.8, -114.1);
+        p.pos = [-9404.8, -114.1, 57.9];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        p.input.forward = 1.0;
+        p.yaw = (-148.9f32 + 114.1).atan2(-9392.8f32 + 9404.8);
+        p.model_yaw = p.yaw;
+
+        let mut swim_ticks = 0;
+        let mut min_z = f32::INFINITY;
+        for _ in 0..1200 {
+            p.ensure_tiles(&archives);
+            p.ensure_wmo(&mut chain, &mut cache);
+            p.tick(1.0 / 60.0);
+            if p.swimming {
+                swim_ticks += 1;
+            }
+            min_z = min_z.min(p.pos[2]);
+            if let (Some(t), true) = (p.terrain_z(p.pos[0], p.pos[1]), p.grounded) {
+                assert!(
+                    p.pos[2] >= t - 0.05,
+                    "feet under the terrain at ({:.1},{:.1}): {:.2} < {:.2}",
+                    p.pos[0],
+                    p.pos[1],
+                    p.pos[2],
+                    t
+                );
+            }
+        }
+        println!("crystal lake: {swim_ticks} swim ticks, min z {min_z:.2}");
+        assert!(swim_ticks > 60, "the crossing is a swim, not a bed walk");
+        assert!(min_z > 55.0, "the body never sinks toward the void");
+        assert!(p.pos[1] < -150.0, "the far shore is reached");
+        assert!(p.grounded, "and the body walks out onto it");
     }
 }
