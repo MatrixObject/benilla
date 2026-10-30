@@ -595,11 +595,19 @@ fn set_unit_stores_the_guid_and_refresh_unit_rebuilds_it() {
     "#,
     )
     .unwrap();
+    s.resolve();
     let panes = s.character_panes();
     assert_eq!(panes.len(), 2, "every visible character pane, named or not");
     assert_eq!(panes[0].name, None, "the anonymous pane is listed");
     assert_eq!((panes[0].guid, panes[1].guid), (ORC, WOLF));
     assert_eq!(panes[0].builds, 1, "a visible pane asks for its copy");
+    // The host draws the copy inside the pane, so the row carries its resolved rect.
+    let rect = panes[0].rect.expect("a laid-out pane has its rect");
+    assert!(
+        (rect.right - rect.left - 90.0).abs() < 1e-3
+            && (rect.top - rect.bottom - 90.0).abs() < 1e-3,
+        "{rect:?}"
+    );
 
     // The target moves; the pane does not follow it.
     s.set_unit_guids(&guids(WOLF, 0));

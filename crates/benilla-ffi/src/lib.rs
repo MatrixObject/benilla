@@ -8490,6 +8490,76 @@ pub extern "C" fn bn_ui_model_cards(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
+/// The visible character panes (`PlayerModel`, `DressUpModel`, `TabardModel`), one TSV row each:
+/// `name \t guid \t display \t builds \t facing \t left \t top \t width \t height` in root units
+/// (y up). The host paints the interface from the dump, which carries no 3D pass, so the pane's
+/// copy is the host's to build and draw (`0x5059a0`: `SetUnit` duplicates the subject's model);
+/// this row says which pane, what subject and where. `bn_ui_character_built` answers the build.
+#[no_mangle]
+pub extern "C" fn bn_ui_character_panes(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            let mut out = String::new();
+            for p in s.character_panes() {
+                let Some(r) = p.rect else {
+                    continue;
+                };
+                let name = p.name.as_deref().unwrap_or("");
+                out.push_str(&format!(
+                    "{name}\t{}\t{}\t{}\t{:.4}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\n",
+                    p.guid,
+                    p.display,
+                    p.builds,
+                    p.facing,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.top - r.bottom,
+                ));
+            }
+            Some(out)
+        })
+    })) else {
+        return 0;
+    };
+    let Some(text) = text else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// The host built the copy for request `build` of the pane named `name`: the answer the VM's
+/// `character_copy_built` expects, so the pane stops reporting that build pending.
+#[no_mangle]
+pub extern "C" fn bn_ui_character_built(name: *const c_char, build: u64) -> u32 {
+    let Some(name) = cstr_to_str(name) else {
+        return 0;
+    };
+    let Ok(done) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut held = slot.borrow_mut();
+            let s = held.as_mut()?;
+            let h = s.frame_handle(name)?;
+            s.character_copy_built(h, build);
+            Some(())
+        })
+    })) else {
+        return 0;
+    };
+    u32::from(done.is_some())
+}
+
 /// Append the focused EditBox caret row (see the seam note below) to a whole
 /// dump's text. Shared by the one-shot and sliced dumps.
 fn ui_dump_apply_caret(text: &mut String) {

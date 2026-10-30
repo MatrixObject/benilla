@@ -704,6 +704,7 @@ impl crate::script::UiScript {
                     copy: c.copy,
                     file: m.path.is_some(),
                     facing: m.facing,
+                    rect: model.resolved.get(&h).copied(),
                     light: m.light,
                     fog: m.scene_fog(),
                 })
@@ -951,6 +952,8 @@ pub struct CharacterPaneFrame {
     pub file: bool,
     /// The facing, the root's yaw (`+0x39c`).
     pub facing: f32,
+    /// The pane's resolved rect in root units (y up), before its layout resolves `None`.
+    pub rect: Option<crate::layout::Rect>,
     /// The pane's light and the fog its scene draws with.
     pub light: ModelLight,
     pub fog: Option<crate::widget::ModelFog>,
