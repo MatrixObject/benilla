@@ -7475,6 +7475,18 @@ const UI_DUMP_DEFS_LUA: &str = r#"
         if not ok or type(dl) ~= "string" then return "ARTWORK" end
         return dl
     end
+    -- The region's blend (col 28, `GetBlendMode` `0x79a890`): the client draws
+    -- an `alphaMode="ADD"` texture (a button's checked/highlight marks, a
+    -- nameplate glow) by adding it, so its opaque black background shows as
+    -- nothing. Drawn as plain alpha instead, that black covers what lies under
+    -- it - the ActionButton checked mark hid the slot it marks. Textures only;
+    -- a FontString has no blend and keeps the empty column.
+    local function blend_str(r, ty)
+        if ty ~= "Texture" or not r.GetBlendMode then return "" end
+        local ok, b = pcall(function() return r:GetBlendMode() end)
+        if not ok or type(b) ~= "string" then return "" end
+        return clean(b)
+    end
     local function dump_one(f)
         local mine = {}
         -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
@@ -7542,7 +7554,7 @@ const UI_DUMP_DEFS_LUA: &str = r#"
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv,
-                texcoord_str(r), layer_str(r) }, "\t"))
+                texcoord_str(r), layer_str(r), blend_str(r, ty) }, "\t"))
             end
         end
         return mine

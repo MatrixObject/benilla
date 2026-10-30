@@ -2470,6 +2470,40 @@ mod loader_tests {
         assert!(s.errors().is_empty(), "{:?}", s.errors());
     }
 
+    /// A state texture's `alphaMode` is the client's additive mark (`ActionButtonTemplate.xml`:
+    /// the highlight and the checked art both carry `alphaMode="ADD"`), and the slot store must
+    /// keep it: the check art is a full-opaque black square with a yellow rim, so drawn as plain
+    /// alpha it covers the icon it marks.
+    #[test]
+    fn a_state_texture_keeps_the_alpha_mode_it_was_loaded_with() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <CheckButton name="ModeBtn">
+                    <Size><AbsDimension x="40" y="40"/></Size>
+                    <NormalTexture file="Interface\Buttons\UI-Quickslot2"/>
+                    <HighlightTexture file="Interface\Buttons\ButtonHilight-Square" alphaMode="ADD"/>
+                    <CheckedTexture file="Interface\Buttons\CheckButtonHilight" alphaMode="ADD"/>
+                </CheckButton>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let got: (String, String, String) = s
+            .eval(
+                r#"return ModeBtn:GetNormalTexture():GetBlendMode(),
+                    ModeBtn:GetHighlightTexture():GetBlendMode(),
+                    ModeBtn:GetCheckedTexture():GetBlendMode()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            ("BLEND".to_string(), "ADD".to_string(), "ADD".to_string()),
+            "the normal texture blends; the highlight and checked marks add"
+        );
+    }
+
     /// An instance's state texture named as its template's carries the name: `GetName()` reads the
     /// region's own (`SetName 0x76c650`, from `0x76fdf0`). The global stays the first holder's, as
     /// `0x701bd0` publishes only into an empty one (`0x701c8a`), so it is the destroyed template
