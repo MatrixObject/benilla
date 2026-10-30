@@ -2392,7 +2392,8 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::StopAttack) => {
                     // `0x624370`: the stop goes out and `+0xc54` rises; `+0xc48` stays
-                    // until the echo.
+                    // until the echo. `0x5ecae4` guards on the lock alone, so a second
+                    // stop before the echo sends a second `0x142`.
                     let _ = session.attack_stop();
                     sh.stop_in_flight.store(1, Ordering::SeqCst);
                 }
