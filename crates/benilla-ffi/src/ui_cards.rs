@@ -331,9 +331,11 @@ pub(crate) fn drain_item_pushes(script: &mut UiScript, cats: Option<&Catalogs>) 
 mod tests {
     use super::*;
 
-    /// The real card file, through the install: one 1000 ms clamped Stand sequence, a 0.02707 x
-    /// 0.07962 header box (the app's `bag_tests` facts, cross-checked from the other side), and a
-    /// four-vertex icon batch that fades in by 133 ms and out to nothing at the end.
+    /// The real card file, through the install: one 1000 ms clamped Stand sequence, the authored
+    /// header box the pane copies (`0x713640`, `MD20+0xb4`; `0x76d0b5` takes `max - min`) —
+    /// 0.03313 x 0.09744, which is the stock card's 42.41 x 124.72 rect at 4:3, where a layout
+    /// unit is 1280 FrameXML units — and a four-vertex icon batch that fades in by 133 ms and out
+    /// to nothing at the end.
     #[test]
     fn forced_backpack_item_poses_its_icon_batch() {
         let data = benilla_formats::wow_data_or_skip!();
@@ -352,7 +354,7 @@ mod tests {
         );
         let (min, max) = file.facts.bbox;
         assert!(
-            (max[0] - min[0] - 0.02707).abs() < 5e-4 && (max[1] - min[1] - 0.07962).abs() < 5e-4,
+            (max[0] - min[0] - 0.03313).abs() < 5e-4 && (max[1] - min[1] - 0.09744).abs() < 5e-4,
             "header box {:?}..{:?}",
             min,
             max
@@ -389,7 +391,6 @@ mod tests {
         assert_eq!(quads.len(), 1, "one icon batch");
         assert!((quads[0].alpha - 1.0).abs() < 1e-3, "opaque at 133 ms");
         assert_eq!(quads[0].tris.len(), 2, "four-vertex quad");
-        // The 0.03 x 0.03 quad at 1280 root units per model unit.
         let (mut l, mut r, mut b, mut t) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for v in quads[0].tris.iter().flatten() {
             l = l.min(v[0]);
@@ -397,9 +398,21 @@ mod tests {
             b = b.min(v[1]);
             t = t.max(v[1]);
         }
+        // The icon quad at the peak: the file's own vertices, scaled by the bone's 133 ms key
+        // (`m2anim`: 1.2 on every axis, the only skinning transform there), at 1280 root units
+        // per model unit with the model scale at 1.
+        let (mut rx, mut ry) = (f32::MIN, f32::MIN);
+        let (mut vx, mut vy) = (f32::MAX, f32::MAX);
+        for p in &file.subs[0].positions {
+            vx = vx.min(p[0]);
+            vy = vy.min(p[1]);
+            rx = rx.max(p[0]);
+            ry = ry.max(p[1]);
+        }
+        let (rx, ry) = (rx - vx, ry - vy);
         assert!(
-            (r - l - 0.030 * 1280.0).abs() < 4.0 && (t - b - 0.030 * 1280.0).abs() < 4.0,
-            "posed quad {:.1} x {:.1} root units",
+            (r - l - rx * 1.2 * 1280.0).abs() < 0.5 && (t - b - ry * 1.2 * 1280.0).abs() < 0.5,
+            "posed quad {:.1} x {:.1} root units from a {rx:.5} x {ry:.5} batch",
             r - l,
             t - b
         );
