@@ -453,15 +453,25 @@ pub(crate) fn item_look(
     )
 }
 
-/// One occupied bag slot's view, off the item object and its template.
+/// One occupied bag slot's view, off the item object and its template. `template` is the
+/// `(class, StartQuest)` pair [`net::ui_item_use_template`] answers, `None` while the query is out.
 fn container_slot(
     item: &net::BnNetInvItem,
     cats: Option<&Catalogs>,
     has_relic_slot: bool,
+    template: Option<(u32, u32)>,
 ) -> ContainerSlot {
     let info = &item.info;
     let name = cstr(&info.name);
+    // `UseContainerItem`'s forks (`0x4fa0e0`): an equippable template whose `StartQuest` is 0
+    // auto-equips (`0x4fa3bd`), as the app's `ui_items/drain.rs` `use_fork` reads it. A template
+    // still in flight is not equippable (`0x5d9ff0`).
     ContainerSlot {
+        use_fork: match template {
+            Some((_, 0)) if info.inventory_type != 0 => UseFork::Equip,
+            _ => UseFork::Plain,
+        },
+        item_class: template.map(|(class, _)| class),
         texture: cats
             .and_then(|c| c.items.as_ref())
             .and_then(|t| t.get(info.display_id))
@@ -1418,9 +1428,10 @@ impl Feed {
                     _ => continue,
                 };
                 if row_bag == id {
+                    let template = net::ui_item_use_template(item.entry);
                     slots.insert(
                         u32::from(item.slot) + 1,
-                        container_slot(item, cats, has_relic_slot),
+                        container_slot(item, cats, has_relic_slot, template),
                     );
                 }
             }
@@ -3073,9 +3084,9 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
 
 #[cfg(test)]
 mod tests {
-    use super::{loot_picks, money_text, HeldAxes, LootPick, LootWindow};
-    use crate::net::BnNetLoot;
-    use benilla_ui::script::UiScript;
+    use super::{container_slot, loot_picks, money_text, HeldAxes, LootPick, LootWindow};
+    use crate::net::{BnNetInvItem, BnNetLoot};
+    use benilla_ui::script::{UiScript, UseFork};
 
     #[test]
     fn a_and_d_turn_until_the_look_channel_is_held() {
@@ -3164,5 +3175,44 @@ mod tests {
         assert_eq!(money_text(&script, 45), "45 Copper");
         assert_eq!(money_text(&script, 12345), "1 Gold 23 Silver 45 Copper");
         assert_eq!(money_text(&script, 20000), "2 Gold");
+    }
+
+    /// A bag slot's right-click takes the equip arm only for a cached template that names an
+    /// inventory type and no `StartQuest` (`0x4fa3bd`); a template still in flight is the plain
+    /// arm, which is what made the bag's right-click send a use instead of an equip.
+    #[test]
+    fn a_bag_slot_equips_by_its_cached_template() {
+        let mut item = BnNetInvItem {
+            entry: 4825,
+            ..Default::default()
+        };
+        item.info.inventory_type = 17;
+        assert_eq!(
+            container_slot(&item, None, false, Some((2, 0))).use_fork,
+            UseFork::Equip,
+            "a two-handed weapon with no quest starter"
+        );
+        assert_eq!(
+            container_slot(&item, None, false, Some((2, 7))).use_fork,
+            UseFork::Plain,
+            "an equippable quest starter offers its quest instead"
+        );
+        assert_eq!(
+            container_slot(&item, None, false, None).use_fork,
+            UseFork::Plain,
+            "the template has not answered"
+        );
+        item.info.inventory_type = 0;
+        assert_eq!(
+            container_slot(&item, None, false, Some((2, 0))).use_fork,
+            UseFork::Plain,
+            "no inventory type: not equippable"
+        );
+        // The class rides with the fork for the use gates and the projectile arm (`0x5e1704`).
+        assert_eq!(
+            container_slot(&item, None, false, Some((2, 0))).item_class,
+            Some(2)
+        );
+        assert_eq!(container_slot(&item, None, false, None).item_class, None);
     }
 }

@@ -320,6 +320,9 @@ struct ItemTemplate {
     subclass: u32,
     bag_family: u32,
     max_durability: u32,
+    /// `item_template.startquest`: a quest starter takes the quest arm of `UseContainerItem`
+    /// ahead of the equip one (`0x4fa3bd`), so an equippable quest item never auto-equips.
+    start_quest: u32,
     /// `item_template.material`: the swing and draw sound's key.
     material: u32,
     /// `item_template.sheath`: where a stowed version of this item hangs.
@@ -1508,6 +1511,18 @@ pub(crate) fn ui_item_info(entry: u32) -> BnNetItemInfo {
     item_info_row(entry, &templates)
 }
 
+/// The template facts a bag slot's use fork reads (`0x4fa3b9`): its class and its `StartQuest`,
+/// `None` while the query is out — the reference's uncached template, which `0x5d9ff0` reads as
+/// not equippable and the dispatcher's gates end silently.
+pub(crate) fn ui_item_use_template(entry: u32) -> Option<(u32, u32)> {
+    shared()
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&entry)
+        .map(|t| (t.class, t.start_quest))
+}
+
 /// Whether the server answered an item query for this entry with no record; such a row stops
 /// waiting on its template (`ui_loot`'s failed-query deviation).
 pub(crate) fn ui_item_unknown(entry: u32) -> bool {
@@ -2419,6 +2434,10 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     }
                 }
                 Ok(Cmd::AutoEquip { bag, slot }) => {
+                    // A refused auto-equip is otherwise silent on the host's side, so the choice
+                    // this handler makes is traced: `equip|auto|<bag>/<slot>|target=<live,entry>`.
+                    let target = equip_target(sh, bag, slot);
+                    note(format!("equip|auto|{bag}/{slot}|target={target:?}"));
                     // VMaNGOS 1.12 answers `CMSG_AUTOEQUIP_ITEM` with `ERR_ITEM_NOT_FOUND` for
                     // the very item it names (probe 2026-10-29: 255/26 refused, then equipped by
                     // `CMSG_SWAP_INV_ITEM` 26→4), so the destination is picked here — the
@@ -2428,7 +2447,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     // `CMSG_SWAP_ITEM`. The displaced piece comes back to the source slot. Ammo
                     // (live 0) loads by entry and stays in its bag (`0x5e1704`). A template that
                     // has not answered keeps the client's own packet.
-                    match equip_target(sh, bag, slot) {
+                    match target {
                         Some((0, entry)) => {
                             let body = benilla_protocol::messages::set_ammo(entry);
                             if let Err(e) = session
@@ -2458,6 +2477,14 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                             }
                         }
                         None => {
+                            let (row_bag, row_slot) = row_pos_for_wire(bag, slot);
+                            let invt = inventory_rows(sh)
+                                .into_iter()
+                                .find(|r| r.bag == row_bag && r.slot == row_slot)
+                                .map(|r| r.info.inventory_type);
+                            note(format!(
+                                "equip|no-slot|{bag}/{slot}|row={row_bag}/{row_slot}|invtype={invt:?}"
+                            ));
                             if let Err(e) = session.auto_equip_item(bag, slot) {
                                 sh.event(format!("error|equip|{e}"));
                             }
@@ -3570,6 +3597,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                             subclass: info.subclass,
                             bag_family: info.bag_family,
                             max_durability: info.max_durability,
+                            start_quest: info.start_quest,
                             material: info.material,
                             sheath: info.sheath,
                         },
