@@ -240,16 +240,22 @@ struct HeldAxes {
     strafe_right: bool,
     turn_left: bool,
     turn_right: bool,
-    /// The `TURNORACTION` channel the right button's binding holds: the drag turns the body.
-    look: bool,
 }
 
 impl HeldAxes {
-    fn axes(&self) -> (f32, f32, f32) {
+    /// `0x7c5360`: A/D turn the body unless the look channel is held, when they
+    /// strafe and no keyboard turn runs - the facing follows the camera.
+    fn axes(&self, look: bool) -> (f32, f32, f32) {
         let f = f32::from(self.forward) - f32::from(self.backward);
         let s = f32::from(self.strafe_right) - f32::from(self.strafe_left);
         let t = f32::from(self.turn_left) - f32::from(self.turn_right);
-        (f, s, t)
+        if look {
+            // The turn keys read left-positive, the strafe axis right-positive,
+            // so the fold flips the sign (`0x7c5360`: `turn_right - turn_left`).
+            (f, s - t, 0.0)
+        } else {
+            (f, s, t)
+        }
     }
 
     fn any(&self) -> bool {
@@ -1851,11 +1857,9 @@ impl Feed {
                 }
                 BindingInput::Stop(HeldInput::TurnRight) => self.held.turn_right = false,
                 BindingInput::Start(HeldInput::TurnOrAction) => {
-                    self.held.look = true;
                     player::ui_turn_held(true);
                 }
                 BindingInput::Stop(HeldInput::TurnOrAction) => {
-                    self.held.look = false;
                     player::ui_turn_held(false);
                 }
                 // `CameraOrSelectOrMove` is the left button's bit (`0x514190`): KVM's move-to
@@ -1873,7 +1877,9 @@ impl Feed {
         }
         // The bindings own the mover outright, as the reference's `BindingsState`
         // does: this frame's axes are the held bits, and no raw key state mixes in.
-        let (f, s, t) = self.held.axes();
+        // The look channel is the right button's (`IsMouselooking`), read after the
+        // edges above so a same-frame press and A/D already strafe.
+        let (f, s, t) = self.held.axes(player::look_turn());
         player::ui_move(world, f, s, t, true);
         // The heartbeat's turn axis reads right-positive, the body's left-positive.
         net::ui_set_move(f, s, -t, true);
@@ -2964,4 +2970,26 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
             .and_then(|f| f.template(id))
             .cloned()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeldAxes;
+
+    #[test]
+    fn a_and_d_turn_until_the_look_channel_is_held() {
+        let mut held = HeldAxes::default();
+        held.turn_left = true;
+        held.turn_right = true;
+        assert_eq!(held.axes(false), (0.0, 0.0, 0.0), "A+D cancel");
+        held.turn_right = false;
+        assert_eq!(held.axes(false), (0.0, 0.0, 1.0), "A turns left");
+        // `0x7c5360`: with the right button's channel held the same key strafes
+        // left and no keyboard turn runs.
+        assert_eq!(held.axes(true), (0.0, -1.0, 0.0), "A strafes left");
+        held.turn_left = false;
+        held.strafe_right = true;
+        assert_eq!(held.axes(true), (0.0, 1.0, 0.0), "D strafes right");
+        assert_eq!(held.axes(false), (0.0, 1.0, 0.0), "Q/E strafe either way");
+    }
 }
