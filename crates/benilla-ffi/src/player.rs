@@ -197,6 +197,13 @@ pub struct BnPlayerState {
     /// (`driver::transplant_up`, `0x5fe919`), so the swing finishes there
     /// instead of restarting from its first frame.
     pub overlay_anim_ms: u32,
+    /// The strafe counter-twist, radians: how far SpineLow (key bone 4) turns
+    /// the upper body back toward the aim, and Head (key bone 6) the rest
+    /// (`0x607ed0`'s tail into the `0x711f10` bone channels). WoW yaw sign,
+    /// capped at ±π/4 each; 0 when the body faces its aim. A mounted rider's
+    /// spine share is 0 and only the head turns.
+    pub twist_spine: f32,
+    pub twist_head: f32,
 }
 
 /// Wrap an angle to (-π, π].
@@ -237,6 +244,25 @@ fn camera_pivot_height(target: f32, live: f32, surface: Option<f32>, feet: f32) 
     (floor + reach)
         .min(cap)
         .clamp(CAM_PIVOT_FLOOR, CAM_PIVOT_CEIL)
+}
+
+/// The counter-twist's shares of the aim-to-body gap (`creature_anim::twist`'s
+/// `twist_shares`, the reference's `0x711f10` bone channels off `0x607ed0`'s
+/// tail): SpineLow (key bone 4) takes half the gap and Head (key bone 6) the
+/// rest, each capped at π/4, so a pure strafe's head lands back on the aim.
+fn twist_shares(gap: f32) -> (f32, f32) {
+    use std::f32::consts::FRAC_PI_4;
+    let spine = (gap * 0.5).clamp(-FRAC_PI_4, FRAC_PI_4);
+    let head = (gap - spine).clamp(-FRAC_PI_4, FRAC_PI_4);
+    (spine, head)
+}
+
+/// [`twist_shares`] with the mount gate: the `0x607ed0` tail arms SpineLow only
+/// while the unit has no mount model (`CGUnit+0xdc` null), and Head always, so a
+/// rider's head keeps its share and stops short of the aim.
+fn armed_twist_shares(gap: f32, mounted: bool) -> (f32, f32) {
+    let (spine, head) = twist_shares(gap);
+    (if mounted { 0.0 } else { spine }, head)
 }
 
 /// The strafe body offset from the aim (`creature_anim::select::strafe_body_offset`):
@@ -1771,11 +1797,17 @@ impl Player {
 
         // The rendered body eases to the aim plus the strafe counter-twist
         // (`creature_anim::select::strafe_body_offset`): ±π/2 for a pure
-        // strafe, ±π/4 with forward or back, mirrored while backpedaling.
-        let offset = strafe_body_offset(forward, strafe);
-        let cur = wrap_pi(self.model_yaw - self.yaw);
-        let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
-        self.model_yaw = wrap_pi(self.yaw + eased);
+        // strafe, ±π/4 with forward or back, mirrored while backpedaling. A
+        // swimmer faces its aim outright (`player/gait.rs`), the stroke's own
+        // clips carrying the sideways motion.
+        if self.swimming {
+            self.model_yaw = self.yaw;
+        } else {
+            let offset = strafe_body_offset(forward, strafe);
+            let cur = wrap_pi(self.model_yaw - self.yaw);
+            let eased = cur + (offset - cur) * (1.0 - (-STRAFE_BLEND_RATE * dt).exp());
+            self.model_yaw = wrap_pi(self.yaw + eased);
+        }
 
         // Smart follow (`cameraSmoothStyle` default): while the character is
         // driven, the camera returns behind the aim at `cameraYawSmoothSpeed`.
@@ -2324,6 +2356,8 @@ impl Player {
     fn state(&self) -> BnPlayerState {
         let (eye, target) = self.camera();
         let (overlay_anim, overlay_weight, overlay_elapsed) = self.overlay();
+        let (twist_spine, twist_head) =
+            armed_twist_shares(wrap_pi(self.yaw - self.model_yaw), self.mounted);
         BnPlayerState {
             pos: self.pos,
             yaw: self.model_yaw,
@@ -2340,6 +2374,8 @@ impl Player {
             overlay_anim,
             overlay_weight,
             overlay_anim_ms: (overlay_elapsed * 1000.0) as u32,
+            twist_spine,
+            twist_head,
         }
     }
 }
@@ -3111,6 +3147,42 @@ mod tests {
         assert_eq!(p.state().mount_anim, 5, "a moving mount runs");
         p.vel = [0.0, 2.5, 0.0];
         assert_eq!(p.state().mount_anim, 4, "a walk-paced mount walks");
+    }
+
+    #[test]
+    fn a_pure_strafe_twists_the_spine_half_and_the_head_the_rest() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (spine, head) = twist_shares(-FRAC_PI_2);
+        assert!((spine + FRAC_PI_4).abs() < 1.0e-6, "half the gap: {spine}");
+        assert!((head + FRAC_PI_4).abs() < 1.0e-6, "the rest: {head}");
+        assert!(
+            (spine + head + FRAC_PI_2).abs() < 1.0e-6,
+            "the head lands on the aim"
+        );
+    }
+
+    #[test]
+    fn a_diagonal_gap_is_split_evenly_and_a_wide_one_is_capped() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (spine, head) = twist_shares(FRAC_PI_4);
+        assert!((spine - FRAC_PI_4 * 0.5).abs() < 1.0e-6);
+        assert!((head - FRAC_PI_4 * 0.5).abs() < 1.0e-6);
+        // A gap past a pure strafe caps each channel at 45°, so the head stops
+        // short of the aim.
+        let (spine, head) = twist_shares(FRAC_PI_2 + 0.3);
+        assert!((spine - FRAC_PI_4).abs() < 1.0e-6);
+        assert!((head - FRAC_PI_4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_mounted_rider_keeps_only_the_head_share() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (spine, head) = armed_twist_shares(FRAC_PI_2, true);
+        assert_eq!(spine, 0.0, "SpineLow disarms under a mount");
+        assert!((head - FRAC_PI_4).abs() < 1.0e-6, "the head still turns");
+        let (spine, head) = armed_twist_shares(FRAC_PI_2, false);
+        assert!((spine - FRAC_PI_4).abs() < 1.0e-6);
+        assert!((head - FRAC_PI_4).abs() < 1.0e-6);
     }
 
     #[test]

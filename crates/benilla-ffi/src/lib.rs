@@ -5057,6 +5057,74 @@ pub extern "C" fn bn_model_attach_pose(
 
     out: *mut f32,
 ) -> u32 {
+    attach_pose_impl(
+        world,
+        model_path,
+        (base_anim, base_ms),
+        (over_anim, over_ms),
+        weight,
+        attach_id,
+        (0.0, 0.0),
+        out,
+    )
+}
+
+/// [`bn_model_attach_pose`] with the strafe counter-twist applied, so a held
+/// item's hand follows the twisted torso.
+#[no_mangle]
+
+pub extern "C" fn bn_model_attach_pose_twist(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base_anim: u32,
+
+    base_ms: u32,
+
+    over_anim: u32,
+
+    over_ms: u32,
+
+    weight: f32,
+
+    attach_id: u32,
+
+    twist_spine: f32,
+
+    twist_head: f32,
+
+    out: *mut f32,
+) -> u32 {
+    attach_pose_impl(
+        world,
+        model_path,
+        (base_anim, base_ms),
+        (over_anim, over_ms),
+        weight,
+        attach_id,
+        (twist_spine, twist_head),
+        out,
+    )
+}
+
+fn attach_pose_impl(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base: (u32, u32),
+
+    over: (u32, u32),
+
+    weight: f32,
+
+    attach_id: u32,
+
+    twist: (f32, f32),
+
+    out: *mut f32,
+) -> u32 {
     if world.is_null() || model_path.is_null() || out.is_null() {
         return 0;
     }
@@ -5104,14 +5172,14 @@ pub extern "C" fn bn_model_attach_pose(
         return 0;
     };
 
-    let mats = if weight > 0.0 && over_anim != u32::MAX {
+    let mut mats = if weight > 0.0 && over.0 != u32::MAX {
         let upper = upper_subtree(&rig.bones, 4);
 
         masked_bone_matrices(
             &rig.bones,
             &rig.global_seqs,
-            (base_anim as usize, base_ms, base_ms),
-            (over_anim as usize, over_ms, over_ms),
+            (base.0 as usize, base.1, base.1),
+            (over.0 as usize, over.1, over.1),
             weight,
             &upper,
         )
@@ -5120,15 +5188,17 @@ pub extern "C" fn bn_model_attach_pose(
             .map(|i| {
                 bone_matrix_at(
                     &rig.bones,
-                    base_anim as usize,
-                    base_ms,
-                    base_ms,
+                    base.0 as usize,
+                    base.1,
+                    base.1,
                     &rig.global_seqs,
                     i,
                 )
             })
             .collect()
     };
+
+    twist_pose(&rig.bones, &mut mats, twist.0, twist.1);
 
     let Some(m) = mats.get(bone) else {
         return 0;
@@ -6005,6 +6075,181 @@ pub(crate) fn upper_subtree(bones: &[BnBone], key: u16) -> Vec<bool> {
     mark
 }
 
+/// `root` and every bone under it, by parent chain. No key-bone fallback: the
+/// twist channels arm on their own bone alone (the reference's `[+0xd58]` bits).
+fn subtree_of(bones: &[BnBone], root: usize) -> Vec<bool> {
+    let mut mark = vec![false; bones.len()];
+
+    if root >= bones.len() {
+        return mark;
+    }
+
+    mark[root] = true;
+
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+
+        for i in 0..bones.len() {
+            let p = bones[i].parent;
+
+            if p >= 0 && (p as usize) < bones.len() && mark[p as usize] && !mark[i] {
+                mark[i] = true;
+
+                changed = true;
+            }
+        }
+    }
+
+    mark
+}
+
+/// The strafe counter-twist on a posed rig: SpineLow (key bone 4) turns its
+/// subtree back toward the aim by `spine`, Head (key bone 6) by `head`, each
+/// about the vertical through its own pivot — the reference's `0x711f10` bone
+/// channels, armed by `0x607ed0`'s tail. The head runs after the spine, on the
+/// already-twisted matrix, so it turns relative to the spine as the client
+/// composes the residual gap. Angles are WoW yaws; the UE mirrors take the sign
+/// flip every model export takes. A model lacking a key bone skips that share.
+fn twist_pose(bones: &[BnBone], mats: &mut [BnMat4], spine: f32, head: f32) {
+    for (key, yaw) in [(4u16, spine), (6u16, head)] {
+        if yaw.abs() < 1.0e-6 {
+            continue;
+        }
+
+        let Some(root) = bones.iter().position(|b| b.key_bone == key) else {
+            continue;
+        };
+
+        let Some(m) = mats.get(root) else { continue };
+
+        let pivot = [m[3], m[7], m[11]];
+
+        let sub = subtree_of(bones, root);
+
+        let (s, c) = (-yaw).sin_cos();
+
+        for (i, &on) in sub.iter().enumerate() {
+            if !on {
+                continue;
+            }
+
+            let Some(m) = mats.get_mut(i) else { continue };
+
+            // A yaw about world up: the three basis columns turn, and the bone's
+            // offset turns about the pivot (`mats` are affine, row-major).
+            for col in 0..3 {
+                let (x, y) = (m[col], m[4 + col]);
+
+                m[col] = c * x - s * y;
+
+                m[4 + col] = s * x + c * y;
+            }
+
+            let (x, y) = (m[3] - pivot[0], m[7] - pivot[1]);
+
+            m[3] = c * x - s * y + pivot[0];
+
+            m[7] = s * x + c * y + pivot[1];
+        }
+    }
+}
+
+#[cfg(test)]
+mod twist_tests {
+    use super::*;
+
+    fn bone(key: u16, parent: i16) -> BnBone {
+        BnBone {
+            key_bone: key,
+            parent,
+            pivot: [0.0; 3],
+            trans: F32Track {
+                interp: 0,
+                seq: -1,
+                ranges: Vec::new(),
+                times: Vec::new(),
+                keys: Vec::new(),
+            },
+            rot: QuatTrack {
+                interp: 0,
+                seq: -1,
+                ranges: Vec::new(),
+                times: Vec::new(),
+                keys: Vec::new(),
+            },
+            scale: F32Track {
+                interp: 0,
+                seq: -1,
+                ranges: Vec::new(),
+                times: Vec::new(),
+                keys: Vec::new(),
+            },
+        }
+    }
+
+    fn placed(at: [f32; 3]) -> BnMat4 {
+        [
+            1.0, 0.0, 0.0, at[0], 0.0, 1.0, 0.0, at[1], 0.0, 0.0, 1.0, at[2], 0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
+    /// Root, SpineLow at z 1, Head above and to the side of it, a leg off the
+    /// root. The spine's yaw turns the head and nothing below the hips; the
+    /// head's rides on top and turns about its own, already-moved pivot.
+    fn rig() -> (Vec<BnBone>, Vec<BnMat4>) {
+        let bones = vec![bone(0, -1), bone(4, 0), bone(6, 1), bone(1, 0), bone(0, 2)];
+        let mats = vec![
+            identity(),
+            placed([0.0, 0.0, 1.0]),
+            placed([1.0, 0.0, 2.0]),
+            placed([1.0, 0.0, 0.0]),
+            placed([2.0, 0.0, 2.0]),
+        ];
+        (bones, mats)
+    }
+
+    fn identity() -> BnMat4 {
+        placed([0.0; 3])
+    }
+
+    #[test]
+    fn a_spine_twist_turns_its_subtree_and_leaves_the_legs() {
+        use std::f32::consts::FRAC_PI_2;
+        let (bones, mut mats) = rig();
+        twist_pose(&bones, &mut mats, FRAC_PI_2, 0.0);
+        let leg = mats[3];
+        assert!((leg[3] - 1.0).abs() < 1.0e-6, "the leg never moves");
+        assert!((mats[1][3]).abs() < 1.0e-6, "the pivot itself holds");
+        // WoW +90° yaw on (1,0) lands on (0,1); UE's Y mirror makes it (0,-1).
+        assert!((mats[2][3]).abs() < 1.0e-6, "head x: {}", mats[2][3]);
+        assert!((mats[2][7] + 1.0).abs() < 1.0e-6, "head y: {}", mats[2][7]);
+        assert!((mats[2][11] - 2.0).abs() < 1.0e-6, "head keeps its height");
+    }
+
+    #[test]
+    fn the_head_turns_on_the_twisted_spine() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+        let (bones, mut mats) = rig();
+        twist_pose(&bones, &mut mats, FRAC_PI_2, FRAC_PI_4);
+        // The spine's 90° takes the head's (1,0) offset to UE (0,-1), and the
+        // helm — a child of the head at (2,0) — to (0,-2). The head's own
+        // residual 45° turns about the head's moved pivot, so the head bone
+        // stays put and the helm lands 45° on from it.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((mats[2][3]).abs() < 1.0e-5, "head x: {}", mats[2][3]);
+        assert!((mats[2][7] + 1.0).abs() < 1.0e-5, "head y: {}", mats[2][7]);
+        assert!((mats[2][11] - 2.0).abs() < 1.0e-6, "head keeps its height");
+        assert!((mats[4][3] + h).abs() < 1.0e-5, "helm x: {}", mats[4][3]);
+        assert!(
+            (mats[4][7] + 1.0 + h).abs() < 1.0e-5,
+            "helm y: {}",
+            mats[4][7]
+        );
+    }
+}
+
 /// Compose one global matrix per bone from local matrices, memoised per bone.
 fn compose_globals(
     bones: &[BnBone],
@@ -6175,6 +6420,7 @@ pub fn m2_skinned_positions(bytes: &[u8], anim: usize, time_ms: u32) -> Option<V
         &bones,
         anim,
         time_ms,
+        (0.0, 0.0),
     ))
 }
 
@@ -6192,6 +6438,8 @@ pub fn m2_skinned_positions_rig(
     anim: usize,
 
     time_ms: u32,
+
+    twist: (f32, f32),
 ) -> Vec<[f32; 3]> {
     // global_time_ms: for gseq tracks, use global clock.
 
@@ -6201,9 +6449,11 @@ pub fn m2_skinned_positions_rig(
 
     let global_time_ms = time_ms;
 
-    let mats: Vec<BnMat4> = (0..bones.len())
+    let mut mats: Vec<BnMat4> = (0..bones.len())
         .map(|i| bone_matrix_at(bones, anim, time_ms, global_time_ms, global_seqs, i))
         .collect();
+
+    twist_pose(bones, &mut mats, twist.0, twist.1);
 
     skin_vertices(model, &mats)
 }
@@ -6223,10 +6473,14 @@ pub fn m2_skinned_positions_rig_masked(
     over: (usize, u32, u32),
 
     weight: f32,
+
+    twist: (f32, f32),
 ) -> Vec<[f32; 3]> {
     let upper = upper_subtree(bones, 4);
 
-    let mats = masked_bone_matrices(bones, global_seqs, base, over, weight, &upper);
+    let mut mats = masked_bone_matrices(bones, global_seqs, base, over, weight, &upper);
+
+    twist_pose(bones, &mut mats, twist.0, twist.1);
 
     skin_vertices(model, &mats)
 }
@@ -6665,6 +6919,56 @@ pub extern "C" fn bn_model_skinned_positions(
 
     cap: u32,
 ) -> u32 {
+    skinned_positions_impl(world, model_path, anim_idx, time_ms, (0.0, 0.0), out, cap)
+}
+
+/// [`bn_model_skinned_positions`] with the strafe counter-twist applied to the
+/// posed rig before the blend (see [`twist_pose`]).
+#[no_mangle]
+
+pub extern "C" fn bn_model_skinned_positions_twist(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    anim_idx: u32,
+
+    time_ms: u32,
+
+    twist_spine: f32,
+
+    twist_head: f32,
+
+    out: *mut f32,
+
+    cap: u32,
+) -> u32 {
+    skinned_positions_impl(
+        world,
+        model_path,
+        anim_idx,
+        time_ms,
+        (twist_spine, twist_head),
+        out,
+        cap,
+    )
+}
+
+fn skinned_positions_impl(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    anim_idx: u32,
+
+    time_ms: u32,
+
+    twist: (f32, f32),
+
+    out: *mut f32,
+
+    cap: u32,
+) -> u32 {
     if world.is_null() || model_path.is_null() || out.is_null() {
         return 0;
     }
@@ -6691,6 +6995,7 @@ pub extern "C" fn bn_model_skinned_positions(
         &rig.bones,
         anim_idx as usize,
         time_ms,
+        twist,
     );
 
     let n = verts.len().min(cap as usize);
@@ -6733,6 +7038,75 @@ pub extern "C" fn bn_model_skinned_positions_masked(
 
     cap: u32,
 ) -> u32 {
+    skinned_positions_masked_impl(
+        world,
+        model_path,
+        (base_anim, base_ms),
+        (over_anim, over_ms),
+        weight,
+        (0.0, 0.0),
+        out,
+        cap,
+    )
+}
+
+/// [`bn_model_skinned_positions_masked`] with the strafe counter-twist applied
+/// to the posed rig before the blend: `spine` turns the SpineLow subtree,
+/// `head` the Head subtree, in WoW yaw radians (see [`twist_pose`]).
+#[no_mangle]
+
+pub extern "C" fn bn_model_skinned_positions_masked_twist(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base_anim: u32,
+
+    base_ms: u32,
+
+    over_anim: u32,
+
+    over_ms: u32,
+
+    weight: f32,
+
+    twist_spine: f32,
+
+    twist_head: f32,
+
+    out: *mut f32,
+
+    cap: u32,
+) -> u32 {
+    skinned_positions_masked_impl(
+        world,
+        model_path,
+        (base_anim, base_ms),
+        (over_anim, over_ms),
+        weight,
+        (twist_spine, twist_head),
+        out,
+        cap,
+    )
+}
+
+fn skinned_positions_masked_impl(
+    world: *const BnWorld,
+
+    model_path: *const c_char,
+
+    base: (u32, u32),
+
+    over: (u32, u32),
+
+    weight: f32,
+
+    twist: (f32, f32),
+
+    out: *mut f32,
+
+    cap: u32,
+) -> u32 {
     if world.is_null() || model_path.is_null() || out.is_null() {
         return 0;
     }
@@ -6757,9 +7131,10 @@ pub extern "C" fn bn_model_skinned_positions_masked(
         rig.cached.format.model(),
         &rig.global_seqs,
         &rig.bones,
-        (base_anim as usize, base_ms, base_ms),
-        (over_anim as usize, over_ms, over_ms),
+        (base.0 as usize, base.1, base.1),
+        (over.0 as usize, over.1, over.1),
         weight,
+        twist,
     );
 
     let n = verts.len().min(cap as usize);
