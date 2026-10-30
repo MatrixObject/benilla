@@ -212,7 +212,9 @@ struct Feed {
     /// Time until the next slow pass (units, actions, auras, loot, party).
     until_slow: f32,
     /// The first slow pass pushes the world whole without firing events; the interface has just
-    /// loaded and must not hear changes from before it.
+    /// loaded and must not hear changes from before it. The action bar is the exception: its
+    /// buttons hid themselves at `OnLoad` on an empty VM, so the first pass fires
+    /// `ACTIONBAR_SLOT_CHANGED` to give them back.
     first: bool,
 
     units: HashMap<&'static str, (Option<UnitState>, Watch)>,
@@ -1193,6 +1195,10 @@ impl Feed {
                     }
                 }
             }
+            // The first pass's slot events are held until every slot and its state are pushed:
+            // the stock `ActionButton_Update` they trigger asks `IsUsableAction`, and a state
+            // that landed after its own event would leave that button greyed.
+            let mut first_slots: Vec<u32> = Vec::new();
             for &(slot, kind, action) in &actions {
                 let id = u32::from(slot) + 1;
                 let texture = match kind {
@@ -1227,7 +1233,9 @@ impl Feed {
                 if self.action_slots.get(&id) != Some(&fresh) {
                     script.set_action(id, Some(fresh.clone()));
                     self.action_slots.insert(id, fresh);
-                    if !self.first {
+                    if self.first {
+                        first_slots.push(id);
+                    } else {
                         fire(
                             script,
                             "ACTIONBAR_SLOT_CHANGED",
@@ -1257,6 +1265,18 @@ impl Feed {
                         fire(script, "ACTIONBAR_UPDATE_STATE", Vec::new());
                     }
                 }
+            }
+            // The first pass signals its slots even though the interface has just loaded: the
+            // stock `ActionButton_OnLoad` ran on a VM with no slots and `ActionButton_Update`
+            // hid every button, so only these events bring the buttons back. The reference has
+            // the action table before the load and its OnLoad paints; ours cannot, and the
+            // app's own feed signals a new VM's slots for the same reason.
+            for id in first_slots {
+                fire(
+                    script,
+                    "ACTIONBAR_SLOT_CHANGED",
+                    vec![ScriptValue::Int(i64::from(id))],
+                );
             }
             self.actions = actions;
         }
