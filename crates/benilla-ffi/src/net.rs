@@ -1017,7 +1017,8 @@ pub(crate) enum Cmd {
         slot: u8,
         spell: u8,
     },
-    /// `CMSG_AUTOEQUIP_ITEM`: the server picks the destination equipment slot.
+    /// Auto-equip the item at this wire position. Sent as `CMSG_AUTOEQUIP_ITEM`'s equivalent swap
+    /// (see the dispatch arm): this server refuses that packet, so the destination is picked here.
     AutoEquip {
         bag: u8,
         slot: u8,
@@ -1149,6 +1150,10 @@ struct Shared {
     item_templates: Mutex<HashMap<u32, ItemTemplate>>,
     /// Entries the server answered with no record, so a row can stop waiting on its template.
     item_unknown: Mutex<HashSet<u32>>,
+    /// `ChrClasses`' relic-slot flag for our class (`UnitHasRelicSlot`, `0x519e50`): the RANGED
+    /// seat takes a relic for Paladin, Shaman and Druid and a ranged weapon otherwise. Written by
+    /// the UI pass that loads the catalog, read by the equip command's slot pick.
+    relic_slot: AtomicBool,
     /// Quest log templates, keyed by quest id.
     quests: Mutex<HashMap<u32, QuestTemplateLite>>,
     /// Quest ids already asked for (the log re-sends descriptors constantly).
@@ -1306,6 +1311,7 @@ fn shared() -> &'static Shared {
         item_queue: Mutex::new(Vec::new()),
         item_templates: Mutex::new(HashMap::new()),
         item_unknown: Mutex::new(HashSet::new()),
+        relic_slot: AtomicBool::new(false),
         quests: Mutex::new(HashMap::new()),
         quest_asked: Mutex::new(HashSet::new()),
         spells: Mutex::new(Vec::new()),
@@ -1508,6 +1514,12 @@ pub(crate) fn ui_item_unknown(entry: u32) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&entry)
+}
+
+/// Record whether our class's RANGED seat is a relic slot, from the `ChrClasses` catalog the UI
+/// pass loads; the equip command reads it to pick a destination slot.
+pub(crate) fn set_relic_slot(on: bool) {
+    shared().relic_slot.store(on, Ordering::Relaxed);
 }
 
 pub(crate) fn ui_spells() -> Vec<u32> {
@@ -2405,8 +2417,49 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     }
                 }
                 Ok(Cmd::AutoEquip { bag, slot }) => {
-                    if let Err(e) = session.auto_equip_item(bag, slot) {
-                        sh.event(format!("error|equip|{e}"));
+                    // VMaNGOS 1.12 answers `CMSG_AUTOEQUIP_ITEM` with `ERR_ITEM_NOT_FOUND` for
+                    // the very item it names (probe 2026-10-29: 255/26 refused, then equipped by
+                    // `CMSG_SWAP_INV_ITEM` 26→4), so the destination is picked here — the
+                    // template's static mask, first empty candidate, as the server's own
+                    // auto-equip would — and sent as the drag gesture's swap: both ends in the
+                    // player's array is `CMSG_SWAP_INV_ITEM`, an item inside a bag is
+                    // `CMSG_SWAP_ITEM`. The displaced piece comes back to the source slot. Ammo
+                    // (live 0) loads by entry and stays in its bag (`0x5e1704`). A template that
+                    // has not answered keeps the client's own packet.
+                    match equip_target(sh, bag, slot) {
+                        Some((0, entry)) => {
+                            let body = benilla_protocol::messages::set_ammo(entry);
+                            if let Err(e) = session
+                                .send_body(benilla_protocol::messages::opcode::CMSG_SET_AMMO, &body)
+                            {
+                                sh.event(format!("error|set_ammo|{e}"));
+                            }
+                        }
+                        Some((live, _)) => {
+                            let dst = live - 1;
+                            let sent = if bag == BAG_EQUIPPED {
+                                session.swap_inv_item(slot, dst)
+                            } else {
+                                let body = benilla_protocol::messages::swap_item(
+                                    BAG_EQUIPPED,
+                                    dst,
+                                    bag,
+                                    slot,
+                                );
+                                session.send_body(
+                                    benilla_protocol::messages::opcode::CMSG_SWAP_ITEM,
+                                    &body,
+                                )
+                            };
+                            if let Err(e) = sent {
+                                sh.event(format!("error|equip|{e}"));
+                            }
+                        }
+                        None => {
+                            if let Err(e) = session.auto_equip_item(bag, slot) {
+                                sh.event(format!("error|equip|{e}"));
+                            }
+                        }
                     }
                 }
                 Ok(Cmd::SwapInv { src, dst }) => {
@@ -3004,6 +3057,94 @@ pub(crate) fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) 
         copy_name(&mut row.name, &t.name);
     }
     row
+}
+
+/// The 1-based live inventory slots a template's `InventoryType` equips into, the static mask
+/// `IsValidForSlot` (`0x5da1d0`) reads; `benilla-app`'s `ui_items/mod.rs:869` `find_equip_slot`,
+/// which is vmangos' `Player::FindEquipSlot`. Without it every bag item looks like a misfit, so a
+/// drop on the doll takes the auto-equip arm instead of the swap and a `CursorCanGoInSlot`
+/// highlight never lights.
+pub(crate) fn find_equip_slot(inventory_type: u32, has_relic_slot: bool) -> Vec<u8> {
+    // Live-API ids: wire `EQUIPMENT_SLOT_*` + 1. Ammo is 0, loaded by entry with `CMSG_SET_AMMO`.
+    const AMMO: u8 = 0;
+    const HEAD: u8 = 1;
+    const NECK: u8 = 2;
+    const SHOULDERS: u8 = 3;
+    const BODY: u8 = 4;
+    const CHEST: u8 = 5;
+    const WAIST: u8 = 6;
+    const LEGS: u8 = 7;
+    const FEET: u8 = 8;
+    const WRISTS: u8 = 9;
+    const HANDS: u8 = 10;
+    const FINGER1: u8 = 11;
+    const FINGER2: u8 = 12;
+    const TRINKET1: u8 = 13;
+    const TRINKET2: u8 = 14;
+    const BACK: u8 = 15;
+    const MAINHAND: u8 = 16;
+    const OFFHAND: u8 = 17;
+    const RANGED: u8 = 18;
+    const TABARD: u8 = 19;
+    match inventory_type {
+        1 => vec![HEAD],
+        2 => vec![NECK],
+        3 => vec![SHOULDERS],
+        4 => vec![BODY],
+        5 | 20 => vec![CHEST],
+        6 => vec![WAIST],
+        7 => vec![LEGS],
+        8 => vec![FEET],
+        9 => vec![WRISTS],
+        10 => vec![HANDS],
+        11 => vec![FINGER1, FINGER2],
+        12 => vec![TRINKET1, TRINKET2],
+        13 => vec![MAINHAND, OFFHAND],
+        14 => vec![OFFHAND],
+        // The RANGED slot is the relic slot for Paladin, Shaman and Druid, so the ranged types and
+        // `INVTYPE_RELIC` (28) exclude each other.
+        15 if !has_relic_slot => vec![RANGED],
+        16 => vec![BACK],
+        17 => vec![MAINHAND],
+        18 => vec![20, 21, 22, 23],
+        19 => vec![TABARD],
+        21 => vec![MAINHAND],
+        22 | 23 => vec![OFFHAND],
+        24 => vec![AMMO],
+        25 | 26 if !has_relic_slot => vec![RANGED],
+        28 if has_relic_slot => vec![RANGED],
+        // NON_EQUIP (0), QUIVER (27) and anything past MAX_INVTYPE are not equippable.
+        _ => Vec::new(),
+    }
+}
+
+/// The first empty candidate of an equip mask, else the first, as vmangos `Player::FindEquipSlot`
+/// picks with `swap` set and the socket's occupant goes back to the source.
+fn equip_destination(candidates: &[u8], worn: impl Fn(u8) -> bool) -> Option<u8> {
+    candidates
+        .iter()
+        .copied()
+        .find(|live| !worn(*live))
+        .or_else(|| candidates.first().copied())
+}
+
+/// The live slot an `AutoEquip` command sends its item to (0 is the ammo seat, loaded by entry
+/// rather than moved) and the entry that names it. `None` when the row is not there or its
+/// template names no slot, so the caller can keep the client's own packet.
+fn equip_target(sh: &Shared, bag: u8, slot: u8) -> Option<(u8, u32)> {
+    let rows = inventory_rows(sh);
+    let row = rows.iter().find(|r| r.bag == bag && r.slot == slot)?;
+    let candidates = find_equip_slot(
+        row.info.inventory_type,
+        sh.relic_slot.load(Ordering::Relaxed),
+    );
+    let live = equip_destination(&candidates, |live| {
+        live != 0
+            && rows
+                .iter()
+                .any(|r| r.bag == BAG_EQUIPPED && r.slot == live - 1)
+    })?;
+    Some((live, row.entry))
 }
 
 /// Every occupied slot of the player's own inventory, in client order:
@@ -5332,8 +5473,34 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_swing_refusal, latch_swing_refusal, swing_anim_main, take_due_swing_refusal,
+        clear_swing_refusal, equip_destination, find_equip_slot, latch_swing_refusal,
+        swing_anim_main, take_due_swing_refusal,
     };
+
+    /// A failed `CMSG_AUTOEQUIP_ITEM` becomes a swap to this slot: the first empty candidate of
+    /// the template's mask, the first when every candidate is worn, and the ammo seat (live 0)
+    /// when the item is a projectile.
+    #[test]
+    fn an_equip_lands_in_its_first_empty_candidate() {
+        assert_eq!(equip_destination(&[11, 12], |live| live == 11), Some(12));
+        assert_eq!(equip_destination(&[11, 12], |_| true), Some(11));
+        assert_eq!(equip_destination(&[0], |_| true), Some(0));
+        assert_eq!(equip_destination(&[], |_| false), None);
+    }
+
+    /// The masks the destination is picked from: rings and trinkets fill both seats, the ranged
+    /// types swap places with the relic's, and a bag's seats are the worn bag slots.
+    #[test]
+    fn the_equip_masks_name_the_reference_slots() {
+        assert_eq!(find_equip_slot(11, false), vec![11, 12]);
+        assert_eq!(find_equip_slot(13, false), vec![16, 17]);
+        assert_eq!(find_equip_slot(15, false), vec![18]);
+        assert_eq!(find_equip_slot(15, true), Vec::<u8>::new());
+        assert_eq!(find_equip_slot(28, true), vec![18]);
+        assert_eq!(find_equip_slot(24, false), vec![0]);
+        assert_eq!(find_equip_slot(18, false), vec![20, 21, 22, 23]);
+        assert_eq!(find_equip_slot(0, false), Vec::<u8>::new());
+    }
 
     /// The same rows benilla-app's `select::tests` pins: the reference's `swing_anim_main` table,
     /// so the host's swing clip is the one the real client plays for that weapon.

@@ -23,6 +23,8 @@ use benilla_formats::{
 use benilla_protocol::messages::{
     ObjectFields, BAG_PLAYER_INVENTORY, SLOT_BAG_FIRST, SLOT_PACK_FIRST,
 };
+
+use crate::net::find_equip_slot;
 use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, InvSlotView, InventorySlots,
@@ -447,65 +449,6 @@ pub(crate) fn item_look(
             .and_then(|t| t.get(info.display_id))
             .and_then(|d| norm_icon(d.icon.clone())),
     )
-}
-
-/// The 1-based live inventory slots a template's `InventoryType` equips into, the static mask
-/// `IsValidForSlot` (`0x5da1d0`) reads; `benilla-app`'s `ui_items/mod.rs:869` `find_equip_slot`,
-/// which is vmangos' `Player::FindEquipSlot`. Without it every bag item looks like a misfit, so a
-/// drop on the doll takes the auto-equip arm instead of the swap and a `CursorCanGoInSlot`
-/// highlight never lights.
-fn find_equip_slot(inventory_type: u32, has_relic_slot: bool) -> Vec<u8> {
-    // Live-API ids: wire `EQUIPMENT_SLOT_*` + 1. Ammo is 0, loaded by entry with `CMSG_SET_AMMO`.
-    const AMMO: u8 = 0;
-    const HEAD: u8 = 1;
-    const NECK: u8 = 2;
-    const SHOULDERS: u8 = 3;
-    const BODY: u8 = 4;
-    const CHEST: u8 = 5;
-    const WAIST: u8 = 6;
-    const LEGS: u8 = 7;
-    const FEET: u8 = 8;
-    const WRISTS: u8 = 9;
-    const HANDS: u8 = 10;
-    const FINGER1: u8 = 11;
-    const FINGER2: u8 = 12;
-    const TRINKET1: u8 = 13;
-    const TRINKET2: u8 = 14;
-    const BACK: u8 = 15;
-    const MAINHAND: u8 = 16;
-    const OFFHAND: u8 = 17;
-    const RANGED: u8 = 18;
-    const TABARD: u8 = 19;
-    match inventory_type {
-        1 => vec![HEAD],
-        2 => vec![NECK],
-        3 => vec![SHOULDERS],
-        4 => vec![BODY],
-        5 | 20 => vec![CHEST],
-        6 => vec![WAIST],
-        7 => vec![LEGS],
-        8 => vec![FEET],
-        9 => vec![WRISTS],
-        10 => vec![HANDS],
-        11 => vec![FINGER1, FINGER2],
-        12 => vec![TRINKET1, TRINKET2],
-        13 => vec![MAINHAND, OFFHAND],
-        14 => vec![OFFHAND],
-        // The RANGED slot is the relic slot for Paladin, Shaman and Druid, so the ranged types and
-        // `INVTYPE_RELIC` (28) exclude each other.
-        15 if !has_relic_slot => vec![RANGED],
-        16 => vec![BACK],
-        17 => vec![MAINHAND],
-        18 => vec![20, 21, 22, 23],
-        19 => vec![TABARD],
-        21 => vec![MAINHAND],
-        22 | 23 => vec![OFFHAND],
-        24 => vec![AMMO],
-        25 | 26 if !has_relic_slot => vec![RANGED],
-        28 if has_relic_slot => vec![RANGED],
-        // NON_EQUIP (0), QUIVER (27) and anything past MAX_INVTYPE are not equippable.
-        _ => Vec::new(),
-    }
 }
 
 /// One occupied bag slot's view, off the item object and its template.
@@ -1416,6 +1359,9 @@ impl Feed {
                     .is_some_and(|t| t.has_relic_slot(u32::from(c)))
             })
         });
+        // The equip command picks its destination slot off the wire thread, where this catalog
+        // is not loaded: hand it the one bit of class data the mask reads.
+        net::set_relic_slot(has_relic_slot);
         // The server's half of the item lock, ahead of every feed: the reference compares the
         // incoming guid with the one still in the descriptor (`0x5ddd42`), so a handler reads the
         // slot as it was. The cursor verbs lock what they move and only the server lifts it; with
@@ -2944,11 +2890,8 @@ fn container_use(use_: &ContainerUse) {
     let (bag, slot) = wire_pos(item.bag, item.slot);
     match use_.arm {
         UseArm::Item(UseFork::Equip) => {
-            // The click's own packet, at the wire position the reference client uses. VMaNGOS 1.12
-            // answers this with `EQUIP_ERR_ITEM_NOT_FOUND` while naming the item it just resolved
-            // (probe 2026-10-29: `inv|fail|23|0|0x4000000000000016` for a pack item at 255/26), yet
-            // the same item equips over `CMSG_SWAP_INV_ITEM` 26->4 — the drag gesture's packet.
-            // The packet here stays the client's; the swap console is the host's equip instrument.
+            // The auto-equip intent at the wire position the reference client uses; the command
+            // turns it into the swap this server accepts (the packet is refused, `net::Cmd::AutoEquip`).
             let _ = net::send_cmd(Cmd::AutoEquip { bag, slot });
         }
         UseArm::Item(_) if use_.may_cast => {
