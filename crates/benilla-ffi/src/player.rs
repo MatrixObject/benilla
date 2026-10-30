@@ -786,6 +786,10 @@ pub struct Player {
     /// Latched by the water depth over the feet; gravity is
     /// bypassed while set and the feet float at `0.75·h` under the surface.
     swimming: bool,
+    /// Seconds since the last swim breach. A launch keeps the swim latch off
+    /// until it halves (`0x7c5de0`: `vel_y > 0` within `speed/(2·g)`), so a
+    /// deep breach hops and re-latches instead of flying a whole land arc.
+    swim_hop_s: f32,
     input: Input,
     jump_was_down: bool,
     /// Camera yaw in the UE convention (0 = +X, clockwise positive) and pitch
@@ -888,6 +892,7 @@ impl Player {
             vel: [0.0; 3],
             grounded: false,
             swimming: false,
+            swim_hop_s: f32::MAX,
             input: Input::default(),
             jump_was_down: false,
             // UE yaw of "facing +X" is 0; looking down the +X axis in WoW.
@@ -950,7 +955,10 @@ impl Player {
         self.vel = [0.0; 3];
         self.grounded = false;
         self.swimming = false;
-        self.snap_pending = false;
+        // The server's feet can sit under the surface (an old saved pose, a
+        // teleport into a spot the maps cut a step below); the snap lifts the
+        // body once the floor set under it is whole.
+        self.snap_pending = true;
         self.hold_pose = true;
         self.last_ground = pos;
         self.void_time = 0.0;
@@ -1561,6 +1569,7 @@ impl Player {
             return;
         }
         self.sample_server_state(dt);
+        self.swim_hop_s += dt;
         if self.dead {
             // A corpse neither walks nor jumps; the camera still follows.
             self.input = Input::default();
@@ -1588,7 +1597,10 @@ impl Player {
             self.tick_fly(dt);
             return;
         }
-        if self.snap_pending {
+        // The spawn snap waits for the floor set under the body: at login the
+        // tile is still streaming, and a one-shot taken on a missing tile
+        // lifts nothing and is then lost.
+        if self.snap_pending && !self.floors_folding(self.pos[0], self.pos[1]) {
             self.snap_pending = false;
             // A body with a floor within a step under its feet is inside the
             // building, not under it: the idle cast settles it onto that floor
@@ -1597,9 +1609,19 @@ impl Player {
                 .ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
                 .is_some_and(|(z, _)| self.pos[2] - z <= STEP_UP_HEIGHT);
             if !near {
-                if let Some(z) =
-                    self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0)
-                {
+                // The street over a spawn under a city is the lowest WMO floor;
+                // over open ground the surface itself is the terrain. Take the
+                // lower of the two, so a spawn under a bridge does not climb
+                // onto its deck when the bank beside it is nearer.
+                let lift = [
+                    self.lowest_floor_above(self.pos[0], self.pos[1], self.pos[2], 60.0),
+                    self.terrain_z(self.pos[0], self.pos[1])
+                        .filter(|z| *z > self.pos[2] + 0.1 && *z < self.pos[2] + 60.0),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by(f32::total_cmp);
+                if let Some(z) = lift {
                     self.pos[2] = z;
                     self.vel[2] = 0.0;
                     self.grounded = true;
@@ -1612,10 +1634,13 @@ impl Player {
         let strafe = self.input.strafe.clamp(-1.0, 1.0);
 
         // The swim latch: the depth over the feet against
-        // `0.75·h`, held in a 1/36-yd band. A rising launch is not caught, so
-        // a swim jump can leave the water.
+        // `0.75·h`, held in a 1/36-yd band. A launch is not caught while it is
+        // still rising inside `speed/(2·g)` of the take-off (`0x7c5de0`): a
+        // swim jump hops about that far and re-latches there, so a deep breach
+        // is a hop in the water, not a land jump out of it.
         let surface = self.water(self.pos[0], self.pos[1]);
         let enter = SWIM_DEPTH_FRAC * CAPSULE_HEIGHT;
+        let hop_blocked = self.vel[2] > 0.0 && self.swim_hop_s < SWIM_JUMP_SPEED / (2.0 * GRAVITY);
         self.swimming = match surface {
             None => false,
             Some(s) => {
@@ -1623,7 +1648,7 @@ impl Player {
                 if self.swimming {
                     depth >= enter - SWIM_HYSTERESIS
                 } else {
-                    depth > enter && self.vel[2] <= 0.0
+                    depth > enter && !hop_blocked
                 }
             }
         };
@@ -1765,6 +1790,7 @@ impl Player {
                 self.swimming = false;
                 self.vel[2] = SWIM_JUMP_SPEED;
                 self.grounded = false;
+                self.swim_hop_s = 0.0;
                 self.pos[2] += 0.05;
             } else if self.grounded {
                 self.vel[2] = JUMP_SPEED;
@@ -1829,19 +1855,21 @@ impl Player {
         if self.swimming {
             // The floating resolver: no gravity, the vertical only
             // from the stroke. The feet sink to the rest line
-            // `surface - 0.75·h` when the surface falls, and a shallow bottom
-            // still holds them higher.
+            // `surface - 0.75·h` when the surface falls, a shallow bottom still
+            // holds them higher, and the bed is solid from either side: a dive
+            // stops on its surface instead of sinking through the terrain.
             let mut z = self.pos[2] + self.vel[2] * dt;
             if let Some(s) = surface {
                 let rest = s - enter;
+                // Read the bed from the feet's own ceiling, so a fast dive
+                // cannot carry the candidate under it and miss it.
                 let bed = self
-                    .ground(self.pos[0], self.pos[1], z + STEP_UP_HEIGHT)
-                    .map(|(b, _)| b)
-                    .filter(|b| *b > z - 0.05);
-                z = match bed {
-                    Some(b) if b > rest => b,
-                    _ => z.min(rest),
-                };
+                    .ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                    .map(|(b, _)| b);
+                z = z.min(rest);
+                if let Some(b) = bed {
+                    z = z.max(b);
+                }
             }
             self.pos[2] = z;
             self.grounded = false;
@@ -3728,6 +3756,125 @@ mod tests {
         p.tiles.clear();
         p.tick(0.1);
         assert!(!p.swimming);
+    }
+
+    #[test]
+    fn a_dive_stops_on_the_lakebed() {
+        // Open water 8 yd deep over a flat bed: the capsule solver stops a dive
+        // on the bed's surface, so the swimmer can never sink through the
+        // terrain and out of the world.
+        let mut p = swimmer(0.0, -1.6);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let (cx, cy) = world_to_chunk(p.pos[0], p.pos[1]);
+        let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+        // The wet block and the bed both reach well past the swim: a dive
+        // travels forward while it sinks, and leaving either one mid-test would
+        // measure the fall, not the bed's hold.
+        let mut wide = flat_liquid(0.0);
+        wide.positions = vec![
+            [17200.0, 17200.0, 0.0],
+            [17200.0, 16900.0, 0.0],
+            [16900.0, 17200.0, 0.0],
+            [16900.0, 16900.0, 0.0],
+        ];
+        let tile = p.tiles.get_mut(&(tx, ty)).unwrap();
+        tile.liquids.clear();
+        tile.liquids.push(wide);
+        tile.buckets[b].push(Tri::new(
+            [16900.0, 16900.0, -8.0],
+            [17200.0, 16900.0, -8.0],
+            [17200.0, 17200.0, -8.0],
+        ));
+        tile.buckets[b].push(Tri::new(
+            [16900.0, 16900.0, -8.0],
+            [17200.0, 17200.0, -8.0],
+            [16900.0, 17200.0, -8.0],
+        ));
+        p.cam_pitch = -1.2; // steep down
+        p.input.forward = 1.0;
+        let mut lowest = f32::INFINITY;
+        for _ in 0..600 {
+            p.tick(1.0 / 60.0);
+            lowest = lowest.min(p.pos[2]);
+        }
+        assert!(p.swimming, "still in the water");
+        assert!(
+            lowest >= -8.0 - 1.0e-3,
+            "the bed is solid from above: lowest {lowest}"
+        );
+        assert!(
+            (p.pos[2] + 8.0).abs() < 0.05,
+            "the dive settles on the bed: {}",
+            p.pos[2]
+        );
+    }
+
+    #[test]
+    fn a_deep_breach_hops_and_re_latches_the_swim() {
+        // `0x7c5de0`: the latch refuses a launch only while it rises inside
+        // `speed/(2·g)` (~0.24 s, ~1.6 yd). Deep under the surface the hop
+        // re-latches there - it does not fly a land jump out of the water.
+        let mut p = swimmer(0.0, -5.0);
+        p.tick(1.0 / 60.0);
+        assert!(p.swimming);
+        p.input.jump = true;
+        p.tick(1.0 / 60.0);
+        assert!(!p.swimming, "the breach clears the latch");
+        let takeoff = p.pos[2];
+        p.input.jump = false;
+        let mut apex = takeoff;
+        for _ in 0..40 {
+            p.tick(1.0 / 60.0);
+            apex = apex.max(p.pos[2]);
+        }
+        assert!(
+            p.swimming,
+            "re-latched at half the launch, not at the apex: z {}",
+            p.pos[2]
+        );
+        assert!(
+            (1.4..1.8).contains(&(apex - takeoff)),
+            "a hop of about 1.6 yd: {takeoff} -> {apex}"
+        );
+        assert!(
+            (p.vel[2]).abs() < 1.0e-6,
+            "the launch's residual velocity is dropped"
+        );
+    }
+
+    #[test]
+    fn a_login_pose_under_the_terrain_is_lifted_onto_it() {
+        // The server's saved pose can sit a few feet under the surface. Once
+        // the floor set under the body is whole, the spawn snap puts the feet
+        // on the surface instead of letting gravity carry them out of the map.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        let (tx, ty) = Player::tile_of(-8800.0, -800.0);
+        let (cx, cy) = world_to_chunk(-8800.0, -800.0);
+        let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+        let mut col = TileCol::new();
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, 10.0],
+            [-8780.0, -820.0, 10.0],
+            [-8780.0, -780.0, 10.0],
+        ));
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, 10.0],
+            [-8780.0, -780.0, 10.0],
+            [-8820.0, -780.0, 10.0],
+        ));
+        p.tiles.insert((tx, ty), col);
+        p.set_server_pose([-8800.0, -800.0, 8.0], 0.0);
+        p.tick(1.0 / 60.0);
+        assert!(
+            (p.pos[2] - 10.0).abs() < 1.0e-3,
+            "lifted onto the surface: {}",
+            p.pos[2]
+        );
+        for _ in 0..120 {
+            p.tick(1.0 / 60.0);
+        }
+        assert!(p.grounded, "and standing there");
+        assert!((p.pos[2] - 10.0).abs() < 1.0e-3, "no fall afterwards");
     }
 
     #[test]
