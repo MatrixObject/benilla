@@ -78,6 +78,10 @@ mod gameobject;
 
 mod held_item;
 
+// ---- A wearer's helm model and cape skin: the parts the body model does not carry ----
+
+mod worn_item;
+
 // ---- Overhead questgiver markers: the ask sweep and the status -> model table ----
 
 mod quest_markers;

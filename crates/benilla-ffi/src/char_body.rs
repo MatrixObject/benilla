@@ -137,10 +137,13 @@ pub extern "C" fn bn_char_model_slots(
 }
 
 /// Same contract as [`bn_char_model_slots`], but the wearer is dressed: `equip`
-/// is the 10 `CreatureDisplayInfoExtra` equipment columns in bodyslot order
-/// (e0 helm, e2..e10 body), i.e. exactly what a humanoid NPC wears. The
-/// visibility set then follows the client's equipment branches (helm hides
-/// hair/ears, robes replace legs, tabard, ...) instead of the naked default.
+/// is 11 worn `ItemDisplayInfo` ids in bodyslot order — e0 helm, e1 shoulders,
+/// e2..e9 the eight body slots (shirt, chest, belt, pants, boots, wrist, gloves,
+/// tabard) and e10 the cloak. A humanoid NPC's `CreatureDisplayInfoExtra` row
+/// supplies the first ten; the cloak is a player's `PLAYER_VISIBLE_ITEM` slot
+/// 14, which the NPC table has no column for. The visibility set then follows
+/// the client's equipment branches (helm hides hair/ears, robes replace legs,
+/// the cloak's group, ...) instead of the naked default.
 #[no_mangle]
 pub extern "C" fn bn_char_model_slots_gear(
     world: *mut BnWorld,
@@ -159,8 +162,8 @@ pub extern "C" fn bn_char_model_slots_gear(
     let Some(p) = cstr_to_str(model_path as *const std::os::raw::c_char) else {
         return 0;
     };
-    // SAFETY: the caller passes 10 readable u32s.
-    let ids: [u32; 10] = unsafe { std::array::from_fn(|i| *equip.add(i)) };
+    // SAFETY: the caller passes 11 readable u32s.
+    let ids: [u32; 11] = unsafe { std::array::from_fn(|i| *equip.add(i)) };
     let w = unsafe { &mut *world };
     // A failed ItemDisplayInfo pass must not hide the body: fall back to the
     // naked geoset set rather than reporting zero visible triangles.
@@ -178,9 +181,9 @@ pub extern "C" fn bn_char_model_slots_gear(
     )
 }
 
-/// The client's worn-equipment geoset selectors for an NPC's 10 equipment
-/// columns (`EquipGeosets`), read off `ItemDisplayInfo`.
-fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 10]) -> Option<EquipGeosets> {
+/// The client's worn-equipment geoset selectors (`EquipGeosets`), read off
+/// `ItemDisplayInfo` for the 11 ids [`bn_char_model_slots_gear`] takes.
+fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 11]) -> Option<EquipGeosets> {
     if !w.ensure_item_display() {
         return None;
     }
@@ -195,6 +198,11 @@ fn equipped_geosets(w: &mut BnWorld, ids: &[u32; 10]) -> Option<EquipGeosets> {
     }
     // The head slot's HelmetGeosetVisData pair (split by sex in the selector).
     eg.helm_vis = cat.get(ids[0]).and_then(|d| d.worn_helm_vis());
+    // Branch B8's cloak group (`0x47780a`): the row's group 0 selects 1501+n.
+    eg.cloak = cat
+        .get(ids[10])
+        .map(|d| d.geoset_groups[0])
+        .filter(|g| *g != 0);
     // Branch B3's gate: the shirt cuffs, as the client reads it.
     eg.forearm_dressed = benilla_formats::forearm_dressed(&worn);
     Some(eg)
