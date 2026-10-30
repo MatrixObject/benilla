@@ -979,6 +979,11 @@ pub(crate) enum Cmd {
     ToggleCloak,
     /// `CMSG_ITEM_QUERY_SINGLE` for a template the UI asked about.
     ItemQuery(u32),
+    /// `CMSG_LEARN_TALENT`: a `Talent.dbc` row and the 0-based rank to learn up to.
+    LearnTalent {
+        talent_id: u32,
+        rank: u32,
+    },
     /// A chat line on any lane; `target` is the whisper target or channel name.
     ChatKind {
         kind: u32,
@@ -2482,6 +2487,12 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 Ok(Cmd::ItemQuery(entry)) => {
                     let _ = session.item_query(entry, 0);
+                }
+                Ok(Cmd::LearnTalent { talent_id, rank }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_LEARN_TALENT,
+                        &benilla_protocol::messages::learn_talent(talent_id, rank),
+                    );
                 }
                 Ok(Cmd::ChatKind { kind, target, msg }) => {
                     if let Err(e) = session.send_chat_kind(kind, target.as_deref(), &msg) {

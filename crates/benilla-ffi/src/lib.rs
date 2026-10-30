@@ -118,6 +118,14 @@ mod ui_feed;
 
 mod item_vm;
 
+// ---- The chain's Blizzard LoadOnDemand addons, so `UIParentLoadAddOn` can load one ----
+
+mod chain_addons;
+
+// ---- The talent window's pages, ranks and learn clicks ----
+
+mod talent_vm;
+
 // ---- The bag buttons' item-push cards: the icon quad posed for the host's 2D pass ----
 
 mod ui_cards;
@@ -8175,6 +8183,11 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
             .unwrap_or_default();
         script.set_default_bindings(defaults);
         script.load_binding_set(1);
+        // The startup scan's chain pass (`0x51c760`), before `UI_Init` reads the toc: the
+        // twelve `Blizzard_*` LoadOnDemand addons are registry rows read off the patch chain,
+        // and `UIParentLoadAddOn("Blizzard_TalentUI")` loads one through that reader. Without
+        // the rows the call finds no addon and `TalentFrame` never exists.
+        let addons = chain_addons::register(&mut script, chain, &w.data_dir);
         let toc_bytes = chain
             .read(r"Interface\FrameXML\FrameXML.toc")
             .unwrap_or_default();
@@ -8235,7 +8248,8 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         script.arm_player_login();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
         eprintln!(
-            "bn_ui_load: {} toc rows, {bindings_loaded} bindings, {} failures, {frames} frames",
+            "bn_ui_load: {} toc rows, {addons} chain addons, {bindings_loaded} bindings, \
+             {} failures, {frames} frames",
             rows,
             failures.len()
         );

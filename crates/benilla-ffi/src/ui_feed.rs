@@ -82,6 +82,8 @@ pub(crate) struct Catalogs {
     pub(crate) quest_headers: Option<QuestHeaderNames>,
     /// `QuestInfo.dbc`: the bare tag word behind a quest-log row.
     pub(crate) quest_tags: Option<QuestTagNames>,
+    /// `TalentTab.dbc` + `Talent.dbc`: the talent window's pages (`0x4f30d0`-`0x4f3454`).
+    pub(crate) talents: Option<benilla_formats::TalentCatalog>,
     /// `DurabilityCosts.dbc` + `DurabilityQuality.dbc`: the vendor's repair price.
     durability: Option<DurabilityTables>,
     race_teams: HashMap<u8, i8>,
@@ -106,6 +108,7 @@ impl Catalogs {
                 spell_ranges: None,
                 quest_headers: None,
                 quest_tags: None,
+                talents: None,
                 durability: None,
                 race_teams: HashMap::new(),
             };
@@ -126,6 +129,7 @@ impl Catalogs {
             spell_ranges: benilla_formats::load_spell_ranges(chain).ok(),
             quest_headers: load_quest_header_names(chain).ok(),
             quest_tags: load_quest_tag_names(chain).ok(),
+            talents: benilla_formats::load_talent_catalog(chain).ok(),
             durability: load_durability_tables(chain).ok(),
             race_teams: load_race_pvp_teams(chain).unwrap_or_default(),
         }
@@ -148,6 +152,11 @@ pub(crate) fn attach(world: *mut BnWorld) {
 /// assets beside the VM: the model facts and the item-push cards.
 pub(crate) fn world_ptr() -> *mut BnWorld {
     WORLD.with(|w| w.get())
+}
+
+/// Read the load's catalogs where a lane runs beside the VM (the talent window's learn clicks).
+pub(crate) fn with_catalogs<R>(f: impl FnOnce(&Catalogs) -> R) -> Option<R> {
+    CATS.with(|c| c.borrow().as_ref().map(f))
 }
 
 /// One row of the loot window: where its take goes.
@@ -304,6 +313,9 @@ struct Feed {
 
     /// The item tooltip's templates, sets and player-requirement state.
     item_vm: ItemVm,
+
+    /// The talent window's pages and learn clicks.
+    talent_vm: crate::talent_vm::TalentVm,
 }
 
 /// Which binding-held movement axes are down; the world frame's `MoveForwardStart`/`Stop` pair
@@ -386,6 +398,7 @@ impl Feed {
             resurrect: (0, false, false),
             held: HeldAxes::default(),
             item_vm: ItemVm::default(),
+            talent_vm: crate::talent_vm::TalentVm::default(),
         }
     }
 }
@@ -2123,7 +2136,13 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
         // The item tooltip builds from the VM's own template cache, so the entries the network
         // answered go in here, on the tick the builder can run.
         if let Some(cats) = cats.as_ref() {
-            FEED.with(|f| f.borrow_mut().item_vm.feed(script, cats, &own));
+            FEED.with(|f| {
+                let mut feed = f.borrow_mut();
+                feed.item_vm.feed(script, cats, &own);
+                // The talent window reads the same catalogs; its pages rebuild when the known
+                // spells, points, race or class change.
+                feed.talent_vm.feed(script, cats, &own);
+            });
         }
         // The quest log likewise lists what this pushes: our slots whose template has landed.
         crate::quest_log_vm::feed(script, cats.as_ref());
@@ -2246,6 +2265,8 @@ pub(crate) fn intents(script: &mut UiScript) {
     for spell in script.take_cancel_aura_requests() {
         let _ = net::send_cmd(Cmd::CancelAura(spell));
     }
+    // `LearnTalent(tab, index)` clicks: the talent row's learn is a `CMSG_LEARN_TALENT`.
+    crate::talent_vm::drain(script);
 
     // The vendor window. `BuyMerchantItem(index)` names the 1-based row of the stock this feed
     // pushed from [`net::ui_vendor`], so the wire wants the entry that row carries and the guid of
