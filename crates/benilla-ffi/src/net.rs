@@ -1627,6 +1627,12 @@ pub(crate) fn ui_self_fields() -> Option<ObjectFields> {
     ui_unit(guid).map(|u| u.fields)
 }
 
+/// The creature visual the server rides us on (`UNIT_FIELD_MOUNTDISPLAYID`),
+/// 0 standing.
+pub(crate) fn ui_self_mount_display() -> u32 {
+    ui_self_fields().map_or(0, |f| f.unit_mount_display_id())
+}
+
 /// Our own cast in flight: `(spell id, elapsed seconds, duration seconds)`,
 /// straight off the `SMSG_SPELL_START` the server sent.
 pub(crate) fn ui_self_cast() -> Option<(u32, f32, f32)> {

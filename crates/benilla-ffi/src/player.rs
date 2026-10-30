@@ -174,6 +174,14 @@ pub struct BnPlayerState {
     pub grounded: u32,
     /// 0/1.
     pub mounted: u32,
+    /// The mount's CreatureDisplayInfo id (`UNIT_FIELD_MOUNTDISPLAYID`), 0
+    /// standing. The host resolves the model and its DBC scale from it; a
+    /// preview mount (no server behind it) reports 0 and the host falls back.
+    pub mount_display: u32,
+    /// The mount's own AnimationData id while mounted (0 Stand, 4 Walk, 5
+    /// Run): the rider holds Mount (91) and the mount walks beneath it. 0
+    /// when standing or unmounted.
+    pub mount_anim: u32,
     /// AnimationData.dbc id to play (0 Stand, 4 Walk, 5 Run, 13 WalkBackwards,
     /// 16 AttackUnarmed, 37 JumpStart, 38 Jump, 39 JumpEnd, 40 Fall, 91 Mount,
     /// 187 JumpLandRun). A one-shot action the lower body cannot show (an attack
@@ -794,6 +802,11 @@ pub struct Player {
     surface: Option<f32>,
     /// The live boom length: snaps in when geometry intrudes, eases back out.
     cam_live: f32,
+    /// `UNIT_FIELD_MOUNTDISPLAYID` for our own guid, re-read each tick: the
+    /// mount the server rides us on, 0 standing.
+    server_mount: u32,
+    /// The M key's preview mount, for a run with no server behind it.
+    mount_preview: bool,
     mounted: bool,
     attack_left: f32,
     /// The server's combat latch (`SMSG_ATTACKSTART` with no stop): the swing
@@ -885,6 +898,8 @@ impl Player {
             pivot_height: CAM_PIVOT_STAND,
             surface: None,
             cam_live: CAM_DIST_DEFAULT,
+            server_mount: 0,
+            mount_preview: false,
             mounted: false,
             attack_left: 0.0,
             attacking: false,
@@ -1500,6 +1515,10 @@ impl Player {
     /// Read the server's combat, cast and death state for our own guid, and
     /// advance the swing cycle and the overlay's weight.
     fn sample_server_state(&mut self, dt: f32) {
+        // The mount is the server's (`UNIT_FIELD_MOUNTDISPLAYID`); the local
+        // M-key preview only stands in when no server field does.
+        self.server_mount = crate::net::ui_self_mount_display();
+        self.mounted = self.server_mount != 0 || self.mount_preview;
         self.attacking = crate::net::ui_self_attacking();
         self.cast = crate::net::ui_self_cast();
         self.dead = crate::net::ui_self_fields().is_some_and(|f| f.unit_is_dead());
@@ -1609,7 +1628,9 @@ impl Player {
             }
         };
         if self.swimming {
-            // The client dismounts on entering deep water.
+            // The client dismounts on entering deep water. A server mount is
+            // cleared through its own field; only the preview drops here.
+            self.mount_preview = false;
             self.mounted = false;
         }
         // The pivot channel: the standing preset, the swim drop in
@@ -2162,6 +2183,22 @@ impl Player {
         }
     }
 
+    /// The mount's own gait: the rider holds Mount (91) while the mount walks
+    /// or runs beneath it, on the same speed split the walk cycle uses.
+    fn mount_anim(&self) -> u32 {
+        if !self.mounted {
+            return 0;
+        }
+        let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
+        if hs < 0.1 {
+            0
+        } else if hs > 2.0 * 2.5 {
+            5 // Run
+        } else {
+            4 // Walk
+        }
+    }
+
     fn anim(&self) -> u32 {
         if self.dead {
             return ANIM_DEATH;
@@ -2255,6 +2292,8 @@ impl Player {
             speed: (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt(),
             grounded: self.grounded as u32,
             mounted: self.mounted as u32,
+            mount_display: self.server_mount,
+            mount_anim: self.mount_anim(),
             anim: self.anim(),
             overlay_anim,
             overlay_weight,
@@ -2738,11 +2777,17 @@ pub extern "C" fn bn_player_attack(world: *mut BnWorld) -> u32 {
     1
 }
 
-/// Mount / dismount (the same flag drives speed and the Mount idle).
+/// Mount / dismount preview (the same flag drives speed and the Mount idle).
+/// A server mount is the server's to end: while `UNIT_FIELD_MOUNTDISPLAYID`
+/// is set the key changes nothing.
 #[no_mangle]
 pub extern "C" fn bn_player_toggle_mount(world: *mut BnWorld) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
-    p.mounted = !p.mounted;
+    if p.server_mount != 0 {
+        return 1;
+    }
+    p.mount_preview = !p.mount_preview;
+    p.mounted = p.mount_preview;
     if p.mounted {
         p.attack_left = 0.0;
     }
@@ -3001,6 +3046,30 @@ mod tests {
             p.pos[2]
         );
     }
+
+    #[test]
+    fn the_mount_is_the_servers_and_the_preview_reports_no_display() {
+        // `UNIT_FIELD_MOUNTDISPLAYID` picks the creature the host draws; the
+        // M-key preview has no server row behind it and reports 0 so the host
+        // can fall back to its stock horse.
+        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        p.mount_preview = true;
+        p.mounted = true;
+        let s = p.state();
+        assert_eq!(s.mounted, 1);
+        assert_eq!(s.mount_display, 0);
+        p.mount_preview = false;
+        p.server_mount = 14374;
+        let s = p.state();
+        assert_eq!(s.mounted, 1);
+        assert_eq!(s.mount_display, 14374);
+        assert_eq!(s.mount_anim, 0, "a standing mount keeps its stand clip");
+        p.vel = [0.0, 11.2, 0.0];
+        assert_eq!(p.state().mount_anim, 5, "a moving mount runs");
+        p.vel = [0.0, 2.5, 0.0];
+        assert_eq!(p.state().mount_anim, 4, "a walk-paced mount walks");
+    }
+
     #[test]
     fn a_room_whose_floor_set_is_still_folding_holds_the_body() {
         // Walking into an interior before the tile's WMO fold finishes: the
