@@ -181,11 +181,12 @@ fn held_fade(fresh: Option<f32>) -> f32 {
     }
 }
 
-/// One model's `ring_footprint` times its render scale: the box the reference sizes from the model's
-/// Stand sequence (`0x60aee0`). Cached per display id, since the answer needs an M2 read. A display
-/// with no row takes the degenerate-box footprint, so a unit always gets a ring.
-fn ring_radius(world: &mut BnWorld, display_id: u32) -> f32 {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, f32>>> = OnceLock::new();
+/// One display's model-local `ring_footprint` - the box the reference sizes from the model's Stand
+/// sequence (`0x60aee0`) - with the display row's own scale. Cached per display id, since the answer
+/// needs an M2 read. A display with no row takes the degenerate-box footprint at scale 1, so a unit
+/// always gets a ring.
+fn ring_local(world: &mut BnWorld, display_id: u32) -> (f32, f32) {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, (f32, f32)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(r) = cache
         .lock()
@@ -195,23 +196,22 @@ fn ring_radius(world: &mut BnWorld, display_id: u32) -> f32 {
         return *r;
     };
     let cat = catalog(world);
-    let radius = match cat.as_ref().and_then(|c| c.model(display_id)) {
+    let answer = match cat.as_ref().and_then(|c| c.model(display_id)) {
         Some(model) => {
             let path = m2_path(&model.model_path);
-            let scale = model.scale;
             let footprint = crate::doodad_rig::model_bytes(world, &path)
                 .as_deref()
                 .and_then(|bytes| benilla_formats::parse_m2_bounds(bytes).ok())
                 .map_or(RING_FALLBACK_RADIUS, |bounds| bounds.ring_footprint);
-            footprint * scale
+            (footprint, model.scale)
         }
-        None => RING_FALLBACK_RADIUS,
+        None => (RING_FALLBACK_RADIUS, 1.0),
     };
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(display_id, radius);
-    radius
+        .insert(display_id, answer);
+    answer
 }
 
 /// The ring's box (`0x608e00`): the texture square, yawed by the fade, laid over the ground.
@@ -312,17 +312,36 @@ pub extern "C" fn bn_selection_ring(world: *mut BnWorld, out: *mut BnSelectionRi
     .color();
 
     // The mount carries the footprint when there is one (`0x60ce70` recomputes the ring's cache from
-    // the mount); the object's own `OBJECT_FIELD_SCALE_X` rides on top of either.
+    // the mount), and then its own row's scale sizes it.
     let mount = f.unit_mount_display_id();
     let display = if mount != 0 {
         mount
     } else {
         f.unit_displayid().unwrap_or(0).max(0) as u32
     };
-    let radius = ring_radius(w, display) * f.object_scale_x().unwrap_or(1.0).max(0.01);
+    // `0x608e00` multiplies the footprint `0x60aee0` cached by the object's scale once. The catalog
+    // scale already in the footprint was a second multiply: it is the same number the server writes
+    // to `OBJECT_FIELD_SCALE_X` (vmangos `Unit::GetScaleForDisplayId`), so every creature's ring
+    // came out a scale short of its body - a tarantula's circle at 0.4 of itself. The row's scale
+    // stands in only where the field never arrived.
+    let (local, row_scale) = ring_local(w, display);
+    let scale = if mount != 0 {
+        row_scale
+    } else {
+        f.object_scale_x().filter(|s| *s > 0.0).unwrap_or(row_scale)
+    };
+    let radius = local * scale.max(0.01);
     let fade = held_fade(w.player.as_ref().and_then(|p| fade_angle(p.camera_fwd())));
 
-    let feet = net::ui_unit_pose(guid).unwrap_or(unit.pos);
+    // The body is drawn on the ground clamp (`bn_ground_clamp_z`), so the ring reads the same
+    // feet: benilla clamps a creature's translation before its ring sees it, and a ring left on
+    // the wire's seat floats above a body whose Z hangs, or sinks into a slope under one that
+    // sits low.
+    let pose = net::ui_unit_pose(guid).unwrap_or(unit.pos);
+    let feet = match (unit.kind, w.player.as_ref()) {
+        (3, Some(p)) => crate::player::clamped_feet(p, pose),
+        _ => pose,
+    };
     // The projector's box: the topmost surface at or below its roof. [`ring_box`] drops what lies
     // below its floor, and holds the feet's level where the cast finds nothing.
     let box_top = feet[2] + 2.0 * radius;

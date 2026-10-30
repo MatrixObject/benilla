@@ -3017,12 +3017,22 @@ pub extern "C" fn bn_ground_clamp_z(world: *const BnWorld, x: f32, y: f32, seat_
 /// `ground_clamp_creatures`' idle arm (benilla-app/src/net/motion/spline.rs): one cast from
 /// `IDLE_UP_BAND` above the seat, reaching `IDLE_UP_BAND + GROUND_CLAMP_DOWN` down. The band is
 /// also the airborne gate, so nothing further below the seat answers.
-fn ground_clamp(p: &Player, x: f32, y: f32, seat_z: f32) -> Option<f32> {
+pub(crate) fn ground_clamp(p: &Player, x: f32, y: f32, seat_z: f32) -> Option<f32> {
     const IDLE_UP_BAND: f32 = 1.0 / 36.0;
     const GROUND_CLAMP_DOWN: f32 = 4.0;
     p.ground(x, y, seat_z + IDLE_UP_BAND)
         .map(|(z, _)| z)
         .filter(|&z| z >= seat_z - GROUND_CLAMP_DOWN)
+}
+
+/// The feet a creature is drawn at: [`ground_clamp`]'s answer, or its seat where the cast finds
+/// nothing. `bn_ground_clamp_z` hands the host the same Z, so anything that must sit on the body's
+/// floor - the selection ring at its feet - reads this rather than the wire's seat.
+pub(crate) fn clamped_feet(p: &Player, pos: [f32; 3]) -> [f32; 3] {
+    match ground_clamp(p, pos[0], pos[1], pos[2]) {
+        Some(z) => [pos[0], pos[1], z],
+        None => pos,
+    }
 }
 
 #[cfg(test)]
