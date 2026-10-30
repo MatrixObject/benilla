@@ -35,6 +35,7 @@ use benilla_ui::script::{
     EQUIPMENT_BAG,
 };
 
+use crate::item_vm::ItemVm;
 use crate::net::{self, Cmd};
 use crate::player;
 use crate::BnWorld;
@@ -61,11 +62,22 @@ thread_local! {
 pub(crate) struct Catalogs {
     races: Option<ChrRaces>,
     classes: Option<ChrClasses>,
-    spells: Option<SpellCatalog>,
+    pub(crate) spells: Option<SpellCatalog>,
     pub(crate) items: Option<ItemDisplayCatalog>,
-    factions: Option<FactionCatalog>,
+    pub(crate) factions: Option<FactionCatalog>,
     creature_types: Option<CreatureTypeTable>,
-    skills: Option<SkillLineCatalog>,
+    pub(crate) skills: Option<SkillLineCatalog>,
+    /// `ItemClass.dbc` / `ItemSubClass.dbc`: `GetItemInfo`'s type pair and the tooltip's type
+    /// cell (`0x48e070`, `0x48e311`, `0xc0db90`).
+    pub(crate) item_classes: Option<benilla_formats::ItemClassCatalog>,
+    pub(crate) item_sub_classes: Option<benilla_formats::ItemSubClassCatalog>,
+    /// `ItemSet.dbc`: the item tooltip's set block (`0x52b650`).
+    pub(crate) item_sets: Option<benilla_formats::ItemSetCatalog>,
+    /// The `$d`/`$o`/`$a` token tables the item tooltip's trigger lines expand through
+    /// (`0x5075f0`).
+    pub(crate) spell_durations: Option<benilla_formats::SpellDurationCatalog>,
+    pub(crate) spell_radii: Option<benilla_formats::SpellRadiusCatalog>,
+    pub(crate) spell_ranges: Option<benilla_formats::SpellRangeCatalog>,
     /// `QuestHeaderList.dbc`: the `ZoneOrSort` id behind each quest-log group's title.
     pub(crate) quest_headers: Option<QuestHeaderNames>,
     /// `QuestInfo.dbc`: the bare tag word behind a quest-log row.
@@ -86,6 +98,12 @@ impl Catalogs {
                 factions: None,
                 creature_types: None,
                 skills: None,
+                item_classes: None,
+                item_sub_classes: None,
+                item_sets: None,
+                spell_durations: None,
+                spell_radii: None,
+                spell_ranges: None,
                 quest_headers: None,
                 quest_tags: None,
                 durability: None,
@@ -100,6 +118,12 @@ impl Catalogs {
             factions: load_faction_catalog(chain).ok(),
             creature_types: load_creature_type_table(chain).ok(),
             skills: load_skill_line_catalog(chain).ok(),
+            item_classes: benilla_formats::load_item_classes(chain).ok(),
+            item_sub_classes: benilla_formats::load_item_sub_classes(chain).ok(),
+            item_sets: benilla_formats::load_item_sets(chain).ok(),
+            spell_durations: benilla_formats::load_spell_durations(chain).ok(),
+            spell_radii: benilla_formats::load_spell_radii(chain).ok(),
+            spell_ranges: benilla_formats::load_spell_ranges(chain).ok(),
             quest_headers: load_quest_header_names(chain).ok(),
             quest_tags: load_quest_tag_names(chain).ok(),
             durability: load_durability_tables(chain).ok(),
@@ -277,6 +301,9 @@ struct Feed {
     resurrect: (u64, bool, bool),
 
     held: HeldAxes,
+
+    /// The item tooltip's templates, sets and player-requirement state.
+    item_vm: ItemVm,
 }
 
 /// Which binding-held movement axes are down; the world frame's `MoveForwardStart`/`Stop` pair
@@ -358,6 +385,7 @@ impl Feed {
             corpse_at: None,
             resurrect: (0, false, false),
             held: HeldAxes::default(),
+            item_vm: ItemVm::default(),
         }
     }
 }
@@ -2092,6 +2120,11 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
         // The bag buttons' item animation: `ITEM_PUSH` fires once the pushed item's template has
         // landed, as `OnItemPush` defers from its item cache.
         crate::ui_cards::drain_item_pushes(script, cats.as_ref());
+        // The item tooltip builds from the VM's own template cache, so the entries the network
+        // answered go in here, on the tick the builder can run.
+        if let Some(cats) = cats.as_ref() {
+            FEED.with(|f| f.borrow_mut().item_vm.feed(script, cats, &own));
+        }
         // The quest log likewise lists what this pushes: our slots whose template has landed.
         crate::quest_log_vm::feed(script, cats.as_ref());
         // The questgiver marker sweep rides the UI tick, where the catalog and our own

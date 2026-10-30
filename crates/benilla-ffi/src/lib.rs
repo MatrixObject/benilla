@@ -114,6 +114,10 @@ mod exterior;
 
 mod ui_feed;
 
+// ---- The item tooltip's templates, sets and requirement state, as the network answered ----
+
+mod item_vm;
+
 // ---- The bag buttons' item-push cards: the icon quad posed for the host's 2D pass ----
 
 mod ui_cards;

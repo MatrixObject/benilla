@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
-    AttackSwingError, AttackerState, CastOutcome, CharCreateReq, MonsterMoveFacing, Object,
-    ObjectFields, ObjectType, ServerPacket, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST,
+    AttackSwingError, AttackerState, CastOutcome, CharCreateReq, ItemInfo, MonsterMoveFacing,
+    Object, ObjectFields, ObjectType, ServerPacket, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST,
 };
 // The server-authored path walk: benilla's own sampler, shared with the Bevy client.
 use benilla_protocol::motion::{monster_move_spline, Spline};
@@ -332,6 +332,10 @@ struct ItemTemplate {
     material: u32,
     /// `item_template.sheath`: where a stowed version of this item hangs.
     sheath: u32,
+    /// The whole response row: what the VM's item-tooltip builder reads beyond the
+    /// fields above (stats, damage, spells, bonding, requirements), as the
+    /// reference keeps one item cache for every consumer (`0x5d8b00`).
+    info: Box<ItemInfo>,
 }
 
 /// `Bag` sentinel of an equipped-slot row: inventory slot 0..18 is the player's
@@ -1592,6 +1596,29 @@ pub(crate) fn ui_item_use_template(entry: u32) -> Option<(u32, u32)> {
         .unwrap_or_else(|e| e.into_inner())
         .get(&entry)
         .map(|t| (t.class, t.start_quest))
+}
+
+/// One cached template's whole row, the item-tooltip builder's source (`0x5d8b00`'s cache
+/// lookup); `None` while the query is out.
+pub(crate) fn ui_item_template(entry: u32) -> Option<ItemInfo> {
+    shared()
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&entry)
+        .map(|t| (*t.info).clone())
+}
+
+/// Every cached template's entry id: the UI feed's priming pass pushes all of them into a fresh
+/// VM, as the reference's cache is complete from the moment the client holds it.
+pub(crate) fn ui_cached_template_ids() -> Vec<u32> {
+    shared()
+        .item_templates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Whether the server answered an item query for this entry with no record; such a row stops
@@ -3695,6 +3722,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                             start_quest: info.start_quest,
                             material: info.material,
                             sheath: info.sheath,
+                            info: info.clone(),
                         },
                     );
             } else {
