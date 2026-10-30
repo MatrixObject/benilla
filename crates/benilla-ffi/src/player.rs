@@ -94,7 +94,7 @@ const FLY_SPEED: f32 = 30.0;
 /// main hand: `net::self_swing_anim`, the reference's `swing_anim_main`).
 const ANIM_DEATH: u32 = 1;
 const ANIM_SPELL_CAST: u32 = 53;
-/// The attack overlay's visible window (s), the unarmed clip's own length.
+/// The swing one-shot's visible window (s), the unarmed clip's own length.
 const SWING_WINDOW: f32 = 0.7;
 /// The overlay's blend time constant (s): the vanilla masked layer's ease.
 const OVERLAY_BLEND: f32 = 0.12;
@@ -877,13 +877,11 @@ pub struct Player {
     /// The M key's preview mount, for a run with no server behind it.
     mount_preview: bool,
     mounted: bool,
+    /// Seconds left on the swing one-shot, armed by the swing packet
+    /// (`SMSG_ATTACKERSTATEUPDATE` through [`bn_player_swing`]). The attacker's clip
+    /// comes from that record (`0x6246a0`), never from the attack latch, so starting
+    /// or stopping auto-attack does not replay it.
     attack_left: f32,
-    /// The server's combat latch (`SMSG_ATTACKSTART` with no stop): the swing
-    /// cycle keeps repeating while set.
-    attacking: bool,
-    /// Seconds into the current weapon cycle; the attack overlay shows for the
-    /// first [`SWING_WINDOW`].
-    swing_phase: f32,
     /// The live cast the server started for us: (spell, elapsed, duration).
     cast: Option<(u32, f32, f32)>,
     /// Our own descriptor reads dead: the Death anim, and no locomotion.
@@ -980,8 +978,6 @@ impl Player {
             mount_preview: false,
             mounted: false,
             attack_left: 0.0,
-            attacking: false,
-            swing_phase: 0.0,
             cast: None,
             dead: false,
             overlay_weight: 0.0,
@@ -1605,20 +1601,8 @@ impl Player {
         // M-key preview only stands in when no server field does.
         self.server_mount = crate::net::ui_self_mount_display();
         self.mounted = self.server_mount != 0 || self.mount_preview;
-        self.attacking = crate::net::ui_self_attacking();
         self.cast = crate::net::ui_self_cast();
         self.dead = crate::net::ui_self_fields().is_some_and(|f| f.unit_is_dead());
-        // One weapon cycle per swing (`BnNetPlayer.attack_time`); the overlay
-        // shows for the cycle's first window.
-        let period = crate::net::ui_player()
-            .map(|p| p.attack_time as f32 / 1000.0)
-            .unwrap_or(2.0)
-            .max(0.4);
-        if self.attacking && !self.mounted {
-            self.swing_phase = (self.swing_phase + dt) % period;
-        } else {
-            self.swing_phase = 0.0;
-        }
         let want = if !self.dead
             && !self.mounted
             && self.grounded
@@ -2219,10 +2203,11 @@ impl Player {
             || (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt() > 0.1
     }
 
-    /// The swing edge: the server's attack latch at the head of a weapon
-    /// cycle, or the host's local unarmed test press.
+    /// The swing one-shot: armed by the swing packet (`SMSG_ATTACKERSTATEUPDATE`),
+    /// whose record carries the attacker's own clip (`0x6246a0`). The attack latch
+    /// plays nothing by itself, so the auto-attack toggle never replays a swing.
     fn swing_active(&self) -> bool {
-        (self.attacking && self.swing_phase < SWING_WINDOW) || self.attack_left > 0.0
+        self.attack_left > 0.0
     }
 
     /// A cast with a cast time, still running.
@@ -2233,9 +2218,9 @@ impl Player {
     /// The upper-body overlay `(anim, weight, elapsed)`: a one-shot the
     /// committed lower body cannot play full-body rides the masked spine
     /// subtree instead, resumed at `elapsed` seconds into the clip. The clock
-    /// is the one that drove the whole-body clip (the swing's phase into the
-    /// weapon cycle, the cast's elapsed, or the local press's spent window), so
-    /// the torso picks the swing up where the legs interrupted it.
+    /// is the one that drove the whole-body clip (the swing's spent window or
+    /// the cast's elapsed), so the torso picks the swing up where the legs
+    /// interrupted it.
     fn overlay(&self) -> (u32, f32, f32) {
         if self.dead || self.mounted || !self.grounded || !self.lower_body_committed() {
             return (0, 0.0, 0.0);
@@ -2243,11 +2228,7 @@ impl Player {
         let (anim, elapsed) = if self.cast_active() {
             (ANIM_SPELL_CAST, self.cast.map_or(0.0, |(_, e, _)| e))
         } else if self.swing_active() {
-            let elapsed = if self.attacking && self.swing_phase < SWING_WINDOW {
-                self.swing_phase
-            } else {
-                (SWING_WINDOW - self.attack_left).max(0.0)
-            };
+            let elapsed = (SWING_WINDOW - self.attack_left).max(0.0);
             (crate::net::self_swing_anim(), elapsed)
         } else {
             return (0, 0.0, 0.0);
@@ -2912,17 +2893,19 @@ pub extern "C" fn bn_player_zoom(world: *mut BnWorld, notches: f32) -> u32 {
     1
 }
 
-/// Unarmed attack edge. Ignored in the air or mounted, like the client.
+/// Our body's swing one-shot (`0x6246a0`): the host calls it for every
+/// `SMSG_ATTACKERSTATEUPDATE` that names us, a whiff as much as a hit. Ignored in
+/// the air or mounted, where the body cannot play it whole.
 #[no_mangle]
-pub extern "C" fn bn_player_attack(world: *mut BnWorld) -> u32 {
+pub extern "C" fn bn_player_swing(world: *mut BnWorld) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
     if !p.grounded || p.mounted {
         return 0;
     }
     // The clip the body swings: the equipped main hand's, the same table the
-    // server's attack latch resolves at `SMSG_ATTACKSTART`.
+    // server's `GetWeapon` (`0x6246a0`) reads at each swing.
     crate::net::refresh_self_swing_anim();
-    p.attack_left = 0.7;
+    p.attack_left = SWING_WINDOW;
     1
 }
 

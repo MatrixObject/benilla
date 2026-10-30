@@ -1282,9 +1282,15 @@ struct Shared {
     /// Whether our own guid is in melee auto-attack, from
     /// `SMSG_ATTACKSTART`/`SMSG_ATTACKSTOP`.
     self_attacking: AtomicU32,
-    /// The guid our auto-attack was started on, 0 when none: `AttackTarget`'s
-    /// toggle needs it to tell "start" from "stop" (`0x6131a0`).
+    /// The attack lock (`+0xc48`): the unit our auto-attack was started on, 0 when
+    /// none. Stored when `CMSG_ATTACKSWING` goes out, cleared only by the
+    /// `SMSG_ATTACKSTOP` echo (`0x624e40`); `StopAttack` leaves it held, so a press
+    /// that follows a stop is another stop, not a fresh swing.
     attack_target: AtomicU64,
+    /// The stop-in-flight flag (`+0xc54`, `0x624370`): set when `CMSG_ATTACKSTOP`
+    /// goes out, cleared by its echo. `0x5ecb70` sends the swing while it is set even
+    /// with the lock held, the target switch's stop-then-re-swing.
+    stop_in_flight: AtomicU32,
     /// The latched melee refusal (`0x5ecdb0`): code 1 out of range, 2 bad facing,
     /// with the time its next line is due. A landed swing clears it (`0x5ea800`);
     /// each shown line re-arms it four seconds later (`0x5ec9b6`).
@@ -1405,6 +1411,7 @@ fn shared() -> &'static Shared {
         corpse_delay_ms: AtomicU32::new(0),
         self_attacking: AtomicU32::new(0),
         attack_target: AtomicU64::new(0),
+        stop_in_flight: AtomicU32::new(0),
         swing_refusal: Mutex::new(None),
         self_swing_anim: AtomicU32::new(16),
         quest_status: Mutex::new(HashMap::new()),
@@ -1722,16 +1729,22 @@ pub(crate) fn select(guid: u64) {
     let _ = send_cmd(Cmd::Target(guid));
 }
 
-/// `StopAttack` (`0x5ecac0`): clear our attack state at once and send `CMSG_ATTACKSTOP`
-/// only when we were attacking, the reference's own guard. The server's `SMSG_ATTACKSTOP`
-/// echo is then only confirmation.
+/// `StopAttack` (`0x5ecac0`): send `CMSG_ATTACKSTOP` while the attack lock (`+0xc48`)
+/// is held. The lock stays — `0x5ecac0` and `0x624370` clear nothing — so it is only
+/// the `SMSG_ATTACKSTOP` echo (`0x624e40`) that ends the attack, and a press that
+/// follows a stop is another stop (a no-op on the wire), never a fresh swing.
 pub(crate) fn stop_attack() {
     let sh = shared();
-    let engaged = sh.self_attacking.swap(0, Ordering::SeqCst) != 0;
-    sh.attack_target.store(0, Ordering::SeqCst);
-    if engaged {
+    if sh.attack_target.load(Ordering::SeqCst) != 0 {
         let _ = send_cmd(Cmd::StopAttack);
     }
+}
+
+/// `0x5ecb70`'s send condition: the swing goes out while no attack lock (`+0xc48`) is
+/// held, or while a stop is in flight (`+0xc54`) — the target switch's stop-then-swing,
+/// and the only case a locked player re-arms.
+fn attack_sends_swing(lock: u64, stop_in_flight: bool) -> bool {
+    stop_in_flight || lock == 0
 }
 
 /// Latch a melee refusal (`0x5ecdb0`): due now, so the next tick shows it.
@@ -2362,16 +2375,26 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     }
                 }
                 Ok(Cmd::Attack(guid)) => {
-                    let _ = session.attack_swing(guid);
-                    sh.attack_target.store(guid, Ordering::SeqCst);
+                    // `0x5ecb70`'s send condition: with the attack lock (`+0xc48`) held
+                    // the swing goes out only while a stop is in flight (`+0xc54`); a start
+                    // re-issued on a locked target is the silent tail alone, which is what
+                    // keeps a second press from restarting the swing.
+                    let lock = sh.attack_target.load(Ordering::SeqCst);
+                    let stop_pending = sh.stop_in_flight.load(Ordering::SeqCst) != 0;
+                    if attack_sends_swing(lock, stop_pending) {
+                        let _ = session.attack_swing(guid);
+                        sh.attack_target.store(guid, Ordering::SeqCst);
+                    }
                     // `start_attack_local`'s tail (`0x5ecd78`): a melee start snaps the
                     // weapon out of its sheath, so our own `UNIT_FIELD_BYTES_2` sheath
                     // byte reads drawn to everyone who sees us, not only the anim.
                     let _ = session.set_sheathed(1);
                 }
                 Ok(Cmd::StopAttack) => {
+                    // `0x624370`: the stop goes out and `+0xc54` rises; `+0xc48` stays
+                    // until the echo.
                     let _ = session.attack_stop();
-                    sh.attack_target.store(0, Ordering::SeqCst);
+                    sh.stop_in_flight.store(1, Ordering::SeqCst);
                 }
                 Ok(Cmd::QuestgiverStatusQuery(npc)) => {
                     let _ = session.questgiver_status_query(npc);
@@ -3624,8 +3647,11 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(attacker);
             if *attacker == sh.self_guid.load(Ordering::SeqCst) {
+                // `0x624e40`: the echo is the only thing that clears the attack lock
+                // (`+0xc48`) and the stop flag (`+0xc54`).
                 sh.self_attacking.store(0, Ordering::SeqCst);
                 sh.attack_target.store(0, Ordering::SeqCst);
+                sh.stop_in_flight.store(0, Ordering::SeqCst);
             }
         }
         ServerPacket::MessageChat(msg) => {
@@ -3832,6 +3858,13 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             // cleared, for our own guid only (`0x6259b6`).
             if s.attacker == sh.self_guid.load(Ordering::SeqCst) {
                 clear_swing_refusal();
+            }
+            // Every swing plays the attacker's own clip off this record (`0x6246a0`
+            // reads the weapon through `GetWeapon`), and `HitInfo & 0x10000` is the
+            // one suppression — a whiff swings as a hit does. The host only plays it;
+            // the numbers below are the victim's side.
+            if s.attacker != 0 && s.hit_info & 0x10000 == 0 {
+                sh.event(format!("animate|swing|{}|{}", s.attacker, s.hit_info));
             }
             // `displayed` is the client gate: a dodged or
             // parried on-next-swing ability gets neither log line nor number.
@@ -5115,6 +5148,12 @@ pub extern "C" fn bn_net_unit_click(button: u32, guid: u64) -> u32 {
         return 3;
     }
     if crate::ui_feed::attackable(guid) {
+        // `SetSelection`'s teardown stops the old attack (`0x493a08`) before the new
+        // unit's swing (`0x4936a3`), which is why that start may send past a stop that
+        // is still in flight; a same-unit re-click returns before either (`0x493617`).
+        if ui_attack_target() != 0 && ui_attack_target() != guid {
+            stop_attack();
+        }
         return queued(Cmd::Attack(guid), 2);
     }
     // The alive branch (`0x60c162`): `UNIT_NPC_FLAGS`, gated by the cached quest status.
@@ -5934,10 +5973,31 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_equip_slots, clear_swing_refusal, defense_anim, equip_destination, find_equip_slot,
-        latch_swing_refusal, main_hand_class, row_pos_for_wire, swing_anim_main,
+        attack_sends_swing, auto_equip_slots, clear_swing_refusal, defense_anim, equip_destination,
+        find_equip_slot, latch_swing_refusal, main_hand_class, row_pos_for_wire, swing_anim_main,
         take_due_swing_refusal, wound_anim, wound_full_body, BAG_EQUIPPED,
     };
+
+    /// The attack lock (`+0xc48`) survives a stop, so a start re-issued before the
+    /// `SMSG_ATTACKSTOP` echo sends no swing (`0x5ecb70`): hammering the attack key
+    /// stops and stops again rather than restarting the swing on every press. Only a
+    /// stop in flight re-arms it — the target switch's stop-then-swing (`0x4936a3`).
+    #[test]
+    fn a_locked_attack_sends_no_second_swing() {
+        assert!(
+            !attack_sends_swing(0x42, false),
+            "locked and no stop: nothing goes out"
+        );
+        assert!(
+            attack_sends_swing(0x42, true),
+            "the switch's stop in flight re-arms"
+        );
+        assert!(attack_sends_swing(0, false), "an idle player swings");
+        assert!(
+            attack_sends_swing(0, true),
+            "a stop on nothing still lets the start send"
+        );
+    }
 
     /// A one-handed weapon reaches the off hand only for a dual wielder, as
     /// `Player::FindEquipSlot` gives it; every other type keeps the client's own map.

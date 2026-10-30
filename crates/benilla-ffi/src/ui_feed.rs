@@ -1306,7 +1306,9 @@ impl Feed {
                 }
                 let cast = net::ui_self_cast();
                 let attack = action == ATTACK_SPELL;
-                let current = (attack && net::ui_self_attacking())
+                // `IsCurrentAction` (`0x4e5467`): an attack slot is current while the
+                // attack lock (`+0xc48`) is set.
+                let current = (attack && net::ui_attack_target() != 0)
                     || cast.is_some_and(|(s, _, _)| s == action);
                 let state = ActionState {
                     usable: true,
@@ -3044,7 +3046,10 @@ fn attack_press(script: &mut UiScript, may_pick: bool) {
         fire_error(script, "ERR_NO_ATTACK_TARGET");
         return;
     }
-    if net::ui_self_attacking() {
+    if net::ui_attack_target() != 0 {
+        // `0x60ecb0` tests the attack lock (`+0xc48`), which the stop leaves held:
+        // a press before the `SMSG_ATTACKSTOP` echo is another stop, so hammering
+        // the key never re-sends the swing.
         net::stop_attack();
     } else if attack_keeps(target) {
         let _ = net::send_cmd(Cmd::Attack(target));
