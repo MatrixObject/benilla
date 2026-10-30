@@ -10728,6 +10728,132 @@ pub extern "C" fn bn_model_portrait_camera(
     1
 }
 
+/// A `<PlayerModel>` pane's camera, the record the paper dolls render through: raw camera index 1
+/// (`0x505b30`, the "characterinfo" record), not `cameraLookup[0]`. A model with no second camera
+/// gets the client's fixed rig (`0x505890`) aimed at the header bounding-box centre. Raw **WoW
+/// model space**, like [`bn_model_portrait_camera`]. The host maps `(x, -y, z) × 100` and turns
+/// the model root, not the camera, by the pane's rotation (`UIParent.lua:1422`'s 0.61 initial).
+///
+/// Returns 1 for the authored record, 2 for the fixed rig, 0 when the model cannot be read;
+/// `out` is written only on a non-zero return. Cached per path: the M2 is up to a megabyte
+/// decompressed and archives are immutable.
+#[no_mangle]
+pub extern "C" fn bn_model_pane_camera(
+    world: *mut BnWorld,
+    path: *const c_char,
+    out: *mut BnModelCamera,
+) -> u32 {
+    if world.is_null() || path.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(path) = cstr_to_str(path) else {
+        return 0;
+    };
+    // SAFETY: the caller passes the handle `bn_init` returned; `m2_bytes`
+    // only reads the archives behind it.
+    let w = unsafe { &*world };
+    thread_local! {
+        static PANE_CAM_CACHE: std::cell::RefCell<HashMap<String, Option<(u32, BnModelCamera)>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = path.to_string();
+    let cam = PANE_CAM_CACHE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if let Some(hit) = cell.get(&key) {
+            return *hit;
+        }
+        let v = m2_bytes(w, path).and_then(|b| pane_camera_record(&b));
+        cell.insert(key, v);
+        v
+    });
+    let Some((mode, cam)) = cam else {
+        return 0;
+    };
+    // SAFETY: `out` was checked non-null and points at a caller-owned struct.
+    unsafe {
+        *out = cam;
+    }
+    mode
+}
+
+/// [`bn_model_pane_camera`]'s parse: the authored `cameras[1]`, else the fixed rig.
+fn pane_camera_record(bytes: &[u8]) -> Option<(u32, BnModelCamera)> {
+    let record = |c: benilla_formats::M2PortraitCamera| BnModelCamera {
+        eye: c.position,
+        target: c.target,
+        roll: c.roll,
+        fov: c.fov,
+        near: c.near_clip,
+        far: c.far_clip,
+    };
+    if let Some(c) = benilla_formats::parse_m2_camera(bytes, 1) {
+        return Some((1, record(c)));
+    }
+    let b = benilla_formats::parse_m2_bounds(bytes).ok()?;
+    let centre = [
+        (b.bbox_min[0] + b.bbox_max[0]) * 0.5,
+        (b.bbox_min[1] + b.bbox_max[1]) * 0.5,
+        (b.bbox_min[2] + b.bbox_max[2]) * 0.5,
+    ];
+    // `PANE_FIXED_EYE_WOW` and the fixed record's clip planes, `0x505890`.
+    Some((
+        2,
+        BnModelCamera {
+            eye: [200.0 / 36.0, 0.0, 87.0 / 36.0],
+            target: centre,
+            roll: 0.0,
+            fov: 0.5,
+            near: 1.0 / 36.0,
+            far: 5000.0,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod pane_camera_tests {
+    use super::*;
+
+    /// Every playable race carries the authored `cameras[1]` record that the
+    /// reference's `<PlayerModel>` panes render through (`0x505b30`), so a pane
+    /// must take it verbatim instead of the fixed rig.
+    #[test]
+    fn a_pane_takes_the_authored_cameras_1() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        for (path, eye, target, fov) in [
+            (
+                "Character\\Human\\Male\\HumanMale.m2",
+                [3.6585_f32, 0.0338, 0.9227],
+                [-0.3644_f32, 0.0291, 0.9873],
+                0.97991_f32,
+            ),
+            (
+                "Character\\Tauren\\Male\\TaurenMale.m2",
+                [4.4317, -0.0213, 1.0861],
+                [0.2520, -0.0210, 1.0086],
+                0.87991,
+            ),
+        ] {
+            let bytes = chain.read_file(path).expect("read model");
+            let (mode, cam) =
+                pane_camera_record(&bytes).unwrap_or_else(|| panic!("{path}: no pane camera"));
+            assert_eq!(mode, 1, "{path}: took the fixed rig, not cameras[1]");
+            for (got, want) in cam.eye.iter().zip(eye).chain(cam.target.iter().zip(target)) {
+                assert!(close(*got, want), "{path}: eye/target {got} vs {want}");
+            }
+            assert!(close(cam.fov, fov), "{path}: fov {} vs {fov}", cam.fov);
+            assert!(close(cam.near, 8.0 / 36.0), "{path}: near {}", cam.near);
+            assert!(close(cam.far, 1000.0 / 36.0), "{path}: far {}", cam.far);
+        }
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_read_has_no_pane_camera() {
+        assert!(pane_camera_record(&[0u8; 16]).is_none());
+    }
+}
+
 /// A global-sequence channel's parked key: the stage bones sit at t = 0 and
 /// never animate (the client samples t = 0).
 fn parked<T: Copy>(keys: &[(u32, T)]) -> Option<T> {
