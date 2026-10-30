@@ -163,7 +163,7 @@ fn main() {
     // frames) instead of the glue menu - that is the dump the HUD runs at
     // 2s intervals after enter_world.
     if std::env::args().nth(2).as_deref() == Some("full") {
-        let frames = bn_ui_load(cworld);
+        let frames = bn_ui_load(world);
         println!("== full FrameXML load: {frames} frames");
     } else {
         bn_ui_load_glue(cworld);
