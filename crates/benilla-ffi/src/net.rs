@@ -829,6 +829,19 @@ struct UnitRec {
     /// The live `SMSG_MONSTER_MOVE` spline this unit is walking, evaluated by benilla's own
     /// [`Spline`] (the same sampler the Bevy client uses); `None` at rest.
     spline: Option<Spline>,
+    /// The display facing [`bn_net_units_pump`] turns toward its goal, and the turn ring that
+    /// smooths it; `None` while the wire owns the pose, so a body re-seeds from the pose it
+    /// stops at when it starts walking again.
+    disp: Option<DispFacing>,
+}
+
+/// A stationary body's display-facing state: benilla-app's `DisplayFacing`
+/// (`net/motion/facing.rs`), the client's `CGUnit+0xc94` yaw and `+0xc9c..+0xca8` delta ring.
+struct DispFacing {
+    /// The yaw drawn, which the goal-chain pump turns every frame.
+    cur: f32,
+    /// A zero head means the next pump takes the ring-fill leg.
+    hist: [f32; 4],
 }
 
 /// The unit's present pose: benilla's spline sample while one exists, else the
@@ -841,13 +854,157 @@ struct UnitRec {
 /// back to where it began the moment it stopped (the "回到原点"/stutter report).
 fn effective_pose(rec: &UnitRec) -> ([f32; 3], f32) {
     let now = std::time::Instant::now();
-    match &rec.spline {
+    let wire = match &rec.spline {
         Some(s) => {
             let (pos, facing, _pitch) = s.sample(now);
             (pos, facing.unwrap_or(rec.facing))
         }
         None => (rec.pos, rec.facing),
+    };
+    // What the client shows is the display facing, not the raw wire one: the Bevy client writes
+    // `Transform.rotation` from the goal-chain pump and keeps the wire yaw only as its fallback
+    // goal (`benilla-app/src/net/motion/facing.rs`).
+    (wire.0, rec.disp.as_ref().map(|d| d.cur).unwrap_or(wire.1))
+}
+
+/// `[0x8029d0]`, inclusive on the unfolded goal-minus-current delta: inside it the goal is taken
+/// verbatim and the ring resets.
+const TURN_DEAD_BAND: f32 = 0.01;
+/// `[0x8029b0]`: a plain mean over the 4-sample ring.
+const TURN_RING_AVG: f32 = 0.25;
+/// `[0x7ffa24]`: with the overshoot clamp binding, the error halves every pump.
+const TURN_STEP_FRACTION: f32 = 0.5;
+/// `UNIT_FLAG_STUNNED`, goal-chain row 4.
+const UNIT_FLAG_STUNNED: u32 = 0x0004_0000;
+
+/// The shortest signed arc to `angle`, so a turn never takes the long way round the circle.
+fn wrap_pi(angle: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    PI - (PI - angle).rem_euclid(TAU)
+}
+
+/// One pump of the client's `+0xc98` box filter (`0x600cd0`, `600ea8`-`600fd5`), verbatim from
+/// benilla-app's `filter_step`. It has no `dt`: the reference halves the error per frame.
+fn facing_filter_step(cur: f32, goal: f32, hist: &mut [f32; 4]) -> f32 {
+    use std::f32::consts::TAU;
+    let raw_delta = goal - cur;
+    if raw_delta.abs() <= TURN_DEAD_BAND {
+        *hist = [0.0; 4];
+        return goal.rem_euclid(TAU);
     }
+    let delta = wrap_pi(raw_delta);
+    // A reversal empties the ring (`600f12`-`600f3b`).
+    if delta * hist[0] < 0.0 {
+        hist[0] = 0.0;
+    }
+    let step = if hist[0] == 0.0 {
+        *hist = [delta; 4]; // the ring-fill leg, no averaging (`600f50`-`600f6a`)
+        delta
+    } else {
+        hist.copy_within(0..3, 1); // `600f76 memmove(+0xca0, +0xc9c, 12)`
+        hist[0] = delta;
+        let avg = hist.iter().sum::<f32>() * TURN_RING_AVG;
+        // Never overshoot the goal (`600f9e`-`600fc9`).
+        if avg.abs() > delta.abs() {
+            delta
+        } else {
+            avg
+        }
+    };
+    (cur + step * TURN_STEP_FRACTION).rem_euclid(TAU)
+}
+
+/// The horizontal bearing from `from` to `to`, `None` when they coincide - the goal chain's own
+/// guard, so a mob standing on your head keeps its wire facing instead of spinning on noise.
+fn facing_bearing(from: [f32; 3], to: [f32; 3]) -> Option<f32> {
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    (dx * dx + dy * dy >= 1.0e-4).then(|| dy.atan2(dx))
+}
+
+/// One frame of the client's facing goal chain (`0x600cd0`), benilla-app's `drive_display_facing`.
+///
+/// The server does not report a creature turning to face its victim while both stand in melee: it
+/// sends the walk, then nothing. The 1.12 client owns that turn, and its chain in branch order is
+///
+/// | row | test | goal |
+/// |---|---|---|
+/// | 0 | the body we steer | excluded |
+/// | 1 | walking a spline | the wire owns the pose |
+/// | 2 | `UNIT_STANDSTATE != 0` | raw |
+/// | 4 | `UNIT_FLAG_STUNNED` | raw |
+/// | 6 | another player | the relay's own facing, excluded |
+/// | 7 | `UNIT_FIELD_TARGET` resolves | the bearing to that unit |
+/// | - | none of the above | the raw wire facing |
+///
+/// Row 3 (a state emote whose `Emotes.dbc` flags lack `EMOTE_FLAG_INTERACTION`) is not built here:
+/// the middle layer loads no emote catalog, so no emote can pin a body. No range, line-of-sight,
+/// faction or alive test is on this path.
+#[no_mangle]
+pub extern "C" fn bn_net_units_pump() -> u32 {
+    use std::f32::consts::TAU;
+    let sh = shared();
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let mut units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+
+    // Goals first, then apply: no transform is mutated while another's pose is read.
+    let mut goals: Vec<(u64, Option<f32>)> = Vec::new();
+    let mut ungoverned: Vec<u64> = Vec::new();
+    for (guid, rec) in units.iter() {
+        // Rows 0 and 6, and only creatures are governed: a gameobject sits at its authored facing.
+        if *guid == self_guid || rec.kind != 3 {
+            continue;
+        }
+        // Row 1: walking. Drop the state so the next seed reads the pose it stops at.
+        if matches!(rec.spline.as_ref(), Some(s) if s.running(now)) {
+            ungoverned.push(*guid);
+            continue;
+        }
+        // Rows 2 and 4: a stand state or a stun pins the body to the wire's facing.
+        if rec.fields.unit_stand_state() != 0 || rec.fields.unit_flags() & UNIT_FLAG_STUNNED != 0 {
+            goals.push((*guid, None));
+            continue;
+        }
+        // Row 7.
+        let goal = rec
+            .fields
+            .unit_target()
+            .and_then(|t| units.get(&t))
+            .and_then(|t| facing_bearing(effective_pose(rec).0, effective_pose(t).0));
+        goals.push((*guid, goal));
+    }
+    for guid in &ungoverned {
+        if let Some(rec) = units.get_mut(guid) {
+            rec.disp = None;
+        }
+    }
+
+    let mut turned = 0;
+    for (guid, goal) in goals {
+        let Some(rec) = units.get_mut(&guid) else {
+            continue;
+        };
+        // The seed leg: the pose still comes from the wire, so nothing is written this frame
+        // (`0x601020`).
+        let Some(disp) = rec.disp.as_mut() else {
+            rec.disp = Some(DispFacing {
+                cur: effective_pose(rec).1.rem_euclid(TAU),
+                hist: [0.0; 4],
+            });
+            continue;
+        };
+        // The raw facing is a goal, not a freeze: it swings a body back when its target dies.
+        let new = facing_filter_step(
+            disp.cur,
+            goal.unwrap_or(rec.facing).rem_euclid(TAU),
+            &mut disp.hist,
+        );
+        if new != disp.cur {
+            disp.cur = new;
+            turned += 1;
+        }
+    }
+    turned
 }
 
 /// Begin a [`Spline`] on `guid` from a `SMSG_MONSTER_MOVE`, through benilla's own
@@ -891,6 +1048,8 @@ fn apply_monster_move(
                 rec.facing = f;
             }
             rec.spline = Some(spline);
+            // A wire pose overrides the local facing turn: the smoother re-seeds from it.
+            rec.disp = None;
         }
         None => {
             // A stop / zero duration / one-point path: no walk. Keep where the last
@@ -907,6 +1066,7 @@ fn apply_monster_move(
             if let Some(f) = face {
                 rec.facing = f;
             }
+            rec.disp = None;
         }
     }
 }
@@ -2445,6 +2605,8 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
     let mut prev_input: (f32, f32, f32) = (0.0, 0.0, 0.0);
     let mut last_move_flags: u32 = 0;
     let mut last_pose_sent: Option<([f32; 3], f32)> = None;
+    let mut last_facing: Option<f32> = None;
+    let mut next_face_log = std::time::Instant::now();
 
     loop {
         // Commands first: sending is cheap and must not wait a server packet.
@@ -2904,6 +3066,8 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
         const MF_BACKWARD: u32 = 0x2;
         const MF_STRAFE_LEFT: u32 = 0x4;
         const MF_STRAFE_RIGHT: u32 = 0x8;
+        const MF_TURN_LEFT: u32 = 0x10;
+        const MF_TURN_RIGHT: u32 = 0x20;
         let input = {
             let g = sh.last_input.lock().unwrap_or_else(|e| e.into_inner());
             *g
@@ -2929,21 +3093,30 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
             }
             let forward = input.0;
             let strafe = input.1;
+            let turn = input.2;
             let moving_fwd = forward > 0.1;
             let moving_bwd = forward < -0.1;
             let strafe_r = strafe > 0.1;
             let strafe_l = strafe < -0.1;
+            // The host's turn axis is left-positive, as `bn_player_input`'s and as benilla-app's
+            // `gait.rs:54` (`+yaw = turning left`).
+            let turning_l = turn > 0.1;
+            let turning_r = turn < -0.1;
 
             let prev_fwd = prev_input.0 > 0.1;
             let prev_bwd = prev_input.0 < -0.1;
             let prev_sr = prev_input.1 > 0.1;
             let prev_sl = prev_input.1 < -0.1;
+            let prev_tl = prev_input.2 > 0.1;
+            let prev_tr = prev_input.2 < -0.1;
 
             // Compute current flags from input.
             let cur_flags: u32 = (if moving_fwd { MF_FORWARD } else { 0 })
                 | (if moving_bwd { MF_BACKWARD } else { 0 })
                 | (if strafe_r { MF_STRAFE_RIGHT } else { 0 })
-                | (if strafe_l { MF_STRAFE_LEFT } else { 0 });
+                | (if strafe_l { MF_STRAFE_LEFT } else { 0 })
+                | (if turning_l { MF_TURN_LEFT } else { 0 })
+                | (if turning_r { MF_TURN_RIGHT } else { 0 });
 
             // Use session.send_movement so MovementInfo construction and serialization
             // exactly match WorldWriter.send_movement (no manual struct build + send_body).
@@ -3011,6 +3184,39 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     pos[0], pos[1], pos[2]
                 ));
             }
+
+            // The turn axis' edges (`movement_net.rs:255-261`): a held turn rotates the mover for
+            // every observer through these flags, so no separate facing report goes out.
+            if turning_l && !prev_tl && !prev_tr {
+                send_move(MOVE_OP::MSG_MOVE_START_TURN_LEFT, MF_TURN_LEFT);
+                sh.event(format!("move|StartTurnLeft|{:.3}", yaw));
+            }
+            if turning_r && !prev_tr && !prev_tl {
+                send_move(MOVE_OP::MSG_MOVE_START_TURN_RIGHT, MF_TURN_RIGHT);
+                sh.event(format!("move|StartTurnRight|{:.3}", yaw));
+            }
+            if !turning_l && !turning_r && (prev_tl || prev_tr) {
+                send_move(MOVE_OP::MSG_MOVE_STOP_TURN, 0);
+                sh.event(format!("move|StopTurn|{:.3}", yaw));
+            }
+
+            // A facing change off the turn axis -- the camera drag, the chase turn, a
+            // server-authored snap -- is the mover's own report, one `SET_FACING` per tick it
+            // differs (`movement_net.rs:262-267`). Without it the server keeps the yaw from the
+            // last packet that moved us, so a turn in place is never seen and every melee press
+            // comes back `SMSG_ATTACKSWING_BADFACING`. The compare runs whether or not a packet
+            // went out, so a released turn leaves no catch-up facing.
+            if cur_flags & (MF_TURN_LEFT | MF_TURN_RIGHT) == 0
+                && matches!(last_facing, Some(prev) if prev != yaw)
+            {
+                send_move(MOVE_OP::MSG_MOVE_SET_FACING, cur_flags);
+                let fnow = std::time::Instant::now();
+                if fnow >= next_face_log {
+                    sh.event(format!("move|SetFacing|{:.1}", yaw.to_degrees()));
+                    next_face_log = fnow + HB_INTERVAL;
+                }
+            }
+            last_facing = Some(yaw);
 
             // Heartbeat while moving (every 500 ms, carries all active flags).
             let now = std::time::Instant::now();
@@ -3551,6 +3757,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                         pos: [0.0; 3],
                         facing: 0.0,
                         spline: None,
+                        disp: None,
                     },
                 );
             }
@@ -3568,6 +3775,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                     rec.pos = [v.x, v.y, v.z];
                     rec.facing = o;
                     rec.spline = None;
+                    rec.disp = None;
                 }
             }
             if is_self {
@@ -3593,6 +3801,7 @@ fn apply_object(obj: &Object, sh: &Shared) {
                     pos,
                     facing,
                     spline: None,
+                    disp: None,
                 },
             );
             if *object_type == ObjectType::Player {
