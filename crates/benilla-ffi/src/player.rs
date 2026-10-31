@@ -1559,7 +1559,7 @@ impl Player {
     /// W/A/S/D level, Space/Ctrl vertical, with no gravity, collision or water.
     /// The camera keeps the third-person framing but skips the boom probe, so
     /// walls and floors never pull it into the body.
-    fn tick_fly(&mut self, dt: f32) {
+    fn tick_fly(&mut self, dt: f32, look_held: bool) {
         let forward = self.input.forward.clamp(-1.0, 1.0);
         let strafe = self.input.strafe.clamp(-1.0, 1.0);
         let up = self.input.up.clamp(-1.0, 1.0);
@@ -1567,7 +1567,9 @@ impl Player {
         if turn != 0.0 {
             let d = turn * TURN_RATE * TURN_RATE_MOVING * dt;
             self.yaw = wrap_pi(self.yaw + d);
-            self.cam_yaw = wrap_pi(self.cam_yaw - d);
+            if !look_held {
+                self.cam_yaw = wrap_pi(self.cam_yaw - d);
+            }
         }
         let (sy, cy) = self.yaw.sin_cos();
         let mut v = [cy * forward + sy * strafe, sy * forward - cy * strafe, up];
@@ -1595,8 +1597,9 @@ impl Player {
             self.model_yaw = self.yaw;
         }
         self.body_turn_step = 0.0;
-        // Smart follow behind the aim, as on the ground.
-        if forward.abs() + strafe.abs() > 0.01 {
+        // Smart follow behind the aim, as on the ground; a held drag freezes
+        // it (`camera`'s `FollowRig::advance` cancels while `look_held`).
+        if forward.abs() + strafe.abs() > 0.01 && !look_held {
             let target = wrap_pi(-self.yaw);
             let d = wrap_pi(target - self.cam_yaw);
             let max = FOLLOW_RATE * dt;
@@ -1674,7 +1677,7 @@ impl Player {
             }
         }
         if self.fly {
-            self.tick_fly(dt);
+            self.tick_fly(dt, looking);
             return;
         }
         // The spawn snap waits for the floor set under the body: at login the
@@ -1760,7 +1763,9 @@ impl Player {
         // The 1.12 control model: A/D turn the character unless the
         // right mouse button is held, when the host reports them as strafe. A
         // keyboard turn is left-positive and carries the aim and the camera
-        // rigidly (`camera`); the rendered body is the standing chase's and
+        // rigidly (`camera`), unless a look session is held: `seat_camera` takes
+        // no carry while the drag owns the camera, so the body turns under a
+        // view the pointer keeps. The rendered body is the standing chase's and
         // lags behind (`player/gait.rs`); translating or falling scales the
         // turn by 0.75.
         let turn = self.input.turn.clamp(-1.0, 1.0);
@@ -1773,7 +1778,9 @@ impl Player {
                 };
             let d = turn * rate * dt;
             self.yaw = wrap_pi(self.yaw + d);
-            self.cam_yaw = wrap_pi(self.cam_yaw - d);
+            if !looking {
+                self.cam_yaw = wrap_pi(self.cam_yaw - d);
+            }
         }
 
         // WASD moves in the aim's basis, as the client does (`state`:
@@ -3914,6 +3921,37 @@ mod tests {
         assert!(p.yaw.abs() < 1.0e-6, "the aim stays put");
         assert!(p.model_yaw.abs() < 1.0e-6);
         assert!((p.cam_yaw - 100.0 * LOOK_SENSITIVITY).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn a_held_look_session_freezes_the_camera_under_a_keyboard_turn() {
+        // The host reports the held look button every frame, zero delta
+        // included, so the latch is armed before each tick.
+        let mut p = player_on_flat();
+        let cam = p.cam_yaw;
+        p.input.turn = 1.0;
+        for _ in 0..10 {
+            p.look(0.0, 0.0, false);
+            p.tick(0.05);
+        }
+        let d = TURN_RATE * 0.5;
+        assert!(
+            (p.yaw - d).abs() < 1.0e-4,
+            "the body turns under the drag: {}",
+            p.yaw
+        );
+        assert!(
+            (p.cam_yaw - cam).abs() < 1.0e-5,
+            "a held drag takes no carry (`seat_camera`): {}",
+            p.cam_yaw
+        );
+        // Released, the next keyboard turn carries the camera again.
+        p.tick(0.05);
+        assert!(
+            (p.cam_yaw - (cam - TURN_RATE * 0.05)).abs() < 1.0e-4,
+            "the carry returns on release: {}",
+            p.cam_yaw
+        );
     }
 
     #[test]
