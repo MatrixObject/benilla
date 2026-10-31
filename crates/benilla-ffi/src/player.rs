@@ -50,6 +50,11 @@ const STEP_UP_ADVANCE: f32 = STEP_UP_HEIGHT * 1.191_753_6;
 /// onto a floor inside it; anything deeper is a drop, not a step
 /// (`benilla-app`'s `STEP_SNAP_SLACK`).
 const STEP_SNAP_SLACK: f32 = 1.0 / 36.0;
+/// The one-sided facing band (`0x632700`: a face the motion approaches from
+/// its back is skipped; `benilla-world`'s `one_sided::FACING_EPS`). The
+/// downward probe and the wall test read it the same way, so a beam's
+/// underside is a ceiling to the head and no floor to the feet.
+const FACE_FACING_EPS: f32 = 1.0e-5;
 // The capsule the client traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
 // the probe below is a point at the feet plus the step window, which is the
 // same corridor for a walker on the floors this data ships.
@@ -1197,9 +1202,15 @@ impl Player {
         let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<(f32, f32)> = None;
         let mut consider = |t: &Tri| {
+            // The reference's one-sided trace (`0x632700`): a downward probe
+            // keeps only faces wound up at it. A beam's underside is a ceiling
+            // to the head, never the ground under the feet.
+            if t.n[2] < -FACE_FACING_EPS {
+                return;
+            }
             if let Some(z) = t.height_at(x, y, ceil) {
                 if best.map_or(true, |(bz, _)| z > bz) {
-                    best = Some((z, t.n[2].abs()));
+                    best = Some((z, t.n[2]));
                 }
             }
         };
@@ -1220,6 +1231,57 @@ impl Player {
         } else {
             // Crossing a border before the neighbour finished loading: any
             // loaded tile still answers in world coords.
+            for (&(k0, k1), tile) in &self.tiles {
+                if let Some(i) = TileCol::wmo_cell(k0, k1, x, y) {
+                    for t in &tile.wmo_cells[i] {
+                        consider(t);
+                    }
+                    for t in &tile.doodad_cells[i] {
+                        consider(t);
+                    }
+                }
+                for bucket in &tile.buckets {
+                    for t in bucket {
+                        consider(t);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// The lowest downward-facing surface at or above `above` over (x, y): the
+    /// head's ceiling. The same one-sided law from the other side, an upward
+    /// probe keeping only faces wound down at it (`0x632700`), so a floor is
+    /// never a ceiling and a beam's underside is always one.
+    fn ceiling(&self, x: f32, y: f32, above: f32) -> Option<f32> {
+        let (tx, ty) = Self::tile_of(x, y);
+        let mut best: Option<f32> = None;
+        let mut consider = |t: &Tri| {
+            if t.n[2] > -FACE_FACING_EPS {
+                return;
+            }
+            if let Some(z) = t.height_at(x, y, f32::MAX) {
+                if z >= above && best.is_none_or(|b| z < b) {
+                    best = Some(z);
+                }
+            }
+        };
+        if let Some(tile) = self.tiles.get(&(tx, ty)) {
+            let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
+            let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+            for t in &tile.buckets[b] {
+                consider(t);
+            }
+            if let Some(i) = TileCol::wmo_cell(tx, ty, x, y) {
+                for t in &tile.wmo_cells[i] {
+                    consider(t);
+                }
+                for t in &tile.doodad_cells[i] {
+                    consider(t);
+                }
+            }
+        } else {
             for (&(k0, k1), tile) in &self.tiles {
                 if let Some(i) = TileCol::wmo_cell(k0, k1, x, y) {
                     for t in &tile.wmo_cells[i] {
@@ -1261,6 +1323,10 @@ impl Player {
         let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<f32> = None;
         let mut consider = |t: &Tri| {
+            // One-sided like `ground`: an overhanging face is a ceiling.
+            if t.n[2] < -FACE_FACING_EPS {
+                return;
+            }
             if let Some(z) = t.height_at(x, y, f32::MAX) {
                 best = Some(best.map_or(z, |bz| bz.max(z)));
             }
@@ -1301,6 +1367,49 @@ impl Player {
         (z - self.pos[2] > 0.05).then_some(z)
     }
 
+    /// The destination's floor gate, the reference's walk resolver: a floor
+    /// more than a step above the feet is a wall, unless the travel rides it
+    /// (the foot cone, `0x631440`) or certifies a step-up landing ahead
+    /// (`0x636147`). A drop never blocks - walking off a ledge is the snap's
+    /// business (`0x6367b0`).
+    fn floor_blocks(&self, x: f32, y: f32, dirx: f32, diry: f32) -> bool {
+        let Some((z, nz)) = self.ground(x, y, self.pos[2] + STEP_UP_HEIGHT) else {
+            // Nothing within reach. If the terrain there stands above the step
+            // reach, it is a face too steep to climb and the body must not
+            // enter it: walking it in sinks the capsule under the surface,
+            // where `ground` finds no floor above the feet and the body drops
+            // out of the world. Impassable chunks add a fence for the same
+            // reason (`0x6aae2a`). A destination over a drop answers below the
+            // feet instead, so walking off a cliff still falls.
+            return self
+                .terrain_z(x, y)
+                .is_some_and(|t| t > self.pos[2] + STEP_UP_HEIGHT);
+        };
+        let rise = z - self.pos[2];
+        if rise > STEP_UP_HEIGHT - 1.0e-3 {
+            return true;
+        }
+        // A walkable face never blocks, and neither does a steep one at or
+        // under the feet: walking off a kerb follows its bevel down.
+        if nz >= GROUND_COS || rise <= 0.0 {
+            return false;
+        }
+        // A steep edge rising inside the foot cone is ridden up its skirt; a
+        // higher one must certify a step-up landing ahead.
+        rise > FOOT_CONE_HEIGHT && self.step_up_landing(x, y, dirx, diry).is_none()
+    }
+
+    /// A steep destination floor inside the foot cone: the skirt the body
+    /// rides up (`0x631440`, `0x635c00`), so a wall test at the destination
+    /// does not stop the travel.
+    fn destination_ride(&self, x: f32, y: f32) -> bool {
+        let Some((z, nz)) = self.ground(x, y, self.pos[2] + STEP_UP_HEIGHT) else {
+            return false;
+        };
+        let rise = z - self.pos[2];
+        nz < GROUND_COS && rise > 0.0 && rise <= FOOT_CONE_HEIGHT
+    }
+
     /// The liquid surface over (x, y), the lowest of any stacked blocks
     /// so a stream over the sea reads as the
     /// stream). Magma and slime are swum in like water.
@@ -1336,29 +1445,14 @@ impl Player {
         best
     }
 
-    /// A steep solid face within `radius` of `p` (a wall; floors are excluded).
-    /// Every face the reference's body trace meets is here: terrain (and the
-    /// impassable chunks' fences), WMO walk faces and doodad hulls, one
-    /// audience. Faces entirely below `step_base + STEP_UP_HEIGHT` are steps,
-    /// not walls: the client's mover climbs them, so its wall test must not
-    /// see them. Pass `f32::NEG_INFINITY` to keep every face (the camera's
-    /// probe).
-    fn hit_steep(&self, p: [f32; 3], radius: f32, step_base: f32) -> bool {
+    /// Run `f` over every collision triangle within reach of `p`: the WMO and
+    /// doodad cells around it, and the terrain chunks (the body's own tile, or
+    /// every loaded tile while its own is still arriving). `true` stops the
+    /// scan. The reference's body trace sees one audience - terrain, WMO walk
+    /// faces and doodad hulls alike - so every test below reads this one.
+    fn any_tri_near(&self, p: [f32; 3], mut f: impl FnMut(&Tri) -> bool) -> bool {
         let (tx, ty) = Self::tile_of(p[0], p[1]);
-        let r2 = radius * radius;
-        let steep = |t: &Tri| -> bool {
-            if t.n[2].abs() >= GROUND_COS {
-                return false;
-            }
-            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
-            if top <= step_base + STEP_UP_HEIGHT {
-                return false; // a curb the mover steps over
-            }
-            let q = closest_on_tri(p, t);
-            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < r2
-        };
-        let probe = |ktx: i32, kty: i32, tile: &TileCol| -> bool {
+        let mut probe = |ktx: i32, kty: i32, tile: &TileCol| -> bool {
             let Some(i) = TileCol::wmo_cell(ktx, kty, p[0], p[1]) else {
                 return false;
             };
@@ -1372,8 +1466,8 @@ impl Player {
                         continue;
                     }
                     let cell = (gy * WMO_GRID + gx) as usize;
-                    if tile.wmo_cells[cell].iter().any(steep)
-                        || tile.doodad_cells[cell].iter().any(steep)
+                    if tile.wmo_cells[cell].iter().any(&mut f)
+                        || tile.doodad_cells[cell].iter().any(&mut f)
                     {
                         return true;
                     }
@@ -1392,7 +1486,7 @@ impl Player {
                         continue;
                     }
                     let b = ((y % 16) * 16 + (x % 16)) as usize;
-                    if tile.buckets[b].iter().any(steep) {
+                    if tile.buckets[b].iter().any(&mut f) {
                         return true;
                     }
                 }
@@ -1408,9 +1502,30 @@ impl Player {
             .any(|(&(k0, k1), tile)| probe(k0, k1, tile))
     }
 
-    /// Horizontal blocking by a steep solid face: the client's capsule (a
-    /// radius `CAPSULE_RADIUS` sweep between the feet and the head) against
-    /// walls. Floors (`|n.z| >= GROUND_COS`) are left to [`Self::ground`].
+    /// A steep solid face within `radius` of `p` (a wall; floors are excluded).
+    /// Faces entirely below `step_base + STEP_UP_HEIGHT` are steps, not walls:
+    /// the client's mover climbs them, so its wall test must not see them.
+    #[cfg(test)]
+    fn hit_steep(&self, p: [f32; 3], radius: f32, step_base: f32) -> bool {
+        let r2 = radius * radius;
+        self.any_tri_near(p, |t| {
+            if t.n[2].abs() >= GROUND_COS {
+                return false;
+            }
+            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            if top <= step_base + STEP_UP_HEIGHT {
+                return false;
+            }
+            let q = closest_on_tri(p, t);
+            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < r2
+        })
+    }
+
+    /// Horizontal blocking by a steep solid face, direction-blind: the
+    /// capsule's three rings against walls. Kept for the probes; the mover
+    /// itself asks [`Self::wall_normal`], which reads the travel.
+    #[cfg(test)]
     fn wall_hit(&self, x: f32, y: f32, feet: f32) -> bool {
         let lo = feet + CAPSULE_RADIUS;
         let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
@@ -1421,6 +1536,90 @@ impl Player {
                 feet,
             )
         })
+    }
+
+    /// The horizontal normal of a steep face the travel enters at (`x`, `y`),
+    /// or `None`. One-sided (`0x632700`): a face the motion approaches from
+    /// its back is skipped, so walking along or away from a wall is not a hit
+    /// and only the faces before the body stop it. Faces entirely below
+    /// `feet + STEP_UP_HEIGHT` are steps, not walls.
+    fn wall_normal(&self, x: f32, y: f32, feet: f32, dirx: f32, diry: f32) -> Option<[f32; 2]> {
+        let lo = feet + CAPSULE_RADIUS;
+        let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+        let r2 = CAPSULE_RADIUS * CAPSULE_RADIUS;
+        for k in 0..3 {
+            let p = [x, y, lo + (hi - lo) * (k as f32 / 2.0)];
+            let mut found: Option<[f32; 2]> = None;
+            self.any_tri_near(p, |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false; // a floor or a ceiling
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                if top <= feet + STEP_UP_HEIGHT {
+                    return false; // a curb the mover steps over
+                }
+                let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                if hl < 1.0e-6 {
+                    return false;
+                }
+                let n = [t.n[0] / hl, t.n[1] / hl];
+                // The reference skips a face whose winding points along the
+                // cast (`n·dir > FACING_EPS`): its back is toward the motion.
+                if n[0] * dirx + n[1] * diry >= -FACE_FACING_EPS {
+                    return false;
+                }
+                let q = closest_on_tri(p, t);
+                let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2 {
+                    return false;
+                }
+                found = Some(n);
+                true
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// One frame's horizontal travel through the collision set: the step, less
+    /// what a wall the travel enters absorbs, with the remainder sliding along
+    /// the face (`slide_mover`'s behaviour). Returns whether the body moved.
+    /// The floor gate rides a step or certifies a step-up; a taller one is a
+    /// wall. Three passes cover the plane changes one frame can meet.
+    fn horizontal_step(&mut self, step: [f32; 2]) -> bool {
+        let start = [self.pos[0], self.pos[1]];
+        let mut rem = step;
+        for _ in 0..3 {
+            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
+            if len < 1.0e-6 {
+                break;
+            }
+            let (dirx, diry) = (rem[0] / len, rem[1] / len);
+            let (nx, ny) = (self.pos[0] + rem[0], self.pos[1] + rem[1]);
+            if let Some(n) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
+                // A certified step-up or a foot-cone ride clears the face;
+                // otherwise the step stops there and the rest slides along it.
+                if self.destination_ride(nx, ny)
+                    || self.step_up_landing(nx, ny, dirx, diry).is_some()
+                {
+                    self.pos[0] = nx;
+                    self.pos[1] = ny;
+                    return true;
+                }
+                let into = rem[0] * n[0] + rem[1] * n[1];
+                rem = [rem[0] - into * n[0], rem[1] - into * n[1]];
+                continue;
+            }
+            if self.floor_blocks(nx, ny, dirx, diry) {
+                break;
+            }
+            self.pos[0] = nx;
+            self.pos[1] = ny;
+            return true;
+        }
+        self.pos[0] != start[0] || self.pos[1] != start[1]
     }
 
     /// The framing pivot for this frame: the standing/swimming preset above
@@ -1897,57 +2096,15 @@ impl Player {
             }
         }
 
-        // Horizontal step with the client's wall response: a floor more
-        // than a step above the feet blocks the axis; the other one slides.
+        // Horizontal step with the client's wall response: a face the travel
+        // enters stops the step and the rest slides along it (`0x632700`'s
+        // one-sided trace + avian's move-and-slide). The old direction-blind
+        // test held a body walking along a kerb, whose bevel is inside the
+        // capsule's radius from either side.
         let step = [self.vel[0] * dt, self.vel[1] * dt];
-        if step[0] != 0.0 || step[1] != 0.0 {
-            let len = (step[0] * step[0] + step[1] * step[1]).sqrt();
-            let (dirx, diry) = (step[0] / len, step[1] / len);
-            let blocked = |dx: f32, dy: f32| -> bool {
-                let (nx, ny) = (self.pos[0] + dx, self.pos[1] + dy);
-                if self.wall_hit(nx, ny, self.pos[2]) {
-                    return true;
-                }
-                let Some((z, nz)) = self.ground(nx, ny, self.pos[2] + STEP_UP_HEIGHT) else {
-                    // Nothing within reach at the destination. If the terrain
-                    // there stands above the step reach, it is a face too steep
-                    // to climb and the body must not enter it: walking it in
-                    // sinks the capsule under the surface, where `ground` finds
-                    // no floor above the feet and the body drops out of the
-                    // world. Impassable chunks add a fence for the same reason
-                    // (`0x6aae2a`); walkable steep faces are stopped here, the
-                    // way the reference's slope test stops them. A destination
-                    // over a drop answers below the feet instead, so walking off
-                    // a cliff still falls.
-                    return self
-                        .terrain_z(nx, ny)
-                        .is_some_and(|t| t > self.pos[2] + STEP_UP_HEIGHT);
-                };
-                let rise = z - self.pos[2];
-                if rise > STEP_UP_HEIGHT - 1.0e-3 {
-                    return true;
-                }
-                // A walkable face never blocks, and neither does a steep one at
-                // or under the feet: walking off a kerb follows its bevel down
-                // (`0x6367b0`'s snap, not the wall test).
-                if nz >= GROUND_COS || rise <= 0.0 {
-                    return false;
-                }
-                // A steep edge rising inside the foot cone is ridden up its
-                // skirt; a higher one must certify a step-up landing ahead.
-                rise > FOOT_CONE_HEIGHT && self.step_up_landing(nx, ny, dirx, diry).is_none()
-            };
-            if !blocked(step[0], step[1]) {
-                self.pos[0] += step[0];
-                self.pos[1] += step[1];
-            } else if step[0] != 0.0 && !blocked(step[0], 0.0) {
-                self.pos[0] += step[0];
-            } else if step[1] != 0.0 && !blocked(0.0, step[1]) {
-                self.pos[1] += step[1];
-            } else {
-                self.vel[0] = 0.0;
-                self.vel[1] = 0.0;
-            }
+        if (step[0] != 0.0 || step[1] != 0.0) && !self.horizontal_step(step) {
+            self.vel[0] = 0.0;
+            self.vel[1] = 0.0;
         }
 
         if self.swimming {
@@ -1998,6 +2155,18 @@ impl Player {
             let prev_z = self.pos[2];
             self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
             self.pos[2] += self.vel[2] * dt;
+            // The head is solid too: a rise stops where the capsule's top meets
+            // a downward-facing face (`0x632700`'s upward probe), and the arc
+            // falls back from there. A jump under a beam used to leave the
+            // body standing on the beam's underside, wedged in the wall.
+            if self.vel[2] > 0.0 {
+                if let Some(c) = self.ceiling(self.pos[0], self.pos[1], prev_z + 0.01) {
+                    if self.pos[2] + CAPSULE_HEIGHT > c {
+                        self.pos[2] = (c - CAPSULE_HEIGHT).max(prev_z);
+                        self.vel[2] = 0.0;
+                    }
+                }
+            }
             // A step-down follows the surface only as far as the foot cone
             // reaches this frame (`0x6367b0`: `travel · STEP_SLOPE_RATIO +
             // 1/36`); a floor deeper than a step is a drop, and the body falls
@@ -4891,5 +5060,198 @@ mod tests {
         assert_eq!(kit.hold, Some(123), "the precast kit's UseStandingLoop");
         assert_eq!(kit.release, Some(54), "the cast kit's SpellCastOmni");
         crate::bn_shutdown(w);
+    }
+
+    /// The reference's trace is one-sided (`0x632700`): a wall the travel does
+    /// not enter - beside it, or behind it - is no barrier, and the slide
+    /// carries the body along it. The direction-blind test held any body whose
+    /// destination lay inside the capsule's radius of any face, which is what
+    /// stalled walking along the Trade District bevel.
+    #[test]
+    fn a_wall_beside_the_travel_does_not_hold_it() {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        let mut p = player_on_flat();
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        // A +X-facing wall 0.3 yd west of the start, four yards tall.
+        let wall = Tri::new(
+            [PROFILE_X0 - 0.3, -804.0, 0.0],
+            [PROFILE_X0 - 0.3, -796.0, 0.0],
+            [PROFILE_X0 - 0.3, -804.0, 4.0],
+        );
+        let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &wall);
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        for ly in y0..=y1 {
+            for lx in x0..=x1 {
+                col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(wall);
+            }
+        }
+        // Only a face before the body is a wall.
+        assert!(p.wall_normal(PROFILE_X0, -800.0, 0.0, 1.0, 0.0).is_none());
+        assert!(p.wall_normal(PROFILE_X0, -800.0, 0.0, 0.0, 1.0).is_none());
+        assert!(p.wall_normal(PROFILE_X0, -800.0, 0.0, -1.0, 0.0).is_some());
+
+        let walk = |p: &mut Player, yaw: f32, frames: usize| {
+            p.pos = [PROFILE_X0, -800.0, 0.0];
+            p.vel = [0.0; 3];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            p.yaw = yaw;
+            p.model_yaw = yaw;
+            p.input.forward = 1.0;
+            p.input.strafe = 0.0;
+            let start = [p.pos[0], p.pos[1]];
+            for _ in 0..frames {
+                p.tick(1.0 / 60.0);
+            }
+            p.input.forward = 0.0;
+            (p.pos[0] - start[0], p.pos[1] - start[1])
+        };
+        let (dx, dy) = walk(&mut p, PI, 30);
+        assert!(
+            dx.abs() < 1.0e-3 && dy.abs() < 1.0e-3,
+            "walking into the wall still stops: ({dx:.3}, {dy:.3})"
+        );
+        let (dx, dy) = walk(&mut p, FRAC_PI_2, 30);
+        assert!(
+            dy > 3.0 && dx.abs() < 0.02,
+            "along the wall the walk moves: ({dx:.3}, {dy:.3})"
+        );
+        let (dx, dy) = walk(&mut p, 0.0, 30);
+        assert!(
+            dx > 3.0 && dy.abs() < 0.02,
+            "away from it too: ({dx:.3}, {dy:.3})"
+        );
+    }
+
+    /// A beam's underside is a ceiling: the one-sided downward probe (`0x632700`)
+    /// never answers a downward-facing face as a floor, and a jump's head stops
+    /// on it instead of the body standing on the beam. The reported lock - jumping
+    /// on a stair under a beam left the body wedged inside the wall - was the
+    /// orientation-blind floor read putting the feet on the beam.
+    #[test]
+    fn a_beam_over_the_head_is_a_ceiling_and_never_a_floor() {
+        let mut p = player_on_flat();
+        let floor = p.pos[2];
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let beam_z = floor + 3.0;
+        let beam = Tri::new(
+            [PROFILE_X0 - 2.0, -802.0, beam_z],
+            [PROFILE_X0 - 2.0, -798.0, beam_z],
+            [PROFILE_X0 + 2.0, -802.0, beam_z],
+        );
+        assert!(beam.n[2] < 0.0, "the beam is wound downward");
+        let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &beam);
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        for ly in y0..=y1 {
+            for lx in x0..=x1 {
+                col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(beam);
+            }
+        }
+        assert!(
+            p.ground(PROFILE_X0, -800.0, f32::MAX)
+                .is_some_and(|(z, _)| (z - floor).abs() < 1.0e-3),
+            "the beam is no floor"
+        );
+        assert_eq!(p.ceiling(PROFILE_X0, -800.0, floor + 0.05), Some(beam_z));
+
+        let clamp = beam_z - CAPSULE_HEIGHT;
+        p.input.jump = true;
+        p.tick(1.0 / 60.0);
+        p.input.jump = false;
+        let mut apex = floor;
+        for _ in 0..240 {
+            p.tick(1.0 / 60.0);
+            apex = apex.max(p.pos[2]);
+            assert!(
+                !(p.grounded && p.pos[2] > floor + 0.01),
+                "the body must never stand on the beam: z={}",
+                p.pos[2]
+            );
+        }
+        assert!(
+            (apex - clamp).abs() < 0.05,
+            "the head stops at the beam: apex {apex:.3} vs {clamp:.3}"
+        );
+        assert!(p.grounded, "and the body lands");
+        assert!(
+            (p.pos[2] - floor).abs() < 1.0e-3,
+            "back on the floor: {}",
+            p.pos[2]
+        );
+    }
+
+    /// The reported Trade District stall at (-8625.03, 656.25, 100.57): a
+    /// Stormwind WMO bevel lies inside the capsule's radius of the spot, and
+    /// the direction-blind wall test held the body in all sixteen headings
+    /// (0.00 yd each). The ceiling 14 yd up also used to answer as "ground".
+    /// With the one-sided trace and the slide the pavement is walked.
+    #[test]
+    fn the_reported_trade_district_pavement_is_walked_not_held() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        assert!(!archives.is_empty(), "the install's MPQs open");
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (x0, y0, z0) = (-8625.03f32, 656.25f32, 100.57f32);
+        let mut p = Player::new("Azeroth", x0, y0);
+        p.pos = [x0, y0, z0];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        let k = Player::tile_of(x0, y0);
+        for _ in 0..4000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&k)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len())
+            {
+                break;
+            }
+        }
+        let (floor, ny) = p
+            .ground(x0, y0, z0 + STEP_UP_HEIGHT)
+            .expect("the pavement is a floor");
+        assert!(ny >= GROUND_COS, "and standable: ny={ny}");
+        assert!((floor - 99.7).abs() < 0.2, "pavement at {floor}");
+        assert!(
+            p.ceiling(x0, y0, floor + 0.05)
+                .is_none_or(|c| c > floor + CAPSULE_HEIGHT),
+            "nothing at the head here"
+        );
+        for yaw in [0.0f32, std::f32::consts::PI] {
+            p.pos = [x0, y0, floor];
+            p.vel = [0.0; 3];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            p.yaw = yaw;
+            p.model_yaw = yaw;
+            p.input.forward = 1.0;
+            p.input.strafe = 0.0;
+            let mut moved = 0.0f32;
+            for _ in 0..120 {
+                let before = [p.pos[0], p.pos[1]];
+                p.ensure_wmo(&mut chain, &mut cache);
+                p.tick(1.0 / 60.0);
+                moved += ((p.pos[0] - before[0]).powi(2) + (p.pos[1] - before[1]).powi(2)).sqrt();
+            }
+            assert!(
+                moved > 5.0,
+                "yaw {yaw:.2}: the walk along the bevel must move (got {moved:.2} yd)"
+            );
+        }
+        p.input.forward = 0.0;
     }
 }
