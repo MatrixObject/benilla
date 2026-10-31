@@ -1732,9 +1732,8 @@ impl Player {
 
         // The swim latch: the depth over the feet against
         // `0.75·h`, held in a 1/36-yd band. A launch is not caught while it is
-        // still rising inside `speed/(2·g)` of the take-off (`0x7c5de0`): a
-        // swim jump hops about that far and re-latches there, so a deep breach
-        // is a hop in the water, not a land jump out of it.
+        // still rising inside `speed/(2·g)` of the take-off (`0x7c5de0`), so a
+        // breach from just under the surface does not re-latch on the way up.
         let surface = self.water(self.pos[0], self.pos[1]);
         let enter = SWIM_DEPTH_FRAC * CAPSULE_HEIGHT;
         let hop_blocked = self.vel[2] > 0.0 && self.swim_hop_s < SWIM_JUMP_SPEED / (2.0 * GRAVITY);
@@ -1875,18 +1874,23 @@ impl Player {
             self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
         }
 
-        // Jump: an edge. In water Space is the swim jump, which
-        // clears the latch with a stronger seed at any depth.
+        // Jump: an edge. Reference `0x7c6230` takes a swimmer at any depth, clearing
+        // the latch with the swim seed (a deep press hops and re-latches, `0x7c5de0`).
+        // Deviation: the maintainer's call - Space leaps only while the body swims AT
+        // the surface, its head (the capsule top) not under the waterline; a submerged
+        // press is dropped, so a diver rises by aiming up and stroking (`0x7c6f70`),
+        // never by a launch out through the surface.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
+        let at_surface = surface.is_some_and(|s| self.pos[2] >= s - CAPSULE_HEIGHT);
         if jump {
-            if self.swimming {
+            if self.swimming && at_surface {
                 self.swimming = false;
                 self.vel[2] = SWIM_JUMP_SPEED;
                 self.grounded = false;
                 self.swim_hop_s = 0.0;
                 self.pos[2] += 0.05;
-            } else if self.grounded {
+            } else if !self.swimming && self.grounded {
                 self.vel[2] = JUMP_SPEED;
                 self.grounded = false;
                 self.pos[2] += 0.05;
@@ -4260,36 +4264,81 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_breach_hops_and_re_latches_the_swim() {
-        // `0x7c5de0`: the latch refuses a launch only while it rises inside
-        // `speed/(2·g)` (~0.24 s, ~1.6 yd). Deep under the surface the hop
-        // re-latches there - it does not fly a land jump out of the water.
+    fn a_submerged_press_is_dropped() {
+        // Deviation: Space leaps only at the surface, so a body whose head is
+        // under the waterline keeps swimming and does not launch. A diver
+        // rises by aiming up and stroking, never by a breach.
         let mut p = swimmer(0.0, -5.0);
         p.tick(1.0 / 60.0);
         assert!(p.swimming);
         p.input.jump = true;
         p.tick(1.0 / 60.0);
-        assert!(!p.swimming, "the breach clears the latch");
+        assert!(p.swimming, "the latch survives a submerged press");
+        assert!(
+            (p.pos[2] + 5.0).abs() < 1.0e-4,
+            "no launch, the depth holds: {}",
+            p.pos[2]
+        );
+        assert!(p.vel[2].abs() < 1.0e-6, "no upward seed");
+    }
+
+    #[test]
+    fn the_surface_leap_hops_out_and_re_latches_the_swim() {
+        // `0x7c5de0`: the latch stays off while the launch rises inside
+        // `speed/(2·g)`; the leap leaves the water, falls back, and the swim
+        // re-latches at the rest line with the fall's velocity dropped.
+        let mut p = swimmer(0.0, -1.6);
+        // A lakebed under the wet block: the leap leaves the water, and a body
+        // over no floor at all is the void guard's business, not the jump's.
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let (cx, cy) = world_to_chunk(p.pos[0], p.pos[1]);
+        let b = ((cy % 16) * 16 + (cx % 16)) as usize;
+        let tile = p.tiles.get_mut(&(tx, ty)).unwrap();
+        tile.buckets[b].push(Tri::new(
+            [16900.0, 16900.0, -12.0],
+            [17200.0, 16900.0, -12.0],
+            [17200.0, 17200.0, -12.0],
+        ));
+        tile.buckets[b].push(Tri::new(
+            [16900.0, 16900.0, -12.0],
+            [17200.0, 17200.0, -12.0],
+            [16900.0, 17200.0, -12.0],
+        ));
+        p.tick(1.0 / 60.0);
+        assert!(p.swimming);
+        p.input.jump = true;
+        p.tick(1.0 / 60.0);
+        assert!(!p.swimming, "the surface press breaches");
         let takeoff = p.pos[2];
         p.input.jump = false;
         let mut apex = takeoff;
-        for _ in 0..40 {
+        let mut relatched = None;
+        for i in 0..90 {
             p.tick(1.0 / 60.0);
             apex = apex.max(p.pos[2]);
+            if p.swimming {
+                relatched = Some(i);
+                break;
+            }
         }
         assert!(
-            p.swimming,
-            "re-latched at half the launch, not at the apex: z {}",
+            relatched.is_some(),
+            "the fall re-enters the water: z {}",
             p.pos[2]
         );
         assert!(
-            (1.4..1.8).contains(&(apex - takeoff)),
-            "a hop of about 1.6 yd: {takeoff} -> {apex}"
+            (1.8..2.1).contains(&(apex - takeoff)),
+            "a jump of about 2 yd out of the water: {takeoff} -> {apex}"
         );
+        // The latch reads the depth at the top of the tick, so the fall is a
+        // frame past the rest line when the swim re-enters.
+        let rest = -(SWIM_DEPTH_FRAC * CAPSULE_HEIGHT);
         assert!(
-            (p.vel[2]).abs() < 1.0e-6,
-            "the launch's residual velocity is dropped"
+            ((rest - 0.25)..(rest + 0.05)).contains(&p.pos[2]),
+            "back in the swim at the rest line: {}",
+            p.pos[2]
         );
+        assert!(p.vel[2].abs() < 1.0e-6, "the fall's velocity is dropped");
     }
 
     #[test]
