@@ -3013,11 +3013,16 @@ fn container_use(use_: &ContainerUse) {
             let _ = net::send_cmd(Cmd::AutoEquip { bag, slot });
         }
         UseArm::Item(_) if use_.may_cast => {
-            let _ = net::send_cmd(Cmd::UseItem {
-                bag,
-                slot,
-                spell: 0,
-            });
+            // The reference's `0x5d8d00` bails inside `TryCast` when the template names no ON_USE
+            // block (`ItemUseRoute::Nothing`, `benilla-app/src/ui_items/mod.rs:796`): nothing is
+            // sent, so the server is never asked and no refusal line is drawn either. The third
+            // byte of `CMSG_USE_ITEM` is that block's ordinal, not always 0 — an item whose block 0
+            // is empty or ON_EQUIP has its use spell later (`ItemInfo::use_spell_index`).
+            let Some(spell) = net::ui_item_template(item.entry).and_then(|t| t.use_spell_index())
+            else {
+                return;
+            };
+            let _ = net::send_cmd(Cmd::UseItem { bag, slot, spell });
         }
         UseArm::Sell => {
             let vendor = net::ui_vendor();
