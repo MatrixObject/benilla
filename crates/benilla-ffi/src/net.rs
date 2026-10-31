@@ -1270,6 +1270,10 @@ struct Shared {
     names_asked: Mutex<HashSet<u64>>,
     /// A wire chat line waiting to be fired as its `CHAT_MSG_*` event on the UI tick.
     chat_events: Mutex<VecDeque<(String, Vec<ScriptValue>)>>,
+    /// `SMSG_INVENTORY_CHANGE_FAILURE` reasons waiting for the UI tick, which turns each into the
+    /// stock `UI_ERROR_MESSAGE` line (`DisplayError` `0x496720`). Queued because the Lua VM lives
+    /// on the UI thread and the string is read from the player's own `GlobalStrings`.
+    inv_fails: Mutex<VecDeque<u8>>,
     /// Our own pushes waiting on their item templates, in wire order: `ITEM_PUSH` fires once the
     /// icon is resolvable, so the stock bag buttons animate when the server says the item landed.
     item_pushes: Mutex<VecDeque<PendingItemPush>>,
@@ -1408,6 +1412,7 @@ fn shared() -> &'static Shared {
         names: Mutex::new(HashMap::new()),
         names_asked: Mutex::new(HashSet::new()),
         chat_events: Mutex::new(VecDeque::new()),
+        inv_fails: Mutex::new(VecDeque::new()),
         item_pushes: Mutex::new(VecDeque::new()),
         resurrect_from: AtomicU64::new(0),
         resurrect_sickness: AtomicU32::new(0),
@@ -1540,6 +1545,26 @@ pub(crate) fn push_chat_event(name: &'static str, args: Vec<ScriptValue>) {
 pub(crate) fn take_chat_events() -> Vec<(String, Vec<ScriptValue>)> {
     let sh = shared();
     let mut q = sh.chat_events.lock().unwrap_or_else(|e| e.into_inner());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    q.drain(..).collect()
+}
+
+/// Hand a refused equip/use to the UI tick, which fires `UI_ERROR_MESSAGE` for it.
+pub(crate) fn push_inv_fail(reason: u8) {
+    let sh = shared();
+    let mut q = sh.inv_fails.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 8 {
+        q.pop_front();
+    }
+    q.push_back(reason);
+}
+
+/// Drain the refusal reasons the UI tick has to show, in wire order.
+pub(crate) fn take_inv_fails() -> Vec<u8> {
+    let sh = shared();
+    let mut q = sh.inv_fails.lock().unwrap_or_else(|e| e.into_inner());
     if q.is_empty() {
         return Vec::new();
     }
@@ -2006,6 +2031,17 @@ enum RunMode {
     Glue,
 }
 
+/// The locale tag the logon challenge carries, the client's `[0xc2a2a4]` read from the install's
+/// `Wow.ini` (`0x4024c2`-`0x402562`): realmd stores it on the account, and the world server picks
+/// its `mangos_string` column from it, so every system message it sends is in that language. 0
+/// (enUS) until `bn_init` opens the chain, and for an install whose `Wow.ini` names no locale.
+static LOGIN_LOCALE: AtomicU32 = AtomicU32::new(0);
+
+/// Record the install's locale tag for the next logon (`bn_init`).
+pub(crate) fn set_login_locale(tag: u32) {
+    LOGIN_LOCALE.store(tag, Ordering::Relaxed);
+}
+
 fn worker(
     host: String,
     user: String,
@@ -2019,7 +2055,8 @@ fn worker(
     *sh.creds.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((host.clone(), user.clone(), pass.clone()));
 
-    let mut logon = match benilla_protocol::logon(&host, &user, &pass, 0) {
+    let locale = LOGIN_LOCALE.load(Ordering::Relaxed);
+    let mut logon = match benilla_protocol::logon(&host, &user, &pass, locale) {
         Ok(l) => l,
         Err(e) => {
             sh.event(format!("error|logon|{e}"));
@@ -3677,15 +3714,16 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             }
         }
         ServerPacket::MessageChat(msg) => {
-            // chat|<type>|<sender>|<text>: the host feeds its chat frame. Types
-            // follow the client's ChatType ids (0x00 say, 0x0A system, ...).
+            // chat|<type>|<sender>|<text>: a trace of every message the wire carried, for the
+            // host log. Type ids are the client's ChatType ids (0x00 say, 0x0A system, ...).
             let who = msg
                 .sender_name
                 .clone()
                 .unwrap_or_else(|| msg.sender_guid.to_string());
             sh.event(format!("chat|{}|{}|{}", msg.chat_type, who, msg.text));
-            // The same line as the stock UI's event: the FFI has no app chat router, so the
-            // VM's own `ChatFrame_OnEvent` prints it and owns the new-message indicator.
+            // The chat frame is printed only by the stock UI's event: the FFI has no app chat
+            // router, so the VM's own `ChatFrame_OnEvent` prints it and owns the new-message
+            // indicator. The host must not draw this trace line a second time.
             crate::chat_vm::enqueue(msg);
         }
         // The world stream is very chatty; object updates are the bulk, so they
@@ -3860,7 +3898,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 u8::from(p.created)
             ));
         }
-        // A refused equip/use/swap; the host shows the client's own message.
+        // A refused equip/use/swap: the trace line for the host log, and the reason to the UI
+        // tick, which shows the client's own localized `DisplayError` line. Reason 0 is
+        // `EQUIP_ERR_OK`, the one coded suppression (`benilla_protocol::events`).
         ServerPacket::InventoryChangeFailure {
             reason,
             required_level,
@@ -3873,6 +3913,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 required_level.unwrap_or(0),
                 item_guid
             ));
+            if *reason != 0 {
+                push_inv_fail(*reason);
+            }
         }
         // ---- combat feedback: the numbers the client floats over units ----
         ServerPacket::AttackerState(s) => {

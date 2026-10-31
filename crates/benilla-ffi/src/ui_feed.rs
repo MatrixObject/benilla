@@ -2127,6 +2127,11 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     for (event, args) in net::take_chat_events() {
         script.fire_event(&event, args);
     }
+    // A refused equip/use the wire carried: the reference's `DisplayError` line (`0x496720`),
+    // whose text is the player's own `GlobalStrings` row for the reason.
+    for reason in net::take_inv_fails() {
+        fire_error(script, crate::equip_error::equip_error_key(reason));
+    }
     // The gossip menu likewise shows itself here: the latch holds it until its greeting lands, so
     // the stock `GossipFrame` opens with its greeting, options and quest rows in one go.
     crate::gossip_vm::feed(script);

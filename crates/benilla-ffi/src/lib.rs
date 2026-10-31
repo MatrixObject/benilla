@@ -138,6 +138,10 @@ mod ui_cards;
 
 mod cvar_defaults;
 
+// ---- A refused equip's `GlobalStrings` key, for the stock error line ----
+
+mod equip_error;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -396,6 +400,12 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         return std::ptr::null_mut();
     }
 
+    let chain = benilla_formats::Chain::open(data).ok();
+
+    if let Some(chain) = chain.as_ref() {
+        net::set_login_locale(chain.locale().tag());
+    }
+
     Box::into_raw(Box::new(BnWorld {
         archives,
 
@@ -407,7 +417,7 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
 
         tile_path: String::new(),
 
-        chain: benilla_formats::Chain::open(data).ok(),
+        chain,
 
         lights: None,
 
@@ -8548,6 +8558,11 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         let Ok(mut script) = benilla_ui::script::UiScript::new() else {
             return 0u32;
         };
+        // `[0xc0e080]` and `[0x882730]`: start-up reads `Wow.ini` once and every VM answers from
+        // it, so `GetLocale`, the stock text that branches on it and the name check are the
+        // install's, not enUS's. The app seats both the same way (`ui_script::new_vm`).
+        script.set_locale(chain.locale().index());
+        script.set_client_region(benilla_formats::client_region(chain) as i32);
         // The reference answers `GetStringWidth` from its font engine inside the
         // call that asked (`0x79e510` -> `0x772890`), so a `<OnLoad>` or a
         // `GossipResize` that measures lays out against a real box. With no
@@ -9915,6 +9930,9 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         let Ok(mut script) = UiScript::new_glue() else {
             return 0u32;
         };
+        // Both words start-up reads off `Wow.ini` once; the glue text branches on them too.
+        script.set_locale(chain.locale().index());
+        script.set_client_region(benilla_formats::client_region(chain) as i32);
         script.set_text_measurer(Box::new(ui_font::VmMeasure));
         // The engine registers every console var before either interface loads;
         // the glue screens read `gxResolution`, `readEULA` and `movieSubtitle`.
