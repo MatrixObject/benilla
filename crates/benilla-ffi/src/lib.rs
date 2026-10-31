@@ -8051,6 +8051,17 @@ const UI_DUMP_DEFS_LUA: &str = r#"
         -- GetVertexColor on the texture does not answer). The renderer needs
         -- both, so they ride their own row: min, max, value, orientation and
         -- the bar colour.
+        -- Which region is the bar itself (`GetStatusBarTexture`, the slot at
+        -- `+0x324`): only that one is cropped to the value and tinted with the
+        -- bar colour (`0x782dd0` sizes the quad from min/max/value, `0x78fc20`
+        -- writes its vertex colour). Every other region of a StatusBar - the
+        -- decorative tiles, the dark backing - is an ordinary texture and
+        -- draws whole, which is what the XP bar's empty right half needs.
+        local bar_tex = nil
+        if f.IsObjectType and f:IsObjectType("StatusBar") and f.GetStatusBarTexture then
+            local okt, bt = pcall(function() return f:GetStatusBarTexture() end)
+            if okt and type(bt) == "table" then bar_tex = bt end
+        end
         if f.IsObjectType and f:IsObjectType("StatusBar") then
             local okv, v = pcall(function() return f:GetValue() end)
             local okm, mn, mx = pcall(function() return f:GetMinMaxValues() end)
@@ -8100,7 +8111,8 @@ const UI_DUMP_DEFS_LUA: &str = r#"
                 clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
                 num(r:GetWidth()), num(r:GetHeight()), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv,
-                texcoord_str(r), layer_str(r), blend_str(r, ty) }, "\t"))
+                texcoord_str(r), layer_str(r), blend_str(r, ty),
+                (bar_tex ~= nil and r == bar_tex) and "1" or "0" }, "\t"))
             end
         end
         return mine
