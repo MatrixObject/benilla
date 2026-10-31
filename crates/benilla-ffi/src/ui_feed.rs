@@ -500,13 +500,13 @@ pub(crate) fn item_look(
     )
 }
 
-/// One occupied bag slot's view, off the item object and its template. `template` is the
-/// `(class, StartQuest)` pair [`net::ui_item_use_template`] answers, `None` while the query is out.
+/// One occupied bag slot's view, off the item object and its template facts. `template` is the
+/// [`net::ui_item_slot_template`] answer, `None` while the query is out.
 fn container_slot(
     item: &net::BnNetInvItem,
     cats: Option<&Catalogs>,
     has_relic_slot: bool,
-    template: Option<(u32, u32)>,
+    template: Option<net::SlotTemplate>,
 ) -> ContainerSlot {
     let info = &item.info;
     let name = cstr(&info.name);
@@ -515,10 +515,16 @@ fn container_slot(
     // still in flight is not equippable (`0x5d9ff0`).
     ContainerSlot {
         use_fork: match template {
-            Some((_, 0)) if info.inventory_type != 0 => UseFork::Equip,
+            Some(t) if t.start_quest == 0 && info.inventory_type != 0 => UseFork::Equip,
             _ => UseFork::Plain,
         },
-        item_class: template.map(|(class, _)| class),
+        item_class: template.map(|t| t.class),
+        // The dispatcher's own template reads, so the gates and the action bar see the same
+        // facts the reference's cached row carries.
+        use_spell: template.map_or(0, |t| t.use_spell),
+        bar_placeable: template.is_some_and(|t| t.bar_placeable),
+        consumable: template.is_some_and(|t| t.consumable),
+        spell_0: template.is_some_and(|t| t.spell_0),
         texture: cats
             .and_then(|c| c.items.as_ref())
             .and_then(|t| t.get(info.display_id))
@@ -1481,7 +1487,7 @@ impl Feed {
                     _ => continue,
                 };
                 if row_bag == id {
-                    let template = net::ui_item_use_template(item.entry);
+                    let template = net::ui_item_slot_template(item.entry);
                     slots.insert(
                         u32::from(item.slot) + 1,
                         container_slot(item, cats, has_relic_slot, template),
@@ -2235,14 +2241,25 @@ pub(crate) fn intents(script: &mut UiScript) {
                 });
             }
             0x80 => {
-                if let Some(item) = net::ui_inventory().iter().find(|i| i.entry == action) {
-                    let (bag, slot) = wire_pos(item.bag, item.slot);
-                    let _ = net::send_cmd(Cmd::UseItem {
-                        bag,
-                        slot,
-                        spell: 0,
-                    });
+                let Some(item) = net::ui_inventory().into_iter().find(|i| i.entry == action) else {
+                    continue;
+                };
+                // `0x4e607b` → `0x5d8d32`: a copy locked when the press was made is refused
+                // silently.
+                if use_.item_was_locked(item.guid) {
+                    continue;
                 }
+                // The bar's item runs `CGItem::Use`'s whole fork (`0x4e607b` → `0x5d8d00`), not a
+                // bare `CMSG_USE_ITEM`: the third byte is the template's ON_USE block ordinal and
+                // an item with no ON_USE block sends nothing (TryCast's null-record bail), where
+                // a zero third byte would have the server refuse it as ITEM_NOT_FOUND.
+                let Some(spell) =
+                    net::ui_item_template(item.entry).and_then(|t| t.use_spell_index())
+                else {
+                    continue;
+                };
+                let (bag, slot) = wire_pos(item.bag, item.slot);
+                let _ = net::send_cmd(Cmd::UseItem { bag, slot, spell });
             }
             _ => {}
         }
@@ -3180,7 +3197,7 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
 #[cfg(test)]
 mod tests {
     use super::{container_slot, loot_picks, money_text, HeldAxes, LootPick, LootWindow};
-    use crate::net::{BnNetInvItem, BnNetLoot};
+    use crate::net::{BnNetInvItem, BnNetLoot, SlotTemplate};
     use benilla_ui::script::{UiScript, UseFork};
 
     #[test]
@@ -3282,13 +3299,23 @@ mod tests {
             ..Default::default()
         };
         item.info.inventory_type = 17;
+        let template = |start_quest| {
+            Some(SlotTemplate {
+                class: 2,
+                start_quest,
+                use_spell: 0,
+                bar_placeable: true,
+                consumable: false,
+                spell_0: false,
+            })
+        };
         assert_eq!(
-            container_slot(&item, None, false, Some((2, 0))).use_fork,
+            container_slot(&item, None, false, template(0)).use_fork,
             UseFork::Equip,
             "a two-handed weapon with no quest starter"
         );
         assert_eq!(
-            container_slot(&item, None, false, Some((2, 7))).use_fork,
+            container_slot(&item, None, false, template(7)).use_fork,
             UseFork::Plain,
             "an equippable quest starter offers its quest instead"
         );
@@ -3299,15 +3326,35 @@ mod tests {
         );
         item.info.inventory_type = 0;
         assert_eq!(
-            container_slot(&item, None, false, Some((2, 0))).use_fork,
+            container_slot(&item, None, false, template(0)).use_fork,
             UseFork::Plain,
             "no inventory type: not equippable"
         );
         // The class rides with the fork for the use gates and the projectile arm (`0x5e1704`).
         assert_eq!(
-            container_slot(&item, None, false, Some((2, 0))).item_class,
+            container_slot(&item, None, false, template(0)).item_class,
             Some(2)
         );
         assert_eq!(container_slot(&item, None, false, None).item_class, None);
+        // The template's use facts ride with the slot, as the reference's cached row carries them:
+        // `PlaceAction` reads `bar_placeable` (`0x4e6571`) and the bar's count `IsConsumableAction`
+        // (`0x4e5250`), and the dispatcher's gates read the ON_USE spell.
+        let potion = container_slot(
+            &item,
+            None,
+            false,
+            Some(SlotTemplate {
+                class: 0,
+                start_quest: 0,
+                use_spell: 440,
+                bar_placeable: true,
+                consumable: true,
+                spell_0: true,
+            }),
+        );
+        assert_eq!(potion.use_spell, 440);
+        assert!(potion.bar_placeable);
+        assert!(potion.consumable);
+        assert!(potion.spell_0);
     }
 }

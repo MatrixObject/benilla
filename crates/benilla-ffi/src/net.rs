@@ -1644,16 +1644,39 @@ pub(crate) fn ui_item_info(entry: u32) -> BnNetItemInfo {
     item_info_row(entry, &templates)
 }
 
-/// The template facts a bag slot's use fork reads (`0x4fa3b9`): its class and its `StartQuest`,
-/// `None` while the query is out — the reference's uncached template, which `0x5d9ff0` reads as
-/// not equippable and the dispatcher's gates end silently.
-pub(crate) fn ui_item_use_template(entry: u32) -> Option<(u32, u32)> {
+/// The template facts a bag slot's view reads, `None` while the query is out — the reference's
+/// uncached template, which `0x5d9ff0` reads as not equippable and the dispatcher's gates end
+/// silently.
+#[derive(Clone, Copy)]
+pub(crate) struct SlotTemplate {
+    /// The class (`[rec+0x0]`), read by the use gates and the projectile arm (`0x5e1704`).
+    pub class: u32,
+    /// `StartQuest`: a quest starter offers its quest instead of equipping (`0x5d8dd2`).
+    pub start_quest: u32,
+    /// The first block with `SpellTrigger` ON_USE (`0x5d8c80`), 0 for none.
+    pub use_spell: u32,
+    /// `PlaceAction`'s only item filter (`0x4e6571`): an on-use spell or an equip slot.
+    pub bar_placeable: bool,
+    /// The action bar's count gate (`IsConsumableAction`, `0x4e5250`).
+    pub consumable: bool,
+    /// Block 0 names a spell of any trigger (`+0x11c`), the cooldown getter's gate.
+    pub spell_0: bool,
+}
+
+pub(crate) fn ui_item_slot_template(entry: u32) -> Option<SlotTemplate> {
     shared()
         .item_templates
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&entry)
-        .map(|t| (t.class, t.start_quest))
+        .map(|t| SlotTemplate {
+            class: t.class,
+            start_quest: t.start_quest,
+            use_spell: t.info.use_spell.map_or(0, |u| u.spell_id),
+            bar_placeable: t.info.placeable_on_action_bar(),
+            consumable: t.info.is_consumable(),
+            spell_0: t.info.has_spell_0(),
+        })
 }
 
 /// One cached template's whole row, the item-tooltip builder's source (`0x5d8b00`'s cache
