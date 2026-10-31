@@ -416,6 +416,51 @@ fn norm_icon(path: Option<String>) -> Option<String> {
     path.map(|p| p.replace('/', "\\"))
 }
 
+/// The active-action predicate (`0x4e55f0`, twin `0x4b36f0`): a nonzero raw `ActiveIconID` and
+/// the spell's own aura live on us with the cancelable bit, so a second press cancels instead of
+/// casting. Every mount spell names icon 122, which is how its button flips to the dismount face.
+fn aura_toggles(active_icon_id: u32, spell: u32, own: Option<&ObjectFields>) -> bool {
+    active_icon_id != 0
+        && own.is_some_and(|f| {
+            f.unit_auras()
+                .any(|a| a.spell_id == spell && a.is_cancelable())
+        })
+}
+
+fn spell_toggles(spell: u32, own: Option<&ObjectFields>, cats: Option<&Catalogs>) -> bool {
+    let active_icon_id = cats
+        .and_then(|c| c.spells.as_ref())
+        .and_then(|s| s.get(spell))
+        .map_or(0, |d| d.active_icon_id);
+    aura_toggles(active_icon_id, spell, own)
+}
+
+/// [`spell_toggles`] against the live session, for the drains below.
+fn self_toggles(spell: u32) -> bool {
+    CATS.with(|c| {
+        let cats = c.borrow();
+        spell_toggles(spell, net::ui_self_fields().as_ref(), cats.as_ref())
+    })
+}
+
+/// `GetActionTexture`'s spell arm (`0x4e6a50` → `0x4e6bbd`): a live toggle shows `ActiveIconID`,
+/// otherwise the spell's own icon.
+fn spell_action_texture(
+    spell: u32,
+    own: Option<&ObjectFields>,
+    cats: Option<&Catalogs>,
+) -> Option<String> {
+    let d = cats
+        .and_then(|c| c.spells.as_ref())
+        .and_then(|s| s.get(spell))?;
+    let face = if spell_toggles(spell, own, cats) {
+        d.active_icon.clone()
+    } else {
+        d.icon.clone()
+    };
+    norm_icon(face)
+}
+
 /// The coin row's text (`ui_loot`'s `format_money`): 1.12's `GOLD`, `SILVER` and `COPPER`
 /// (`GlobalStrings.lua:2025`, `:3465`, `:865`), read off the player's own pack so a Chinese
 /// install reads Chinese, with the enUS word only when the chain lacks the row.
@@ -1269,10 +1314,7 @@ impl Feed {
             for &(slot, kind, action) in &actions {
                 let id = u32::from(slot) + 1;
                 let texture = match kind {
-                    0x00 => cats
-                        .and_then(|c| c.spells.as_ref())
-                        .and_then(|s| s.get(action))
-                        .and_then(|d| norm_icon(d.icon.clone())),
+                    0x00 => spell_action_texture(action, own, cats),
                     0x80 => {
                         let info = net::ui_item_info(action);
                         cats.and_then(|c| c.items.as_ref())
@@ -1348,6 +1390,42 @@ impl Feed {
                 );
             }
             self.actions = actions;
+        }
+
+        // Live icons (`0x4e6bbd`): a toggle's `ActiveIconID` follows its own aura, so a spell
+        // slot's face changes with no action-table edit. Only slots naming a nonzero
+        // `ActiveIconID` are asked, and only a changed face reaches the VM and its buttons.
+        if own.is_some() {
+            let mut fresh: Vec<(u32, Option<String>)> = Vec::new();
+            for (&id, slot) in &self.action_slots {
+                if slot.kind != 0x00 {
+                    continue;
+                }
+                let has_active = cats
+                    .and_then(|c| c.spells.as_ref())
+                    .and_then(|s| s.get(slot.action))
+                    .is_some_and(|d| d.active_icon_id != 0);
+                if !has_active {
+                    continue;
+                }
+                let texture = spell_action_texture(slot.action, own, cats);
+                if texture != slot.texture {
+                    fresh.push((id, texture));
+                }
+            }
+            for (id, texture) in fresh {
+                if let Some(slot) = self.action_slots.get_mut(&id) {
+                    slot.texture = texture.clone();
+                    script.set_action(id, Some(slot.clone()));
+                }
+                if !self.first {
+                    fire(
+                        script,
+                        "ACTIONBAR_SLOT_CHANGED",
+                        vec![ScriptValue::Int(i64::from(id))],
+                    );
+                }
+            }
         }
 
         // Spellbook: one tab per skill line, the player's race and class resolving the tab.
@@ -2235,6 +2313,12 @@ pub(crate) fn intents(script: &mut UiScript) {
                 }
             }
             0x00 => {
+                // A live `ActiveIconID` spell re-pressed cancels its aura (`0x4e55f0`, cancel
+                // `0x4e60c1`): the mount button's second press is the dismount.
+                if self_toggles(action) {
+                    let _ = net::send_cmd(Cmd::CancelAura(action));
+                    continue;
+                }
                 let _ = net::send_cmd(Cmd::Cast {
                     spell: action,
                     target: if use_.on_self { 0 } else { selection },
@@ -2249,13 +2333,25 @@ pub(crate) fn intents(script: &mut UiScript) {
                 if use_.item_was_locked(item.guid) {
                     continue;
                 }
+                let Some(template) = net::ui_item_template(item.entry) else {
+                    continue;
+                };
+                // The toggle-cancel arm (`0x5d9234`-`0x5d9246`): the item's ON_USE spell is live
+                // as a cancelable active-icon aura, so the press sends `CMSG_CANCEL_AURA` and
+                // casts nothing — a mount item clicked while mounted dismounts.
+                if let Some(spell) = template
+                    .use_spell
+                    .as_ref()
+                    .filter(|s| self_toggles(s.spell_id))
+                {
+                    let _ = net::send_cmd(Cmd::CancelAura(spell.spell_id));
+                    continue;
+                }
                 // The bar's item runs `CGItem::Use`'s whole fork (`0x4e607b` → `0x5d8d00`), not a
                 // bare `CMSG_USE_ITEM`: the third byte is the template's ON_USE block ordinal and
                 // an item with no ON_USE block sends nothing (TryCast's null-record bail), where
                 // a zero third byte would have the server refuse it as ITEM_NOT_FOUND.
-                let Some(spell) =
-                    net::ui_item_template(item.entry).and_then(|t| t.use_spell_index())
-                else {
+                let Some(spell) = template.use_spell_index() else {
                     continue;
                 };
                 let (bag, slot) = wire_pos(item.bag, item.slot);
@@ -2276,6 +2372,12 @@ pub(crate) fn intents(script: &mut UiScript) {
     }
 
     for (spell, on_self) in script.take_spell_casts() {
+        // `CastSpell`'s dispatcher (`0x4b3300`) runs the same active-action toggle (cancel
+        // `0x4b3466`), so a spellbook click while the aura is live dismounts too.
+        if self_toggles(spell) {
+            let _ = net::send_cmd(Cmd::CancelAura(spell));
+            continue;
+        }
         let _ = net::send_cmd(Cmd::Cast {
             spell,
             target: if on_self { 0 } else { selection },
@@ -2993,6 +3095,18 @@ fn container_moves(script: &mut UiScript) {
             continue;
         }
         let slot = (id - 1) as u8;
+        // The doll click is the same `CGItem::Use` (`0x4c7af0` → `0x5d8d00`), so its
+        // toggle-cancel arm applies here too.
+        if let Some(spell) = net::ui_inventory()
+            .iter()
+            .find(|i| i.bag == crate::net::BAG_EQUIPPED && i.slot == slot)
+            .and_then(|i| net::ui_item_template(i.entry))
+            .and_then(|t| t.use_spell)
+            .filter(|s| self_toggles(s.spell_id))
+        {
+            let _ = net::send_cmd(Cmd::CancelAura(spell.spell_id));
+            continue;
+        }
         net::note(format!(
             "ui_items: use equipped item, lua slot {id} (wire 255/{slot})"
         ));
@@ -3030,13 +3144,26 @@ fn container_use(use_: &ContainerUse) {
             let _ = net::send_cmd(Cmd::AutoEquip { bag, slot });
         }
         UseArm::Item(_) if use_.may_cast => {
+            let Some(template) = net::ui_item_template(item.entry) else {
+                return;
+            };
+            // The toggle-cancel arm (`0x5d9234`-`0x5d9246`): the ON_USE spell live as a
+            // cancelable active-icon aura turns the click into `CMSG_CANCEL_AURA`, so the bag's
+            // mount item clicked while mounted dismounts instead of re-casting.
+            if let Some(spell) = template
+                .use_spell
+                .as_ref()
+                .filter(|s| self_toggles(s.spell_id))
+            {
+                let _ = net::send_cmd(Cmd::CancelAura(spell.spell_id));
+                return;
+            }
             // The reference's `0x5d8d00` bails inside `TryCast` when the template names no ON_USE
             // block (`ItemUseRoute::Nothing`, `benilla-app/src/ui_items/mod.rs:796`): nothing is
             // sent, so the server is never asked and no refusal line is drawn either. The third
             // byte of `CMSG_USE_ITEM` is that block's ordinal, not always 0 — an item whose block 0
             // is empty or ON_EQUIP has its use spell later (`ItemInfo::use_spell_index`).
-            let Some(spell) = net::ui_item_template(item.entry).and_then(|t| t.use_spell_index())
-            else {
+            let Some(spell) = template.use_spell_index() else {
                 return;
             };
             let _ = net::send_cmd(Cmd::UseItem { bag, slot, spell });
@@ -3196,9 +3323,30 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
 
 #[cfg(test)]
 mod tests {
-    use super::{container_slot, loot_picks, money_text, HeldAxes, LootPick, LootWindow};
+    use super::{
+        aura_toggles, container_slot, loot_picks, money_text, HeldAxes, LootPick, LootWindow,
+    };
     use crate::net::{BnNetInvItem, BnNetLoot, SlotTemplate};
     use benilla_ui::script::{UiScript, UseFork};
+
+    /// The active-action predicate (`0x4e55f0`): only a spell that names an `ActiveIconID` and
+    /// whose own aura is live with the cancelable bit toggles — the mount's second press.
+    #[test]
+    fn only_a_live_cancelable_active_icon_spell_cancels_on_repress() {
+        use benilla_protocol::messages::ObjectFields;
+        // Raw indices: `UNIT_FIELD_AURA` 47, `UNIT_FIELD_AURAFLAGS` 95 (a nibble per slot).
+        let mounted = ObjectFields::from_pairs(&[(47u16, 458), (95, 0xf)]);
+        let uncancelable = ObjectFields::from_pairs(&[(47u16, 458), (95, 0xe)]);
+        let another = ObjectFields::from_pairs(&[(47u16, 470), (95, 0xf)]);
+        assert!(aura_toggles(122, 458, Some(&mounted)), "the mount's own live cancelable aura");
+        assert!(!aura_toggles(0, 458, Some(&mounted)), "no ActiveIconID");
+        assert!(
+            !aura_toggles(122, 458, Some(&uncancelable)),
+            "live but not cancelable"
+        );
+        assert!(!aura_toggles(122, 458, Some(&another)), "another spell's aura");
+        assert!(!aura_toggles(122, 458, None));
+    }
 
     #[test]
     fn a_and_d_turn_until_the_look_channel_is_held() {
