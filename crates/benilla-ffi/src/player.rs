@@ -90,10 +90,9 @@ const STATIONARY_CHASE_RATE: f32 = 8.0;
 const FLY_SPEED: f32 = 30.0;
 
 // ---- the upper-body one-shots ----
-/// AnimationData ids: Death and SpellCast (the swing clip comes from the armed
-/// main hand: `net::self_swing_anim`, the reference's `swing_anim_main`).
+/// AnimationData ids: Death (the swing clip comes from the armed main hand:
+/// `net::self_swing_anim`, the reference's `swing_anim_main`).
 const ANIM_DEATH: u32 = 1;
-const ANIM_SPELL_CAST: u32 = 53;
 /// The swing one-shot's visible window (s), the unarmed clip's own length.
 const SWING_WINDOW: f32 = 0.7;
 /// The overlay's blend time constant (s): the vanilla masked layer's ease.
@@ -191,8 +190,8 @@ pub struct BnPlayerState {
     /// 187 JumpLandRun). A one-shot action the lower body cannot show (an attack
     /// or a cast while running) rides the overlay instead.
     pub anim: u32,
-    /// The upper-body overlay's AnimationData id (16 attack, 53 cast), or 0
-    /// for none: the vanilla masked SpineLow subtree split.
+    /// The upper-body overlay's AnimationData id (the swing's clip, or the
+    /// cast's precast hold), or 0 for none: the vanilla masked SpineLow split.
     pub overlay_anim: u32,
     /// The overlay's blend weight, 0..1.
     pub overlay_weight: f32,
@@ -837,6 +836,16 @@ struct Input {
     up: f32,
 }
 
+/// A cast's `SpellVisual` kits, resolved to `AnimationData` ids: the precast
+/// kit's clip is the hold the caster keeps for the whole cast, the cast kit's
+/// is the one-shot the GO plays (`0x60f34c`, `creature_anim::route_cast_visuals`).
+/// A kit row with no anim holds nothing (`None`).
+#[derive(Clone, Copy)]
+pub(crate) struct CastKit {
+    pub hold: Option<u32>,
+    pub release: Option<u32>,
+}
+
 pub struct Player {
     map: String,
     /// Feet, WoW world yards.
@@ -884,6 +893,11 @@ pub struct Player {
     attack_left: f32,
     /// The live cast the server started for us: (spell, elapsed, duration).
     cast: Option<(u32, f32, f32)>,
+    /// The spell whose `SpellVisual` kits were last looked up, and those kits
+    /// (`None` when the spell or its visual row is not in the tables): the
+    /// precast kit's clip is held for the cast, the cast kit's plays once at GO.
+    cast_kit_spell: u32,
+    cast_kit: Option<CastKit>,
     /// Our own descriptor reads dead: the Death anim, and no locomotion.
     dead: bool,
     /// The overlay's eased weight, 0..1.
@@ -979,6 +993,8 @@ impl Player {
             mounted: false,
             attack_left: 0.0,
             cast: None,
+            cast_kit_spell: 0,
+            cast_kit: None,
             dead: false,
             overlay_weight: 0.0,
             ui_input: None,
@@ -1690,6 +1706,12 @@ impl Player {
                     self.vel[2] = 0.0;
                     self.grounded = true;
                     self.last_ground = self.pos;
+                } else if self.ground(self.pos[0], self.pos[1], f32::MAX).is_none() {
+                    // Nothing under the spot at any depth - a hole in the
+                    // collision data, not a body in the air: the seat the
+                    // server gave is all there is, so stand on it.
+                    self.grounded = true;
+                    self.last_ground = self.pos;
                 }
             }
         }
@@ -1934,6 +1956,17 @@ impl Player {
             // Water ends the arc: the swim picks are their own clips and the
             // bracket clock (`tick_arc`) does not run here.
             self.airborne = false;
+        } else if self.standing_still(jump) {
+            // A body on its feet and committed to no motion keeps its seat:
+            // the reference integrates gravity only for a moving or airborne
+            // mover, so standing on a spot the collision set has no floor for
+            // (a hole in the terrain data, a WMO upper storey) holds the
+            // server's Z instead of pumping a fall and a void-guard restore.
+            self.vel[2] = 0.0;
+            self.grounded = true;
+            self.last_ground = self.pos;
+            self.void_time = 0.0;
+            self.tick_arc(dt, jump, self.pos[2]);
         } else {
             // Vertical: gravity then the floor probe (benilla's order).
             // The probe's ceiling has to cover the whole step, not just the
@@ -2194,13 +2227,25 @@ impl Player {
     /// Whether the lower body is committed to locomotion, the vanilla
     /// `ROUTE_COMMITTED_MOVE` gate that masks a one-shot onto the upper body:
     /// translating, turning, swimming or airborne.
-    fn lower_body_committed(&self) -> bool {
+    pub(crate) fn lower_body_committed(&self) -> bool {
         self.swimming
             || !self.grounded
             || self.input.forward.abs() > 0.01
             || self.input.strafe.abs() > 0.01
             || self.input.turn.abs() > 0.01
             || (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt() > 0.1
+    }
+
+    /// A body on its feet, committed to neither translation nor a jump: the
+    /// vertical resolve holds its seat rather than integrating gravity. The
+    /// turn bits do not count - a turning body is stationary (`[9e8] & 0x20000f`).
+    fn standing_still(&self, jump: bool) -> bool {
+        self.grounded
+            && !self.swimming
+            && !jump
+            && self.input.forward.abs() <= 0.01
+            && self.input.strafe.abs() <= 0.01
+            && (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt() <= 0.1
     }
 
     /// The swing one-shot: armed by the swing packet (`SMSG_ATTACKERSTATEUPDATE`),
@@ -2215,6 +2260,43 @@ impl Player {
         matches!(self.cast, Some((_, elapsed, duration)) if duration > 0.0 && elapsed < duration)
     }
 
+    /// Whether the kits of `spell` still have to be looked up (once per cast).
+    pub(crate) fn needs_cast_kit(&self, spell: u32) -> bool {
+        self.cast_kit_spell != spell
+    }
+
+    /// Record the kits resolved for the running cast's spell.
+    pub(crate) fn set_cast_kit(&mut self, spell: u32, kit: Option<CastKit>) {
+        self.cast_kit_spell = spell;
+        self.cast_kit = kit;
+    }
+
+    /// The clip held for the whole cast: the precast kit's anim. 0 (Stand)
+    /// when the spell's visual names no precast anim - the reference arms no
+    /// hold at all there, so a caster with no kit clip simply stands.
+    fn cast_hold_anim(&self) -> u32 {
+        let Some((spell, _, _)) = self.cast else {
+            return 0;
+        };
+        if self.cast_kit_spell != spell {
+            return 0; // its visual is looked up on the next tick
+        }
+        self.cast_kit.and_then(|k| k.hold).unwrap_or_default()
+    }
+
+    /// The cast kit's clip for `spell`: the one-shot the GO plays, once the
+    /// hold is released (`0x60f34c`). `None` when its visual names no cast anim.
+    pub(crate) fn cast_kit_release(&self, spell: u32) -> Option<u32> {
+        if self.cast_kit_spell != spell {
+            return None;
+        }
+        self.cast_kit.and_then(|k| k.release)
+    }
+
+    pub(crate) fn mounted(&self) -> bool {
+        self.mounted
+    }
+
     /// The upper-body overlay `(anim, weight, elapsed)`: a one-shot the
     /// committed lower body cannot play full-body rides the masked spine
     /// subtree instead, resumed at `elapsed` seconds into the clip. The clock
@@ -2226,13 +2308,17 @@ impl Player {
             return (0, 0.0, 0.0);
         }
         let (anim, elapsed) = if self.cast_active() {
-            (ANIM_SPELL_CAST, self.cast.map_or(0.0, |(_, e, _)| e))
+            (self.cast_hold_anim(), self.cast.map_or(0.0, |(_, e, _)| e))
         } else if self.swing_active() {
             let elapsed = (SWING_WINDOW - self.attack_left).max(0.0);
             (crate::net::self_swing_anim(), elapsed)
         } else {
             return (0, 0.0, 0.0);
         };
+        if anim == 0 {
+            // No clip to ride the torso: a kit with no anim masks nothing.
+            return (0, 0.0, 0.0);
+        }
         (anim, self.overlay_weight, elapsed)
     }
 
@@ -2353,7 +2439,7 @@ impl Player {
         // it moves to `overlay()` and the locomotion anim stays the base.
         if !self.lower_body_committed() {
             if self.cast_active() {
-                return ANIM_SPELL_CAST;
+                return self.cast_hold_anim();
             }
             if self.swing_active() {
                 return crate::net::self_swing_anim();
@@ -2926,6 +3012,34 @@ pub extern "C" fn bn_player_toggle_mount(world: *mut BnWorld) -> u32 {
     p.mounted as u32
 }
 
+/// The cast in flight's `SpellVisual` kits as `AnimationData` ids: the precast
+/// kit's anim is held for the cast, the cast kit's plays once at its GO
+/// (`creature_anim::spell_visual::route_cast_visuals`). `None` when the world's
+/// tables cannot be read yet (the tick retries), `Some(None)` when the spell or
+/// its visual row is not in them (no kit to hold or play).
+fn resolve_cast_kit(w: &mut BnWorld, spell_id: u32) -> Option<Option<CastKit>> {
+    if w.spells.is_none() {
+        w.spells = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::load_spell_catalog(c).ok());
+    }
+    w.spells.as_ref()?;
+    let visuals = crate::fx::visual_catalog(w)?;
+    let visual = w
+        .spells
+        .as_ref()
+        .and_then(|s| s.get(spell_id))
+        .map_or(0, |d| d.visual);
+    Some(visuals.stages(visual).map(|stages| {
+        let anim = |kit: u32| visuals.kit(kit).and_then(|k| k.anim_id).map(u32::from);
+        CastKit {
+            hold: anim(stages.precast),
+            release: anim(stages.cast),
+        }
+    }))
+}
+
 /// Step the player and fill `out` with the pose the host renders.
 #[no_mangle]
 pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlayerState) -> u32 {
@@ -2944,6 +3058,18 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
         let map = p.map.clone();
         crate::player_prefetch_window(w, &map, tx, ty);
     }
+    // The cast's kits are looked up once per cast, before the tick that reads
+    // the hold: the precast clip is held for the cast, the cast clip is kept
+    // for the GO's one-shot.
+    if let Some((spell, _, _)) = crate::net::ui_self_cast() {
+        if w.player.as_ref().is_some_and(|p| p.needs_cast_kit(spell)) {
+            if let Some(kit) = resolve_cast_kit(w, spell) {
+                if let Some(p) = w.player.as_mut() {
+                    p.set_cast_kit(spell, kit);
+                }
+            }
+        }
+    }
     let Some(p) = w.player.as_mut() else { return 0 };
     // Split borrows: the tile load reads the archives, the WMO build the chain
     // and its shared model cache.
@@ -2953,6 +3079,21 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
     p.ensure_wmo(&mut w.chain, &mut w.wmo_collision);
     let t2 = std::time::Instant::now();
     p.tick(dt);
+    // The GO's cast kit: `play_kit` DISCRETE once the hold is released
+    // (`0x60f34c`): full-body on a standing caster, a masked one-shot on a
+    // moving one. A mounted body pins Mount (91) as its base and plays the
+    // clip on the torso instead (`0x5fe7b5`, `0x5fed90`), so it is masked too.
+    if let Some(spell) = crate::net::take_self_cast_release() {
+        if let Some(anim) = p.cast_kit_release(spell) {
+            let full = u32::from(!p.lower_body_committed() && !p.mounted());
+            crate::net::push_event(format!(
+                "react|{}|{}|{}",
+                crate::net::ui_self_guid(),
+                anim,
+                full
+            ));
+        }
+    }
     let t3 = std::time::Instant::now();
     let tiles_ms = (t1 - t0).as_secs_f64() * 1000.0;
     let wmo_ms = (t2 - t1).as_secs_f64() * 1000.0;
@@ -4597,5 +4738,24 @@ mod tests {
         assert!(min_z > 55.0, "the body never sinks toward the void");
         assert!(p.pos[1] < -150.0, "the far shore is reached");
         assert!(p.grounded, "and the body walks out onto it");
+    }
+
+    /// Brown Horse (spell 458, `SpellVisual` 1703): the precast kit holds
+    /// UseStandingLoop 123 for the whole cast and the cast kit plays
+    /// SpellCastOmni 54 once at the GO (`0x60f34c`). The ids are the shipped
+    /// `SpellVisualKit.AnimID`s, so a data rebuild that moves them fails here.
+    #[test]
+    fn brown_horse_cast_holds_the_precast_clip_and_releases_the_cast_kit() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let dir = std::ffi::CString::new(data.to_string_lossy().as_bytes()).expect("data path");
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null(), "bn_init");
+        // SAFETY: the handle bn_init returned, freed at the end.
+        let kit = resolve_cast_kit(unsafe { &mut *w }, 458)
+            .expect("the install's tables")
+            .expect("Brown Horse's SpellVisual");
+        assert_eq!(kit.hold, Some(123), "the precast kit's UseStandingLoop");
+        assert_eq!(kit.release, Some(54), "the cast kit's SpellCastOmni");
+        crate::bn_shutdown(w);
     }
 }

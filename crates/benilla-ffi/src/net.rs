@@ -1222,6 +1222,10 @@ struct Shared {
     /// Casts in flight by caster guid (self included), from SPELL_START until
     /// SPELL_GO / SPELL_FAILED_OTHER.
     casts: Mutex<HashMap<u64, CastState>>,
+    /// Our own cast's spell id at its GO, taken once by the player tick: the GO
+    /// plays the spell's cast kit as a one-shot (`0x60f34c`,
+    /// `creature_anim::route_cast_visuals`), which releasing the hold cannot.
+    self_cast_release: Mutex<Option<u32>>,
     /// Creature templates from `SMSG_CREATURE_QUERY_RESPONSE`, keyed by entry:
     /// name, rank (elite/boss) and creature type - the target frame's data.
     creatures: Mutex<HashMap<u32, CreatureTemplateLite>>,
@@ -1384,6 +1388,7 @@ fn shared() -> &'static Shared {
         spells: Mutex::new(Vec::new()),
         actions: Mutex::new(Vec::new()),
         casts: Mutex::new(HashMap::new()),
+        self_cast_release: Mutex::new(None),
         creatures: Mutex::new(HashMap::new()),
         creature_asked: Mutex::new(HashSet::new()),
         loot: Mutex::new(BnNetLoot::default()),
@@ -1480,6 +1485,22 @@ pub(crate) fn ui_unit(guid: u64) -> Option<UiUnitRec> {
 
 pub(crate) fn ui_self_guid() -> u64 {
     shared().self_guid.load(Ordering::SeqCst)
+}
+
+/// Our own cast's spell id at its GO, taken once: the player tick plays that
+/// spell's cast kit as a one-shot (`SpellVisual` stage `cast`,
+/// `creature_anim::route_cast_visuals`).
+pub(crate) fn take_self_cast_release() -> Option<u32> {
+    shared()
+        .self_cast_release
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Queue one `|`-joined line for the host's net-event reader.
+pub(crate) fn push_event(line: String) {
+    shared().event(line);
 }
 
 pub(crate) fn ui_selection() -> u64 {
@@ -4326,12 +4347,24 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         // a success needs no event (the SpellStart/SpellGo pair follows).
         ServerPacket::CastResult { spell_id, outcome } => match outcome {
             CastOutcome::Ok => {}
-            CastOutcome::Failed { reason, arg } => sh.event(format!(
-                "castfail|{}|{}|{}",
-                spell_id,
-                reason,
-                arg.unwrap_or(0)
-            )),
+            CastOutcome::Failed { reason, arg } => {
+                // A failed cast drops its hold and plays no cast kit (`0x61…`
+                // Fail edge): the cast row IS the hold, so it must not outlive
+                // the verdict or the caster is pinned in the cast pose.
+                let self_guid = sh.self_guid.load(Ordering::SeqCst);
+                if self_guid != 0 {
+                    sh.casts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&self_guid);
+                }
+                sh.event(format!(
+                    "castfail|{}|{}|{}",
+                    spell_id,
+                    reason,
+                    arg.unwrap_or(0)
+                ))
+            }
         },
         // Cast bars: START opens one, GO / FAILED closes it; pushback moves the
         // start later, which is exactly how the client shrinks the fill.
@@ -4357,6 +4390,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             // duration is a Spell.dbc column (recovery_ms / category recovery),
             // so `0` tells the host to resolve it from the catalogue.
             if g.caster == sh.self_guid.load(Ordering::SeqCst) {
+                *sh.self_cast_release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(g.spell_id);
                 sh.event(format!("cooldown|{}|0", g.spell_id));
             }
         }

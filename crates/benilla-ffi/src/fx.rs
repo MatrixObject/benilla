@@ -39,7 +39,9 @@ fn blood_catalog(world: &mut BnWorld) -> Option<Arc<Bloods>> {
     Some(cat)
 }
 
-fn visual_catalog(world: &mut BnWorld) -> Option<Arc<Visuals>> {
+/// `SpellVisual.dbc` × `SpellVisualKit.dbc`, loaded once per data dir and shared:
+/// the cast's hold and cast-kit anims are the first non-visual users.
+pub(crate) fn visual_catalog(world: &mut BnWorld) -> Option<Arc<Visuals>> {
     static CAT: OnceLock<Mutex<Option<(String, Arc<Visuals>)>>> = OnceLock::new();
     let cell = CAT.get_or_init(|| Mutex::new(None));
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
