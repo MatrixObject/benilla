@@ -5692,6 +5692,67 @@ pub extern "C" fn bn_net_unit(index: u32, out: *mut BnNetUnit) -> u32 {
 /// (mainhand, offhand, ranged): the reference's `PLAYER_HELD_SLOTS`.
 const PLAYER_HELD_SLOTS: [u8; 3] = [15, 16, 17];
 
+/// One hand's item as `bn_net_unit_virtual_items` reads it: `(display, (class,
+/// subclass, material, inventory type), sheath)`. A player's hand is the worn
+/// `PLAYER_VISIBLE_ITEM` entry through its template, the reference's pass 1; a
+/// creature's is its own `UNIT_VIRTUAL_ITEM_SLOT_*` fields (`0x605e30`).
+fn held_hand(
+    rec: &UnitRec,
+    slot: u8,
+    templates: &HashMap<u32, ItemTemplate>,
+) -> (u32, (u8, u8, u8, u8), u8) {
+    if rec.kind != 4 {
+        return (
+            rec.fields.unit_virtual_item_display(slot).unwrap_or(0),
+            rec.fields
+                .unit_virtual_item_info(slot)
+                .unwrap_or((0, 0, 0, 0)),
+            rec.fields.unit_virtual_item_sheath(slot).unwrap_or(0),
+        );
+    }
+    let entry = rec
+        .fields
+        .player_visible_item_entry(PLAYER_HELD_SLOTS[slot as usize])
+        .unwrap_or(0);
+    match templates.get(&entry) {
+        Some(t) => (
+            t.display_id,
+            (
+                t.class as u8,
+                t.subclass as u8,
+                t.material as u8,
+                t.inventory_type as u8,
+            ),
+            t.sheath as u8,
+        ),
+        None => (0, (0, 0, 0, 0), 0),
+    }
+}
+
+/// Whether a hand stands in a melee stance, the pick behind the reference's ready
+/// pose (`0x5fcdc0`): only an ItemClass 2 weapon whose subclass stands Ready1H,
+/// Ready2H or Ready2HL. Everything else — a bare hand, a fishing pole (`0x14`), any
+/// non-weapon class — stands ReadyUnarmed (25).
+fn is_melee_hand(display: u32, class: u8, subclass: u8) -> bool {
+    display != 0
+        && class == 2
+        && matches!(
+            subclass,
+            0x0 | 0x1 | 0x4 | 0x5 | 0x6 | 0x7 | 0x8 | 0xa | 0xb | 0xc | 0xd | 0xe | 0xf | 0x11
+        )
+}
+
+/// Whether a drawn off-hand shield leaves the hand for its sheath. At every hand-item
+/// attach the reference asks the animation (`0x60b770` calls `0x60b6e0`): for the
+/// unarmed clips 16/20/25/117/118 it clears the shield's in-hand flag
+/// (`0x60b8c9`/`0x60b8d9`), and the move (`0x60b590`) then hangs it at the sheath point
+/// `0x47a070(sheath type 4)` = 28, the back. A drawn unit whose main hand holds no melee
+/// weapon stands ReadyUnarmed (25), so asking the same question from the equipment here
+/// answers it the same way.
+fn shield_leaves_hand(unit_sheath: Option<u8>, shield: bool, main_melee: bool) -> bool {
+    unit_sheath == Some(1) && shield && !main_melee
+}
+
 /// One tracked unit's three weapon slots as `(display, class, subclass, material,
 /// inventory_type, sheath)` per hand. A creature's come from
 /// `UNIT_VIRTUAL_ITEM_SLOT_DISPLAY`/`UNIT_VIRTUAL_ITEM_INFO`, which the server only
@@ -5720,33 +5781,7 @@ pub extern "C" fn bn_net_unit_virtual_items(
     let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
     for slot in 0..3u8 {
         let s = slot as usize;
-        let (disp, (c, sc, m, it), sheath) = if rec.kind == 4 {
-            let entry = rec
-                .fields
-                .player_visible_item_entry(PLAYER_HELD_SLOTS[s])
-                .unwrap_or(0);
-            match templates.get(&entry) {
-                Some(t) => (
-                    t.display_id,
-                    (
-                        t.class as u8,
-                        t.subclass as u8,
-                        t.material as u8,
-                        t.inventory_type as u8,
-                    ),
-                    t.sheath as u8,
-                ),
-                None => (0, (0, 0, 0, 0), 0),
-            }
-        } else {
-            (
-                rec.fields.unit_virtual_item_display(slot).unwrap_or(0),
-                rec.fields
-                    .unit_virtual_item_info(slot)
-                    .unwrap_or((0, 0, 0, 0)),
-                rec.fields.unit_virtual_item_sheath(slot).unwrap_or(0),
-            )
-        };
+        let (disp, (c, sc, m, it), sheath) = held_hand(rec, slot, &templates);
         unsafe {
             *out_displays.add(s) = disp;
             *out_info.add(s * 4) = c;
@@ -5759,10 +5794,17 @@ pub extern "C" fn bn_net_unit_virtual_items(
     3
 }
 
-/// A unit's `UNIT_FIELD_BYTES_2` sheath byte: 0 stowed, 1 melee drawn, 2 ranged
-/// drawn, or 0xFF while the object has not delivered that field. For our own
-/// body it is whatever we last sent in `CMSG_SETSHEATHED`, which the server
-/// echoes back (the reference's setter `0x611cf0`).
+/// The sheath byte the hands are placed by: a unit's `UNIT_FIELD_BYTES_2` byte 0
+/// (0 stowed, 1 melee drawn, 2 ranged drawn), or 0xFF while the object has not
+/// delivered that field. For our own body it is whatever we last sent in
+/// `CMSG_SETSHEATHED`, which the server echoes back (the reference's setter
+/// `0x611cf0`).
+///
+/// One equipment state overrides the byte: a drawn unit whose main hand holds no melee
+/// weapon stands ReadyUnarmed (25), and the reference then carries an off-hand shield on
+/// the back — see `shield_leaves_hand`. Answering 0 (the stowed byte) puts the shield at
+/// its own sheath point, and the host re-hangs the weapons only when this or the
+/// equipment moves, so the shield stays there across a whole unarmed fight.
 #[no_mangle]
 pub extern "C" fn bn_net_unit_sheath(guid: u64) -> u32 {
     let sh = shared();
@@ -5772,7 +5814,29 @@ pub extern "C" fn bn_net_unit_sheath(guid: u64) -> u32 {
         let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
         units.get(&guid).and_then(|r| r.fields.unit_sheath_state())
     };
-    state.map_or(0xFF, u32::from)
+    let Some(state) = state else {
+        return 0xFF;
+    };
+    if state != 1 {
+        return u32::from(state);
+    }
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rec) = units.get(&guid) else {
+        return u32::from(state);
+    };
+    let templates = sh.item_templates.lock().unwrap_or_else(|e| e.into_inner());
+    let (main_display, (main_class, main_subclass, _, _), _) = held_hand(rec, 0, &templates);
+    let (off_display, (_, _, _, off_inv), _) = held_hand(rec, 1, &templates);
+    let shield = off_display != 0 && off_inv == 14; // INVTYPE_SHIELD
+    if shield_leaves_hand(
+        Some(state),
+        shield,
+        is_melee_hand(main_display, main_class, main_subclass),
+    ) {
+        0
+    } else {
+        u32::from(state)
+    }
 }
 
 /// The AnimationData id of a main-hand melee swing for `guid`: the reference's `swing_anim_main`
@@ -6296,10 +6360,58 @@ pub extern "C" fn bn_net_item_info(entry: u32, out: *mut BnNetItemInfo) -> u32 {
 mod tests {
     use super::{
         attack_sends_swing, auto_equip_slots, clear_swing_refusal, defense_anim, equip_destination,
-        find_equip_slot, latch_swing_refusal, main_hand_class, row_pos_for_wire, swing_anim_main,
-        take_due_swing_refusal, wire_pos_for_row, wound_anim, wound_full_body, BAG_EQUIPPED,
-        BAG_PLAYER_INVENTORY,
+        find_equip_slot, is_melee_hand, latch_swing_refusal, main_hand_class, row_pos_for_wire,
+        shield_leaves_hand, swing_anim_main, take_due_swing_refusal, wire_pos_for_row, wound_anim,
+        wound_full_body, BAG_EQUIPPED, BAG_PLAYER_INVENTORY,
     };
+
+    /// The ready-pose table (`0x5fcdc0`) behind the shield rule: a class 2 weapon that
+    /// stands Ready1H/2H/2HL is a melee hand; a bow, gun, thrown weapon, wand, fishing
+    /// pole, any other class, or an empty hand stands ReadyUnarmed (25).
+    #[test]
+    fn a_hand_stands_armed_only_with_a_melee_weapon() {
+        for sc in [
+            0x0, 0x1, 0x4, 0x5, 0x6, 0x7, 0x8, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x11,
+        ] {
+            assert!(
+                is_melee_hand(0x1234, 2, sc),
+                "subclass {sc:#x} stands armed"
+            );
+        }
+        for sc in [0x2, 0x3, 0x9, 0x10, 0x12, 0x13, 0x14] {
+            assert!(
+                !is_melee_hand(0x1234, 2, sc),
+                "subclass {sc:#x} stands unarmed"
+            );
+        }
+        assert!(!is_melee_hand(0x1234, 4, 0x0), "armor never arms the hand");
+        assert!(!is_melee_hand(0, 2, 0x7), "an empty hand has no display");
+    }
+
+    /// A drawn shield leaves the hand only behind an unarmed stance; the stowed and
+    /// ranged bytes already place it at its sheath point through the item's own sheath
+    /// type, so only the drawn byte reaches this question.
+    #[test]
+    fn a_drawn_shield_leaves_an_unarmed_hand() {
+        assert!(
+            shield_leaves_hand(Some(1), true, false),
+            "drawn shield, bare main hand"
+        );
+        assert!(
+            !shield_leaves_hand(Some(1), true, true),
+            "a sword keeps the shield in hand"
+        );
+        assert!(!shield_leaves_hand(Some(0), true, false), "stowed");
+        assert!(!shield_leaves_hand(Some(2), true, false), "ranged drawn");
+        assert!(
+            !shield_leaves_hand(None, true, false),
+            "no field, no override"
+        );
+        assert!(
+            !shield_leaves_hand(Some(1), false, false),
+            "no shield, nothing to move"
+        );
+    }
 
     /// The attack lock (`+0xc48`) survives a stop, so a start re-issued before the
     /// `SMSG_ATTACKSTOP` echo sends no swing (`0x5ecb70`): hammering the attack key

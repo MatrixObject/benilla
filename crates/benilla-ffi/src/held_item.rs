@@ -11,8 +11,11 @@
 //! `bn_unit_held_item(world, display, inventory_type, slot, sheath, unit_sheath,
 //! out_model, model_cap, out_texture, texture_cap)` returns `attach_id + 1`
 //! (0 = nothing to draw) and writes the `.m2` path plus the object-skin BLP
-//! basename. `unit_sheath` is the unit's `UNIT_FIELD_BYTES_2` byte 0: a drawn
-//! melee (1) or ranged (2) unit holds its weapon, a stowed one (0) wears it.
+//! basename. `unit_sheath` is the sheath byte the hands are placed by: the unit's
+//! `UNIT_FIELD_BYTES_2` byte 0 (a drawn melee (1) or ranged (2) unit holds its
+//! weapon, a stowed one (0) wears it), with the unarmed-stance override the caller
+//! applies — a drawn unit whose main hand holds no melee weapon stands ReadyUnarmed
+//! and carries its shield on the back (`0x60b770`/`0x60b590`).
 
 use std::ffi::c_char;
 
