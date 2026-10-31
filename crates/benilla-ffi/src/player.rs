@@ -1687,11 +1687,19 @@ impl Player {
             self.snap_pending = false;
             // A body with a floor within a step under its feet is inside the
             // building, not under it: the idle cast settles it onto that floor
-            // and the climb would take it to the next storey up.
-            let near = self
+            // and the climb would take it to the next storey up. The server's
+            // own feet can sit a hand under that floor (an old saved pose on a
+            // pavement the maps cut higher), and a body standing still skips
+            // the idle cast, so settle it here.
+            let seat = self
                 .ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
-                .is_some_and(|(z, _)| self.pos[2] - z <= STEP_UP_HEIGHT);
-            if !near {
+                .filter(|(z, _)| self.pos[2] - z <= STEP_UP_HEIGHT);
+            if let Some((z, _)) = seat.filter(|(z, _)| *z > self.pos[2]) {
+                self.pos[2] = z;
+                self.vel[2] = 0.0;
+                self.grounded = true;
+                self.last_ground = self.pos;
+            } else if seat.is_none() {
                 // The street over a spawn under a city is the lowest WMO floor;
                 // over open ground the surface itself is the terrain. Take the
                 // lower of the two, so a spawn under a bridge does not climb
@@ -2001,9 +2009,12 @@ impl Player {
             // through a hole the data does not have. While the set is still
             // owed, a standing body holds its seat - the rule `bn_ground_clamp_z`
             // gives units - and `snap_pending` settles it on the baked floor.
-            let stale = (self.grounded || self.hold_pose)
-                && self.floors_folding(self.pos[0], self.pos[1])
-                && found.map_or(true, |(z, _)| prev_z - z > STEP_UP_HEIGHT);
+            // A body the server just placed holds its seat for the whole fold:
+            // under a city street the ADT lies more than a step below the
+            // pavement, so one terrain-only tick buries the feet for good.
+            let stale = self.floors_folding(self.pos[0], self.pos[1])
+                && (self.hold_pose
+                    || (self.grounded && found.map_or(true, |(z, _)| prev_z - z > STEP_UP_HEIGHT)));
             if stale {
                 self.pos[2] = prev_z;
                 self.vel[2] = 0.0;
@@ -4314,6 +4325,42 @@ mod tests {
         }
         assert!(p.grounded, "and standing there");
         assert!((p.pos[2] - 10.0).abs() < 1.0e-3, "no fall afterwards");
+    }
+
+    /// A Stormwind street's pavement is ~1.1 yd above the ADT under it, more
+    /// than `STEP_UP_HEIGHT`, so a body that settles on the terrain while the
+    /// tile's WMO set is still folding can never step back onto the street.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn login_seat_on_a_city_street() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (sx, sy, sz) = (-9065.09f32, 423.11f32, 92.82f32);
+        let mut p = Player::new("Azeroth", sx, sy);
+        p.set_server_pose([sx, sy, sz], 0.0);
+        for i in 0..900 {
+            p.ensure_tiles(&w.archives);
+            p.ensure_wmo(&mut w.chain, &mut w.wmo_collision);
+            p.tick(1.0 / 60.0);
+            if i % 120 == 119 {
+                println!(
+                    "t{i} z={:.2} grounded={} folding={} seat={:?}",
+                    p.pos[2],
+                    p.grounded,
+                    p.floors_folding(sx, sy),
+                    p.ground(sx, sy, 1000.0)
+                );
+            }
+        }
+        assert!(
+            p.pos[2] > 92.9,
+            "feet on the street, not the ADT under it: {}",
+            p.pos[2]
+        );
+        crate::bn_shutdown(w);
     }
 
     #[test]
