@@ -353,21 +353,9 @@ fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
 
 /// Returns a handle, or null on error.
 
-#[no_mangle]
-
-pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
-    let dir = match cstr_to_str(data_dir) {
-        Some(s) => s,
-
-        None => return std::ptr::null_mut(),
-    };
-
-    let data = Path::new(dir);
-
-    if !data.is_dir() {
-        return std::ptr::null_mut();
-    }
-
+/// Every `.mpq` in `data`, in directory order. Shared by the world handle and
+/// the background model workers, which cannot borrow the handle's list.
+fn open_archives(data: &Path) -> Vec<Archive> {
     let mut archives: Vec<Archive> = Vec::new();
 
     if let Ok(read) = std::fs::read_dir(data) {
@@ -383,6 +371,26 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
             }
         }
     }
+
+    archives
+}
+
+#[no_mangle]
+
+pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
+    let dir = match cstr_to_str(data_dir) {
+        Some(s) => s,
+
+        None => return std::ptr::null_mut(),
+    };
+
+    let data = Path::new(dir);
+
+    if !data.is_dir() {
+        return std::ptr::null_mut();
+    }
+
+    let archives = open_archives(data);
 
     if archives.is_empty() {
         return std::ptr::null_mut();
@@ -1495,6 +1503,155 @@ const LIQUID_FRAME_SETS: [(&str, &str, u32); 3] = [
     ("lava", "lava", 30),
 ];
 
+/// A whole frame set decoded off the game thread: frame-major RGBA, the layout
+/// `bn_liquid_frame_atlas` writes.
+struct LiquidAtlas {
+    w: u32,
+    h: u32,
+    n: u32,
+    rgba: Vec<u8>,
+}
+
+/// `None` memoizes a set this install cannot complete; `Some` is the atlas.
+fn liquid_atlas_cache() -> &'static Mutex<HashMap<u32, Option<Arc<LiquidAtlas>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Arc<LiquidAtlas>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn liquid_pending() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static PENDING: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+struct LiquidJobs {
+    /// (kind, data dir) - the worker opens its own chain per dir.
+    queue: Mutex<VecDeque<(u32, String)>>,
+    ready: Condvar,
+}
+
+fn liquid_jobs() -> &'static LiquidJobs {
+    static JOBS: OnceLock<LiquidJobs> = OnceLock::new();
+    JOBS.get_or_init(|| LiquidJobs {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+    })
+}
+
+/// Decode `kind`'s frames from the worker's own chain (stops at the first
+/// missing or mis-sized frame, as the official loader).
+fn build_liquid_atlas(chain: &mut benilla_formats::Chain, kind: u32) -> Option<LiquidAtlas> {
+    let &(dir, stem, max) = LIQUID_FRAME_SETS.get(kind as usize)?;
+    let mut wh = (0u32, 0u32);
+    let mut rgba: Vec<u8> = Vec::new();
+    let mut n = 0u32;
+    for i in 1..=max {
+        let path = format!("XTextures\\{dir}\\{stem}.{i}.blp");
+        let Some((ww, hh, level)) = read_texture_bytes_chain(chain, &path)
+            .and_then(|b| decode_blp_bytes(&b))
+            .and_then(|(ww, hh, mips)| mips.into_iter().next().map(|m| (ww, hh, m.2)))
+        else {
+            break;
+        };
+        if n == 0 {
+            wh = (ww, hh);
+        } else if (ww, hh) != wh {
+            break;
+        }
+        if level.len() != ww as usize * hh as usize * 4 {
+            break;
+        }
+        rgba.extend_from_slice(&level);
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(LiquidAtlas {
+        w: wh.0,
+        h: wh.1,
+        n,
+        rgba,
+    })
+}
+
+/// Start the atlas worker once; it lives as long as the process.
+fn liquid_workers() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("bn-liquid-atlas".to_string())
+            .spawn(|| {
+                let mut chain: Option<(String, benilla_formats::Chain)> = None;
+                loop {
+                    let job = {
+                        let jobs = liquid_jobs();
+                        let mut q = match jobs.queue.lock() {
+                            Ok(q) => q,
+                            Err(_) => return,
+                        };
+                        while q.is_empty() {
+                            q = match jobs.ready.wait(q) {
+                                Ok(q) => q,
+                                Err(_) => return,
+                            };
+                        }
+                        q.pop_front()
+                    };
+                    let Some((kind, dir)) = job else {
+                        continue;
+                    };
+                    if chain.as_ref().map_or(true, |(d, _)| d != &dir) {
+                        chain = benilla_formats::Chain::open(Path::new(&dir))
+                            .ok()
+                            .map(|c| (dir, c));
+                    }
+                    let built = chain
+                        .as_mut()
+                        .and_then(|(_, c)| build_liquid_atlas(c, kind));
+                    if let Ok(mut cache) = liquid_atlas_cache().lock() {
+                        cache.insert(kind, built.map(Arc::new));
+                    }
+                    if let Ok(mut p) = liquid_pending().lock() {
+                        p.remove(&kind);
+                    }
+                }
+            });
+    });
+}
+
+/// Ask for `kind`'s flipbook on the worker: 1 = built, 0 = queued,
+/// 3 = in flight, 2 = no such set or this install lacks it. The first water
+/// frame of a zone used to read all 30 BLPs inside one tile-build slice
+/// (1-2 s on a spinning disk); the host holds the liquid kind until this says
+/// 1 or 2 instead.
+#[no_mangle]
+pub extern "C" fn bn_liquid_atlas_request(world: *const BnWorld, kind: u32) -> u32 {
+    if world.is_null() || LIQUID_FRAME_SETS.get(kind as usize).is_none() {
+        return 2;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    if let Ok(cache) = liquid_atlas_cache().lock() {
+        match cache.get(&kind) {
+            Some(Some(_)) => return 1,
+            Some(None) => return 2,
+            None => {}
+        }
+    }
+    if let Ok(mut p) = liquid_pending().lock() {
+        if !p.insert(kind) {
+            return 3;
+        }
+    }
+    liquid_workers();
+    let jobs = liquid_jobs();
+    if let Ok(mut q) = jobs.queue.lock() {
+        q.push_back((kind, w.data_dir.clone()));
+        jobs.ready.notify_one();
+    }
+    0
+}
+
 /// Scan `kind`'s frame set, writing {width, height, frame_count} to `out`
 /// (stops at the first missing or mis-sized frame, as the official loader).
 /// Returns 1 on success.
@@ -1506,6 +1663,17 @@ pub extern "C" fn bn_liquid_frame_info(world: *mut BnWorld, kind: u32, out: *mut
     let Some(&(dir, stem, max)) = LIQUID_FRAME_SETS.get(kind as usize) else {
         return 0;
     };
+    // The worker's atlas answers the scan without reading frame 1 again.
+    if let Ok(cache) = liquid_atlas_cache().lock() {
+        if let Some(Some(a)) = cache.get(&kind) {
+            unsafe {
+                *out = a.w;
+                *out.add(1) = a.h;
+                *out.add(2) = a.n;
+            }
+            return 1;
+        }
+    }
     // SAFETY: caller guarantees an exclusive valid handle.
     let w = unsafe { &mut *world };
     let Some(chain) = w.chain.as_mut() else {
@@ -1552,6 +1720,20 @@ pub extern "C" fn bn_liquid_frame_atlas(
     let Some(&(dir, stem, max)) = LIQUID_FRAME_SETS.get(kind as usize) else {
         return 0;
     };
+    // The worker's copy is a plain memcpy; the synchronous walk below is only
+    // the fallback (no request made, or the pool could not build it).
+    if let Ok(cache) = liquid_atlas_cache().lock() {
+        if let Some(Some(a)) = cache.get(&kind) {
+            let total = a.rgba.len();
+            if total > cap as usize {
+                return 0;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(a.rgba.as_ptr(), out, total);
+            }
+            return total as u32;
+        }
+    }
     // SAFETY: caller guarantees an exclusive valid handle and an out buffer
     // of `cap` bytes.
     let w = unsafe { &mut *world };
@@ -3467,6 +3649,39 @@ pub extern "C" fn bn_doodad_count(world: *const BnWorld) -> u32 {
     w.tile.as_ref().map_or(0, |t| t.doodads.len() as u32) + w.wmo_doodads.len() as u32
 }
 
+/// The prop model `bn_doodad_load` would bake for merged doodad `i`, or `None`
+/// past the end of both ranges.
+fn doodad_model_for(w: &BnWorld, i: u32) -> Option<&str> {
+    if let Some(d) = w.tile.as_ref().and_then(|t| t.doodads.get(i as usize)) {
+        return Some(d.model.as_str());
+    }
+    wmo_doodad_at(w, i).map(|d| d.model.as_str())
+}
+
+/// 1 when the worker has already parsed doodad `i`'s model into the shared mesh
+/// cache (so `bn_doodad_load` answers without touching the MPQ), 0 while the
+/// parse is still the pool's, 2 when there is no such doodad. The host holds
+/// its gather cursor on 0 instead of paying a cold M2 read on the game thread;
+/// the tile-prep worker's `prefetch_doodad_models` fills the cache after it
+/// publishes the tile, so the first frame or two can legitimately answer 0.
+#[no_mangle]
+pub extern "C" fn bn_doodad_model_ready(world: *const BnWorld, i: u32) -> u32 {
+    if world.is_null() {
+        return 2;
+    }
+    // SAFETY: caller owns a valid const handle.
+    let w = unsafe { &*world };
+    let Some(model) = doodad_model_for(w, i) else {
+        return 2;
+    };
+    // The cache normalizes the ADT spelling (.mdx/.mdl -> .m2) itself.
+    if doodad_mesh_cached(model).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
 /// A merged doodad index past the MDDF placements, or `None` in the MDDF
 /// range (the caller handles those) / out of range.
 fn wmo_doodad_at(w: &BnWorld, i: u32) -> Option<&WmoDoodadInst> {
@@ -4480,6 +4695,162 @@ fn m2_cached(archives: &[Archive], path: &str) -> Option<Arc<M2Cached>> {
         }
     }
     Some(entry)
+}
+
+// ---- Background model parse ----
+//
+// A first-sight M2 is a cold MPQ read plus a parse: on a spinning-disk
+// install that read measures 250-900 ms, and one spawn touches six to eight
+// entry points. `bn_model_request` names the file once; a worker opens its own
+// archive list, reads and parses it into the shared cache above, and the game
+// thread's later `bn_model_*` calls hit the map instead of the disk.
+
+struct ModelJobs {
+    /// (cache key, data dir, internal path).
+    queue: Mutex<VecDeque<(String, String, String)>>,
+
+    ready: Condvar,
+}
+
+fn model_jobs() -> &'static ModelJobs {
+    static JOBS: OnceLock<ModelJobs> = OnceLock::new();
+
+    JOBS.get_or_init(|| ModelJobs {
+        queue: Mutex::new(VecDeque::new()),
+
+        ready: Condvar::new(),
+    })
+}
+
+/// Paths a request has queued or found missing (`true` = the read/parse failed
+/// for this install, so the answer will not change).
+fn model_requests() -> &'static Mutex<HashMap<String, bool>> {
+    static REQUESTS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+    REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse jobs on their own threads: the read blocks on the disk and the parse
+/// is CPU, and neither belongs on the game thread.
+fn model_workers() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+
+    STARTED.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(2)
+            .clamp(1, 2);
+
+        for i in 0..n {
+            let _ = std::thread::Builder::new()
+                .name(format!("bn-m2-{i}"))
+                .spawn(|| {
+                    // Each worker reads from its own archive list.
+                    let mut archives: Option<(String, Vec<Archive>)> = None;
+
+                    loop {
+                        let job = {
+                            let jobs = model_jobs();
+
+                            let mut q = match jobs.queue.lock() {
+                                Ok(q) => q,
+
+                                Err(_) => return,
+                            };
+
+                            while q.is_empty() {
+                                q = match jobs.ready.wait(q) {
+                                    Ok(q) => q,
+
+                                    Err(_) => return,
+                                };
+                            }
+
+                            q.pop_front()
+                        };
+
+                        let Some((key, dir, path)) = job else {
+                            continue;
+                        };
+
+                        if archives.as_ref().map_or(true, |(d, _)| d != &dir) {
+                            archives = Some((dir.clone(), open_archives(Path::new(&dir))));
+                        }
+
+                        let loaded = archives
+                            .as_ref()
+                            .and_then(|(_, a)| m2_cached(a, &path))
+                            .is_some();
+
+                        if let Ok(mut req) = model_requests().lock() {
+                            if loaded {
+                                req.remove(&key);
+                            } else {
+                                req.insert(key, true);
+                            }
+                        }
+                    }
+                });
+        }
+    });
+}
+
+/// Queue a background read and parse of `internal_path` into the shared M2
+/// cache. 1 = loaded already, 3 = in flight, 0 = queued, 2 = bad arguments or
+/// a path this install does not carry.
+#[no_mangle]
+
+pub extern "C" fn bn_model_request(world: *const BnWorld, internal_path: *const c_char) -> u32 {
+    if world.is_null() || internal_path.is_null() {
+        return 2;
+    }
+
+    let Some(p) = cstr_to_str(internal_path) else {
+        return 2;
+    };
+
+    let p = p.trim();
+
+    if p.is_empty() {
+        return 2;
+    }
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    model_request(&w.data_dir, p)
+}
+
+fn model_request(dir: &str, path: &str) -> u32 {
+    let key = path.to_ascii_lowercase();
+
+    if let Ok(cache) = m2_cache().lock() {
+        if cache.entries.contains_key(&key) {
+            return 1;
+        }
+    }
+
+    if let Ok(mut req) = model_requests().lock() {
+        if let Some(&missed) = req.get(&key) {
+            return if missed { 2 } else { 3 };
+        }
+
+        // Reserve before queueing so a second request answers "in flight".
+        req.insert(key.clone(), false);
+    }
+
+    model_workers();
+
+    let jobs = model_jobs();
+
+    if let Ok(mut q) = jobs.queue.lock() {
+        q.push_back((key, dir.to_string(), path.to_string()));
+
+        jobs.ready.notify_one();
+    }
+
+    0
 }
 
 /// One M2 vertex: `position` (C3, @0), weights (@0x0c), 4 bone indices
