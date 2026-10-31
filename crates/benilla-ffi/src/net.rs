@@ -3391,6 +3391,18 @@ fn row_pos_for_wire(bag: u8, slot: u8) -> (u8, u8) {
     }
 }
 
+/// The wire position of an inventory row: bag 0 is the backpack, whose wire seats are
+/// [`BAG_PLAYER_INVENTORY`]`/`[`SLOT_PACK_FIRST`]..38. A worn item (255) and an item inside an
+/// equipped bag (19..22, with its inner slot) already carry the wire address. The inverse of
+/// [`row_pos_for_wire`].
+fn wire_pos_for_row(bag: u8, slot: u8) -> (u8, u8) {
+    if bag == 0 {
+        (BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST + slot)
+    } else {
+        (bag, slot)
+    }
+}
+
 /// The live slot an `AutoEquip` command sends its item to (0 is the ammo seat, loaded by entry
 /// rather than moved) and the entry that names it. `None` when the row is not there or its
 /// template names no slot, so the caller can keep the client's own packet.
@@ -5022,6 +5034,7 @@ pub extern "C" fn bn_net_reconnect() -> u32 {
 /// 8 = quest query (b=quest), 9 = logout,
 /// 11 = use item (b = bag<<8 | slot, a = spell slot),
 /// 12 = auto-equip (b = bag<<8 | slot),
+/// both at an inventory row's own bag (0 the backpack, 19..22 a worn bag, 0xFF the doll),
 /// 13 = swap inventory slots (a = src, b = dst),
 /// 24 = accept a group invite, 25 = leave/disband the group,
 /// 26 = invite by name (text), 27 = decline the pending invite.
@@ -5048,24 +5061,21 @@ pub extern "C" fn bn_net_send(kind: u32, a: u64, b: u32, text: *const c_char) ->
             spell: a as u32,
             target: 0,
         },
-        11 => Cmd::UseItem {
-            bag: ((b >> 8) & 0xff) as u8,
-            slot: (b & 0xff) as u8,
-            spell: (a & 0xff) as u8,
-        },
-        // The host names a backpack item bag 0 slot 0..15, the row's own addressing; the
-        // command speaks the wire's player array, where those seats are 255/23..38.
-        12 => {
-            let bag = ((b >> 8) & 0xff) as u8;
-            let slot = (b & 0xff) as u8;
-            if bag == 0 {
-                Cmd::AutoEquip {
-                    bag: BAG_EQUIPPED,
-                    slot: SLOT_PACK_FIRST + slot,
-                }
-            } else {
-                Cmd::AutoEquip { bag, slot }
+        // Both name the row the way the inventory rows do — backpack 0, a worn bag 19..22, the
+        // doll 255 — and both speak the wire's player array, where the backpack's seats are
+        // 255/23..38. A host that sent the row's bag 0 straight through asked the server for an
+        // item at its head slot, so a click did nothing.
+        11 => {
+            let (bag, slot) = wire_pos_for_row(((b >> 8) & 0xff) as u8, (b & 0xff) as u8);
+            Cmd::UseItem {
+                bag,
+                slot,
+                spell: (a & 0xff) as u8,
             }
+        }
+        12 => {
+            let (bag, slot) = wire_pos_for_row(((b >> 8) & 0xff) as u8, (b & 0xff) as u8);
+            Cmd::AutoEquip { bag, slot }
         }
         13 => Cmd::SwapInv {
             src: (a & 0xff) as u8,
@@ -6055,7 +6065,8 @@ mod tests {
     use super::{
         attack_sends_swing, auto_equip_slots, clear_swing_refusal, defense_anim, equip_destination,
         find_equip_slot, latch_swing_refusal, main_hand_class, row_pos_for_wire, swing_anim_main,
-        take_due_swing_refusal, wound_anim, wound_full_body, BAG_EQUIPPED,
+        take_due_swing_refusal, wire_pos_for_row, wound_anim, wound_full_body, BAG_EQUIPPED,
+        BAG_PLAYER_INVENTORY,
     };
 
     /// The attack lock (`+0xc48`) survives a stop, so a start re-issued before the
@@ -6097,6 +6108,18 @@ mod tests {
         assert_eq!(row_pos_for_wire(BAG_EQUIPPED, 23), (0, 0));
         assert_eq!(row_pos_for_wire(BAG_EQUIPPED, 38), (0, 15));
         assert_eq!(row_pos_for_wire(19, 3), (19, 3));
+    }
+
+    /// The row's backpack (bag 0) is the player array's 23..38 on the wire, and a worn item or a
+    /// bag item already carries its wire address.
+    #[test]
+    fn a_row_maps_to_its_wire_position() {
+        assert_eq!(wire_pos_for_row(0, 0), (BAG_PLAYER_INVENTORY, 23));
+        assert_eq!(wire_pos_for_row(0, 5), (BAG_PLAYER_INVENTORY, 28));
+        assert_eq!(wire_pos_for_row(0, 15), (BAG_PLAYER_INVENTORY, 38));
+        assert_eq!(wire_pos_for_row(BAG_EQUIPPED, 4), (BAG_EQUIPPED, 4));
+        assert_eq!(wire_pos_for_row(19, 3), (19, 3));
+        assert_eq!(wire_pos_for_row(22, 35), (22, 35));
     }
 
     /// A failed `CMSG_AUTOEQUIP_ITEM` becomes a swap to this slot: the first empty candidate of
