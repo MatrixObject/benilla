@@ -98,6 +98,9 @@ const FLY_SPEED: f32 = 30.0;
 /// AnimationData ids: Death (the swing clip comes from the armed main hand:
 /// `net::self_swing_anim`, the reference's `swing_anim_main`).
 const ANIM_DEATH: u32 = 1;
+/// Loot (50): the kneel while a loot session is open on a kneelable target
+/// (`0x5fd260`, ahead of the Stand/Ready idles).
+const ANIM_LOOT: u32 = 50;
 /// The swing one-shot's visible window (s), the unarmed clip's own length.
 const SWING_WINDOW: f32 = 0.7;
 /// The overlay's blend time constant (s): the vanilla masked layer's ease.
@@ -375,6 +378,10 @@ const WMO_GRID: i32 = 34;
 const WMO_MARGIN: i32 = 1;
 /// One map cell is half a chunk (16.67 yd); the map corner is -17066.67.
 const WMO_CELL: f32 = 33.333_336 / 2.0;
+/// How far outside the grid the origin of a WMO-internal prop may sit and still
+/// be folded into this tile: one building WMO spans several tiles, and a prop
+/// reaches this grid only if its origin is within a few cells of the border.
+const HULL_SLACK_CELLS: i32 = 8;
 
 // ---- doodad collision hulls ----
 // A map doodad collides by its M2 collision hull (the header's coarse
@@ -475,6 +482,11 @@ pub(crate) struct TileCol {
     /// cold parse of ~200 unique M2 meshes costs half a second), so the frame
     /// never stalls on a tile load.
     doodad_next: usize,
+    /// WMO-internal (MODD) placements of this tile's WMOs, resolved once;
+    /// `modd_next` is the fold cursor and `modd_done` the resolve latch.
+    modd: Vec<crate::WmoDoodadInst>,
+    modd_next: usize,
+    modd_done: bool,
 }
 
 impl TileCol {
@@ -498,6 +510,9 @@ impl TileCol {
             wmo_world: Vec::new(),
             wmo_mliq: 0,
             doodad_next: 0,
+            modd: Vec::new(),
+            modd_next: 0,
+            modd_done: false,
         }
     }
 
@@ -521,18 +536,42 @@ impl TileCol {
 
     /// Every grid cell a triangle's XY bounds overlap, clamped to the grid.
     fn wmo_span(tx: i32, ty: i32, t: &Tri) -> (i32, i32, i32, i32) {
-        let minx = t.v[0][0].min(t.v[1][0]).min(t.v[2][0]);
-        let maxx = t.v[0][0].max(t.v[1][0]).max(t.v[2][0]);
-        let miny = t.v[0][1].min(t.v[1][1]).min(t.v[2][1]);
-        let maxy = t.v[0][1].max(t.v[1][1]).max(t.v[2][1]);
-        let (ax, ay) = Self::wmo_local(tx, ty, minx, miny);
-        let (bx, by) = Self::wmo_local(tx, ty, maxx, maxy);
+        let (ax, ay, bx, by) = Self::wmo_bounds_local(tx, ty, t);
         (
             ax.min(bx).clamp(0, WMO_GRID - 1),
             ay.min(by).clamp(0, WMO_GRID - 1),
             ax.max(bx).clamp(0, WMO_GRID - 1),
             ay.max(by).clamp(0, WMO_GRID - 1),
         )
+    }
+
+    /// The same range, `None` when the triangle lies wholly outside the grid:
+    /// a triangle from a far placement is dropped, not clamped into the border
+    /// cell, whose query would then scan every dropped triangle.
+    fn wmo_span_in_grid(tx: i32, ty: i32, t: &Tri) -> Option<(i32, i32, i32, i32)> {
+        let (ax, ay, bx, by) = Self::wmo_bounds_local(tx, ty, t);
+        let (x0, x1) = (ax.min(bx), ax.max(bx));
+        let (y0, y1) = (ay.min(by), ay.max(by));
+        if x1 < 0 || y1 < 0 || x0 >= WMO_GRID || y0 >= WMO_GRID {
+            return None;
+        }
+        Some((
+            x0.clamp(0, WMO_GRID - 1),
+            y0.clamp(0, WMO_GRID - 1),
+            x1.clamp(0, WMO_GRID - 1),
+            y1.clamp(0, WMO_GRID - 1),
+        ))
+    }
+
+    /// Grid coordinates of a triangle's XY bounds, unclamped.
+    fn wmo_bounds_local(tx: i32, ty: i32, t: &Tri) -> (i32, i32, i32, i32) {
+        let minx = t.v[0][0].min(t.v[1][0]).min(t.v[2][0]);
+        let maxx = t.v[0][0].max(t.v[1][0]).max(t.v[2][0]);
+        let miny = t.v[0][1].min(t.v[1][1]).min(t.v[2][1]);
+        let maxy = t.v[0][1].max(t.v[1][1]).max(t.v[2][1]);
+        let (ax, ay) = Self::wmo_local(tx, ty, minx, miny);
+        let (bx, by) = Self::wmo_local(tx, ty, maxx, maxy);
+        (ax, ay, bx, by)
     }
 }
 
@@ -845,10 +884,15 @@ struct Input {
 /// kit's clip is the hold the caster keeps for the whole cast, the cast kit's
 /// is the one-shot the GO plays (`0x60f34c`, `creature_anim::route_cast_visuals`).
 /// A kit row with no anim holds nothing (`None`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct CastKit {
     pub hold: Option<u32>,
     pub release: Option<u32>,
+    /// The cast kit's populated effect slots, `(M2 attach tag, model path)`: the
+    /// GO spawns them all (`0x60edf0`). A summon's hand slots (0x15, 0x16) carry
+    /// the orb the caster shows on success; the field-12 world plant is not an
+    /// attachment and is left to the app's dest-fx path.
+    pub release_fx: Vec<(u16, String)>,
 }
 
 pub struct Player {
@@ -896,6 +940,9 @@ pub struct Player {
     /// comes from that record (`0x6246a0`), never from the attack latch, so starting
     /// or stopping auto-attack does not replay it.
     attack_left: f32,
+    /// The loot latch resolves to a kneelable target this tick: the reference's
+    /// `0x6126b0` session plus `0x612710`'s kind test, read off the open window.
+    loot_kneel: bool,
     /// The live cast the server started for us: (spell, elapsed, duration).
     cast: Option<(u32, f32, f32)>,
     /// The spell whose `SpellVisual` kits were last looked up, and those kits
@@ -997,6 +1044,7 @@ impl Player {
             mount_preview: false,
             mounted: false,
             attack_left: 0.0,
+            loot_kneel: false,
             cast: None,
             cast_kit_spell: 0,
             cast_kit: None,
@@ -1194,6 +1242,91 @@ impl Player {
             if start.elapsed().as_millis() >= 2 {
                 break;
             }
+        }
+        // WMO-internal doodads (MODD): the city's trees, barrels and lamps are
+        // placed inside the building WMO, not in the ADT's MDDF - Stormwind's
+        // main WMO carries ~4800 such props. The renderer draws them
+        // (`resolve_wmo_doodads`); fold the same placements so they collide.
+        if t.modd_next == 0 && !t.modd_done {
+            t.modd = crate::resolve_wmo_doodads(Some(chain), &t.wmos.clone());
+            t.modd_done = true;
+        }
+        // One WMO spans many tiles, so most of its props belong to a neighbour's
+        // copy of the same placement: a far one is dropped before its hull is
+        // transformed, and a triangle outside the grid is dropped instead of
+        // clamped into the border cell - the clamp would flood that cell with
+        // the whole city and turn its query into a full scan.
+        let grid_range = -(HULL_SLACK_CELLS)..(WMO_GRID + HULL_SLACK_CELLS);
+        while t.modd_next < t.modd.len() {
+            let i = t.modd_next;
+            let d = &t.modd[i];
+            let (gx, gy) = TileCol::wmo_local(tx, ty, d.position[0], d.position[1]);
+            if !grid_range.contains(&gx) || !grid_range.contains(&gy) {
+                t.modd_next = i + 1;
+                continue;
+            }
+            if !d.model.is_empty() && !self.hulls.contains_key(&d.model) {
+                let parked = doodad_hull_parked(&d.model);
+                if parked.is_none() && start.elapsed().as_millis() >= 2 {
+                    // A cold model with nothing parked waits for a fresh slice.
+                    break;
+                }
+                let model = d.model.clone();
+                let hull = parked.unwrap_or_else(|| m2_collision_hull(chain, &model));
+                self.hulls.insert(model, hull);
+            }
+            t.modd_next = i + 1;
+            let d = &t.modd[i];
+            let Some(Some(hull)) = self.hulls.get(&d.model) else {
+                continue;
+            };
+            let s = d.scale;
+            let world: Vec<[f32; 3]> = hull
+                .positions
+                .iter()
+                .map(|p| {
+                    let r = q_rot(d.quat, [p[0] * s, p[1] * s, p[2] * s]);
+                    [
+                        r[0] + d.position[0],
+                        r[1] + d.position[1],
+                        r[2] + d.position[2],
+                    ]
+                })
+                .collect();
+            for tri in hull.indices.as_chunks::<3>().0 {
+                let (Some(&va), Some(&vb), Some(&vc)) = (
+                    world.get(tri[0] as usize),
+                    world.get(tri[1] as usize),
+                    world.get(tri[2] as usize),
+                ) else {
+                    continue;
+                };
+                let tri_c = Tri::new(va, vb, vc);
+                let Some((x0, y0, x1, y1)) = TileCol::wmo_span_in_grid(tx, ty, &tri_c) else {
+                    continue;
+                };
+                for ly in y0..=y1 {
+                    for lx in x0..=x1 {
+                        t.doodad_cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                    }
+                }
+            }
+            if start.elapsed().as_millis() >= 2 {
+                break;
+            }
+        }
+        if t.modd_next >= t.modd.len() {
+            if !t.modd.is_empty() {
+                let folded: usize = t.doodad_cells.iter().map(Vec::len).sum();
+                eprintln!(
+                    "bn_player: tile ({},{}) modd: {} placements, {folded} doodad grid tris",
+                    tx,
+                    ty,
+                    t.modd.len()
+                );
+            }
+            // Folded: the placement list (a city's runs to thousands) is dead weight.
+            t.modd = Vec::new();
         }
     }
 
@@ -1851,6 +1984,9 @@ impl Player {
             return;
         }
         self.sample_server_state(dt);
+        // The open loot window is the session (`player+0x1d28`); its guid's kind
+        // decides whether the body may kneel (`0x612710`).
+        self.loot_kneel = crate::net::self_loot_kneel();
         self.swim_hop_s += dt;
         if self.dead {
             // A corpse neither walks nor jumps; the camera still follows.
@@ -2073,23 +2209,20 @@ impl Player {
             self.cam_yaw = wrap_pi(self.cam_yaw + d.clamp(-max, max));
         }
 
-        // Jump: an edge. Reference `0x7c6230` takes a swimmer at any depth, clearing
-        // the latch with the swim seed (a deep press hops and re-latches, `0x7c5de0`).
-        // Deviation: the maintainer's call - Space leaps only while the body swims AT
-        // the surface, its head (the capsule top) not under the waterline; a submerged
-        // press is dropped, so a diver rises by aiming up and stroking (`0x7c6f70`),
-        // never by a launch out through the surface.
+        // Jump: an edge. `0x7c6230` takes a swimmer at any depth with the swim seed;
+        // the launch clears the latch and the depth test re-arms it once the arc
+        // halves (`0x7c5de0`), so a deep press surges upward under the water and a
+        // surface press breaches out.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
-        let at_surface = surface.is_some_and(|s| self.pos[2] >= s - CAPSULE_HEIGHT);
         if jump {
-            if self.swimming && at_surface {
+            if self.swimming {
                 self.swimming = false;
                 self.vel[2] = SWIM_JUMP_SPEED;
                 self.grounded = false;
                 self.swim_hop_s = 0.0;
                 self.pos[2] += 0.05;
-            } else if !self.swimming && self.grounded {
+            } else if self.grounded {
                 self.vel[2] = JUMP_SPEED;
                 self.grounded = false;
                 self.pos[2] += 0.05;
@@ -2446,6 +2579,20 @@ impl Player {
         self.attack_left > 0.0
     }
 
+    /// The loot kneel (`0x5fd260`): a loot session is open on a corpse or a
+    /// non-bobber GameObject, the body is on its feet, and no direction bit
+    /// outranks it. Turning in place keeps the kneel (the shuffle is the stand
+    /// mode's own special, and loot is picked ahead of it). A mount declines it.
+    fn loot_kneeling(&self) -> bool {
+        self.loot_kneel
+            && !self.mounted
+            && self.grounded
+            && !self.swimming
+            && self.input.forward.abs() <= 0.01
+            && self.input.strafe.abs() <= 0.01
+            && (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt() <= 0.1
+    }
+
     /// A cast with a cast time, still running.
     fn cast_active(&self) -> bool {
         matches!(self.cast, Some((_, elapsed, duration)) if duration > 0.0 && elapsed < duration)
@@ -2472,7 +2619,10 @@ impl Player {
         if self.cast_kit_spell != spell {
             return 0; // its visual is looked up on the next tick
         }
-        self.cast_kit.and_then(|k| k.hold).unwrap_or_default()
+        self.cast_kit
+            .as_ref()
+            .and_then(|k| k.hold)
+            .unwrap_or_default()
     }
 
     /// The cast kit's clip for `spell`: the one-shot the GO plays, once the
@@ -2481,7 +2631,16 @@ impl Player {
         if self.cast_kit_spell != spell {
             return None;
         }
-        self.cast_kit.and_then(|k| k.release)
+        self.cast_kit.as_ref().and_then(|k| k.release)
+    }
+
+    /// The cast kit's attached effect models `(tag, path)` for `spell`, spawned
+    /// at the GO alongside the clip (`0x60edf0`: every populated slot).
+    pub(crate) fn cast_kit_fx(&self, spell: u32) -> Option<&[(u16, String)]> {
+        if self.cast_kit_spell != spell {
+            return None;
+        }
+        self.cast_kit.as_ref().map(|k| k.release_fx.as_slice())
     }
 
     pub(crate) fn mounted(&self) -> bool {
@@ -2654,6 +2813,11 @@ impl Player {
             }
         } else if self.land_id != 0 {
             return self.land_id;
+        }
+        // The loot leg (`0x5fd260`) sits after locomotion and the airborne
+        // freeze, ahead of the Stand/Ready idles and their shuffle.
+        if self.loot_kneeling() {
+            return ANIM_LOOT;
         }
         let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
         if hs < 0.1 {
@@ -2829,6 +2993,16 @@ pub extern "C" fn bn_player_reset(
     let w = unsafe { &mut *world };
     let mut p = Player::new(map, x, y);
     p.ensure_tiles(&w.archives);
+    // A city's floors enter the set with its WMO fold, which runs in 2 ms slices
+    // after this call. The drop below is a one-shot, so taken early it seats the
+    // body on the ADT under the pavement (Stormwind: 75.1 against a street at
+    // 93.8), and the mover's snap cannot lift a body a whole storey down - its
+    // seat filter only trusts a floor within a step. Fold this tile first.
+    let fold = std::time::Instant::now();
+    while p.floors_folding(x, y) && fold.elapsed() < std::time::Duration::from_secs(2) {
+        p.ensure_tiles(&w.archives);
+        p.ensure_wmo(&mut w.chain, &mut w.wmo_collision);
+    }
     // Drop to the floor under the spawn (city pavement over the ADT).
     if let Some((z, _)) = p.ground(x, y, f32::MAX) {
         p.pos[2] = z;
@@ -3173,17 +3347,21 @@ pub extern "C" fn bn_player_zoom(world: *mut BnWorld, notches: f32) -> u32 {
 /// Our body's swing one-shot (`0x6246a0`): the host calls it for every
 /// `SMSG_ATTACKERSTATEUPDATE` that names us, a whiff as much as a hit. Ignored in
 /// the air or mounted, where the body cannot play it whole.
+///
+/// Returns the clip the body swings - the equipped main hand's, the same table
+/// the server's `GetWeapon` (`0x6246a0`) reads at each swing - so the host can
+/// rewind it on that packet. The reference re-arms the sequence every hit; a
+/// dedupe on the base id alone would swallow the second swing while the first
+/// window is still open.
 #[no_mangle]
 pub extern "C" fn bn_player_swing(world: *mut BnWorld) -> u32 {
     let Some(p) = player_mut(world) else { return 0 };
     if !p.grounded || p.mounted {
         return 0;
     }
-    // The clip the body swings: the equipped main hand's, the same table the
-    // server's `GetWeapon` (`0x6246a0`) reads at each swing.
     crate::net::refresh_self_swing_anim();
     p.attack_left = SWING_WINDOW;
-    1
+    crate::net::self_swing_anim()
 }
 
 /// Mount / dismount preview (the same flag drives speed and the Mount idle).
@@ -3224,9 +3402,23 @@ fn resolve_cast_kit(w: &mut BnWorld, spell_id: u32) -> Option<Option<CastKit>> {
         .map_or(0, |d| d.visual);
     Some(visuals.stages(visual).map(|stages| {
         let anim = |kit: u32| visuals.kit(kit).and_then(|k| k.anim_id).map(u32::from);
+        let release_fx = visuals
+            .kit(stages.cast)
+            .map(|kit| {
+                kit.effects()
+                    .filter(|(tag, _)| *tag != benilla_formats::WORLD_EFFECT_TAG)
+                    .filter_map(|(tag, effect)| {
+                        visuals
+                            .effect_path(effect)
+                            .map(|path| (tag, crate::creature::m2_path(path)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         CastKit {
             hold: anim(stages.precast),
             release: anim(stages.cast),
+            release_fx,
         }
     }))
 }
@@ -3283,6 +3475,13 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
                 anim,
                 full
             ));
+        }
+        // The cast kit's effect slots are part of that same GO play (`0x60edf0`):
+        // a summon's hand orb (`Spells\Summon_PreCast_Hand.mdx` at tags 0x15 and
+        // 0x16) lands when the mount does. The host hangs them on the body.
+        let guid = crate::net::ui_self_guid();
+        for (tag, path) in p.cast_kit_fx(spell).unwrap_or_default() {
+            crate::net::push_event(format!("fx|kit|{guid}|{tag}|{path}"));
         }
     }
     let t3 = std::time::Instant::now();
@@ -3342,6 +3541,12 @@ pub extern "C" fn bn_ground_clamp_z(world: *const BnWorld, x: f32, y: f32, seat_
     let w = unsafe { &*world };
     w.player
         .as_ref()
+        // The WMO fold is incremental, so until the tile under this spot is
+        // whole the cast sees only the slices that have landed and can seat a
+        // creature on a lower terrace than its own floor. The reference has the
+        // full set before it draws the body; the honest answer here is "no
+        // floor yet", which leaves the host on the server's Z.
+        .filter(|p| !p.floors_folding(x, y))
         .and_then(|p| ground_clamp(p, x, y, seat_z))
         .unwrap_or(f32::NAN)
 }
@@ -4433,22 +4638,41 @@ mod tests {
     }
 
     #[test]
-    fn a_submerged_press_is_dropped() {
-        // Deviation: Space leaps only at the surface, so a body whose head is
-        // under the waterline keeps swimming and does not launch. A diver
-        // rises by aiming up and stroking, never by a breach.
+    fn a_submerged_press_surges_and_re_latches_the_swim() {
+        // `0x7c6230`: Space takes a swimmer at any depth. The launch is ballistic
+        // for `speed/(2·g)` (`0x7c5de0`), which is only ~1.6 yd of the arc, so a
+        // deep press is a surge that re-latches the swim under the surface - never
+        // a breach out of the water.
         let mut p = swimmer(0.0, -5.0);
         p.tick(1.0 / 60.0);
         assert!(p.swimming);
         p.input.jump = true;
         p.tick(1.0 / 60.0);
-        assert!(p.swimming, "the latch survives a submerged press");
+        assert!(!p.swimming, "the launch clears the latch");
+        assert!(p.vel[2] > 0.0, "rising");
+        p.input.jump = false;
+        let takeoff = p.pos[2];
+        let mut apex = takeoff;
+        let mut relatched = None;
+        for i in 0..90 {
+            p.tick(1.0 / 60.0);
+            apex = apex.max(p.pos[2]);
+            if p.swimming {
+                relatched = Some(i);
+                break;
+            }
+        }
+        let rise = apex - takeoff;
         assert!(
-            (p.pos[2] + 5.0).abs() < 1.0e-4,
-            "no launch, the depth holds: {}",
+            (1.2..2.2).contains(&rise),
+            "a surge of about the arc's half: {takeoff} -> {apex}"
+        );
+        assert!(apex < -1.6, "the body stays under the waterline: {apex}");
+        assert!(
+            relatched.is_some(),
+            "the arc's half re-enters the swim latch: {}",
             p.pos[2]
         );
-        assert!(p.vel[2].abs() < 1.0e-6, "no upward seed");
     }
 
     #[test]
@@ -4979,6 +5203,383 @@ mod tests {
         crate::bn_shutdown(w);
     }
 
+    /// Stormwind's trees, barrels and lamps are MODD placements inside the city
+    /// WMO, not the ADT's MDDF. Fold the body's tile the way a live tick does
+    /// and ask the capsule: does a hulled prop stop it? Reports the frames the
+    /// fold costs at its live 2 ms budget.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stormwind_modd_props_stop_the_body() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let (x0, y0) = (-8913.0f32, 554.0f32);
+        let (tx, ty) = Player::tile_of(x0, y0);
+        let k = (tx, ty);
+        let mut p = Player::new("Azeroth", x0, y0);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(c) = load_tile(&w.archives, "Azeroth", tx + dx, ty + dy) {
+                    p.tiles.insert((tx + dx, ty + dy), c);
+                }
+            }
+        }
+        let mut cache = HashMap::new();
+        let mut modd: Vec<crate::WmoDoodadInst> = Vec::new();
+        let mut mddf = 0usize;
+        let mut ticks = 0usize;
+        let clock = std::time::Instant::now();
+        loop {
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            ticks += 1;
+            let Some(t) = p.tiles.get(&k) else { break };
+            if mddf == 0 {
+                mddf = t.doodads.len();
+            }
+            if modd.is_empty() && t.modd_done {
+                modd = t.modd.clone();
+            }
+            let done = t.wmo_ready
+                && t.doodad_next >= t.doodads.len()
+                && t.modd_done
+                && t.modd_next >= t.modd.len();
+            if done || ticks > 200_000 {
+                break;
+            }
+        }
+        let folded: usize = p
+            .tiles
+            .get(&k)
+            .map(|t| t.doodad_cells.iter().map(Vec::len).sum())
+            .unwrap_or(0);
+        println!(
+            "tile ({tx},{ty}) resident={} wmos={} mddf={mddf} modd={} fold frames={ticks} \
+             in {:?}, doodad grid tris={folded}",
+            p.tiles.len(),
+            p.tiles.get(&k).map(|t| t.wmos.len()).unwrap_or(0),
+            modd.len(),
+            clock.elapsed()
+        );
+
+        // Each MODD placement of this tile, approached at ground level from
+        // eight sides: a trunk's hull has to answer from at least one of them.
+        let (mut hulled, mut stopped, mut no_hull) = (0usize, 0usize, 0usize);
+        let mut open: Vec<String> = Vec::new();
+        for d in &modd {
+            let (px, py) = (d.position[0], d.position[1]);
+            if Player::tile_of(px, py) != k {
+                continue;
+            }
+            if !p.hulls.get(&d.model).is_some_and(|h| h.is_some()) {
+                no_hull += 1;
+                continue;
+            }
+            hulled += 1;
+            let Some((feet, _)) = p.ground(px, py, f32::INFINITY) else {
+                continue;
+            };
+            let mut hit = false;
+            for a in 0..8 {
+                let ang = a as f32 * std::f32::consts::PI / 4.0;
+                for r in [0.4, 1.0, 2.0, 3.0] {
+                    if p.wall_hit(px + ang.cos() * r, py + ang.sin() * r, feet) {
+                        hit = true;
+                    }
+                }
+            }
+            if hit {
+                stopped += 1;
+            } else if open.len() < 10 {
+                open.push(format!(
+                    "{} at ({px:.1},{py:.1}) feet={feet:.1}",
+                    d.model.rsplit('\\').next().unwrap_or("")
+                ));
+            }
+        }
+        println!("modd: {hulled} hulled placements in this tile, {stopped} stop the body, {no_hull} hull-less");
+        for o in &open {
+            println!("  WALKS THROUGH {o}");
+        }
+
+        // The same census for the MDDF props, as the control: the fold that has
+        // always worked.
+        let mut m_stopped = 0usize;
+        let mut m_hulled = 0usize;
+        if let Some(t) = p.tiles.get(&k) {
+            for d in &t.doodads {
+                if !p.hulls.get(&d.model).is_some_and(|h| h.is_some()) {
+                    continue;
+                }
+                m_hulled += 1;
+                let (px, py) = (d.position[0], d.position[1]);
+                if let Some((feet, _)) = p.ground(px, py, f32::INFINITY) {
+                    for a in 0..8 {
+                        let ang = a as f32 * std::f32::consts::PI / 4.0;
+                        if p.wall_hit(px + ang.cos(), py + ang.sin(), feet) {
+                            m_stopped += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        println!("mddf control: {m_hulled} hulled, {m_stopped} stop the body");
+
+        // End to end with the mover the live tick runs (`wall_normal` is
+        // one-sided and the step-up gates can forgive a face): walk the body
+        // at the city's trees, fences and barrels from 6 yd out, four headings,
+        // and ask whether it crosses to the far side of the placement. Blocked
+        // the travel ends short of the origin by the hull's radius plus the
+        // capsule; through-and-through it comes out the other side.
+        let mut samples = 0usize;
+        let mut entered = 0usize;
+        for d in &modd {
+            let name = d.model.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+            if !(name.contains("tree") || name.contains("fence") || name.contains("barrel")) {
+                continue;
+            }
+            if !p.hulls.get(&d.model).is_some_and(|h| h.is_some()) {
+                continue;
+            }
+            let (px, py) = (d.position[0], d.position[1]);
+            if Player::tile_of(px, py) != k {
+                continue;
+            }
+            samples += 1;
+            if samples > 12 {
+                break;
+            }
+            let mut crossed = 0usize;
+            let mut legs = 0usize;
+            let mut closest = f32::MAX;
+            let mut near = [0.0f32; 3];
+            let mut near_yaw = 0.0f32;
+            // The hull measured where the body is: its XY reach at knee height
+            // (the model's first 1.2 yd) and its full height. Inside the knee
+            // reach is a penetration; the height says whether the mover's step
+            // rule can excuse it.
+            let (knee, top, zlo) = p
+                .hulls
+                .get(&d.model)
+                .and_then(|h| h.as_ref())
+                .map_or((0.0, 0.0, 0.0), |h| {
+                    h.positions.iter().fold(
+                        (0.0f32, 0.0f32, f32::MAX),
+                        |acc, v| {
+                        (
+                            if v[2] > 0.0 && v[2] < 1.2 {
+                                acc.0.max((v[0] * v[0] + v[1] * v[1]).sqrt() * d.scale)
+                            } else {
+                                acc.0
+                            },
+                            acc.1.max(v[2] * d.scale),
+                            acc.2.min(v[2] * d.scale),
+                        )
+                        }
+                    )
+                });
+            for leg in 0..4 {
+                let a = leg as f32 * std::f32::consts::FRAC_PI_2;
+                let (sx, sy) = (px - a.cos() * 6.0, py - a.sin() * 6.0);
+                // Seat the body on the prop's own floor: a city stacks floors 20
+                // yd apart, and a leg begun on the wrong one tests nothing.
+                let Some((feet, _)) = p.ground(sx, sy, d.position[2] + 3.0) else {
+                    continue;
+                };
+                if (feet - d.position[2]).abs() > 2.0 {
+                    continue;
+                }
+                p.set_server_pose([sx, sy, feet], a);
+                p.grounded = true;
+                p.input.forward = 1.0;
+                legs += 1;
+                for _ in 0..150 {
+                    p.ensure_tiles(&w.archives);
+                    p.ensure_wmo(&mut w.chain, &mut cache);
+                    p.tick(1.0 / 60.0);
+                    let dx = p.pos[0] - px;
+                    let dy = p.pos[1] - py;
+                    let dd = (dx * dx + dy * dy).sqrt();
+                    if dd < closest {
+                        closest = dd;
+                        near = p.pos;
+                        near_yaw = a;
+                    }
+                    // Past the origin along the travel: the body got to the far side.
+                    if (dx * a.cos() + dy * a.sin()) > 0.6 {
+                        break;
+                    }
+                }
+                p.input.forward = 0.0;
+            }
+            if legs == 0 {
+                continue;
+            }
+            // At the closest approach: the mover's own tests, so the print says
+            // which one let the body in.
+            let inside = knee > 0.0 && closest < knee;
+            let (nx, ny) = if inside {
+                ((px - near[0]).signum(), (py - near[1]).signum())
+            } else {
+                (near_yaw.cos(), near_yaw.sin())
+            };
+            if inside {
+                entered += 1;
+                println!(
+                    "  INSIDE {name} at ({px:.1},{py:.1}) closest={closest:.2} < knee={knee:.2} \
+                     hull z={zlo:.2}..{top:.2} prop z={:.2} body z={:.2} wall={:?} steep={} \
+                     ride={} step_up={:?} floor_blocks={}",
+                    d.position[2],
+                    near[2],
+                    p.wall_normal(near[0], near[1], near[2], nx, ny),
+                    p.hit_steep([near[0], near[1], near[2] + 1.0], CAPSULE_RADIUS, near[2]),
+                    p.destination_ride(near[0], near[1]),
+                    p.step_up_landing(near[0], near[1], nx, ny),
+                    p.floor_blocks(near[0], near[1], nx, ny),
+                );
+            } else {
+                println!(
+                    "  blocked {name} at ({px:.1},{py:.1}) legs={legs} closest={closest:.2} \
+                     knee={knee:.2} hull z={zlo:.2}..{top:.2}",
+                );
+            }
+        }
+        println!("mover: {samples} tree/fence/barrel placements approached, {entered} walked through");
+
+        // The leak, one tenth of a yard at a time: march the capsule's three
+        // rings along -X into the prop the body got inside, and print the
+        // nearest steep face each ring sees. `feet` is the prop's own floor, so
+        // no fall explains the answer.
+        let diag = modd
+            .iter()
+            .find(|d| (d.position[0] + 8989.1).abs() < 0.2 && (d.position[1] - 556.3).abs() < 0.2)
+            .expect("the prop the body got inside");
+        let (px, py) = (diag.position[0], diag.position[1]);
+        let feet = p
+            .ground(px, py, f32::INFINITY)
+            .map_or(0.0, |(z, _)| z);
+        println!(
+            "scan {} prop z={:.2} floor={feet:.2} rings={:.2},{:.2},{:.2}",
+            diag.model.rsplit('\\').next().unwrap_or(""),
+            diag.position[2],
+            feet + CAPSULE_RADIUS,
+            feet + 1.0,
+            feet + CAPSULE_HEIGHT - CAPSULE_RADIUS
+        );
+        for s in 0..18 {
+            let off = 1.7 - s as f32 * 0.1;
+            let (x, y) = (px - off, py);
+            let mut row = format!("  x-off={off:.1} dist={:.2}", off);
+            for k in 0..3 {
+                let rz = feet + CAPSULE_RADIUS + (CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS)
+                    * (k as f32 / 2.0);
+                let t = [x, y, rz];
+                let mut dmin = f32::MAX;
+                let mut ncnt = 0usize;
+                p.any_tri_near(t, |tr| {
+                    if tr.n[2].abs() >= GROUND_COS {
+                        return false;
+                    }
+                    let top = tr.v[0][2].max(tr.v[1][2]).max(tr.v[2][2]);
+                    if top <= feet + STEP_UP_HEIGHT {
+                        return false;
+                    }
+                    let q = closest_on_tri(t, tr);
+                    let dd = [t[0] - q[0], t[1] - q[1], t[2] - q[2]];
+                    let r = (dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]).sqrt();
+                    if r < 1.0 {
+                        ncnt += 1;
+                    }
+                    if r < dmin {
+                        dmin = r;
+                    }
+                    false
+                });
+                row.push_str(&format!(
+                    " | z{:.2} near={:.2} faces<1yd={} wall={} ride={}",
+                    rz,
+                    dmin,
+                    ncnt,
+                    p.wall_normal(x, y, feet, 1.0, 0.0).is_some(),
+                    p.hit_steep(t, CAPSULE_RADIUS, feet),
+                ));
+            }
+            println!("{row}");
+        }
+
+        // Per model: placements in this tile and the hull's triangle count. The
+        // ones with no hull are the ones the body walks through, so this names
+        // the models a report of "no collision on the trees" is really about.
+        let mut census: HashMap<String, (usize, usize, usize)> = HashMap::new();
+        for d in &modd {
+            if Player::tile_of(d.position[0], d.position[1]) != k {
+                continue;
+            }
+            let name = d.model.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+            let tris = p
+                .hulls
+                .get(&d.model)
+                .and_then(|h| h.as_ref())
+                .map_or(0, |h| h.indices.len() / 3);
+            let e = census.entry(name).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 = e.1.max(tris);
+            if tris == 0 {
+                e.2 += 1;
+            }
+        }
+        let mut rows: Vec<_> = census.iter().collect();
+        rows.sort_by_key(|(n, (c, t, _))| (std::cmp::Reverse(*c), *t, (*n).clone()));
+        for (n, (c, t, bare)) in rows.iter().take(30) {
+            println!("  x{c:>4} hull={t:>3} no-hull={bare} {n}");
+        }
+        let trees: Vec<_> = rows
+            .iter()
+            .filter(|(n, _)| n.contains("tree") || n.contains("bush") || n.contains("fence"))
+            .collect();
+        println!("  tree/bush/fence models: {}", trees.len());
+        for (n, (c, t, _)) in trees.iter().take(20) {
+            println!("    x{c:>4} hull={t:>3} {n}");
+        }
+
+        // The walk itself, one tick at a time: what the body's own wall test
+        // answers at its own feet, and where the feet actually are.
+        p.set_server_pose([px - 6.0, py, feet], 0.0);
+        p.grounded = true;
+        p.input.forward = 1.0;
+        for i in 0..120 {
+            p.ensure_tiles(&w.archives);
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            let d = [p.pos[0] - px, p.pos[1] - py];
+            let dist = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            let wn = p.wall_normal(p.pos[0] + 0.12, p.pos[1], p.pos[2], 1.0, 0.0);
+            p.tick(1.0 / 60.0);
+            if dist < 3.0 {
+                println!(
+                    "  t{i:>3} ({:.2},{:.2}) z={:.2} dist={dist:.2} grounded={} vel={:.2},{:.2} \
+                     wall@dest={wn:?} ride={} step={:?}",
+                    p.pos[0],
+                    p.pos[1],
+                    p.pos[2],
+                    p.grounded,
+                    p.vel[0],
+                    p.vel[1],
+                    p.destination_ride(p.pos[0] + 0.12, p.pos[1]),
+                    p.step_up_landing(p.pos[0] + 0.12, p.pos[1], 1.0, 0.0),
+                );
+            }
+        }
+        p.input.forward = 0.0;
+        assert!(!modd.is_empty(), "the city WMO must place its own props");
+        assert!(
+            stopped > 0,
+            "a city prop with a hull must stop the body, {hulled} hulled and none did"
+        );
+        crate::bn_shutdown(w);
+    }
+
     /// The logged fall south of Goldshire (`run_qm24.txt`): the body walked
     /// into Crystal Lake, kept walking its bed under the surface, met the
     /// rising far shore where no floor answered above the feet and dropped out
@@ -5059,6 +5660,39 @@ mod tests {
             .expect("Brown Horse's SpellVisual");
         assert_eq!(kit.hold, Some(123), "the precast kit's UseStandingLoop");
         assert_eq!(kit.release, Some(54), "the cast kit's SpellCastOmni");
+        // The plain mount's kits name no effect slot, so the GO hangs nothing.
+        assert!(kit.release_fx.is_empty(), "Brown Horse's cast kit is bare");
+        crate::bn_shutdown(w);
+    }
+
+    /// Felsteed (spell 5784): the cast kit's hand slots 0x15 and 0x16 name the
+    /// summon orb (`Spells\Summon_PreCast_Hand.mdx`, `SpellVisualEffectName`
+    /// 170), the model the GO spawns on the caster's hands (`0x60edf0`). The
+    /// middle layer resolves it to the `.m2` path the host's reader opens.
+    #[test]
+    fn felsteed_cast_kit_carries_the_hand_orb() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let dir = std::ffi::CString::new(data.to_string_lossy().as_bytes()).expect("data path");
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null(), "bn_init");
+        // SAFETY: the handle bn_init returned, freed at the end.
+        let kit = resolve_cast_kit(unsafe { &mut *w }, 5784)
+            .expect("the install's tables")
+            .expect("Felsteed's SpellVisual");
+        let slots: Vec<(u16, &str)> = kit
+            .release_fx
+            .iter()
+            .map(|(tag, path)| (*tag, path.as_str()))
+            .collect();
+        assert_eq!(
+            slots,
+            vec![
+                (0x13, "Spells\\SummonPet_Cast_Impact_Base.m2"),
+                (0x15, "Spells\\Summon_PreCast_Hand.m2"),
+                (0x16, "Spells\\Summon_PreCast_Hand.m2"),
+            ],
+            "the base slot then the two hands, in kit-slot order"
+        );
         crate::bn_shutdown(w);
     }
 

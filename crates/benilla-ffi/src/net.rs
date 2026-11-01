@@ -67,6 +67,10 @@ pub struct BnNetChar {
     pub equip_display: [u32; 19],
     /// `InventoryType` per slot, same order.
     pub equip_inv: [u8; 19],
+    /// `PLAYER_FLAGS`-style character flags (`CHARACTER_FLAG_*`): the select
+    /// build drops slot 0 under `HIDE_HELM` (0x400) and slot 14 under
+    /// `HIDE_CLOAK` (0x800) (`0x472c15`, `0x472c25`).
+    pub flags: u32,
     /// `PLAYER_BYTES`/`PLAYER_BYTES_2` customization: the CharSections
     /// compositor's input, so a character-select preview can dress the body.
     pub skin: u8,
@@ -89,6 +93,7 @@ impl Default for BnNetChar {
             zone: 0,
             equip_display: [0; 19],
             equip_inv: [0; 19],
+            flags: 0,
             skin: 0,
             face: 0,
             hair_style: 0,
@@ -1302,7 +1307,46 @@ pub(crate) enum Cmd {
     /// the socket stays authenticated, so a roster ask re-enters without
     /// re-authenticating.
     LogoutToRoster,
+    /// `CMSG_LOGOUT_REQUEST`, the game menu's Logout rung. The answer is
+    /// `SMSG_LOGOUT_RESPONSE {reason, instant}` (a refusal, an exit at once, or the
+    /// server's own 20 s timer) and then `SMSG_LOGOUT_COMPLETE`, which puts the link
+    /// back at the character park. A second ask is dropped while one is pending.
     Logout,
+    /// `CMSG_LOGOUT_CANCEL`: stops the server's timer and roots nothing; answers
+    /// `SMSG_LOGOUT_CANCEL_ACK`. The stock CAMP/QUIT dialogs' `OnHide` sends it on
+    /// every early close, so a stray cancel is normal.
+    LogoutCancel,
+    /// `CMSG_PLAYER_LOGOUT`: `ForceLogout()`'s ask, which skips the pending latch and
+    /// does not set it.
+    ForceLogout,
+    /// End the worker and drop the link: the host's world teardown and a
+    /// re-authentication need the session gone, which is what a park `Logout` does.
+    CloseLink,
+}
+
+/// What a world loop ended with, so the park knows whether to keep the link.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorldExit {
+    /// The link broke or the host closed it: the worker is done.
+    Closed,
+    /// `SMSG_LOGOUT_COMPLETE`: back at the character park on the same socket.
+    LoggedOut,
+}
+
+/// The logout answers owed to the UI tick, in wire order. A cancel can land in its
+/// response's frame, so they are queued rather than fired from the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogoutSignal {
+    /// A timed logout started: `PLAYER_CAMPING`, which the stock CAMP dialog counts
+    /// down and its Cancel button calls off.
+    Camping,
+    /// The same for a quit: `PLAYER_QUITING`.
+    Quiting,
+    /// The logout was cancelled: `LOGOUT_CANCEL`.
+    Cancelled,
+    /// Refused for any non-zero reason: the one line the reference shows,
+    /// `ERR_LOGOUT_FAILED` (message `0x180` of `DisplayError` `0x5aaf26`).
+    Refused,
 }
 
 /// `ITEM_PUSH`'s bag selector: the reference's `bag` byte is the 1.12 wire bag (255 = the backpack,
@@ -1434,6 +1478,15 @@ struct Shared {
     /// stock `UI_ERROR_MESSAGE` line (`DisplayError` `0x496720`). Queued because the Lua VM lives
     /// on the UI thread and the string is read from the player's own `GlobalStrings`.
     inv_fails: Mutex<VecDeque<u8>>,
+    /// The logout answers waiting for the UI tick, which owns the Lua VM: the events the
+    /// stock CAMP and QUIT dialogs hang off and the refusal line, whose text comes from the
+    /// player's own `GlobalStrings`.
+    logout_signals: Mutex<VecDeque<LogoutSignal>>,
+    /// The reference's `LogoutState`: the pending byte (`[session+0x1b1d]`, `0x5ab000`
+    /// drops a second ask while it is set) and the quit byte (`0x5ab053`), the one bit the
+    /// wire lacks because a quit is also a `CMSG_LOGOUT_REQUEST`.
+    logout_pending: AtomicBool,
+    logout_quitting: AtomicBool,
     /// Our own pushes waiting on their item templates, in wire order: `ITEM_PUSH` fires once the
     /// icon is resolvable, so the stock bag buttons animate when the server says the item landed.
     item_pushes: Mutex<VecDeque<PendingItemPush>>,
@@ -1478,6 +1531,13 @@ struct Shared {
     /// block (`SMSG_SET_FACTION_STANDING`, the quest-update packets, `SMSG_GROUP_LIST`); the
     /// sweep re-asks every giver when it moves, the app's `QuestGiver::bump_reask`.
     quest_epoch: AtomicU64,
+    /// The quest panel's teardown latch (`0x501130`'s cell zero), set by the packets whose own
+    /// handler ends with it: the UI pass answers it with the one `QUEST_FINISHED` the stock
+    /// `QuestFrame` hides on.
+    quest_finish_owed: AtomicBool,
+    /// `0xbe0824` (`closeOnCancel`), written by the details, request and reward publishers and read
+    /// by `DeclineQuest`'s fork (`0x5013f0`).
+    quest_close_on_cancel: AtomicU32,
     /// Latest player pose fed by the host (UE pawn) so the world worker can
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
@@ -1573,6 +1633,9 @@ fn shared() -> &'static Shared {
         names_asked: Mutex::new(HashSet::new()),
         chat_events: Mutex::new(VecDeque::new()),
         inv_fails: Mutex::new(VecDeque::new()),
+        logout_signals: Mutex::new(VecDeque::new()),
+        logout_pending: AtomicBool::new(false),
+        logout_quitting: AtomicBool::new(false),
         item_pushes: Mutex::new(VecDeque::new()),
         resurrect_from: AtomicU64::new(0),
         resurrect_sickness: AtomicU32::new(0),
@@ -1587,6 +1650,8 @@ fn shared() -> &'static Shared {
         quest_status: Mutex::new(HashMap::new()),
         taxi_known: Mutex::new(HashMap::new()),
         quest_epoch: AtomicU64::new(0),
+        quest_finish_owed: AtomicBool::new(false),
+        quest_close_on_cancel: AtomicU32::new(0),
         last_pose: Mutex::new(None),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -1729,6 +1794,71 @@ pub(crate) fn take_inv_fails() -> Vec<u8> {
         return Vec::new();
     }
     q.drain(..).collect()
+}
+
+/// `LogoutState::apply_response` (`benilla-app/src/ui_logout.rs`): what the server's answer means.
+/// A non-zero reason refuses with the one error line and disarms both latches, so a logout
+/// refused in combat is retryable and a quit refused there cannot exit later; an instant answer
+/// says nothing, as the completion follows at once; a timed one opens the dialog the stored quit
+/// byte picks.
+pub(crate) fn apply_logout_response(
+    reason: u32,
+    instant: bool,
+    pending: &mut bool,
+    quitting: &mut bool,
+) -> Option<LogoutSignal> {
+    if reason != 0 {
+        *quitting = false;
+        *pending = false;
+        return Some(LogoutSignal::Refused);
+    }
+    if instant {
+        return None;
+    }
+    Some(if *quitting {
+        LogoutSignal::Quiting
+    } else {
+        LogoutSignal::Camping
+    })
+}
+
+/// Queue one logout answer for the UI tick, which owns the VM and fires it. Bounded like
+/// the chat queue, so a UI that stops draining cannot grow it.
+pub(crate) fn push_logout_signal(signal: LogoutSignal) {
+    let sh = shared();
+    let mut q = sh.logout_signals.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 16 {
+        q.pop_front();
+    }
+    q.push_back(signal);
+}
+
+/// Drain the logout answers in wire order.
+pub(crate) fn take_logout_signals() -> Vec<LogoutSignal> {
+    let sh = shared();
+    let mut q = sh.logout_signals.lock().unwrap_or_else(|e| e.into_inner());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    q.drain(..).collect()
+}
+
+/// The reference's `LogoutState` latches, read and written from either thread: the UI tick
+/// sets them when it turns the Lua verbs into packets, the worker clears them on the answers.
+pub(crate) fn logout_pending() -> bool {
+    shared().logout_pending.load(Ordering::SeqCst)
+}
+
+pub(crate) fn set_logout_pending(on: bool) {
+    shared().logout_pending.store(on, Ordering::SeqCst);
+}
+
+pub(crate) fn logout_quitting() -> bool {
+    shared().logout_quitting.load(Ordering::SeqCst)
+}
+
+pub(crate) fn set_logout_quitting(on: bool) {
+    shared().logout_quitting.store(on, Ordering::SeqCst);
 }
 
 /// Drain the pushes waiting on their item templates, in wire order.
@@ -1898,8 +2028,71 @@ pub(crate) fn ui_loot() -> BnNetLoot {
     *shared().loot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `GAMEOBJECT_TYPE_ID` 17, `FISHINGNODE`: the one GameObject a looting player
+/// does not kneel at (`0x612772`).
+const GO_TYPE_FISHINGNODE: i32 = 17;
+/// `UNIT_FLAG_LOOTING` (`0x400`): a remote unit's loot kneel (`0x6126db`).
+pub(crate) const UNIT_FLAG_LOOTING: u32 = 0x400;
+/// `UNIT_FIELD_FLAGS` bit `0x1000_0000`, which refuses a remote loot kneel
+/// (`0x612710`).
+pub(crate) const UNIT_FLAG_LOOT_SUPPRESS: u32 = 0x1000_0000;
+
+/// Whether the open loot window's target is one the body kneels at
+/// (`0x612710`): a corpse (its health reads 0), or any GameObject but a
+/// fishing bobber. An item, a live unit or an unresolved guid never kneels.
+pub(crate) fn self_loot_kneel() -> bool {
+    let guid = ui_loot().guid;
+    if guid == 0 {
+        return false;
+    }
+    let sh = shared();
+    let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rec) = units.get(&guid) else {
+        return false;
+    };
+    match rec.kind {
+        5 => rec.fields.gameobject_type_id() != GO_TYPE_FISHINGNODE,
+        // The descriptor's health, not `unit_is_dead`: an unsent field is 0 too,
+        // as the reference's `0x61278c` reads it.
+        3 | 4 => rec.fields.unit_health().unwrap_or(0) == 0,
+        _ => false,
+    }
+}
+
 pub(crate) fn ui_giver() -> BnNetGiver {
     *shared().giver.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The quest panel's one teardown (`0x501130(0, report)`): the giver cell is cleared here, before
+/// the UI pass answers with `QUEST_FINISHED`, so the core never re-enters; the latch is only owed
+/// when a `QuestFrame` panel (kind 1..3, the reference's `0xbe0818` 2..4) was open. The `report`
+/// leg (`0x501159`, a DECLINE push to a sharing player) has no state in this layer.
+pub(crate) fn ui_giver_closed() {
+    let sh = shared();
+    let mut giver = sh.giver.lock().unwrap_or_else(|e| e.into_inner());
+    let was_panel = giver.mode >= 2;
+    *giver = BnNetGiver::default();
+    drop(giver);
+    if was_panel {
+        sh.quest_finish_owed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Take the latched teardown, once.
+pub(crate) fn take_quest_finish_owed() -> bool {
+    shared().quest_finish_owed.swap(false, Ordering::SeqCst)
+}
+
+/// `0xbe0824`: whether the panel's Cancel/Decline tears the window down instead of re-asking.
+pub(crate) fn quest_close_on_cancel() -> u32 {
+    shared().quest_close_on_cancel.load(Ordering::SeqCst)
+}
+
+/// The publisher's `closeOnCancel` write (`0x50101a` / `0x50111a`), kept out of the ABI struct.
+pub(crate) fn note_quest_close_on_cancel(value: u32) {
+    shared()
+        .quest_close_on_cancel
+        .store(value, Ordering::SeqCst);
 }
 
 pub(crate) fn ui_vendor() -> BnNetVendor {
@@ -2345,7 +2538,10 @@ fn worker(
                         }
                     }
                 }
-                Ok(Cmd::Logout) | Err(_) => {
+                // The park has no world session to leave, so both the reference's
+                // `Logout()` (which the reference drops) and the host's `CloseLink` end the
+                // worker here.
+                Ok(Cmd::Logout) | Ok(Cmd::CloseLink) | Err(_) => {
                     sh.event("closed|roster");
                     logon.close();
                     sh.set(ST_IDLE);
@@ -2373,7 +2569,33 @@ fn worker(
                     Ok(()) => {
                         sh.set(ST_IN_WORLD);
                         sh.event("world|entered");
-                        run_world(&mut session, &rx, sh);
+                        match run_world(&mut session, &rx, sh) {
+                            WorldExit::Closed => return,
+                            // `SMSG_LOGOUT_COMPLETE`: the same socket is back at the character
+                            // park. The reference's Exit Character Selection does exactly this -
+                            // the world server keeps answering `CMSG_CHAR_ENUM` on the link after
+                            // a logout, so the roster refreshes without re-authenticating.
+                            WorldExit::LoggedOut => {
+                                *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                sh.selection.store(0, Ordering::SeqCst);
+                                sh.self_guid.store(0, Ordering::SeqCst);
+                                sh.mover_ready.store(0, Ordering::SeqCst);
+                                crate::gossip_vm::clear_session();
+                                crate::quest_log_vm::clear_session();
+                                set_logout_pending(false);
+                                set_logout_quitting(false);
+                                // The park waits on the host with no read deadline.
+                                let _ = session.set_read_timeout(None);
+                                sh.set(ST_CHARS);
+                                match roster(&mut session, sh) {
+                                    Ok(n) => sh.event(format!("chars|{n}")),
+                                    Err(e) => sh.event(format!("error|char_enum|{e}")),
+                                }
+                                sh.event("logout|roster");
+                                continue;
+                            }
+                        }
                     }
                     Err(e) => {
                         sh.event(format!("error|player_login|{e}"));
@@ -2507,23 +2729,10 @@ fn worker(
                     }
                 }
             }
-            Ok(Cmd::LogoutToRoster) => {
-                match session.logout(Duration::from_secs(2)) {
-                    Ok(()) => {
-                        // `SMSG_LOGOUT_COMPLETE`: the link is back at the park;
-                        // the roster is re-asked so the host's screen refreshes.
-                        sh.event("logout|roster");
-                        *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                        if let Err(e) = roster(&mut session, sh) {
-                            sh.event(format!("error|char_enum|{e}"));
-                            sh.set(ST_FAILED);
-                            return;
-                        }
-                    }
-                    Err(e) => sh.event(format!("error|logout|{e}")),
-                }
-            }
-            Ok(Cmd::Logout) | Err(_) => {
+            // The park has no world session to leave. `LogoutToRoster` (the host's back button)
+            // and `Logout` (the reference drops a park ask, there is nothing to answer) both end
+            // the worker; the host re-logs from the glue screen.
+            Ok(Cmd::Logout) | Ok(Cmd::LogoutToRoster) | Ok(Cmd::CloseLink) | Err(_) => {
                 sh.event("closed|roster");
                 sh.set(ST_IDLE);
                 return;
@@ -2551,6 +2760,7 @@ fn roster(
                 level: c.level,
                 map: c.map,
                 zone: c.zone,
+                flags: c.flags,
                 skin: c.skin,
                 face: c.face,
                 hair_style: c.hair_style,
@@ -2573,7 +2783,11 @@ fn roster(
 
 /// Pump the world stream: one `recv` with a short deadline per loop so queued
 /// commands (chat, attack, loot) go out promptly even when the server is quiet.
-fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh: &Shared) {
+fn run_world(
+    session: &mut WorldSession,
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    sh: &Shared,
+) -> WorldExit {
     let _ = session.set_read_timeout(Some(std::time::Duration::from_millis(200)));
 
     // A fresh world session owns fresh markers: the previous session's answers name objects that
@@ -3018,11 +3232,43 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                     }
                     sh.event(format!("vendor|repair|{vendor}|{item_guid}"));
                 }
-                Ok(Cmd::Logout) | Err(TryRecvError::Disconnected) => {
-                    let _ = session.logout(std::time::Duration::from_secs(2));
+                // The game menu's leaving. `Logout` is the ask, not the exit: the server
+                // owns the answer (`SMSG_LOGOUT_RESPONSE`, then `SMSG_LOGOUT_COMPLETE` when
+                // its 20 s timer ends), and the worker keeps pumping the link through the
+                // countdown so the CAMP dialog's Cancel can reach it. The pending latch is
+                // the caller's (`0x5ab05b` sets it inside the request call), and `0x5aaf80`
+                // clears it when the cancel sends, so a lost ack cannot strand the player.
+                Ok(Cmd::Logout) | Ok(Cmd::LogoutToRoster) => {
+                    eprintln!(
+                        "bn_net: logout: requested (quitting={}) - awaiting SMSG_LOGOUT_RESPONSE",
+                        logout_quitting()
+                    );
+                    if let Err(e) = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_LOGOUT_REQUEST, &[])
+                    {
+                        sh.event(format!("error|logout_request|{e}"));
+                        set_logout_pending(false);
+                    }
+                }
+                Ok(Cmd::LogoutCancel) => {
+                    if let Err(e) = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_LOGOUT_CANCEL, &[])
+                    {
+                        sh.event(format!("error|logout_cancel|{e}"));
+                    }
+                }
+                // `ForceLogout` (`0x5aaff0`) bypasses the pending latch and does not set it.
+                Ok(Cmd::ForceLogout) => {
+                    if let Err(e) = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_PLAYER_LOGOUT, &[])
+                    {
+                        sh.event(format!("error|player_logout|{e}"));
+                    }
+                }
+                Ok(Cmd::CloseLink) | Err(TryRecvError::Disconnected) => {
                     sh.event("closed|world");
                     sh.set(ST_IDLE);
-                    return;
+                    return WorldExit::Closed;
                 }
                 // Park-only verbs: meaningless in-world, so no-ops here.
                 Ok(Cmd::CharCreateReq(_))
@@ -3030,7 +3276,6 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 | Ok(Cmd::CharRename { .. })
                 | Ok(Cmd::RefreshRoster)
                 | Ok(Cmd::RealmPick(_))
-                | Ok(Cmd::LogoutToRoster)
                 | Ok(Cmd::Enter(_)) => {}
                 Err(TryRecvError::Empty) => break,
             }
@@ -3287,6 +3532,44 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                             sh.event("worldport_ack");
                         }
                     }
+                    // The leaving answers: `ui_logout.rs`'s `LogoutState` decision table, in the
+                    // same wire order. They are intercepted here rather than in `handle_packet`,
+                    // which cannot hand a verdict back to the loop.
+                    ServerPacket::LogoutResponse { reason, instant } => {
+                        // Logged as the reference logs it: the server's inputs (combat, resting,
+                        // account level) are invisible from here.
+                        eprintln!(
+                            "bn_net: logout: server answered reason={reason} instant={instant}"
+                        );
+                        let (mut pending, mut quitting) = (logout_pending(), logout_quitting());
+                        if let Some(signal) =
+                            apply_logout_response(*reason, *instant, &mut pending, &mut quitting)
+                        {
+                            push_logout_signal(signal);
+                        }
+                        set_logout_pending(pending);
+                        set_logout_quitting(quitting);
+                    }
+                    ServerPacket::LogoutCancelAck => {
+                        eprintln!("bn_net: logout: cancelled");
+                        set_logout_quitting(false);
+                        set_logout_pending(false);
+                        push_logout_signal(LogoutSignal::Cancelled);
+                    }
+                    ServerPacket::LogoutComplete => {
+                        eprintln!(
+                            "bn_net: logout: world session ended (quitting={})",
+                            logout_quitting()
+                        );
+                        set_logout_pending(false);
+                        if logout_quitting() {
+                            set_logout_quitting(false);
+                            sh.event("quit|app");
+                            sh.set(ST_IDLE);
+                            return WorldExit::Closed;
+                        }
+                        return WorldExit::LoggedOut;
+                    }
                     _ => {}
                 }
                 handle_packet(&packet, sh);
@@ -3318,7 +3601,7 @@ fn run_world(session: &mut WorldSession, rx: &std::sync::mpsc::Receiver<Cmd>, sh
                 }
                 sh.event(format!("error|recv|{e}"));
                 sh.set(ST_FAILED);
-                return;
+                return WorldExit::Closed;
             }
         }
     }
@@ -4427,6 +4710,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             }
             giver.quest_count = quests.len().min(giver.quests.len()) as u32;
             let count = giver.quest_count;
+            // The greeting is the giver's own panel opening over anything the cell held
+            // (`0x500bd0`'s latch-first `0x500d74`): a quest window the player declined goes with it.
+            ui_giver_closed();
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
             let gender = ui_unit(*npc)
                 .and_then(|u| u.fields.unit_gender())
@@ -4451,7 +4737,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             crate::gossip_vm::text_arrived(*text_id, blocks.clone(), gender);
         }
         ServerPacket::GossipComplete => {
-            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            ui_giver_closed();
             crate::gossip_vm::complete();
             sh.event("giver|close".to_string());
         }
@@ -4473,6 +4759,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             }
             giver.quest_count = list.quests.len().min(giver.quests.len()) as u32;
             let count = giver.quest_count;
+            ui_giver_closed();
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
             sh.event(format!("giver|open|{}|{}", list.npc, count));
         }
@@ -4497,6 +4784,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 };
             }
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            // The details publisher `0x500ef0` writes `autoFinish` into the cancel latch (`0x50101a`).
+            note_quest_close_on_cancel(d.auto_finish);
             sh.event(format!("giver|details|{}", d.quest_id));
         }
         ServerPacket::QuestGiverOfferReward(r) => {
@@ -4520,6 +4809,7 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 };
             }
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            note_quest_close_on_cancel(r.auto_finish);
             sh.event(format!("giver|reward|{}", r.quest_id));
         }
         ServerPacket::QuestGiverRequestItems(r) => {
@@ -4534,10 +4824,13 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             put_str(&mut giver.title, &r.title);
             put_str(&mut giver.body, &r.request_text);
             *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = giver;
+            // The request publisher `0x501070` writes its own flag into the same latch (`0x50111a`).
+            note_quest_close_on_cancel(r.close_on_cancel);
             sh.event(format!("giver|progress|{}", r.quest_id));
         }
         ServerPacket::QuestGiverComplete(c) => {
-            *sh.giver.lock().unwrap_or_else(|e| e.into_inner()) = BnNetGiver::default();
+            // The completion handler `0x5dc400` ends with the panel teardown (`0x501130`).
+            ui_giver_closed();
             // A turn-in can move every giver's marker (`QuestGiver::bump_reask`).
             sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
             sh.event(format!(
@@ -4560,10 +4853,14 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(*guid, *known);
         }
+        // Both refusal handlers (`0x5dbca0`, `0x5dc840`) show their line and then close the window
+        // with `0x501130(0, 0)`.
         ServerPacket::QuestGiverInvalid { .. } => {
+            ui_giver_closed();
             sh.event("giver|invalid".to_string());
         }
         ServerPacket::QuestGiverFailed { .. } => {
+            ui_giver_closed();
             sh.event("giver|failed".to_string());
         }
         // ---- vendor / shop ----
@@ -4719,9 +5016,9 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
                 c.started += Duration::from_millis(*delay_ms as u64);
             }
         }
-        ServerPacket::LogoutComplete
-        | ServerPacket::UpdateWorldState { .. }
-        | ServerPacket::QuestLogFull => {
+        // `SMSG_LOGOUT_COMPLETE` is answered in `run_world`'s recv loop, where it can end the
+        // world session.
+        ServerPacket::UpdateWorldState { .. } | ServerPacket::QuestLogFull => {
             sh.event(format!("pkt|{}", packet.name()));
         }
         // Every packet whose answer to a giver can change without our own descriptor moving:
@@ -5017,7 +5314,7 @@ pub(crate) fn menu_pick_realm(index: u32) -> bool {
 
 /// Drop the menu's link at the worker (the logon or the held realmd socket).
 pub(crate) fn menu_logout() -> bool {
-    send_cmd(Cmd::Logout)
+    send_cmd(Cmd::CloseLink)
 }
 
 pub(crate) fn menu_enter(guid: u64) -> bool {
@@ -5236,8 +5533,7 @@ pub extern "C" fn bn_net_reconnect() -> u32 {
         return 0;
     };
     // Close whatever link is running first, so only one worker owns the state.
-    let _ = send_cmd(Cmd::Logout);
-    let _ = send_cmd(Cmd::LogoutToRoster);
+    let _ = send_cmd(Cmd::CloseLink);
     // Give the running worker a beat to notice its close before we restart.
     std::thread::sleep(Duration::from_millis(50));
     {
@@ -5573,10 +5869,11 @@ pub extern "C" fn bn_net_event(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
-/// Close the session (also used on world teardown).
+/// Close the session (also used on world teardown): end the worker and drop the
+/// link, no logout ask on the wire.
 #[no_mangle]
 pub extern "C" fn bn_net_disconnect() -> u32 {
-    send_cmd(Cmd::Logout) as u32
+    send_cmd(Cmd::CloseLink) as u32
 }
 
 /// Feed the host's latest player pose so the world worker can echo it back to
@@ -6194,7 +6491,18 @@ fn unit_row(guid: u64, rec: &UnitRec) -> BnNetUnit {
         // input): the corpse sparkle lives until the server clears the bit after
         // the loot is emptied.
         lootable: (f.unit_is_dead() && f.unit_lootable()) as u8,
-        anim: spline_gait(rec),
+        // A remote looter kneels (50) while `UNIT_FLAG_LOOTING` is set with
+        // `UNIT_FLAG_LOOT_SUPPRESS` clear (`0x6126db`/`0x612710`), on top of the
+        // standing gait only: any direction outranks the kneel.
+        anim: {
+            let gait = spline_gait(rec);
+            let flags = f.unit_flags();
+            if gait == 0 && flags & UNIT_FLAG_LOOTING != 0 && flags & UNIT_FLAG_LOOT_SUPPRESS == 0 {
+                50
+            } else {
+                gait
+            }
+        },
         npc_flags: f.unit_npc_flags(),
     }
 }

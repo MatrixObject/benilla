@@ -47,6 +47,8 @@ const GENERAL_TAB: &str = "General";
 const GENERAL_TAB_ICON: &str = "Interface\\Icons\\Ability_Kick";
 /// `UNIT_NPC_FLAG_REPAIR`, the bit `CanMerchantRepair` (`0x4fadb0`) tests.
 const NPC_FLAG_REPAIR: u32 = 0x4000;
+/// `UNIT_NPC_FLAG_GOSSIP`, the bit `DeclineQuest`'s fork (`0x5013f0`) tests before its hello.
+const NPC_FLAG_GOSSIP: u32 = 0x1;
 /// Melee auto-attack, the one spell `IsAttackAction` answers true for.
 const ATTACK_SPELL: u32 = 6603;
 /// The corpse-run window the server force-repops after.
@@ -784,15 +786,21 @@ fn unit_state(
         .and_then(|f| player.unit_faction_template().and_then(|t| f.template(t)));
     let (reaction, can_attack, can_assist) = match (template, player_template) {
         (Some(t), Some(p)) if guid != 0 && !std::ptr::eq(t, p) => {
+            // The plate colour asks the unit's reaction toward us (`0x7cbaa0`); the attack and
+            // assist tests ask ours toward it, which is the direction `0x606980`'s mixed arm
+            // (`0x606b7f`, `setl` on `< 4`) and `0x6066f0` (`>= 4`) read.
             let toward = t.reaction_toward(p);
-            let hostile = toward == Reaction::Hostile || p.reaction_toward(t) == Reaction::Hostile;
-            let friendly = toward == Reaction::Friendly;
+            let toward_us = p.reaction_toward(t);
             let r = match toward {
                 Reaction::Hostile => 2,
                 Reaction::Neutral => 4,
                 Reaction::Friendly => 5,
             };
-            (r, hostile, !hostile && friendly)
+            (
+                r,
+                toward_us != Reaction::Friendly,
+                toward_us == Reaction::Friendly,
+            )
         }
         _ => (0, false, false),
     };
@@ -2282,6 +2290,60 @@ pub(crate) fn focus_lost() {
 }
 
 /// Drain the interface's verbs into net commands and the middle layer's movement.
+/// What the Lua verbs said next, before any of it reaches the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Send `CMSG_LOGOUT_REQUEST` (or the forced flavour), with the latches as updated.
+    Send,
+    /// `0x5ab000`'s silent bail: a request is out and unanswered, so nothing happens at all.
+    AlreadyPending,
+    /// A quit with no world session: the process ends, as the glue screen's `Quit()` does.
+    QuitNow,
+    /// A logout with no world session, which the reference drops.
+    Drop,
+}
+
+/// `ui_logout::drain_logout`'s decision, over the reference's two latches: the pending byte
+/// (`[session+0x1b1d]`) and the quit byte (`0x5ab053`), both mirrored here because the worker
+/// thread answers them. `asked_quit` is the verb's own flavour — a quit is the same packet — and
+/// `force` is `ForceLogout` (`0x5aaff0`), which skips the bail and does not set the latch.
+fn logout_gate(
+    force: bool,
+    asked_quit: bool,
+    pending: &mut bool,
+    quitting: &mut bool,
+    in_world: bool,
+    link_up: bool,
+) -> Gate {
+    if force {
+        // The ask `0x5aaff0` makes touches neither latch, and the reference has no world
+        // session to force without.
+        return if in_world && link_up {
+            Gate::Send
+        } else {
+            Gate::Drop
+        };
+    }
+    if *pending {
+        return Gate::AlreadyPending;
+    }
+    // `0x5ab053`: the byte is stored before the ask, and it is the wire's one gap — a quit is
+    // also `CMSG_LOGOUT_REQUEST`.
+    *quitting = asked_quit;
+    if !in_world || !link_up {
+        // No world session and no link are the same shape: a quit exits as the glue screen's
+        // `Quit()` does, a logout is dropped.
+        if *quitting {
+            *quitting = false;
+            return Gate::QuitNow;
+        }
+        return Gate::Drop;
+    }
+    // `0x5ab05b` sets the pending byte inside the request call.
+    *pending = true;
+    Gate::Send
+}
+
 pub(crate) fn intents(script: &mut UiScript) {
     if script.vm_kind() != VmKind::InGame {
         return;
@@ -2717,12 +2779,67 @@ pub(crate) fn intents(script: &mut UiScript) {
             msg: text,
         });
     }
+    // Leaving: the game menu's Logout, Quit Game and the CAMP/QUIT dialogs' Cancel, as
+    // `benilla-app`'s `ui_logout::drain_logout` decides it. The latches are the reference's: the
+    // pending byte is `0x5ab000`'s silent bail, the quit byte says which dialog the answer opens.
     for request in script.take_session_requests() {
-        match request {
-            SessionRequest::Logout | SessionRequest::Quit | SessionRequest::ForceQuit => {
-                let _ = net::send_cmd(Cmd::Logout);
+        let quitting = matches!(request, SessionRequest::Quit);
+        let force = matches!(request, SessionRequest::ForceLogout);
+        let cancel = matches!(request, SessionRequest::CancelLogout);
+        if cancel {
+            // The stock dialogs' `OnHide` sends this on every early close, so a stray cancel is
+            // normal. The latch clears at the ask, not the ack (`0x5aaf80`).
+            net::set_logout_pending(false);
+            net::set_logout_quitting(false);
+            let _ = net::send_cmd(Cmd::LogoutCancel);
+            continue;
+        }
+        // The QUIT dialog's "Exit now": the process ends, no packet.
+        if matches!(request, SessionRequest::ForceQuit) {
+            net::push_event("quit|app".to_string());
+            continue;
+        }
+        let ask = matches!(request, SessionRequest::Logout | SessionRequest::Quit) || force;
+        if !ask {
+            continue;
+        }
+        let mut pending = net::logout_pending();
+        let mut quit = net::logout_quitting();
+        match logout_gate(
+            force,
+            quitting,
+            &mut pending,
+            &mut quit,
+            net::ui_self_guid() != 0,
+            net::menu_active(),
+        ) {
+            Gate::AlreadyPending | Gate::Drop => {}
+            Gate::QuitNow => net::push_event("quit|app".to_string()),
+            Gate::Send => {
+                let cmd = if force { Cmd::ForceLogout } else { Cmd::Logout };
+                if !net::send_cmd(cmd) {
+                    // The ask never reached the worker: disarm both, as the reference's
+                    // failed-send arm does, so a lost packet cannot strand the player.
+                    net::set_logout_pending(false);
+                    net::set_logout_quitting(false);
+                    continue;
+                }
+                if !force {
+                    net::set_logout_pending(pending);
+                    net::set_logout_quitting(quit);
+                }
             }
-            _ => {}
+        }
+    }
+    // The worker's answers, in wire order: the events the stock CAMP and QUIT dialogs hang off,
+    // and the refusal line.
+    for signal in net::take_logout_signals() {
+        match signal {
+            net::LogoutSignal::Camping => fire(script, "PLAYER_CAMPING", Vec::new()),
+            net::LogoutSignal::Quiting => fire(script, "PLAYER_QUITING", Vec::new()),
+            net::LogoutSignal::Cancelled => fire(script, "LOGOUT_CANCEL", Vec::new()),
+            // Message `0x180` of the `DisplayError` at `0x5aaf26`: one line for every reason.
+            net::LogoutSignal::Refused => fire_error(script, "ERR_LOGOUT_FAILED"),
         }
     }
     for _ in 0..script.take_pvp_toggles() {
@@ -2766,6 +2883,11 @@ fn quest_row_cmd(npc: u64, quest: u32, icon: u32) -> Cmd {
 fn giver_intents(script: &mut UiScript) {
     // `CloseGossip` (`0x4e2b20`) is the close core with a zero guid and sends no packet.
     crate::gossip_vm::drain_close(script);
+    // A packet whose own handler ends with the quest teardown (`0x501130`) latched it and already
+    // cleared the cell; the frame answers here, in the pass that has the VM.
+    if net::take_quest_finish_owed() {
+        close_quest_panel(script);
+    }
     let giver = net::ui_giver();
     let npc = giver.npc;
     if npc == 0 {
@@ -2827,28 +2949,77 @@ fn giver_intents(script: &mut UiScript) {
             let _ = net::send_cmd(quest_row_cmd(npc, quest, icon));
         }
     }
+    // The buttons read the panel's quest (`0xbe081c`), which only a details, progress or reward
+    // packet writes — the greeting (`0xbe0818` kind 0) has none.
+    let panel_quest = (giver.mode >= 2).then_some(giver.quest_id);
     for action in script.take_quest_actions() {
-        let cmd = match action {
-            QuestAction::Accept => Cmd::QuestAccept {
-                npc,
-                quest: giver.quest_id,
-            },
-            QuestAction::Continue => Cmd::QuestRequestReward {
-                npc,
-                quest: giver.quest_id,
-            },
-            QuestAction::Reward(choice) => Cmd::QuestReward {
-                npc,
-                quest: giver.quest_id,
-                reward: choice,
-            },
-            // Decline re-opens the giver and Close tears the panel down; neither
-            // has a packet of its own here — the server's own reply closes the frame.
-            QuestAction::Decline | QuestAction::Close => continue,
-        };
-        net::note(format!("giver|action|{npc:#x}"));
-        let _ = net::send_cmd(cmd);
+        // A close ends the drain: the reference's verbs after it find no panel (`0x501130` zeroes
+        // the cell, and every later verb tests it).
+        match action {
+            QuestAction::Close => {
+                close_quest_panel(script);
+                return;
+            }
+            QuestAction::Decline => {
+                // `DeclineQuest`'s fork (`0x5013f0`): the already-acted latch (`0xbe0844`) is not
+                // ported, because a click after this core finds no cell.
+                if benilla_protocol::guid::is_player(npc) || benilla_protocol::guid::is_item(npc) {
+                    close_quest_panel(script);
+                    return;
+                }
+                let Some(flags) = net::ui_unit(npc).map(|u| u.fields.unit_npc_flags()) else {
+                    continue;
+                };
+                let unit = benilla_protocol::guid::is_creature_or_pet(npc);
+                if unit && flags & NPC_FLAG_GOSSIP != 0 {
+                    net::note(format!("giver|decline|{npc:#x}"));
+                    let _ = net::send_cmd(Cmd::GossipHello(npc));
+                } else if !unit || net::quest_close_on_cancel() != 0 {
+                    close_quest_panel(script);
+                    return;
+                } else {
+                    net::note(format!("giver|decline|{npc:#x}"));
+                    let _ = net::send_cmd(Cmd::GiverHello(npc));
+                }
+            }
+            QuestAction::Accept => {
+                if let Some(quest) = panel_quest {
+                    net::note(format!("giver|action|{npc:#x}"));
+                    let _ = net::send_cmd(Cmd::QuestAccept { npc, quest });
+                    // `AcceptQuest`'s tail (`0x5013df`) is the teardown: the reference closes on the
+                    // click, not on an answer.
+                    close_quest_panel(script);
+                    return;
+                }
+            }
+            QuestAction::Continue => {
+                if let Some(quest) = panel_quest {
+                    net::note(format!("giver|action|{npc:#x}"));
+                    let _ = net::send_cmd(Cmd::QuestRequestReward { npc, quest });
+                }
+            }
+            QuestAction::Reward(choice) => {
+                if let Some(quest) = panel_quest {
+                    net::note(format!("giver|action|{npc:#x}"));
+                    let _ = net::send_cmd(Cmd::QuestReward {
+                        npc,
+                        quest,
+                        reward: choice,
+                    });
+                }
+            }
+        }
     }
+}
+
+/// The quest panel's one teardown (`0x501130(0, report)`): the giver cell is cleared before the
+/// release, so the core never re-enters, and `QUEST_FINISHED` fires once — the stock `QuestFrame`
+/// hides on it and its `OnHide` answers with a `CloseQuest()` the next drain finds no cell for.
+/// The `report` leg (`0x501159`, a DECLINE push to a sharing player) has no state in this layer.
+fn close_quest_panel(script: &mut UiScript) {
+    net::ui_giver_closed();
+    script.set_quest(None);
+    fire(script, "QUEST_FINISHED", Vec::new());
 }
 
 /// Resolve a unit token to a guid through the pushed resolver state, following `target` hops.
@@ -3230,10 +3401,15 @@ fn attack_keeps(guid: u64) -> bool {
     t.reaction_toward(&p) != Reaction::Friendly
 }
 
-/// The right click's attack fork (`cursor_mode.rs`'s `can_attack`, asked at `0x482680`): hostile
-/// toward us or we toward it, the same two-way test the enemy cycle uses. A faction that does not
-/// resolve is read as hostile, as the reference reads a data gap: no missing DBC row may cost the
-/// player their swing.
+/// The right click's attack fork (`cursor_mode.rs`'s `can_attack`, asked at `0x482680`): the
+/// reference's `CanAttack` (`0x606980`) selects its terminal arm by the two bit-3 flags, and a
+/// player-controlled attacker against an ordinary unit ends at `0x606b7f` with `setl` on the
+/// player's own reaction `< 4`. So a neutral unit is attackable and only a friendly one is not,
+/// which is why a yellow-barred wolf takes a swing. The `<= 1` both-ways test belongs to the arm
+/// for two uncontrolled units (`0x606aab`, `0x606ab8`), not to this one.
+///
+/// A faction that does not resolve is read as hostile, as the reference reads a data gap: no
+/// missing DBC row may cost the player their swing.
 pub(crate) fn attackable(guid: u64) -> bool {
     let Some(unit) = net::ui_unit(guid) else {
         return false;
@@ -3244,7 +3420,7 @@ pub(crate) fn attackable(guid: u64) -> bool {
     ) else {
         return true;
     };
-    t.reaction_toward(&p) == Reaction::Hostile || p.reaction_toward(&t) == Reaction::Hostile
+    p.reaction_toward(&t) != Reaction::Friendly
 }
 
 /// `TargetNearest*`: the next (or, reversed, previous) candidate in distance order from the body.
@@ -3269,8 +3445,9 @@ fn nearest_candidate(mode: NearestMode, reverse: bool, current: u64) -> Option<u
                 let Some(p) = net::ui_self_fields().as_ref().and_then(faction_template) else {
                     continue;
                 };
-                t.reaction_toward(&p) == Reaction::Hostile
-                    || p.reaction_toward(&t) == Reaction::Hostile
+                // The cycle's own gate (`0x6130a3`): our reaction to the held unit at friendly is
+                // not kept, so every worse rank is a candidate, the same arm `CanAttack` uses.
+                p.reaction_toward(&t) != Reaction::Friendly
             }
             NearestMode::Friend => {
                 let Some(t) = faction_template(&unit.fields) else {
@@ -3310,8 +3487,14 @@ fn nearest_candidate(mode: NearestMode, reverse: bool, current: u64) -> Option<u
 }
 
 /// The faction template behind a descriptor, off the handle's own loaded catalog.
-fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
+pub(crate) fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
     let id = fields.unit_faction_template()?;
+    faction_row(id)
+}
+
+/// One `FactionTemplate.dbc` row by id, for the arms that name a faction directly - a GameObject's
+/// `GAMEOBJECT_FACTION_ID` - rather than through a unit descriptor.
+pub(crate) fn faction_row(id: u32) -> Option<FactionTemplate> {
     CATS.with(|c| {
         c.borrow()
             .as_ref()
@@ -3324,10 +3507,128 @@ fn faction_template(fields: &ObjectFields) -> Option<FactionTemplate> {
 #[cfg(test)]
 mod tests {
     use super::{
-        aura_toggles, container_slot, loot_picks, money_text, HeldAxes, LootPick, LootWindow,
+        aura_toggles, container_slot, logout_gate, loot_picks, money_text, Gate, HeldAxes,
+        LootPick, LootWindow,
     };
     use crate::net::{BnNetInvItem, BnNetLoot, SlotTemplate};
     use benilla_ui::script::{UiScript, UseFork};
+
+    /// `ui_logout::drain_logout`'s latches, driven the way the reference drives them: a second
+    /// ask while the first is unanswered is silent, `ForceLogout` bypasses the bail and leaves
+    /// it clear, and every terminal edge rearms.
+    #[test]
+    fn the_logout_ask_bails_while_one_is_pending_and_every_edge_rearms_it() {
+        let mut pending = false;
+        let mut quitting = false;
+        // The first Logout goes out and latches, without the quit byte.
+        assert_eq!(
+            logout_gate(false, false, &mut pending, &mut quitting, true, true),
+            Gate::Send
+        );
+        assert!(pending && !quitting);
+
+        // A second ask while the first is unanswered, as a double-clicked rung makes: not one
+        // more packet, no error line, and a double-clicked Quit cannot turn a camp into a quit
+        // because `0x5ab000` returns before `0x5ab053` stores the byte.
+        for _ in 0..60 {
+            assert_eq!(
+                logout_gate(false, true, &mut pending, &mut quitting, true, true),
+                Gate::AlreadyPending
+            );
+        }
+        assert!(pending && !quitting, "the bail touches neither latch");
+
+        // The forced flavour is the escape hatch: it sends and does not move the camp's latch.
+        assert_eq!(
+            logout_gate(true, false, &mut pending, &mut quitting, true, true),
+            Gate::Send
+        );
+        assert!(pending, "ForceLogout does not set the pending byte");
+
+        // A cancel (`0x5aaf80`, at the ask) disarms, and the next ask is heard again.
+        pending = false;
+        quitting = false;
+        assert_eq!(
+            logout_gate(false, false, &mut pending, &mut quitting, true, true),
+            Gate::Send
+        );
+        assert!(pending);
+
+        // A quit stores its byte, which is what makes the answer open the QUIT dialog.
+        pending = false;
+        assert_eq!(
+            logout_gate(false, true, &mut pending, &mut quitting, true, true),
+            Gate::Send
+        );
+        assert!(pending && quitting);
+
+        // No world session, and a dead link: a quit exits with the byte disarmed, a logout is
+        // dropped with nothing latched. The bail comes first, so these asks are the ones that
+        // got through.
+        pending = false;
+        assert_eq!(
+            logout_gate(false, true, &mut pending, &mut quitting, false, true),
+            Gate::QuitNow
+        );
+        assert!(!quitting, "a quit with nothing to ask does not stay armed");
+        pending = false;
+        assert_eq!(
+            logout_gate(false, false, &mut pending, &mut quitting, false, true),
+            Gate::Drop
+        );
+        assert!(!pending);
+        assert_eq!(
+            logout_gate(false, true, &mut pending, &mut quitting, true, false),
+            Gate::QuitNow
+        );
+        // A forced logout needs the world session the ask targets.
+        assert_eq!(
+            logout_gate(true, false, &mut pending, &mut quitting, false, true),
+            Gate::Drop
+        );
+    }
+
+    /// `LogoutState::apply_response`: the server's answer decides which dialog, if any, and a
+    /// refusal disarms a pending quit.
+    #[test]
+    fn the_logout_response_decides_which_dialog_if_any() {
+        let mut pending = true;
+        let mut quitting = false;
+        assert_eq!(
+            crate::net::apply_logout_response(0, true, &mut pending, &mut quitting),
+            None,
+            "an instant logout shows no dialog — the completion follows at once"
+        );
+        assert!(pending && !quitting);
+        assert_eq!(
+            crate::net::apply_logout_response(0, false, &mut pending, &mut quitting),
+            Some(crate::net::LogoutSignal::Camping)
+        );
+        assert_eq!(
+            crate::net::apply_logout_response(0, false, &mut pending, &mut quitting),
+            Some(crate::net::LogoutSignal::Camping),
+            "the answer does not consume the latch"
+        );
+
+        quitting = true;
+        assert_eq!(
+            crate::net::apply_logout_response(0, false, &mut pending, &mut quitting),
+            Some(crate::net::LogoutSignal::Quiting),
+            "a quit says so"
+        );
+
+        // In combat: the error line, and the quit is disarmed so a later logout cannot exit.
+        assert_eq!(
+            crate::net::apply_logout_response(1, false, &mut pending, &mut quitting),
+            Some(crate::net::LogoutSignal::Refused)
+        );
+        assert!(!quitting);
+        assert!(
+            !pending,
+            "the refusal arm clears the pending byte — otherwise a logout refused in combat \
+             would never be retryable"
+        );
+    }
 
     /// The active-action predicate (`0x4e55f0`): only a spell that names an `ActiveIconID` and
     /// whose own aura is live with the cancelable bit toggles — the mount's second press.
@@ -3338,13 +3639,19 @@ mod tests {
         let mounted = ObjectFields::from_pairs(&[(47u16, 458), (95, 0xf)]);
         let uncancelable = ObjectFields::from_pairs(&[(47u16, 458), (95, 0xe)]);
         let another = ObjectFields::from_pairs(&[(47u16, 470), (95, 0xf)]);
-        assert!(aura_toggles(122, 458, Some(&mounted)), "the mount's own live cancelable aura");
+        assert!(
+            aura_toggles(122, 458, Some(&mounted)),
+            "the mount's own live cancelable aura"
+        );
         assert!(!aura_toggles(0, 458, Some(&mounted)), "no ActiveIconID");
         assert!(
             !aura_toggles(122, 458, Some(&uncancelable)),
             "live but not cancelable"
         );
-        assert!(!aura_toggles(122, 458, Some(&another)), "another spell's aura");
+        assert!(
+            !aura_toggles(122, 458, Some(&another)),
+            "another spell's aura"
+        );
         assert!(!aura_toggles(122, 458, None));
     }
 

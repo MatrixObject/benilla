@@ -30,6 +30,16 @@ benilla-ui = { path = "../benilla-ui" }
 benilla-protocol = { path = "../benilla-protocol" }
 # Glyph outlines for `bn_ui_text_bitmap` (FontString -> RGBA for the UE HUD).
 ab_glyph = "0.2"
+# The client's audio: kira's mix with a cpal output written here (kira's own cpal
+# backend wants cpal 0.18, which cannot share this lock with the workspace's 0.17).
+# No Bevy, no app; the scheduler below is the app's rules over kira's primitives.
+kira = { version = "0.12", default-features = false, features = [
+    "mp3",
+    "wav",
+    "pcm",
+    "adpcm",
+] }
+cpal = "0.17"
 
 [[example]]
 name = "smoke"

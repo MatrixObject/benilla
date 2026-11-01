@@ -320,13 +320,14 @@ fn overhead_height(world: &mut BnWorld, display_id: u32, mounted: bool) -> f32 {
     height
 }
 
-/// `CanAttack` from the player (`0x606980`), reduced to the template comparator: either side reads
-/// the other as hostile. See the module header for what the reduction drops.
+/// `CanAttack` from the player (`0x606980`), reduced to the template comparator: the mixed
+/// player-unit arm (`0x606b7f`) refuses only at a friendly reaction, so a neutral unit is on the
+/// enemy side of the plates. See the module header for what the reduction drops.
 fn is_enemy(factions: Option<&FactionCatalog>, target: &ObjectFields, own: &ObjectFields) -> bool {
     let (Some(t), Some(p)) = (template_of(factions, target), template_of(factions, own)) else {
         return false;
     };
-    t.reaction_toward(&p) == Reaction::Hostile || p.reaction_toward(&t) == Reaction::Hostile
+    p.reaction_toward(&t) != Reaction::Friendly
 }
 
 /// The plate's category, `0x60f70b`-`0x60f72d`: not attackable from us is the friendly side, and a

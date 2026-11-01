@@ -560,6 +560,7 @@ impl UiScript {
                     max_lines: 0,
                 },
                 scale: paint.scale,
+                placed: false,
             });
         }
         if reverse {

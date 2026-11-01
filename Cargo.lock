@@ -606,7 +606,9 @@ dependencies = [
  "benilla-protocol",
  "benilla-ui",
  "benilla-wmo",
+ "cpal 0.17.1",
  "glam 0.30.10",
+ "kira",
 ]
 
 [[package]]

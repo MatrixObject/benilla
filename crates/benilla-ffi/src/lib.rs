@@ -142,6 +142,18 @@ mod cvar_defaults;
 
 mod equip_error;
 
+// ---- The world cursor: the pick under the pointer, resolved to a `Interface\Cursor` stem ----
+
+mod cursor;
+
+// ---- The soundscape: zone music, the ambience bed and the UI's sound verbs, on our own thread ----
+
+mod audio;
+
+// ---- kira's mix into the machine's output (cpal 0.17, the workspace's lock) ----
+
+mod audio_out;
+
 use std::io::Cursor;
 
 use std::path::Path;
@@ -405,6 +417,9 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
     if let Some(chain) = chain.as_ref() {
         net::set_login_locale(chain.locale().tag());
     }
+
+    // The soundscape thread opens its own chain here; nothing is read until the first world tick.
+    audio::set_data_dir(dir);
 
     Box::into_raw(Box::new(BnWorld {
         archives,
@@ -1212,6 +1227,10 @@ pub extern "C" fn bn_load_tile(
 
         w.doodad_flats.clear();
 
+        // The zone under the player comes from these chunks, so publish them.
+
+        audio::note_tile(map, x, z, &w.mcnk);
+
         return w.mcnk.len() as u32;
     }
 
@@ -1237,6 +1256,8 @@ pub extern "C" fn bn_load_tile(
                     w.tile_seq += 1;
                     w.wmo_flats.clear();
                     w.doodad_flats.clear();
+                    // The zone under the player comes from these chunks, so publish them.
+                    audio::note_tile(map, x, z, &w.mcnk);
 
                     return w.mcnk.len() as u32;
                 }
@@ -8648,6 +8669,9 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         // The load's last step is arming `PLAYER_LOGIN`;
         // `bn_ui_world_enter` spends it once the player is in the world.
         script.arm_player_login();
+        // A new VM session installs a new mode cell, so the cursor's "base already restored"
+        // latch does not cross it.
+        cursor::forget_vm();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
         eprintln!(
             "bn_ui_load: {} toc rows, {addons} chain addons, {bindings_loaded} bindings, \
@@ -8848,6 +8872,69 @@ pub extern "C" fn bn_ui_paint(buf: *mut c_char, cap: u32) -> u32 {
                     if circular { 1 } else { 0 },
                     fill,
                 ));
+            }
+            Some(out)
+        })
+    })) else {
+        return 0;
+    };
+    let Some(text) = text else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// The quads a widget places itself and every region's ScrollFrame draw clip, as TSV lines in
+/// painter order: `T \t owner \t region \t left \t top \t width \t height` for a placed rect (a
+/// Slider's thumb along its track, a ColorSelect marker), the same shape with `C` for a draw clip,
+/// in root units (y up). Neither rides a dump column: a thumb's `GetLeft` answers its anchor (0,0)
+/// and a scroll child's content carries no clip at all, so a host that paints the interface itself
+/// would draw the thumb at the origin and the content past its ScrollFrame. The owner and region
+/// names are the dump's own columns.
+#[no_mangle]
+pub extern "C" fn bn_ui_geometry(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            let mut out = String::new();
+            for q in s.extract() {
+                // Only regions have dump rows to match against.
+                if !matches!(q.target, benilla_ui::order::ZTarget::Region(_)) {
+                    continue;
+                }
+                let owner = s.target_owner_name(q.target).unwrap_or_default();
+                let region = s.target_region_name(q.target).unwrap_or_default();
+                if q.placed && matches!(q.content, benilla_ui::script::QuadContent::Texture { .. })
+                {
+                    if let Some(r) = q.rect {
+                        out.push_str(&format!(
+                            "T\t{owner}\t{region}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\n",
+                            r.left,
+                            r.top,
+                            r.right - r.left,
+                            r.top - r.bottom
+                        ));
+                    }
+                }
+                if let Some(c) = q.clip {
+                    out.push_str(&format!(
+                        "C\t{owner}\t{region}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\n",
+                        c.left,
+                        c.top,
+                        c.right - c.left,
+                        c.top - c.bottom
+                    ));
+                }
             }
             Some(out)
         })
@@ -9308,6 +9395,48 @@ pub extern "C" fn bn_ui_cursor_icon(buf: *mut c_char, cap: u32) -> u32 {
     let n = (path.len() as u64).min(cap as u64 - 1) as usize;
     unsafe {
         std::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// Say what the pointer is over, for the world cursor's classifier: the pick's guid (0 for
+/// nothing) and whether the loot leg's key is held. The host's own screen pick, because the
+/// reference classifies the object under the cursor, not the selected unit.
+#[no_mangle]
+pub extern "C" fn bn_cursor_set_pick(guid: u64, shift_held: u32) {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor::set_inputs(|i| {
+            i.pick = guid;
+            i.shift_held = shift_held != 0;
+        })
+    }));
+    let _ = out;
+}
+
+/// This frame's world cursor: the `Interface\Cursor\` stem the reference would park in its mode
+/// cell, e.g. `Attack`, `UnableSpeak`, `Point`. A FrameXML `SetCursor` write wins over the world
+/// classifier; over the UI with no write, the base mode is restored. Returns the bytes written,
+/// 0 with `buf` emptied when there is no UI session - the host keeps its own pointer there.
+#[no_mangle]
+pub extern "C" fn bn_cursor_stem(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let script = slot.as_mut()?;
+            Some(cursor::stem(script))
+        })
+    }));
+    let Ok(Some(stem)) = out else {
+        unsafe { *buf = 0 };
+        return 0;
+    };
+    let n = (stem.len() as u64).min(cap as u64 - 1) as usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping(stem.as_ptr(), buf as *mut u8, n);
         *buf.add(n) = 0;
     }
     n as u32
@@ -10052,6 +10181,9 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
             vec![ScriptValue::Str("login".to_string())],
         );
         let frames = script.eval::<f64>("return GetNumFrames()").unwrap_or(0.0) as u32;
+        // A new VM session installs a new mode cell, so the cursor's "base already restored"
+        // latch does not cross it.
+        cursor::forget_vm();
         BN_UI.with(|slot| *slot.borrow_mut() = Some(script));
         eprintln!(
             "bn_ui_load_glue: {} toc rows, {} failures, {frames} frames",
@@ -10357,6 +10489,9 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
                 // loot, the death dialog, chat, and the movement bindings.
                 ui_feed::intents(script);
             }
+            // The soundscape's beat: this frame's sound verbs and the zone under the player,
+            // published for our audio thread. It never reads an archive on this thread.
+            audio::ui_tick(script);
             for e in script.take_errors() {
                 note_vm_error(format!("tick: {e}"));
             }
@@ -10376,7 +10511,12 @@ pub extern "C" fn bn_ui_mouse_move(x: f32, y: f32) -> u32 {
             let mut slot = slot.borrow_mut();
             match slot.as_mut() {
                 Some(script) => {
-                    script.mouse_move(x, y);
+                    // The world frame is mouse-enabled so an addon's handlers can hover it, but its
+                    // hit is the world's: the cursor's world arm runs only while no player-UI frame
+                    // holds the hover.
+                    let hit = script.mouse_move(x, y);
+                    let over_ui = hit.is_some_and(|id| !script.is_world_frame(id));
+                    cursor::set_inputs(|i| i.over_ui = over_ui);
                     1u32
                 }
                 None => 0u32,
@@ -11103,6 +11243,18 @@ pub struct BnBooth {
     /// Body displays in the CharEnum order: shirt, chest, waist, legs, feet,
     /// wrist, hands, tabard (0 = bare).
     pub stand_gear: [u32; 8],
+    /// The worn displays the body array has no room for: helm (0 under
+    /// `HIDE_HELM`), shoulders, cloak (0 under `HIDE_CLOAK`), and the two
+    /// drawn weapons (`0x472c4f`: the select build forces SheatheType 0, so
+    /// they hang from the hands).
+    pub stand_helm: u32,
+    pub stand_shoulder: u32,
+    pub stand_cloak: u32,
+    pub stand_main: u32,
+    pub stand_off: u32,
+    /// The weapons' `InventoryType`, so a shield lands on its point.
+    pub stand_main_inv: u8,
+    pub stand_off_inv: u8,
     /// The stage spot (attachment 0) in raw WoW model space.
     pub stand_pos: [f32; 3],
     /// The body's in-scene yaw (radians, WoW +Z): the stage bone chain's parked
@@ -11384,6 +11536,13 @@ struct StandLook {
     hair_color: u8,
     facial: u8,
     gear: [u32; 8],
+    helm: u32,
+    shoulder: u32,
+    cloak: u32,
+    main: u32,
+    off: u32,
+    main_inv: u8,
+    off_inv: u8,
     facing: f32,
 }
 
@@ -11532,8 +11691,8 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
                 hair: look.hair_style,
                 hair_color: look.hair_color,
                 facial: look.facial_hair,
-                gear: [0; 8],
                 facing: s.glue_create_facing(),
+                ..StandLook::default()
             };
             // The create body wears its class's CharStartOutfit (glue_booth).
             let outfit = BN_MENU.with(|m| {
@@ -11547,6 +11706,28 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
             for it in outfit {
                 if let Some(slot) = start_outfit_slot(it.inv_type) {
                     stand.gear[slot] = it.display_id;
+                    continue;
+                }
+                // The slots the body display array has no room for, by the
+                // recruit set's InventoryType (benilla's `equip_slot`). A
+                // recruit set has no helm or cloak to hide, so flags are 0.
+                match it.inv_type {
+                    1 => stand.helm = it.display_id,     // HEAD
+                    3 => stand.shoulder = it.display_id, // SHOULDERS
+                    16 => stand.cloak = it.display_id,   // BACK
+                    13 | 17 | 21 => {
+                        // WEAPON / TWOHAND / MAINHAND
+                        stand.main = it.display_id;
+                        stand.main_inv = it.inv_type;
+                    }
+                    14 | 22 | 23 => {
+                        // SHIELD / OFFHAND / HOLDABLE
+                        stand.off = it.display_id;
+                        stand.off_inv = it.inv_type;
+                    }
+                    // 15/25/26 ranged: the glue build skips the ranged slot
+                    // (`0x472bfe`), and 2/11/12/18/24/28 never render.
+                    _ => {}
                 }
             }
         } else if pane.select {
@@ -11577,6 +11758,24 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
                     row.equip_display[9],
                     row.equip_display[18],
                 ],
+                // The select build's wardrobe: `HIDE_HELM` drops slot 0 and
+                // `HIDE_CLOAK` slot 14 (`0x472c15`/`0x472c25`); the two drawn
+                // weapons are slots 15/16, the ranged slot 17 skipped.
+                helm: if row.flags & benilla_protocol::messages::CHARACTER_FLAG_HIDE_HELM != 0 {
+                    0
+                } else {
+                    row.equip_display[0]
+                },
+                shoulder: row.equip_display[2],
+                cloak: if row.flags & benilla_protocol::messages::CHARACTER_FLAG_HIDE_CLOAK != 0 {
+                    0
+                } else {
+                    row.equip_display[14]
+                },
+                main: row.equip_display[15],
+                off: row.equip_display[16],
+                main_inv: row.equip_inv[15],
+                off_inv: row.equip_inv[16],
                 facing: s.glue_select_cells().facing,
             };
         }
@@ -11616,6 +11815,13 @@ pub extern "C" fn bn_ui_booth(world: *const BnWorld, out: *mut BnBooth) -> u32 {
         o.stand_hair_color = stand.hair_color;
         o.stand_facial = stand.facial;
         o.stand_gear = stand.gear;
+        o.stand_helm = stand.helm;
+        o.stand_shoulder = stand.shoulder;
+        o.stand_cloak = stand.cloak;
+        o.stand_main = stand.main;
+        o.stand_off = stand.off;
+        o.stand_main_inv = stand.main_inv;
+        o.stand_off_inv = stand.off_inv;
         if let Some((pos, yaw, scale)) = info.and_then(|i| i.seat) {
             o.stand_pos = pos;
             o.stand_yaw = yaw + stand.facing;

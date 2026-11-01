@@ -96,7 +96,7 @@ impl UiScript {
             };
             // A region's texture, which ranks it in the batch sort.
             let mut region_tex = None;
-            let (rect, alpha, content, clip, scale) = match target {
+            let (rect, alpha, content, clip, scale, placed) = match target {
                 ZTarget::Frame(fh) => {
                     let frame = model.arena.frame(fh);
                     let alpha = frame.map(|f| f.effective_alpha).unwrap_or(1.0);
@@ -132,6 +132,7 @@ impl UiScript {
                         content,
                         clip,
                         scale,
+                        false,
                     )
                 }
                 ZTarget::Region(rh) => {
@@ -429,7 +430,7 @@ impl UiScript {
                     };
                     // A region draws at its owner's scale: only frames carry one (`0x76ac90`).
                     let scale = owner_frame.map(|f| f.effective_scale).unwrap_or(1.0);
-                    (rect, alpha, content, clip, scale)
+                    (rect, alpha, content, clip, scale, thumb_fill || color_thumb)
                 }
             };
             // A `Model` frame's scene draws in its bucket's ARTWORK batch, last: `0x76fb00` drains
@@ -462,6 +463,7 @@ impl UiScript {
                 content,
                 clip,
                 scale,
+                placed,
             });
             // A ScrollingMessageFrame adds one Text quad per visible ring line, stacked bottom-up
             // with each line's fade alpha; the ring lives in its kind state, not in FontStrings.

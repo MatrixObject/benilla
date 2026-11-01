@@ -330,6 +330,10 @@ pub struct ExtractedQuad {
     /// The owner's `effective_scale` (`0x76ac90`), already in `rect`; a `Text` quad's font and
     /// shadow offset must be scaled by it too.
     pub scale: f32,
+    /// The rect is the widget's own placement at draw (a Slider's thumb along its track, a
+    /// ColorSelect marker), not the region's anchored rect: `0x789ba0` sizes the thumb from the
+    /// value fraction, which no layout pass and no `GetLeft` answers.
+    pub placed: bool,
 }
 
 /// A two-stop gradient (`SetGradientAlpha`/`SetGradient`, XML `<Gradient>`): the four-colour form
