@@ -66,8 +66,31 @@ fn card_cache() -> &'static Mutex<HashMap<String, Option<Arc<CardFile>>>> {
 
 /// The pane facts for the model key `key` (case-folded, no extension), read through the
 /// archives: what `Model:SetModel` needs to take the file's implicit rect and seed its Stand arm.
+/// The card parse answers them for a card file; every other model (the minimap and world-map
+/// arrows) needs only the header read.
 pub(crate) fn facts_for(world: &BnWorld, key: &str) -> Option<ModelFileFacts> {
-    card_file(world, key).map(|f| f.facts.clone())
+    if let Some(file) = card_file(world, key) {
+        return Some(file.facts.clone());
+    }
+    let path = format!("{}.m2", key.replace('/', "\\"));
+    Some(model_facts(&crate::doodad_rig::model_bytes(world, &path)?))
+}
+
+/// A model file's header facts: the sequences the clock arms and the box the implicit rect takes.
+fn model_facts(bytes: &[u8]) -> ModelFileFacts {
+    ModelFileFacts {
+        sequences: benilla_formats::parse_m2_animations(bytes)
+            .iter()
+            .map(|a| SequenceFacts {
+                anim_id: a.anim_id,
+                duration_ms: a.end_ms.saturating_sub(a.start_ms),
+                looping: a.looping,
+            })
+            .collect(),
+        bbox: benilla_formats::parse_m2_bounds(bytes)
+            .map_or(([0.0; 3], [0.0; 3]), |b| (b.bbox_min, b.bbox_max)),
+        cameras: benilla_formats::parse_m2_pane_cameras(bytes).len() as u32,
+    }
 }
 
 fn card_file(world: &BnWorld, key: &str) -> Option<Arc<CardFile>> {
@@ -104,19 +127,7 @@ fn parse_card_bytes(bytes: &[u8], dir: &str) -> Option<CardFile> {
     let bones = crate::parse_m2_bones(bytes)?;
     let gseqs = crate::parse_m2_global_sequences(bytes);
     let anims = benilla_formats::parse_m2_animations(bytes);
-    let facts = ModelFileFacts {
-        sequences: anims
-            .iter()
-            .map(|a| SequenceFacts {
-                anim_id: a.anim_id,
-                duration_ms: a.end_ms.saturating_sub(a.start_ms),
-                looping: a.looping,
-            })
-            .collect(),
-        bbox: benilla_formats::parse_m2_bounds(bytes)
-            .map_or(([0.0; 3], [0.0; 3]), |b| (b.bbox_min, b.bbox_max)),
-        cameras: benilla_formats::parse_m2_pane_cameras(bytes).len() as u32,
-    };
+    let facts = model_facts(bytes);
     let seqs = anims
         .iter()
         .map(|a| (a.anim_id, a.seq_index, a.start_ms))
@@ -428,5 +439,26 @@ mod tests {
             ..card
         };
         assert!(pose(&file, &end, layout_unit).is_empty(), "gone at 1 s");
+    }
+
+    /// The world map's arrow names `Interface\Minimap\MinimapArrow.mdx`, which ships as `.m2`:
+    /// its header answers the pane's implicit rect, the box the stock world map centres on the
+    /// player's position.
+    #[test]
+    fn the_arrow_file_answers_the_header_facts() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let bytes = chain
+            .read_file("interface\\minimap\\minimaparrow.m2")
+            .expect("read MinimapArrow.m2");
+        let facts = model_facts(&bytes);
+        let (min, max) = facts.bbox;
+        assert!(
+            (max[0] - min[0] - 0.0262).abs() < 5e-4 && (max[1] - min[1] - 0.0263).abs() < 5e-4,
+            "header box {min:?}..{max:?}"
+        );
+        assert_eq!(facts.sequences.len(), 1);
+        assert_eq!(facts.sequences[0].anim_id, 0);
+        assert_eq!(facts.cameras, 0);
     }
 }

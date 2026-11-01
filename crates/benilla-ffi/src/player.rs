@@ -55,6 +55,11 @@ const STEP_SNAP_SLACK: f32 = 1.0 / 36.0;
 /// downward probe and the wall test read it the same way, so a beam's
 /// underside is a ceiling to the head and no floor to the feet.
 const FACE_FACING_EPS: f32 = 1.0e-5;
+/// The water kinds' accept margin for a submerged point (yd): the reference's camera probe
+/// compares `z < surface + 0.01` at `0x69ba23` (the f32 `0x3c23d70a`), so the view turns
+/// submerged as the near rectangle's lowest corner reaches the surface. Magma and slime
+/// compare strictly (`benilla-world`'s `SUBMERSION_EPS`).
+const SUBMERSION_EPS: f32 = 0.01;
 // The capsule the client traces with (`CAPSULE_RADIUS`/`CAPSULE_HEIGHT`);
 // the probe below is a point at the feet plus the step window, which is the
 // same corridor for a walker on the floors this data ships.
@@ -71,9 +76,12 @@ const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
 /// `pitch_speed × Δy / 90`, which at the default 180 and 90 both land here.
 const LOOK_SENSITIVITY: f32 = 0.003;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom's deviation, for a wider view
-/// The shortest boom the collision probe will pull to: any closer and the eye
-/// sits inside the body (the client's first-person cut is not modelled).
-const CAM_BOOM_MIN: f32 = 1.0;
+/// The shortest boom the collision probe will pull to. A wall the player backs into cuts the
+/// camera to the head, as the client's sweep does (`seat = head + boom · frac`, `frac` reaching 0),
+/// so the eye never ends up behind the surface it stopped at: the PVS seed is the camera, and an
+/// eye inside the wall seeds nothing and culls the room it was in. The floor only keeps the eye off
+/// the pivot exactly, since the host derives its forward from `target - eye`.
+const CAM_BOOM_MIN: f32 = 1.0 / 64.0;
 /// `benilla-world`'s `CAMERA_PROBE_RADIUS` (collision.rs): the camera's sweep
 /// sphere, which keeps the near plane out of the surface it stops at.
 const CAM_PROBE_RADIUS: f32 = 0.3;
@@ -1543,16 +1551,15 @@ impl Player {
         nz < GROUND_COS && rise > 0.0 && rise <= FOOT_CONE_HEIGHT
     }
 
-    /// The liquid surface over (x, y), the lowest of any stacked blocks
-    /// so a stream over the sea reads as the
-    /// stream). Magma and slime are swum in like water.
-    fn water(&self, x: f32, y: f32) -> Option<f32> {
+    /// Run `f` over every liquid surface under (x, y) with its kind and world
+    /// height: the ADT's MCLQ blocks plus every WMO's MLIQ, sampled from the
+    /// body's own tile (or every loaded tile while its own is still arriving).
+    fn for_each_liquid(&self, x: f32, y: f32, mut f: impl FnMut(benilla_formats::LiquidKind, f32)) {
         let (tx, ty) = Self::tile_of(x, y);
-        let mut best: Option<f32> = None;
         let mut consider = |tile: &TileCol| {
             for m in &tile.liquids {
                 if let Some(z) = liquid_height(m, x, y) {
-                    best = Some(best.map_or(z, |b: f32| b.min(z)));
+                    f(m.kind, z);
                 }
             }
             for (inst, m) in &tile.wmo_liquids {
@@ -1566,7 +1573,7 @@ impl Player {
                 );
                 if let Some(lz) = liquid_height(m, local[0], local[1]) {
                     let wz = q_rot(q, [local[0], local[1], lz])[2] + inst.position[2];
-                    best = Some(best.map_or(wz, |b: f32| b.min(wz)));
+                    f(m.kind, wz);
                 }
             }
         };
@@ -1575,6 +1582,35 @@ impl Player {
             // Border frame with the neighbour still loading.
             None => self.tiles.values().for_each(consider),
         }
+    }
+
+    /// The liquid surface over (x, y), the lowest of any stacked blocks
+    /// so a stream over the sea reads as the
+    /// stream). Magma and slime are swum in like water.
+    fn water(&self, x: f32, y: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        self.for_each_liquid(x, y, |_, z| best = Some(best.map_or(z, |b: f32| b.min(z))));
+        best
+    }
+
+    /// The liquid a point at (x, y, z) is submerged in, and that surface's
+    /// height: the lowest surface over its XY that the point sits under, as
+    /// `benilla-world`'s `submersion_claim_at` resolves the app camera. A
+    /// water kind accepts a point up to [`SUBMERSION_EPS`] above the surface,
+    /// since the probe tests the near rectangle's lowest corner; magma and
+    /// slime compare strictly.
+    fn liquid_at(&self, x: f32, y: f32, z: f32) -> Option<(benilla_formats::LiquidKind, f32)> {
+        let mut best: Option<(benilla_formats::LiquidKind, f32)> = None;
+        self.for_each_liquid(x, y, |kind, surface| {
+            let eps = if kind.is_fullbright() {
+                0.0
+            } else {
+                SUBMERSION_EPS
+            };
+            if z < surface + eps && best.is_none_or(|(_, b)| surface < b) {
+                best = Some((kind, surface));
+            }
+        });
         best
     }
 
@@ -1852,7 +1888,7 @@ impl Player {
     /// The longest clear boom up to `max`: the first solid face along it, less
     /// the probe's radius (`CAMERA_PROBE_RADIUS`), so the eye keeps clear of
     /// the surface it stops at; floored at [`CAM_BOOM_MIN`] so the eye never
-    /// ends up inside the body.
+    /// lands on the pivot exactly.
     fn solid_boom(&self, pivot: [f32; 3], fwd: [f32; 3], max: f32) -> f32 {
         if max <= 0.0 {
             return 0.0;
@@ -3526,6 +3562,39 @@ pub extern "C" fn bn_terrain_wow_z(world: *const BnWorld, x: f32, y: f32) -> f32
         .unwrap_or(f32::NAN)
 }
 
+/// The liquid a WoW-space point sits in, for the host's underwater atmosphere: the lowest
+/// surface over its XY that the point is under (a water kind accepts +0.01 yd, magma and slime
+/// strictly). Writes `out[0]` = surface Z and `out[1]` = depth below it, both in WoW yards, and
+/// returns the kind: 1 water, 2 ocean, 3 magma, 4 slime, 0 dry (nothing written).
+#[no_mangle]
+pub extern "C" fn bn_liquid_at(
+    world: *const BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    out: *mut f32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w.player.as_ref() else { return 0 };
+    let Some((kind, surface)) = p.liquid_at(x, y, z) else {
+        return 0;
+    };
+    // SAFETY: the caller passes room for two floats.
+    unsafe {
+        *out = surface;
+        *out.add(1) = surface - z;
+    }
+    match kind {
+        benilla_formats::LiquidKind::Still | benilla_formats::LiquidKind::Rapids => 1,
+        benilla_formats::LiquidKind::Ocean => 2,
+        benilla_formats::LiquidKind::Magma => 3,
+        benilla_formats::LiquidKind::Slime => 4,
+    }
+}
+
 /// The Z a body standing at (`x`, `y`) with its seat at `seat_z` ends at, in WoW yards, or `NaN`
 /// where the cast finds no floor and the seat stands. This is the reference's idle ground cast
 /// (`0x636dcd`-`0x636e45`) over this body's own surface set (ADT walking faces, WMO floors, doodad
@@ -3912,13 +3981,38 @@ mod tests {
             "the boom stops at the wall: {}",
             p.cam_live
         );
-        assert!(p.cam_live >= CAM_BOOM_MIN, "never inside the body");
+        assert!(p.cam_live >= CAM_BOOM_MIN, "never past the floor");
         // Turn the orbit away from the wall: the boom eases out at 8.33 yd/s,
         // not in one frame.
         p.cam_yaw = std::f32::consts::FRAC_PI_2;
         p.tick(0.1);
         assert!(p.cam_live > 2.6, "released from the wall");
         assert!(p.cam_live < CAM_DIST_DEFAULT, "eased, not snapped");
+    }
+
+    #[test]
+    fn a_wall_against_the_head_cuts_the_boom_but_never_past_the_wall() {
+        // Walking into the wall leaves the body's centre about a capsule radius
+        // from it, inside the camera probe's own sphere: the roomy boom stops
+        // short of zero and the eye would sit behind the surface. The PVS seed
+        // is the camera, so an eye inside the wall seeds nothing and the flood
+        // culls the room the player is standing in - the blanked view and the
+        // flicker as the orbit crosses the plane. The boom must fall to the
+        // floor and stay on the player's side.
+        let mut p = player_with_wall();
+        p.pos = [-8799.7, -800.0, 0.0];
+        p.tick(0.1);
+        assert!(
+            (p.cam_live - CAM_BOOM_MIN).abs() < 1.0e-6,
+            "the boom falls to the floor at the wall: {}",
+            p.cam_live
+        );
+        let (eye, _) = p.camera();
+        assert!(
+            eye[0] > -8800.0,
+            "the eye stays on the player's side of the wall: {}",
+            eye[0]
+        );
     }
 
     /// World x of the profiles' own x = 0; every profile is authored around it.
@@ -4524,6 +4618,55 @@ mod tests {
             liquid_height(&m, 17066.666 + LIQUID_UNIT, y),
             None,
             "dry corner"
+        );
+    }
+
+    fn liquid_player(meshes: Vec<benilla_formats::LiquidMesh>) -> Player {
+        let mut p = Player::new("Azeroth", 17064.0, 17064.0);
+        let mut tile = TileCol::new();
+        tile.liquids = meshes;
+        p.tiles.insert(Player::tile_of(p.pos[0], p.pos[1]), tile);
+        p
+    }
+
+    #[test]
+    fn liquid_at_reads_the_lowest_surface_and_its_kind() {
+        let mut ocean = flat_liquid(20.0);
+        ocean.kind = benilla_formats::LiquidKind::Ocean;
+        let p = liquid_player(vec![flat_liquid(12.0), ocean]);
+        let (x, y) = (p.pos[0], p.pos[1]);
+        assert_eq!(
+            p.liquid_at(x, y, 0.0),
+            Some((benilla_formats::LiquidKind::Still, 12.0)),
+            "the lowest surface over the XY wins"
+        );
+        assert_eq!(
+            p.liquid_at(x, y, 15.0),
+            Some((benilla_formats::LiquidKind::Ocean, 20.0)),
+            "above the stream's surface, only the sea over it still holds the point"
+        );
+        assert_eq!(p.liquid_at(x, y, 25.0), None, "above every surface is dry");
+    }
+
+    #[test]
+    fn water_takes_the_probe_margin_and_magma_does_not() {
+        let water = liquid_player(vec![flat_liquid(12.0)]);
+        let (x, y) = (water.pos[0], water.pos[1]);
+        assert!(
+            water.liquid_at(x, y, 12.005).is_some(),
+            "the near rectangle's corner still reads submerged"
+        );
+        assert!(
+            water.liquid_at(x, y, 12.02).is_none(),
+            "above the 0.01 yard margin is dry"
+        );
+        let mut magma = flat_liquid(12.0);
+        magma.kind = benilla_formats::LiquidKind::Magma;
+        let lava = liquid_player(vec![magma]);
+        assert!(lava.liquid_at(x, y, 11.99).is_some());
+        assert!(
+            lava.liquid_at(x, y, 12.0).is_none(),
+            "magma compares strictly, with no margin"
         );
     }
 

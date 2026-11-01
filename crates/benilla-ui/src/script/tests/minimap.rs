@@ -36,6 +36,11 @@ fn minimap_zoom_api_and_extract() {
     );
     s.run("m:SetZoom(-2)").unwrap();
     assert_eq!(s.eval::<u8>("return m:GetZoom()").unwrap(), 0);
+    assert_eq!(
+        s.minimap_zoom(),
+        Some((0, MINIMAP_DEFAULT_ZOOM, false)),
+        "the host reads both live indices and the inside flag"
+    );
 
     s.resolve();
     let mm = s
@@ -93,6 +98,7 @@ fn minimap_indoor_and_outdoor_zoom_indices_are_independent() {
     );
     s.run("m:SetZoom(5)").unwrap();
     assert_eq!(s.eval::<u8>("return m:GetZoom()").unwrap(), 5);
+    assert_eq!(s.minimap_zoom(), Some((2, 5, true)));
 
     // Both indices ride out through extraction, whatever the flag says.
     s.resolve();

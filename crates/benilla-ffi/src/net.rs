@@ -1381,6 +1381,24 @@ pub(crate) struct PendingItemPush {
     pub tries: u16,
 }
 
+/// `SMSG_LOGIN_SETTIMESPEED`: the realm clock advancing at `timescale` game-minutes per real
+/// second (vmangos about `0.01667`, real time), the same model as the app's `GameTime`.
+struct GameClock {
+    /// Minute of the game day (`0..1440`) when the packet arrived.
+    base_minute: u32,
+    timescale: f32,
+    received: Instant,
+}
+
+impl GameClock {
+    /// The current time in half-minutes (`0..2880`, 1440 = noon), the unit the light samples take.
+    fn half_minutes(&self) -> u32 {
+        let elapsed = self.received.elapsed().as_secs_f32() * self.timescale;
+        let minute = (self.base_minute as f32 + elapsed).rem_euclid(1440.0);
+        ((minute * 2.0) as u32).min(2879)
+    }
+}
+
 struct Shared {
     status: AtomicU32,
     /// The guid handed to `player_login`; `UpdateObject` entries for it feed
@@ -1527,6 +1545,13 @@ struct Shared {
     quest_status: Mutex<HashMap<u64, u32>>,
     /// The last `SMSG_TAXINODE_STATUS` per flight master guid: `false` draws the green `!`.
     taxi_known: Mutex<HashMap<u64, bool>>,
+    /// The realm clock from `SMSG_LOGIN_SETTIMESPEED`, advanced by its timescale; `None`
+    /// until the server sends one (the lighting keeps noon until then).
+    game_time: Mutex<Option<GameClock>>,
+    /// `SMSG_INIT_WORLD_STATES`' zone table plus every `SMSG_UPDATE_WORLD_STATE` write, and a
+    /// generation that moves on each so the world map's landmark pass rebuilds only on change
+    /// (`0x48fa0d`).
+    world_states: Mutex<(u64, HashMap<u32, u32>)>,
     /// Bumped by the packets whose answers can move a marker without touching our descriptor
     /// block (`SMSG_SET_FACTION_STANDING`, the quest-update packets, `SMSG_GROUP_LIST`); the
     /// sweep re-asks every giver when it moves, the app's `QuestGiver::bump_reask`.
@@ -1542,6 +1567,11 @@ struct Shared {
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
     last_pose: Mutex<Option<([f32; 3], f32)>>,
+    /// The server has told us where this session's character stands (its own
+    /// create). Until then `last_pose` is the host's placeholder - after a
+    /// character switch it still holds the previous body's feet - and must not
+    /// replace the self record the host reads as the login pose.
+    self_pose_from_server: AtomicBool,
     /// Host's latest directional input: (forward, strafe, turn) each -1..1.
     /// Positive forward = W, negative = S. Positive strafe = D, negative = A.
     /// Positive turn = right, negative = left.
@@ -1588,6 +1618,44 @@ pub(crate) fn with_chars<R>(f: impl FnOnce(&[BnNetChar]) -> R) -> Option<R> {
     let sh = shared();
     let rows = sh.chars.lock().unwrap_or_else(|e| e.into_inner());
     Some(f(&rows))
+}
+
+/// The world-state table's generation: bumped by every `SMSG_INIT_WORLD_STATES` and
+/// `SMSG_UPDATE_WORLD_STATE`, the edge the world map's landmark sources rebuild on.
+pub(crate) fn world_state_epoch() -> u64 {
+    shared()
+        .world_states
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+}
+
+/// The world-state table, cloned for a landmark rebuild.
+pub(crate) fn ui_world_states() -> HashMap<u32, u32> {
+    shared()
+        .world_states
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .clone()
+}
+
+/// Drop the table with the world session that filled it, so the next login's landmark pass
+/// starts from nothing rather than the previous zone's holds.
+fn clear_world_states(sh: &Shared) {
+    let mut states = sh.world_states.lock().unwrap_or_else(|e| e.into_inner());
+    *states = (states.0.wrapping_add(1), HashMap::new());
+}
+
+/// The realm's time of day in half-minutes (`0..2880`, 1440 = noon), advanced from
+/// `SMSG_LOGIN_SETTIMESPEED`; `None` until that packet arrives.
+pub(crate) fn world_time_half_minutes() -> Option<u32> {
+    shared()
+        .game_time
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(GameClock::half_minutes)
 }
 
 fn shared() -> &'static Shared {
@@ -1649,10 +1717,13 @@ fn shared() -> &'static Shared {
         self_swing_anim: AtomicU32::new(16),
         quest_status: Mutex::new(HashMap::new()),
         taxi_known: Mutex::new(HashMap::new()),
+        game_time: Mutex::new(None),
+        world_states: Mutex::new((0, HashMap::new())),
         quest_epoch: AtomicU64::new(0),
         quest_finish_owed: AtomicBool::new(false),
         quest_close_on_cancel: AtomicU32::new(0),
         last_pose: Mutex::new(None),
+        self_pose_from_server: AtomicBool::new(false),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
 }
@@ -2563,6 +2634,15 @@ fn worker(
                 crate::gossip_vm::clear_session();
                 crate::quest_log_vm::clear_session();
                 *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                // The world loop copies `last_pose` into the self record every
+                // tick, so a pose left from the previous character would
+                // overwrite this session's login pose before the host reads it
+                // (and the host places its pawn from that record).
+                *sh.last_pose.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *sh.last_input.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0, 0.0);
+                sh.self_pose_from_server.store(false, Ordering::SeqCst);
+                *sh.game_time.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                clear_world_states(sh);
                 sh.set(ST_ENTERING);
                 sh.event(format!("enter|{guid}"));
                 match session.player_login(guid) {
@@ -2578,6 +2658,15 @@ fn worker(
                             WorldExit::LoggedOut => {
                                 *sh.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                 sh.units.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                // The parked character's pose belongs to its session:
+                                // leaving it behind is what let the next character
+                                // adopt the previous one's feet.
+                                *sh.last_pose.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                *sh.last_input.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    (0.0, 0.0, 0.0);
+                                sh.self_pose_from_server.store(false, Ordering::SeqCst);
+                                *sh.game_time.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                clear_world_states(sh);
                                 sh.selection.store(0, Ordering::SeqCst);
                                 sh.self_guid.store(0, Ordering::SeqCst);
                                 sh.mover_ready.store(0, Ordering::SeqCst);
@@ -3325,16 +3414,21 @@ fn run_world(
         if let Some((pos, yaw)) = pose {
             // Our own body is client-authoritative: the server never relays our `MSG_MOVE_*` back,
             // so the self record only holds the login pose. Without this the host's and the VM's
-            // distance tests measure from where we logged in, not where we stand.
-            let self_guid = sh.self_guid.load(Ordering::SeqCst);
-            if let Some(rec) = sh
-                .units
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&self_guid)
-            {
-                rec.pos = pos;
-                rec.facing = yaw;
+            // distance tests measure from where we logged in, not where we stand. The exception is
+            // the session's first pose: until the server's own create has been read the host's pose
+            // is a placeholder (after a character switch, the previous body's feet) and must not
+            // hide the login pose.
+            if sh.self_pose_from_server.load(Ordering::SeqCst) {
+                let self_guid = sh.self_guid.load(Ordering::SeqCst);
+                if let Some(rec) = sh
+                    .units
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&self_guid)
+                {
+                    rec.pos = pos;
+                    rec.facing = yaw;
+                }
             }
             let forward = input.0;
             let strafe = input.1;
@@ -4063,6 +4157,9 @@ fn apply_object(obj: &Object, sh: &Shared) {
             }
             if is_self {
                 sh.mover_ready.store(1, Ordering::SeqCst);
+                if movement.position.is_some() {
+                    sh.self_pose_from_server.store(true, Ordering::SeqCst);
+                }
             }
         }
         Object::Create {
@@ -4092,6 +4189,9 @@ fn apply_object(obj: &Object, sh: &Shared) {
             }
             if *guid == self_guid {
                 sh.mover_ready.store(1, Ordering::SeqCst);
+                if movement.position.is_some() {
+                    sh.self_pose_from_server.store(true, Ordering::SeqCst);
+                }
             }
         }
         Object::OutOfRange { guids } => {
@@ -4216,6 +4316,25 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         ServerPacket::CorpseReclaimDelay { delay_ms } => {
             sh.corpse_delay_ms.store(*delay_ms, Ordering::SeqCst);
+        }
+        // `SMSG_LOGIN_SETTIMESPEED`: the realm clock the lighting's day/night curve reads.
+        // Vanilla sends it as the world loads, so the first frames keep the noon row.
+        ServerPacket::TimeSpeed {
+            hours,
+            minutes,
+            timescale,
+            ..
+        } => {
+            *sh.game_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(GameClock {
+                base_minute: u32::from(*hours) * 60 + u32::from(*minutes),
+                timescale: *timescale,
+                received: Instant::now(),
+            });
+            sh.event(format!(
+                "time|{}|{}",
+                u32::from(*hours) * 60 + u32::from(*minutes),
+                timescale
+            ));
         }
         ServerPacket::AttackStart { attacker, .. } => {
             sh.engaged
@@ -5018,7 +5137,24 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         }
         // `SMSG_LOGOUT_COMPLETE` is answered in `run_world`'s recv loop, where it can end the
         // world session.
-        ServerPacket::UpdateWorldState { .. } | ServerPacket::QuestLogFull => {
+        // `0x4c5650`: the table is replaced whole, map and zone included; the trailing `(0, 0)`
+        // pair vmangos counts is data, as the reference keeps it.
+        ServerPacket::InitWorldStates(w) => {
+            let mut states = sh.world_states.lock().unwrap_or_else(|e| e.into_inner());
+            states.1.clear();
+            for &(id, value) in &w.states {
+                states.1.insert(id, value);
+            }
+            states.0 = states.0.wrapping_add(1);
+            sh.event(format!("pkt|{}", packet.name()));
+        }
+        ServerPacket::UpdateWorldState { id, value } => {
+            let mut states = sh.world_states.lock().unwrap_or_else(|e| e.into_inner());
+            states.1.insert(*id, *value);
+            states.0 = states.0.wrapping_add(1);
+            sh.event(format!("pkt|{}", packet.name()));
+        }
+        ServerPacket::QuestLogFull => {
             sh.event(format!("pkt|{}", packet.name()));
         }
         // Every packet whose answer to a giver can change without our own descriptor moving:

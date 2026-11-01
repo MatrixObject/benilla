@@ -269,7 +269,7 @@ pub use tabard::{
     TABARD_CREATION_COST,
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
-pub use worldmap_arrow::ARROW_MODEL;
+pub use worldmap_arrow::{WorldMapArrowView, ARROW_MODEL};
 
 pub(crate) use button::{set_label_font_justify_h_lua, LabelFont};
 pub use inspect::{InspectView, UnitReach};
@@ -907,6 +907,18 @@ impl UiScript {
         model.arena.minimap_kinds().iter().find_map(|&h| {
             match model.arena.frame(h).map(|f| &f.kind_state) {
                 Some(KindState::Minimap(m)) => m.mask_texture.clone(),
+                _ => None,
+            }
+        })
+    }
+
+    /// The first Minimap's live zoom: `(outdoor, inside)` indices and the WMO-inside flag, from the
+    /// widget `Minimap:SetZoom` writes (`0x86f698`/`0x86f69c`). `None` until a Minimap exists.
+    pub fn minimap_zoom(&self) -> Option<(u8, u8, bool)> {
+        let model = self.model_ref();
+        model.arena.minimap_kinds().iter().find_map(|&h| {
+            match model.arena.frame(h).map(|f| &f.kind_state) {
+                Some(KindState::Minimap(m)) => Some((m.zoom, m.inside_zoom, m.inside)),
                 _ => None,
             }
         })

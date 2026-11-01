@@ -118,6 +118,10 @@ mod exterior;
 
 mod ui_feed;
 
+// ---- The world map (M): the DBC catalog and the per-frame selection/blip feed ----
+
+mod world_map;
+
 // ---- The item tooltip's templates, sets and requirement state, as the network answered ----
 
 mod item_vm;
@@ -8568,8 +8572,10 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
     // The engine clears the nameplate toggles with the VM it loads.
     nameplates::clear_bits();
     // SAFETY: caller guarantees a valid handle for the call's span.
-    let w = unsafe { &*world };
-    let Some(chain) = w.chain.as_ref() else {
+    let w = unsafe { &mut *world };
+    // Mutable: the world map's catalog loaders read DBC files through `&mut Chain` before the
+    // toc walk, the rest of this function only reads.
+    let Some(chain) = w.chain.as_mut() else {
         return 0;
     };
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8606,6 +8612,12 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
             .unwrap_or_default();
         script.set_default_bindings(defaults);
         script.load_binding_set(1);
+        // The world map's catalog, before the toc walk: the stock `WorldMapFrame` and any addon
+        // reading `GetMapContinents`/`GetMapZones` at file scope answer from it, as the
+        // reference holds this DBC data from load (`0x4a5d00`).
+        world_map::seed(chain, &mut script);
+        // Everything past the map catalog only reads the chain.
+        let chain: &benilla_formats::Chain = chain;
         // The startup scan's chain pass (`0x51c760`), before `UI_Init` reads the toc: the
         // twelve `Blizzard_*` LoadOnDemand addons are registry rows read off the patch chain,
         // and `UIParentLoadAddOn("Blizzard_TalentUI")` loads one through that reader. Without
@@ -8964,6 +8976,30 @@ pub extern "C" fn bn_ui_model_cards(buf: *mut c_char, cap: u32) -> u32 {
         return 0;
     }
     let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ui_cards::rows)) else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
+/// The world map's player arrow, one TSV row in root units (y up):
+/// `left \t top \t width \t height \t scale \t facing`; empty while it is absent, hidden with its
+/// map, or its file's facts have not landed. The stock arrow is a `Model` pane the region dump
+/// cannot carry (`WorldMapFrame.lua` `CreateWorldMapArrowFrame`), so the host paints it from the
+/// same baked spin atlas as the minimap arrow: the art is one and the same
+/// `Interface\Minimap\MinimapArrow.blp`.
+#[no_mangle]
+pub extern "C" fn bn_ui_world_map_arrow(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(world_map::arrow_row))
+    else {
         return 0;
     };
     let n = (text.len() as u64).min(cap as u64 - 1) as usize;
@@ -10250,6 +10286,32 @@ pub extern "C" fn bn_ui_set_seam(seam: f32) -> u32 {
         })
     }));
     out.unwrap_or(0)
+}
+
+/// The `<Minimap>` widget's live zoom, three `u32`s written to `out`: the outdoor index, the
+/// indoor index, and the WMO-inside flag that picks between them (`0x86f698`/`0x86f69c`/`0xceaa60`).
+/// `Minimap:SetZoom` writes the active one; the host maps the index to its view radius
+/// (`0x6da9b0`). Returns 3, or 0 before the UI (or a Minimap) exists.
+#[no_mangle]
+pub extern "C" fn bn_minimap_zoom(out: *mut u32) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Ok(zoom) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| slot.borrow().as_ref().and_then(|s| s.minimap_zoom()))
+    })) else {
+        return 0;
+    };
+    let Some((outdoor, inside, is_inside)) = zoom else {
+        return 0;
+    };
+    // SAFETY: the caller passes three writable `u32`s.
+    unsafe {
+        *out = u32::from(outdoor);
+        *out.add(1) = u32::from(inside);
+        *out.add(2) = u32::from(is_inside);
+    }
+    3
 }
 
 /// Fire a batch of host signals into the VM, in order.
@@ -11881,6 +11943,75 @@ pub extern "C" fn bn_light_sample(
     // SAFETY: `out` holds at least `cap >= N` floats.
     unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
     N
+}
+
+/// [`bn_light_sample`] under a liquid: the same 26 floats and layout, resolved with the zone's
+/// underwater `LightParams` slot (area-blended, as `0x6d2d00` blends every slot) or, for magma
+/// and slime, the fixed global row (`0x6d2371`). Ocean additionally runs the depth ramp
+/// `0x6d2823`, scaling ambient by `fac1` (down to 0.5) and sun diffuse by `fac2` (down to 0.75)
+/// over the first 30 yd below the surface. `submersion` is `bn_liquid_at`'s return: 1 water,
+/// 2 ocean, 3 magma, 4 slime; anything else samples dry.
+#[no_mangle]
+pub extern "C" fn bn_light_sample_submerged(
+    world: *mut BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    map: u32,
+    time: u32,
+    submersion: u32,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    const N: u32 = 26;
+    if world.is_null() || out.is_null() || cap < N {
+        return 0;
+    }
+    let sub = match submersion {
+        1 => benilla_formats::Submersion::Water,
+        2 => benilla_formats::Submersion::Ocean,
+        3 => benilla_formats::Submersion::Magma,
+        4 => benilla_formats::Submersion::Slime,
+        _ => benilla_formats::Submersion::Dry,
+    };
+    // SAFETY: the caller passes the handle `bn_init` returned.
+    let w = unsafe { &mut *world };
+    if w.lights.is_none() {
+        let loaded = w
+            .chain
+            .as_mut()
+            .and_then(|c| benilla_formats::LightCatalog::load(c).ok());
+        w.lights = loaded;
+    }
+    let Some(cat) = w.lights.as_ref() else {
+        return 0;
+    };
+    let a = cat.sample_blended(map, [x, y, z], time, false, sub, false);
+    let (fac1, fac2) = sub.ocean_depth_factors(z).unwrap_or((1.0, 1.0));
+    let mut vals = [0.0f32; N as usize];
+    vals[0] = a.fog_end;
+    vals[1] = a.fog_start_frac;
+    vals[2..5].copy_from_slice(&a.fog_color);
+    for (v, c) in vals[5..8].iter_mut().zip(a.sun_diffuse) {
+        *v = c * fac2;
+    }
+    for (v, c) in vals[8..11].iter_mut().zip(a.ambient) {
+        *v = c * fac1;
+    }
+    for (i, s) in a.sky.iter().enumerate() {
+        vals[11 + i * 3..14 + i * 3].copy_from_slice(s);
+    }
+    // SAFETY: `out` holds at least `cap >= N` floats.
+    unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
+    N
+}
+
+/// The realm's game time in half-minutes (`0..2880`, 1440 = noon): `SMSG_LOGIN_SETTIMESPEED`
+/// advanced by its timescale. This is the `time` argument the light samples take. Returns
+/// `u32::MAX` until the server sends the clock, which the host renders as noon.
+#[no_mangle]
+pub extern "C" fn bn_world_time() -> u32 {
+    net::world_time_half_minutes().unwrap_or(u32::MAX)
 }
 
 /// One `Spell.dbc` display row as a TSV line:

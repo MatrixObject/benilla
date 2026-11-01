@@ -8,6 +8,7 @@ use mlua::{Lua, MultiValue, ObjectLike, Table, Value};
 use super::binding_abi::bool_or_default;
 use super::object::{create_frame, decode_id, frame_handle_of, frame_wrapper, point_from_str};
 use super::Model;
+use crate::widget::KindState;
 
 /// The arrow's model (`0x8453c0`), not `Rotating-MinimapArrow`.
 pub const ARROW_MODEL: &str = "Interface\\Minimap\\MinimapArrow.mdx";
@@ -308,6 +309,44 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// The world map's arrow as a host paints it: the resolved rect in root units (y up), the model
+/// scale the file's quad draws at (`1280 · modelScale · frameScale` units a model unit,
+/// `0x76d1a0`), and the facing the last `UpdateWorldMapArrowFrames` copied. The stock arrow is a
+/// `Model` pane the region dump cannot carry, and its art is the minimap's own
+/// `Interface\Minimap\MinimapArrow.blp`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldMapArrowView {
+    pub rect: crate::layout::Rect,
+    pub scale: f32,
+    pub facing: f32,
+}
+
+impl crate::script::UiScript {
+    /// The world arrow, `None` while the singleton is uncreated, hidden with its frame chain, or
+    /// still without its rect (the file's facts have not landed).
+    pub fn world_map_arrow(&self) -> Option<WorldMapArrowView> {
+        let model = self.model_ref();
+        let id = model.worldmap.arrow_world?;
+        let h = model.id_to_frame.get(&id).copied()?;
+        let f = model.arena.frame(h)?;
+        if !f.effective_visible {
+            return None;
+        }
+        let KindState::Model(m) = &f.kind_state else {
+            return None;
+        };
+        let rect = model.resolved.get(&h).copied()?;
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        Some(WorldMapArrowView {
+            rect,
+            scale: m.scale * f.effective_scale,
+            facing: m.facing,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +447,39 @@ mod tests {
             0,
             "zero values"
         );
+    }
+
+    #[test]
+    fn the_host_view_is_the_arrows_rect_scale_and_facing() {
+        let mut s = vm();
+        assert!(s.world_map_arrow().is_none(), "no singleton yet");
+        s.run("CreateWorldMapArrowFrame(WM)").unwrap();
+        assert!(
+            s.world_map_arrow().is_none(),
+            "no facts: the implicit rect is still empty"
+        );
+        arrow_facts(&mut s);
+        s.run("arrow = ({WM:GetChildren()})[2] UpdateWorldMapArrowFrames()")
+            .unwrap();
+        s.run("PositionWorldMapArrowFrame('CENTER', 'WorldMapDetailFrame', 'TOPLEFT', 100, -50)")
+            .unwrap();
+        s.set_world_map_feed(None, Some((0.5, 0.5)), 1.25, None, Vec::new(), Vec::new());
+        s.run("UpdateWorldMapArrowFrames()").unwrap();
+        s.resolve();
+        let view = s.world_map_arrow().expect("the arrow is drawn");
+        let (cx, cy) = s
+            .eval::<(f32, f32)>("local x, y = arrow:GetCenter() return x, y")
+            .unwrap();
+        assert!(
+            (view.rect.left + view.rect.width() * 0.5 - cx).abs() < 0.01
+                && (view.rect.top - view.rect.height() * 0.5 - cy).abs() < 0.01,
+            "the box's centre is the arrow's: {view:?} vs {cx},{cy}"
+        );
+        assert!((view.rect.width() - 0.0262 * 1280.0).abs() < 0.05, "{view:?}");
+        assert!((view.scale - 1.0).abs() < 1e-6, "g48 · 5/3 at 4:3: {view:?}");
+        assert!((view.facing - 1.25).abs() < 1e-6, "{view:?}");
+        s.run("WM:Hide()").unwrap();
+        assert!(s.world_map_arrow().is_none(), "hidden with its frame chain");
     }
 
     #[test]
