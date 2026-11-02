@@ -1044,6 +1044,20 @@ impl UiScript {
             .any(|(_, f)| f.name.as_deref() == Some(name) && f.effective_visible)
     }
 
+    /// The named frames whose Button holds `LockHighlight`: their highlight texture draws
+    /// without hover, and their label takes the highlight font. The stock character select
+    /// marks its selected row exactly this way (`CharacterSelect.lua:215-221`), so a host
+    /// that paints the dump's HIGHLIGHT rows only under the pointer would never show a
+    /// selection.
+    pub fn highlight_locked_frames(&self) -> Vec<String> {
+        self.model_ref()
+            .arena
+            .iter_frames()
+            .filter(|(_, f)| matches!(f.kind_state, KindState::Button(ref bs) if bs.locked_highlight))
+            .filter_map(|(_, f)| f.name.clone())
+            .collect()
+    }
+
     /// The named frame's effective alpha while it is effectively visible: the app's minimap ping
     /// sprite follows the stock `MiniMapPing` `<Model>` this way.
     pub fn frame_effective_alpha(&self, name: &str) -> Option<f32> {

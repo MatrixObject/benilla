@@ -8902,6 +8902,40 @@ pub extern "C" fn bn_ui_paint(buf: *mut c_char, cap: u32) -> u32 {
     n as u32
 }
 
+/// The frame names whose Button holds `LockHighlight`, one per line. Their highlight texture
+/// draws without a pointer over it, so a host that gates the dump's constant HIGHLIGHT rows on
+/// hover must let these through or a selected character row shows no selection at all.
+#[no_mangle]
+pub extern "C" fn bn_ui_highlight_locked(buf: *mut c_char, cap: u32) -> u32 {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let Ok(text) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BN_UI.with(|slot| {
+            let held = slot.borrow();
+            let s = held.as_ref()?;
+            let mut out = String::new();
+            for name in s.highlight_locked_frames() {
+                out.push_str(&name);
+                out.push('\n');
+            }
+            Some(out)
+        })
+    })) else {
+        return 0;
+    };
+    let Some(text) = text else {
+        return 0;
+    };
+    let n = (text.len() as u64).min(cap as u64 - 1) as usize;
+    // SAFETY: the caller passes a writable buffer of `cap` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    n as u32
+}
+
 /// The quads a widget places itself and every region's ScrollFrame draw clip, as TSV lines in
 /// painter order: `T \t owner \t region \t left \t top \t width \t height` for a placed rect (a
 /// Slider's thumb along its track, a ColorSelect marker), the same shape with `C` for a draw clip,
