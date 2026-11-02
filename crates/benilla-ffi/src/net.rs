@@ -6465,6 +6465,17 @@ fn victim_reaction(sh: &Shared, s: &AttackerState) -> Option<(u16, bool)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&s.victim);
+    // Our own body is client-authoritative: the server never sends it a spline, so
+    // `UnitRec.spline` stays empty while we walk and `spline_gait` would call us
+    // standing. The gait has to come from our own movement input, the same Walk/Run
+    // split `player::anim` reads, or a moving wound takes the whole body.
+    let self_guid = sh.self_guid.load(Ordering::SeqCst);
+    let self_moving = if s.victim == self_guid {
+        let input = *sh.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        input.0.abs() > 0.1 || input.1.abs() > 0.1 || input.2.abs() > 0.1
+    } else {
+        false
+    };
     let (entry, base_anim, moving, mounted) = {
         let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
         let rec = units.get(&s.victim)?;
@@ -6478,13 +6489,13 @@ fn victim_reaction(sh: &Shared, s: &AttackerState) -> Option<(u16, bool)> {
             .find(|(index, _)| *index == 3)
             .map(|(_, value)| value)
             .unwrap_or(0);
-        let gait = spline_gait(rec);
-        (
-            entry,
-            gait,
-            gait != 0,
-            rec.fields.unit_mount_display_id() != 0,
-        )
+        let (gait, moving) = if s.victim == self_guid {
+            (u32::from(self_moving) * 4, self_moving)
+        } else {
+            let gait = spline_gait(rec);
+            (gait, gait != 0)
+        };
+        (entry, gait, moving, rec.fields.unit_mount_display_id() != 0)
     };
     let no_wound = sh
         .creatures
