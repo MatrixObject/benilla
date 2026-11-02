@@ -6472,7 +6472,9 @@ fn victim_reaction(sh: &Shared, s: &AttackerState) -> Option<(u16, bool)> {
     let self_guid = sh.self_guid.load(Ordering::SeqCst);
     let self_moving = if s.victim == self_guid {
         let input = *sh.last_input.lock().unwrap_or_else(|e| e.into_inner());
-        input.0.abs() > 0.1 || input.1.abs() > 0.1 || input.2.abs() > 0.1
+        // The same committed-lower-body test `player::lower_body_committed` uses: any
+        // forward/strafe/turn axis, not just a held key at speed.
+        input.0.abs() > 0.01 || input.1.abs() > 0.01 || input.2.abs() > 0.01
     } else {
         false
     };
