@@ -10348,6 +10348,93 @@ pub extern "C" fn bn_minimap_zoom(out: *mut u32) -> u32 {
     3
 }
 
+/// The stock Options window's video rows, as the UE host applies them: the window
+/// (`gxWindow`/`gxMaximize`/`gxResolution`/`gxVSync`), the view distance (`farclip`),
+/// the environment-detail stop (`WorldDetail`, 0 Low..2 High) and `renderScale`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BnVideoSettings {
+    pub resolution_w: u32,
+    pub resolution_h: u32,
+    /// `gxWindow`: 1 = windowed, 0 = borderless fullscreen.
+    pub windowed: u32,
+    /// `gxMaximize`: a windowed window fills the monitor.
+    pub maximize: u32,
+    pub vsync: u32,
+    /// The reference's `farclip`, clamped to its accepted [177, 777] yards.
+    pub farclip: f32,
+    /// 0 Low, 1 Medium, 2 High: how far the environment's detail doodads draw.
+    pub world_detail: u32,
+    /// `renderScale`, clamped to [0.5, 2.0].
+    pub render_scale: f32,
+    /// 1 when a UI session answered; 0 before the interface exists.
+    pub valid: u32,
+}
+
+/// One CVar's live value from the loaded interface, `None` before it exists.
+fn video_cvar(name: &str) -> Option<String> {
+    BN_UI.with(|slot| slot.borrow().as_ref().and_then(|s| s.cvar(name)))
+}
+
+fn video_number(name: &str, default: f32) -> f32 {
+    video_cvar(name)
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn video_flag(name: &str, default: bool) -> u32 {
+    u32::from(video_number(name, if default { 1.0 } else { 0.0 }) != 0.0)
+}
+
+/// `gxResolution` as `"1280x800"`; the registered 1600x900 when it does not parse.
+fn video_resolution() -> (u32, u32) {
+    let Some(text) = video_cvar("gxResolution") else {
+        return (1600, 900);
+    };
+    let Some((w, h)) = text.split_once(['x', 'X']) else {
+        return (1600, 900);
+    };
+    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+        (Ok(w), Ok(h)) if (320..=8192).contains(&w) && (240..=8192).contains(&h) => (w, h),
+        _ => (1600, 900),
+    }
+}
+
+fn read_video_settings() -> BnVideoSettings {
+    let (resolution_w, resolution_h) = video_resolution();
+    let world_detail = (video_number("WorldDetail", 1.0).max(0.0) as u32).min(2);
+    BnVideoSettings {
+        resolution_w,
+        resolution_h,
+        windowed: video_flag("gxWindow", false),
+        maximize: video_flag("gxMaximize", false),
+        vsync: video_flag("gxVSync", true),
+        farclip: video_number("farclip", 350.0).clamp(177.0, 777.0),
+        world_detail,
+        render_scale: video_number("renderScale", 1.0).clamp(0.5, 2.0),
+        valid: u32::from(BN_UI.with(|slot| slot.borrow().is_some())),
+    }
+}
+
+/// The stock Options window's live video settings. Returns `valid` (1 with a UI
+/// session, 0 before it exists); `out` always receives the parsed values.
+#[no_mangle]
+pub extern "C" fn bn_video_settings(out: *mut BnVideoSettings) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Ok(settings) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read_video_settings))
+    else {
+        return 0;
+    };
+    // SAFETY: the caller passes one writable `BnVideoSettings`.
+    unsafe {
+        *out = settings;
+    }
+    u32::from(settings.valid)
+}
+
 /// Fire a batch of host signals into the VM, in order.
 fn fire(script: &mut UiScript, signals: Vec<GlueSignal>) {
     for signal in signals {
