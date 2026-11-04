@@ -4038,7 +4038,9 @@ fn equip_target(sh: &Shared, bag: u8, slot: u8) -> Option<(u8, u32)> {
 }
 
 /// Every occupied slot of the player's own inventory, in client order:
-/// equipment 0..18, backpack, then the four equipped bags.
+/// equipment 0..18 and the four equipped bag items themselves (wire 19..22 - the doll's
+/// live 20..23, which `GetInventoryItemTexture` and `SetBagPortaitTexture` read), the
+/// backpack, then the contents of those bags.
 pub(crate) fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
     let self_guid = sh.self_guid.load(Ordering::SeqCst);
     let units = sh.units.lock().unwrap_or_else(|e| e.into_inner());
@@ -4077,7 +4079,7 @@ pub(crate) fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
         out.push(row);
     };
 
-    for i in 0..19u8 {
+    for i in 0..23u8 {
         if let Some(guid) = f.player_inv_slot(i) {
             if guid != 0 {
                 push(BAG_EQUIPPED, i, guid);

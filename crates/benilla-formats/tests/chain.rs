@@ -688,7 +688,10 @@ fn filters_wmo_collidable_triangles_by_mopy() {
         "World\\wmo\\Azeroth\\Buildings\\GoldshireInn\\GoldshireInn.wmo",
     )
     .expect("goldshire inn collision");
-    assert_eq!(inn.triangle_count(), 5114, "Goldshire Inn collidable tris");
+    // 5114 authored faces + 2084 reversed steep faces: the inn's interior groups
+    // are a shell wound for the exterior, and the mover's one-sided wall test
+    // skipped the room-facing side (a body walked out through the wall).
+    assert_eq!(inn.triangle_count(), 7198, "Goldshire Inn collidable tris");
     assert!(
         inn.indices
             .iter()
