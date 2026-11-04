@@ -895,6 +895,133 @@ fn keep_nearest(best: &mut Option<f32>, d: Option<f32>, max: f32) {
     }
 }
 
+/// Earliest time in (0, 1] at which a sphere of radius `r` moving along
+/// `c + t·d` touches the vertex `v`. `None` when it already overlaps at the
+/// start (depenetration owns that case) or the ray misses.
+fn sphere_ray(c: [f32; 3], d: [f32; 3], v: [f32; 3], r: f32) -> Option<f32> {
+    let m = [c[0] - v[0], c[1] - v[1], c[2] - v[2]];
+    let a = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if a < 1.0e-12 {
+        return None;
+    }
+    let cc = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] - r * r;
+    if cc < 0.0 {
+        return None;
+    }
+    let b = 2.0 * (m[0] * d[0] + m[1] * d[1] + m[2] * d[2]);
+    let disc = b * b - 4.0 * a * cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-b - disc.sqrt()) / (2.0 * a);
+    if t > 1.0e-6 && t <= 1.0 { Some(t) } else { None }
+}
+
+/// Earliest time in (0, 1] at which the moving point `c + t·d` is `r` away
+/// from the infinite line `a + u·e` (`e` unit). Used for a triangle edge: the
+/// caller checks the clamped `u` sits inside the segment.
+fn cylinder_ray(c: [f32; 3], d: [f32; 3], a: [f32; 3], e: [f32; 3], r: f32) -> Option<f32> {
+    let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let wd = w[0] * d[0] + w[1] * d[1] + w[2] * d[2];
+    let we = w[0] * e[0] + w[1] * e[1] + w[2] * e[2];
+    let de = d[0] * e[0] + d[1] * e[1] + d[2] * e[2];
+    let dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let qa = dd - de * de;
+    if qa < 1.0e-9 {
+        return None; // the travel runs along the edge
+    }
+    let qc = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - we * we - r * r;
+    if qc < 0.0 {
+        return None;
+    }
+    let qb = 2.0 * (wd - we * de);
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-qb - disc.sqrt()) / (2.0 * qa);
+    if t > 1.0e-6 && t <= 1.0 { Some(t) } else { None }
+}
+
+/// Swept sphere against one triangle: the earliest contact of a sphere moving
+/// along `c + t·d` (t in (0, 1]) with the triangle's plane, its three edges
+/// (infinite cylinder clamped to the segment) or its three vertices. Both
+/// windings count - a wall's plane is solid from either side - so the result
+/// also carries the contact normal, horizontal and turned against the travel.
+fn sweep_sphere_tri(c: [f32; 3], d: [f32; 3], r: f32, t: &Tri) -> Option<(f32, [f32; 3])> {
+    let mut best: Option<f32> = None;
+    let mut keep = |tt: f32| {
+        if best.is_none_or(|b| tt < b) {
+            best = Some(tt);
+        }
+    };
+    // Plane: the nearest time the center reaches `r` from either side, with
+    // the contact point (center minus the plane offset) inside the triangle.
+    let n = t.n;
+    let dn = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+    let s = n[0] * (c[0] - t.v[0][0]) + n[1] * (c[1] - t.v[0][1]) + n[2] * (c[2] - t.v[0][2]);
+    if s.abs() >= r && dn.abs() > 1.0e-9 {
+        let target = if s > 0.0 { r } else { -r };
+        let tt = (target - s) / dn;
+        if tt > 1.0e-6 && tt <= 1.0 {
+            let p = [
+                c[0] + d[0] * tt - n[0] * target,
+                c[1] + d[1] * tt - n[1] * target,
+                c[2] + d[2] * tt - n[2] * target,
+            ];
+            let q = closest_on_tri(p, t);
+            let dd = (p[0] - q[0]) * (p[0] - q[0])
+                + (p[1] - q[1]) * (p[1] - q[1])
+                + (p[2] - q[2]) * (p[2] - q[2]);
+            if dd < 1.0e-6 {
+                keep(tt);
+            }
+        }
+    }
+    // Edges: sphere center vs the edge's infinite cylinder, clamped to the
+    // segment; the endpoints fall to the vertex test below.
+    for i in 0..3 {
+        let a = t.v[i];
+        let b = t.v[(i + 1) % 3];
+        let e = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let el = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+        if el < 1.0e-9 {
+            continue;
+        }
+        let eu = [e[0] / el, e[1] / el, e[2] / el];
+        if let Some(tt) = cylinder_ray(c, d, a, eu, r) {
+            let w = [c[0] + d[0] * tt - a[0], c[1] + d[1] * tt - a[1], c[2] + d[2] * tt - a[2]];
+            let u = w[0] * eu[0] + w[1] * eu[1] + w[2] * eu[2];
+            if u >= 0.0 && u <= el {
+                keep(tt);
+            }
+        }
+    }
+    for v in t.v {
+        if let Some(tt) = sphere_ray(c, d, v, r) {
+            keep(tt);
+        }
+    }
+    let tt = best?;
+    let center = [c[0] + d[0] * tt, c[1] + d[1] * tt, c[2] + d[2] * tt];
+    let q = closest_on_tri(center, t);
+    let delta = [center[0] - q[0], center[1] - q[1], center[2] - q[2]];
+    let dl = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    let nrm = if dl > 1.0e-4 {
+        // Horizontal push for a vertical wall; a sloped face still pushes
+        // sideways, which is what the 2D step consumes.
+        let hl = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if hl > 1.0e-4 {
+            [delta[0] / hl, delta[1] / hl, 0.0]
+        } else {
+            n
+        }
+    } else {
+        n
+    };
+    Some((tt, nrm))
+}
+
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
 fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
     let [a, b, c] = t.v;
@@ -1939,54 +2066,156 @@ impl Player {
         self.pos[0] != start[0] || self.pos[1] != start[1]
     }
 
-    /// One frame's horizontal travel through the collision set: the step, less
-    /// what a wall the travel enters absorbs, with the remainder sliding along
-    /// the face (`slide_mover`'s behaviour). Returns whether the body moved.
-    /// The floor gate rides a step or certifies a step-up; a taller one is a
-    /// wall.
-    ///
-    /// The travel is swept in passes of at most half a capsule radius: a
-    /// destination more than a radius past the face could never be seen by the
-    /// point test at the end of a long frame (a streaming hitch hands the mover
-    /// a multi-yard step), so the body would cross the wall unseen. Halving the
-    /// radius keeps every pass inside the test's reach, which is the swept
-    /// cylinder the reference's mover uses. The loop is a little longer than
-    /// the three passes the old point test needed because a slid pass can meet
-    /// a second face at a corner.
+    /// Earliest contact of the capsule's three rings with this frame's travel
+    /// `dir * len`: a continuous sphere-vs-triangle sweep (plane, edges,
+    /// vertices) over every steep face within reach, both windings. The result
+    /// is `(t, horizontal normal, face top)`; `None` means the travel is clear.
+    fn sweep_capsule(&self, dir: [f32; 2], len: f32) -> Option<(f32, [f32; 2], f32)> {
+        let feet = self.pos[2];
+        let lo = feet + CAPSULE_RADIUS;
+        let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+        let d = [dir[0] * len, dir[1] * len, 0.0];
+        let mid = [
+            self.pos[0] + d[0] * 0.5,
+            self.pos[1] + d[1] * 0.5,
+            lo + (hi - lo) * 0.5,
+        ];
+        let mut best: Option<(f32, [f32; 2], f32)> = None;
+        for k in 0..3 {
+            let z = lo + (hi - lo) * (k as f32 / 2.0);
+            let c = [self.pos[0], self.pos[1], z];
+            self.any_tri_near(mid, |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false; // a floor or a ceiling
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                if top <= feet + STEP_UP_HEIGHT {
+                    return false; // a curb the mover steps over
+                }
+                if let Some((tt, n)) = sweep_sphere_tri(c, d, CAPSULE_RADIUS, t) {
+                    let hl = (n[0] * n[0] + n[1] * n[1]).sqrt();
+                    if hl > 1.0e-6 && best.is_none_or(|(b, _, _)| tt < b) {
+                        best = Some((tt, [n[0] / hl, n[1] / hl], top));
+                    }
+                }
+                false
+            });
+        }
+        best
+    }
+
+    /// Push the capsule out of every steep face it is already inside, along
+    /// the nearest face's outward normal. Three passes absorb a corner; a
+    /// clear body is left untouched. Returns whether it moved.
+    fn depenetrate(&mut self) -> bool {
+        let feet = self.pos[2];
+        let lo = feet + CAPSULE_RADIUS;
+        let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+        let mut moved = false;
+        for _ in 0..3 {
+            let mut best: Option<(f32, [f32; 2])> = None;
+            for k in 0..3 {
+                let p = [self.pos[0], self.pos[1], lo + (hi - lo) * (k as f32 / 2.0)];
+                self.any_tri_near(p, |t| {
+                    if t.n[2].abs() >= GROUND_COS {
+                        return false;
+                    }
+                    let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                    if top <= feet + STEP_UP_HEIGHT {
+                        return false;
+                    }
+                    let q = closest_on_tri(p, t);
+                    let dx = p[0] - q[0];
+                    let dy = p[1] - q[1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist >= CAPSULE_RADIUS {
+                        return false;
+                    }
+                    let depth = CAPSULE_RADIUS - dist;
+                    let n = if dist > 1.0e-4 {
+                        [dx / dist, dy / dist]
+                    } else {
+                        let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                        if hl < 1.0e-6 {
+                            return false;
+                        }
+                        [t.n[0] / hl, t.n[1] / hl]
+                    };
+                    if best.is_none_or(|(bd, _)| depth > bd) {
+                        best = Some((depth, n));
+                    }
+                    false
+                });
+            }
+            let Some((depth, n)) = best else { break };
+            self.pos[0] += n[0] * (depth + 1.0e-3);
+            self.pos[1] += n[1] * (depth + 1.0e-3);
+            moved = true;
+        }
+        moved
+    }
+
+    /// One frame's horizontal travel through the collision set, swept: each
+    /// iteration finds the *earliest* touch of the capsule with any steep face
+    /// along the remaining travel, advances to it, absorbs the into-face
+    /// component and slides the rest. A body that starts inside a face leaves
+    /// along the nearest normal first, and up to four contacts (a corner, a
+    /// door frame, a wall's residual) are resolved in one frame; three more
+    /// depenetration passes absorb what the last slide left. There is no fixed
+    /// substep cap - the sweep is continuous, so a hitch-length step cannot
+    /// land beyond a wall.
     fn horizontal_step_swept(&mut self, step: [f32; 2]) -> bool {
         let start = [self.pos[0], self.pos[1]];
+        self.depenetrate();
         let mut rem = step;
-        for _ in 0..48 {
+        for _ in 0..12 {
             let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
             if len < 1.0e-6 {
                 break;
             }
             let (dirx, diry) = (rem[0] / len, rem[1] / len);
-            let sub = len.min(CAPSULE_RADIUS * 0.5);
-            let (nx, ny) = (self.pos[0] + dirx * sub, self.pos[1] + diry * sub);
-            if let Some((n, top)) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
-                // A certified step-up or a foot-cone ride clears the face when
-                // the landing reaches its top; otherwise the step stops there
-                // and the rest slides along it.
-                if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], top) {
-                    self.pos[0] = nx;
-                    self.pos[1] = ny;
-                    rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
-                    continue;
-                }
-                let into = rem[0] * n[0] + rem[1] * n[1];
-                if into >= 0.0 {
+            let Some((t, n, top)) = self.sweep_capsule([dirx, diry], len) else {
+                let (nx, ny) = (self.pos[0] + rem[0], self.pos[1] + rem[1]);
+                if self.floor_blocks(nx, ny, dirx, diry) {
+                    self.depenetrate();
                     break;
                 }
-                rem = [rem[0] - into * n[0], rem[1] - into * n[1]];
-                continue;
-            }
-            if self.floor_blocks(nx, ny, dirx, diry) {
+                self.pos[0] = nx;
+                self.pos[1] = ny;
+                rem = [0.0, 0.0];
                 break;
+            };
+            if t <= 1.0e-4 {
+                // Already touching: the slide below cannot make progress, so
+                // settle the body out of the face and stop this frame.
+                self.depenetrate();
+                break;
+            }
+            let nx = self.pos[0] + dirx * len * t;
+            let ny = self.pos[1] + diry * len * t;
+            // A certified step-up or foot-cone ride clears the face when the
+            // landing reaches its top; the climb keeps the remaining travel.
+            if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], top) {
+                self.pos[0] = nx;
+                self.pos[1] = ny;
+                rem = [dirx * len * (1.0 - t), diry * len * (1.0 - t)];
+                continue;
             }
             self.pos[0] = nx;
             self.pos[1] = ny;
-            rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
+            let left = [dirx * len * (1.0 - t), diry * len * (1.0 - t)];
+            let into = left[0] * n[0] + left[1] * n[1];
+            rem = if into < 0.0 {
+                [left[0] - into * n[0], left[1] - into * n[1]]
+            } else {
+                [0.0, 0.0]
+            };
+            self.depenetrate();
+        }
+        for _ in 0..3 {
+            if !self.depenetrate() {
+                break;
+            }
         }
         self.pos[0] != start[0] || self.pos[1] != start[1]
     }
@@ -3910,6 +4139,92 @@ pub extern "C" fn bn_player_collision_probe(
             *out.add(i) = *v;
         }
     }
+    1
+}
+
+/// Read-only penetration probe for the indoor-leak matrix: the deepest overlap
+/// of the capsule's three rings with any steep face around the body, in yards,
+/// counted with no one-sided filter so both windings answer. `out` layout
+/// (8 f32): [0] max penetration depth (0 = clear), [1] nearest ring-to-face
+/// distance (-1 = none), [2..5] the deepest face's world normal, [5] its top z,
+/// [6] faces within one radius, [7] feet z. Writes nothing into the player.
+#[no_mangle]
+pub extern "C" fn bn_player_penetration(
+    world: *const BnWorld,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() || cap < 10 {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w.player.as_ref() else { return 0 };
+    let feet = p.pos[2];
+    let lo = feet + CAPSULE_RADIUS;
+    let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+    let r = CAPSULE_RADIUS;
+    let mut max_depth = 0.0f32;
+    let mut nearest = f32::MAX;
+    let mut best_n = [0.0f32; 3];
+    let mut best_top = 0.0f32;
+    let mut faces = 0usize;
+    for k in 0..3 {
+        let q = [p.pos[0], p.pos[1], lo + (hi - lo) * (k as f32 / 2.0)];
+        p.any_tri_near(q, |t| {
+            if t.n[2].abs() >= GROUND_COS {
+                return false; // a floor or a ceiling
+            }
+            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            if top <= feet + STEP_UP_HEIGHT {
+                return false; // a curb the mover steps over
+            }
+            let c = closest_on_tri(q, t);
+            let d = ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2))
+                .sqrt();
+            if d < nearest {
+                nearest = d;
+            }
+            if d < r {
+                faces += 1;
+            }
+            let depth = r - d;
+            if depth > max_depth {
+                max_depth = depth;
+                best_n = t.n;
+                best_top = top;
+            }
+            false
+        });
+    }
+    let mut o = [0.0f32; 10];
+    o[0] = max_depth;
+    o[1] = if nearest < f32::MAX { nearest } else { -1.0 };
+    o[2..5].copy_from_slice(&best_n);
+    o[5] = best_top;
+    o[6] = faces as f32;
+    o[7] = feet;
+    // Diagnostics for the matrix driver: whether the body is a corpse and
+    // whether a stock binding owns the axes this frame (both zero the input).
+    o[8] = if p.dead { 1.0 } else { 0.0 };
+    o[9] = if p.ui_input.is_some() { 1.0 } else { 0.0 };
+    // SAFETY: the caller passes room for 8 floats.
+    unsafe {
+        for (i, v) in o.iter().enumerate() {
+            *out.add(i) = *v;
+        }
+    }
+    1
+}
+
+/// Drop the stock UI's movement latch so a scripted driver's `bn_player_input`
+/// is not overridden by a parked `[0,0,0]` binding. Measurement only; the
+/// bindings re-latch on the next Start/Stop exactly as before.
+#[no_mangle]
+pub extern "C" fn bn_player_ui_release(world: *mut BnWorld) -> u32 {
+    let Some(p) = player_mut(world) else { return 0 };
+    p.ui_input = None;
+    p.ui_walk = None;
+    p.ui_jump = false;
     1
 }
 
@@ -6299,13 +6614,16 @@ mod tests {
             (p.pos[0] - start[0], p.pos[1] - start[1])
         };
         let (dx, dy) = walk(&mut p, PI, 30);
+        // The start is 0.03 yd inside the capsule radius (0.3 gap vs 0.33),
+        // so the swept mover pushes out to contact and then has no travel
+        // left: the walk is absorbed, nothing crosses the face.
         assert!(
-            dx.abs() < 1.0e-3 && dy.abs() < 1.0e-3,
-            "walking into the wall still stops: ({dx:.3}, {dy:.3})"
+            dx.abs() < 0.05 && dy.abs() < 1.0e-3,
+            "walking into the wall still stops at contact: ({dx:.3}, {dy:.3})"
         );
         let (dx, dy) = walk(&mut p, FRAC_PI_2, 30);
         assert!(
-            dy > 3.0 && dx.abs() < 0.02,
+            dy > 3.0 && dx.abs() < 0.05,
             "along the wall the walk moves: ({dx:.3}, {dy:.3})"
         );
         let (dx, dy) = walk(&mut p, 0.0, 30);
