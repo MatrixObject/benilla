@@ -30,6 +30,10 @@ mod coords;
 
 mod ui_font;
 
+// ---- Loading-screen overlay state machine (Map/LoadingScreens/GameTips) ----
+
+mod loading_screen;
+
 // ---- Doodad material animation addressed by model path (no tile switch) ----
 
 mod model_anim;
@@ -98,6 +102,10 @@ mod quest_log_vm;
 // ---- The ground ring under the selected unit: footprint, fade and selector colour ----
 
 mod selection_ring;
+
+// ---- The blob shadow under every unit: footprint, ground projection and CVar gate ----
+
+mod blob_shadow;
 
 // ---- The health-bar plate over a unit: its gate, its seat, and the widget layer's states ----
 
@@ -280,6 +288,12 @@ pub struct BnWorld {
     char_sections: Option<benilla_formats::CharSections>,
     item_display: Option<benilla_formats::ItemDisplayCatalog>,
     char_geosets: Option<benilla_formats::CharacterGeosets>,
+
+    /// `LoadingScreens.dbc`, `GameTips.dbc` and `Map.dbc`, parsed once on the first loading-screen
+    /// raise; a read failure degrades to no art / no tip and is not retried.
+    loading_screens: Option<benilla_formats::LoadingScreenCatalog>,
+    game_tips: Option<benilla_formats::GameTipsCatalog>,
+    maps: Option<benilla_formats::MapCatalog>,
 }
 
 impl BnWorld {
@@ -468,6 +482,12 @@ pub extern "C" fn bn_init(data_dir: *const c_char) -> *mut BnWorld {
         item_display: None,
 
         char_geosets: None,
+
+        loading_screens: None,
+
+        game_tips: None,
+
+        maps: None,
     }))
 }
 
@@ -2027,12 +2047,23 @@ pub struct WmoSub {
     /// The WMO group this batch was authored in (`u16::MAX` when the model's
     /// group table is unknown): the portal PVS answers per group.
     group: u16,
+    /// `groupFlags & 0x48 == 0`: the reference's interior test. Interior INT
+    /// batches are lit by their MOCV, not by the sun.
+    interior: bool,
+    /// MOBA section: 0 = Trans, 1 = Int, 2 = Ext, 3 = not a WMO batch.
+    class: u32,
+    /// 1 when every vertex carried MOCV. Without it the host must keep the
+    /// batch on the dynamic-lit path (the bake has no data to show).
+    has_colors: bool,
 }
 
 /// One WMO instance baked into tile-local UE axes: `world = position + in_wow·v`,
 /// then `(world − centre)` through the WoW->UE mirror, contiguous per submesh.
 pub struct WmoFlat {
     verts: Vec<BnVertex>,
+    /// MOCV parallel to `verts` (RGBA bytes, raw — no gamma): the interior
+    /// bake. White where the group authored none.
+    colors: Vec<[u8; 4]>,
     idx: Vec<u32>,
     subs: Vec<WmoSub>,
     /// The placement's world bounding sphere (WoW yards): the far-clip test's
@@ -2141,6 +2172,7 @@ fn build_wmo_flat_q(
 ) -> WmoFlat {
     let mut out = WmoFlat {
         verts: Vec::new(),
+        colors: Vec::new(),
         idx: Vec::new(),
         subs: Vec::new(),
         sphere: ([0.0; 3], 0.0),
@@ -2183,6 +2215,16 @@ fn build_wmo_flat_q(
                 u: uv[0],
                 v: uv[1],
             });
+            // MOCV, raw bytes (the reference multiplies the texture by these as-is).
+            let c = sm.vertex_colors.get(i).map_or([255u8, 255, 255, 255], |c| {
+                [
+                    (c[0] * 255.0).round() as u8,
+                    (c[1] * 255.0).round() as u8,
+                    (c[2] * 255.0).round() as u8,
+                    (c[3] * 255.0).round() as u8,
+                ]
+            });
+            out.colors.push(c);
         }
         let idx0 = out.idx.len() as u32;
         for t in sm.indices.chunks(3) {
@@ -2218,6 +2260,14 @@ fn build_wmo_flat_q(
             idx0,
             idx_n: out.idx.len() as u32 - idx0,
             group,
+            interior: sm.interior,
+            class: match sm.wmo_batch {
+                Some(benilla_formats::WmoBatchClass::Trans) => 0,
+                Some(benilla_formats::WmoBatchClass::Int) => 1,
+                Some(benilla_formats::WmoBatchClass::Ext) => 2,
+                None => 3,
+            },
+            has_colors: sm.vertex_colors.len() == sm.positions.len(),
             tex,
             two_sided: sm.two_sided,
             blend: match sm.blend {
@@ -3273,8 +3323,44 @@ pub extern "C" fn bn_wmo_instance_submesh(
         *out.add(2) = sm.idx0;
         *out.add(3) = sm.idx_n;
         *out.add(4) = u32::from(sm.group);
+        *out.add(5) = sm.class;
+        *out.add(6) = u32::from(sm.interior) | (u32::from(sm.has_colors) << 1);
+        *out.add(7) = 0;
     }
     1
+}
+
+/// Vertex colours (MOCV) of instance `i`, `[first, first+count)`, four raw
+/// bytes per vertex. Returns the byte count written (0 when out of range).
+#[no_mangle]
+pub extern "C" fn bn_wmo_instance_fill_colors_range(
+    world: *const BnWorld,
+    i: u32,
+    first: u32,
+    count: u32,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(flat) = wmo_flat(world, i) else {
+        return 0;
+    };
+    let n = (cap / 4).min(count) as usize;
+    let start = first as usize;
+    let end = start.saturating_add(n).min(flat.colors.len());
+    if start >= end {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            flat.colors[start..end].as_ptr() as *const u8,
+            out,
+            (end - start) * 4,
+        );
+    }
+    ((end - start) * 4) as u32
 }
 
 /// Submesh `j` of instance `i` texture path into `buf` (NUL-terminated).
@@ -3522,13 +3608,23 @@ struct WmoDoodadInst {
     /// draws with the MODR groups that name it, so the cull needs both.
     wmo_uid: u32,
     di: u32,
+    /// The MODD `+0x24` colour, RGBA: the prop's authored base light. The
+    /// reference sets it as an interior doodad's diffuse/ambient and never
+    /// samples the sun, so it is the whole light an interior prop has.
+    light: [u8; 4],
+    /// Some MODR-owning group is interior (`MOGP flags & 0x48 == 0`), the
+    /// reference's per-(prop, group) class (`0x695aa0`). A prop no interior
+    /// group names stays on the dynamic path.
+    interior: bool,
 }
 
 /// A root's MODD/MODS tables, WMO model space, cached by root path: the
 /// compose is per placement, the MPQ read and parse once per model.
 struct WmoRootDoodads {
-    insts: Vec<(String, [f32; 3], [f32; 4], f32)>,
+    insts: Vec<(String, [f32; 3], [f32; 4], f32, [u8; 4])>,
     sets: Vec<(u32, u32)>,
+    /// Per MODD index: an interior group names it (see `WmoDoodadInst::interior`).
+    interior: Vec<bool>,
 }
 
 fn wmo_root_doodads(
@@ -3546,17 +3642,36 @@ fn wmo_root_doodads(
     let parsed = chain.and_then(|c| {
         let bytes = c.read_file(&key).ok()?;
         let root = benilla_formats::parse_wmo_root(&bytes).ok()?;
+        // Which MODD props sit in an interior group: MODR names them, MOGP
+        // flags classify the group (`0x48 == 0` is interior, group.rs:113).
+        // One read per group file, paid once per model and cached here.
+        let mut interior = vec![false; root.doodads().len()];
+        let stem = key.strip_suffix(".wmo").unwrap_or(&key);
+        for gi in 0..root.group_count() {
+            let Ok(gb) = c.read_file(&format!("{stem}_{gi:03}.wmo")) else {
+                continue;
+            };
+            if benilla_formats::wmo_group_header(&gb).map_or(true, |h| h.flags & 0x48 != 0) {
+                continue;
+            }
+            for r in benilla_formats::wmo_group_doodad_refs(&gb) {
+                if let Some(s) = interior.get_mut(r as usize) {
+                    *s = true;
+                }
+            }
+        }
         Some(Arc::new(WmoRootDoodads {
             insts: root
                 .doodads()
                 .iter()
-                .map(|d| (d.model.clone(), d.position, d.orientation, d.scale))
+                .map(|d| (d.model.clone(), d.position, d.orientation, d.scale, d.color))
                 .collect(),
             sets: root
                 .doodad_sets()
                 .iter()
                 .map(|s| (s.start, s.count))
                 .collect(),
+            interior,
         }))
     });
     if let Ok(mut c) = cache.lock() {
@@ -3606,7 +3721,7 @@ fn resolve_wmo_doodads(
             }
         }
         for (start, count) in ranges {
-            for (di, (model, pos, q_local, scale)) in root
+            for (di, (model, pos, q_local, scale, color)) in root
                 .insts
                 .iter()
                 .enumerate()
@@ -3629,6 +3744,8 @@ fn resolve_wmo_doodads(
                     uid: wmo_doodad_uid(&inst.model, inst.unique_id, di as u32),
                     wmo_uid: inst.unique_id,
                     di: di as u32,
+                    light: *color,
+                    interior: root.interior.get(di).copied().unwrap_or(false),
                 });
             }
         }
@@ -3722,6 +3839,227 @@ pub extern "C" fn bn_doodad_model_ready(world: *const BnWorld, i: u32) -> u32 {
 fn wmo_doodad_at(w: &BnWorld, i: u32) -> Option<&WmoDoodadInst> {
     let mddf_n = w.tile.as_ref().map_or(0, |t| t.doodads.len()) as u32;
     w.wmo_doodads.get(i.checked_sub(mddf_n)? as usize)
+}
+
+/// Interior light of WMO-internal doodad `i`: 1 and the MODD `+0x24` colour
+/// packed RGBA in `*out` when an interior group owns it, 0 otherwise. The
+/// host draws those props unlit with `tex × colour`, the reference's base
+/// light, so a roof hole or the sun cannot relight them.
+#[no_mangle]
+pub extern "C" fn bn_doodad_interior_light(
+    world: *const BnWorld,
+    i: u32,
+    out: *mut u32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle and a writable `out`.
+    let w = unsafe { &*world };
+    let Some(d) = wmo_doodad_at(w, i) else {
+        return 0;
+    };
+    if !d.interior {
+        return 0;
+    }
+    let [r, g, b, a] = d.light;
+    unsafe { *out = u32::from_le_bytes([r, g, b, a]) };
+    1
+}
+
+/// One interior WMO batch's box + light, in the flat's own axes (WoW yards,
+/// UE-mirrored, tile-centre-relative).
+struct InteriorLightBox {
+    lo: [f32; 3],
+    hi: [f32; 3],
+    /// Mean MOCV, 0..255 per channel; alpha is the interior light datum
+    /// (`1 + 4·a`), never opacity.
+    light: [u8; 4],
+}
+
+struct WmoInteriorBoxes {
+    boxes: Vec<InteriorLightBox>,
+}
+
+/// Per `(tile path, instance)`: the interior batches' boxes and mean MOCV.
+/// The entity query runs a few times per second, the vertex walk once per
+/// instance, so the boxes are shared through a process-wide cache.
+fn wmo_interior_boxes(tile_path: &str, inst: u32, flat: &WmoFlat) -> Arc<WmoInteriorBoxes> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), Arc<WmoInteriorBoxes>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (tile_path.to_string(), inst);
+    if let Ok(c) = cache.lock() {
+        if let Some(hit) = c.get(&key) {
+            return hit.clone();
+        }
+    }
+    let mut boxes = Vec::new();
+    for sm in &flat.subs {
+        if !sm.interior || !sm.has_colors {
+            continue;
+        }
+        let start = sm.vtx0 as usize;
+        let end = start + sm.vtx_n as usize;
+        if sm.vtx_n == 0 || end > flat.verts.len() || end > flat.colors.len() {
+            continue;
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        let mut sum = [0u64; 4];
+        for i in start..end {
+            let v = &flat.verts[i];
+            lo[0] = lo[0].min(v.x);
+            lo[1] = lo[1].min(v.y);
+            lo[2] = lo[2].min(v.z);
+            hi[0] = hi[0].max(v.x);
+            hi[1] = hi[1].max(v.y);
+            hi[2] = hi[2].max(v.z);
+            for k in 0..4 {
+                sum[k] += u64::from(flat.colors[i][k]);
+            }
+        }
+        let n = (end - start) as u64;
+        boxes.push(InteriorLightBox {
+            lo,
+            hi,
+            light: [
+                (sum[0] / n) as u8,
+                (sum[1] / n) as u8,
+                (sum[2] / n) as u8,
+                (sum[3] / n) as u8,
+            ],
+        });
+    }
+    let out = Arc::new(WmoInteriorBoxes { boxes });
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= 128 {
+            c.clear();
+        }
+        c.insert(key, out.clone());
+    }
+    out
+}
+
+/// Interior ambient of a point: 1 and the containing interior group's mean
+/// MOCV in `out[0..4]` (RGBA bytes; alpha is the `1 + 4·a` light datum) when
+/// `(x, y, z)` (WoW yards) lies in an interior WMO group of the loaded tile,
+/// 0 for the outdoors or no tile. The host adds that colour as the entity's
+/// indoor light (the reference's room-lit entity, `interior.rs:739-761`): a
+/// unit the roof already shadows is then not left on the sky's fill alone.
+#[no_mangle]
+pub extern "C" fn bn_wmo_interior_light(
+    world: *const BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    out: *mut u8,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle and a writable `out`.
+    let w = unsafe { &*world };
+    let Some(tile) = w.tile.as_ref() else {
+        return 0;
+    };
+    let (cx, cy) = tile.center;
+    // The flat's axes: (world - centre) through the WoW->UE mirror.
+    let (px, py, pz) = wow_vec_to_ue(x - cx, y - cy, z);
+    const PAD_XY: f32 = 0.6;   // yards: wall thickness / door frame
+    const PAD_DOWN: f32 = 1.0;
+    const PAD_UP: f32 = 3.0;   // a body's height above the floor
+    // The thinnest containing batch is the one an entity stands on (the floor),
+    // which is exactly what the reference's downward ray samples.
+    let mut best: Option<([u8; 4], f32)> = None;
+    for (inst, flat) in &w.wmo_flats {
+        let boxes = wmo_interior_boxes(&w.tile_path, *inst, flat);
+        for b in &boxes.boxes {
+            if px < b.lo[0] - PAD_XY
+                || px > b.hi[0] + PAD_XY
+                || py < b.lo[1] - PAD_XY
+                || py > b.hi[1] + PAD_XY
+                || pz < b.lo[2] - PAD_DOWN
+                || pz > b.hi[2] + PAD_UP
+            {
+                continue;
+            }
+            let thin = b.hi[2] - b.lo[2];
+            if best.map_or(true, |(_, t)| thin < t) {
+                best = Some((b.light, thin));
+            }
+        }
+    }
+    let Some((light, _)) = best else {
+        return 0;
+    };
+    // Fold the reference's `1 + 4·a` light datum into the colour: the host's
+    // M2 materials take a plain RGB ambient term and must not read alpha
+    // (opacity) from it. Clamped, since a bright MOCV and a high alpha can
+    // exceed the byte range.
+    let scale = 1.0 + 4.0 * (f32::from(light[3]) / 255.0);
+    let fold = |c: u8| ((f32::from(c) * scale).round() as u32).min(255) as u8;
+    unsafe {
+        *out = fold(light[0]);
+        *out.add(1) = fold(light[1]);
+        *out.add(2) = fold(light[2]);
+        *out.add(3) = 255;
+    }
+    1
+}
+
+/// Diagnostics behind `bn_wmo_interior_light` (the `bn.InteriorProbe` command):
+/// `out[0]` tile present (1/0), `out[1]` baked WMO instances, `out[2]` interior
+/// boxes, `out[3]` nearest box distance in yards (-1 = no box), `out[4..7]`
+/// nearest box lo, `out[7..10]` its hi, `out[10]` its instance index. Returns
+/// the number of f32 slots written.
+#[no_mangle]
+pub extern "C" fn bn_wmo_interior_stats(
+    world: *const BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    out: *mut f32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller owns a valid const handle and a writable `out`.
+    let w = unsafe { &*world };
+    let mut stats = [0.0f32; 11];
+    stats[3] = -1.0;
+    if let Some(tile) = w.tile.as_ref() {
+        stats[0] = 1.0;
+        stats[1] = w.wmo_flats.len() as f32;
+        let (cx, cy) = tile.center;
+        let (px, py, pz) = wow_vec_to_ue(x - cx, y - cy, z);
+        let mut best = f32::MAX;
+        for (inst, flat) in &w.wmo_flats {
+            let boxes = wmo_interior_boxes(&w.tile_path, *inst, flat);
+            stats[2] += boxes.boxes.len() as f32;
+            for b in &boxes.boxes {
+                let dx = (b.lo[0] - px).max(px - b.hi[0]).max(0.0);
+                let dy = (b.lo[1] - py).max(py - b.hi[1]).max(0.0);
+                let dz = (b.lo[2] - pz).max(pz - b.hi[2]).max(0.0);
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                if d < best {
+                    best = d;
+                    stats[3] = d;
+                    stats[4] = b.lo[0];
+                    stats[5] = b.lo[1];
+                    stats[6] = b.lo[2];
+                    stats[7] = b.hi[0];
+                    stats[8] = b.hi[1];
+                    stats[9] = b.hi[2];
+                    stats[10] = *inst as f32;
+                }
+            }
+        }
+    }
+    unsafe {
+        for (i, v) in stats.iter().enumerate() {
+            *out.add(i) = *v;
+        }
+    }
+    stats.len() as u32
 }
 
 /// The baked flat for doodad `i`, or `None` before `bn_doodad_load`.
@@ -4732,6 +5070,18 @@ fn m2_cached(archives: &[Archive], path: &str) -> Option<Arc<M2Cached>> {
     Some(entry)
 }
 
+/// The model's terrain-conform mode: `display.rs`'s
+/// `terrain_tilt = (global_flags & 3) as u8`, where 1 = pitch only (mounts,
+/// quadrupeds), 3 = pitch + roll (kodo-like) and 0/2 = upright. `GlobalModelFlags`
+/// sits at MD20 `+0x10`, the same word `benilla-assets/src/m2.rs` reads.
+pub(crate) fn model_terrain_tilt(archives: &[Archive], path: &str) -> u32 {
+    m2_cached(archives, path).map_or(0, |c| {
+        c.bytes
+            .get(0x10..0x14)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 3)
+    })
+}
+
 // ---- Background model parse ----
 //
 // A first-sight M2 is a cold MPQ read plus a parse: on a spinning-disk
@@ -5122,6 +5472,30 @@ pub extern "C" fn bn_model_vertex_tint(
         }
     }
     nv as u32
+}
+
+/// The model's terrain-conform mode (`GlobalModelFlags & 3`): 1 = pitch only,
+/// 3 = pitch + roll, 0/2 = upright. The host logs it once per mount, so the
+/// slope pose is a reading of the model data instead of a guess.
+
+#[no_mangle]
+
+pub extern "C" fn bn_model_terrain_tilt(world: *const BnWorld, model_path: *const c_char) -> u32 {
+    if world.is_null() || model_path.is_null() {
+        return 0;
+    }
+
+    let p = match cstr_to_str(model_path) {
+        Some(s) => s,
+
+        None => return 0,
+    };
+
+    // SAFETY: valid handle.
+
+    let w = unsafe { &*world };
+
+    model_terrain_tilt(&w.archives, p)
 }
 
 /// Count of M2 vertices. The UE renderer sizes its vertex buffer from this
@@ -8439,6 +8813,18 @@ const UI_DUMP_DEFS_LUA: &str = r#"
         if not ok or type(b) ~= "string" then return "" end
         return clean(b)
     end
+    -- The reveal (dump cols 31-33): FontString `SetAlphaGradient(start, length)` as
+    -- `has<TAB>start<TAB>length`, always three fields so the TSV stays rectangular.
+    -- The client applies this per glyph inside its own text pass; a host that
+    -- rasterizes the whole string needs the numbers to paint the write-on itself.
+    local function gradient_str(r, ty)
+        if ty ~= "FontString" then return "0\t0.00\t0.00" end
+        local ok, s, l = pcall(function() return r:GetAlphaGradient() end)
+        if not ok or type(s) ~= "number" or type(l) ~= "number" then
+            return "0\t0.00\t0.00"
+        end
+        return string.format("1\t%.2f\t%.2f", s, l)
+    end
     local function dump_one(f)
         local mine = {}
         -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
@@ -8518,7 +8904,8 @@ const UI_DUMP_DEFS_LUA: &str = r#"
                 num(r:GetWidth()), num(r:GetHeight()), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv,
                 texcoord_str(r), layer_str(r), blend_str(r, ty),
-                (bar_tex ~= nil and r == bar_tex) and "1" or "0" }, "\t"))
+                (bar_tex ~= nil and r == bar_tex) and "1" or "0",
+                gradient_str(r, ty) }, "\t"))
             end
         end
         return mine
@@ -9518,6 +9905,8 @@ pub extern "C" fn bn_cursor_stem(buf: *mut c_char, cap: u32) -> u32 {
 /// the host can grow its buffer and retry. Returns the bytes written.
 ///
 /// `offset` is `(wrap_px, spacing_px)`; honored only when `wrapped`.
+/// `gradient` is the FontString's `SetAlphaGradient` reveal `(start, length)`,
+/// honored only when `wrapped`.
 #[allow(clippy::too_many_arguments)]
 fn text_bitmap_common(
     world: *const BnWorld,
@@ -9527,6 +9916,7 @@ fn text_bitmap_common(
     text: *const c_char,
     offset: (f32, f32),
     wrapped: bool,
+    gradient: Option<(f32, f32)>,
     out_rgba: *mut u8,
     cap: u32,
     out_w: *mut u32,
@@ -9552,7 +9942,9 @@ fn text_bitmap_common(
         };
         let face = font_str.unwrap_or(ui_font::DEFAULT_FONT);
         if wrapped {
-            ui_font::rasterize_wrapped(chain, face, size_px, outline, text_str, offset.0, offset.1)
+            ui_font::rasterize_wrapped_gradient(
+                chain, face, size_px, outline, text_str, offset.0, offset.1, gradient,
+            )
         } else {
             // The pre-wrap contract: hard lines only, rows advance by the em.
             ui_font::rasterize(chain, face, size_px, outline, text_str)
@@ -9618,6 +10010,7 @@ pub extern "C" fn bn_ui_text_bitmap(
         text,
         (0.0, 0.0),
         false,
+        None,
         out_rgba,
         cap,
         out_w,
@@ -9631,7 +10024,9 @@ pub extern "C" fn bn_ui_text_bitmap(
 
 /// Same as [`bn_ui_text_bitmap`] but wraps to `wrap_px` drawn pixels
 /// (`<= 1` = no wrap, hard `'\n'` still breaks) with `spacing_px` extra line
-/// gap. This is what the current UE HUD calls.
+/// gap, and bakes a `SetAlphaGradient` reveal (`gradient_start`,
+/// `gradient_length`; a non-positive length = none) into each glyph's alpha.
+/// This is what the current UE HUD calls.
 #[no_mangle]
 pub extern "C" fn bn_ui_text_bitmap_wrap(
     world: *const BnWorld,
@@ -9640,6 +10035,8 @@ pub extern "C" fn bn_ui_text_bitmap_wrap(
     outline: u32,
     wrap_px: f32,
     spacing_px: f32,
+    gradient_start: f32,
+    gradient_length: f32,
     text: *const c_char,
     out_rgba: *mut u8,
     cap: u32,
@@ -9658,6 +10055,11 @@ pub extern "C" fn bn_ui_text_bitmap_wrap(
         text,
         (wrap_px, spacing_px),
         true,
+        if gradient_length > 0.0 {
+            Some((gradient_start, gradient_length))
+        } else {
+            None
+        },
         out_rgba,
         cap,
         out_w,
@@ -10372,8 +10774,33 @@ pub struct BnVideoSettings {
 }
 
 /// One CVar's live value from the loaded interface, `None` before it exists.
-fn video_cvar(name: &str) -> Option<String> {
+pub(crate) fn video_cvar(name: &str) -> Option<String> {
     BN_UI.with(|slot| slot.borrow().as_ref().and_then(|s| s.cvar(name)))
+}
+
+/// Host-side write of one video CVar, the same store `SetCVar` writes: the
+/// scripted/console path for knobs the stock Options UI owns (the registered
+/// `mapShadows` toggle is one). 1 when the interface took the value, 0 before
+/// a session exists.
+#[no_mangle]
+pub extern "C" fn bn_set_video_cvar(name: *const c_char, value: *const c_char) -> i32 {
+    if name.is_null() || value.is_null() {
+        return 0;
+    }
+    // SAFETY: callers pass NUL-terminated strings for the call's duration.
+    let name = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+    let value = unsafe { std::ffi::CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned();
+    BN_UI.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(script) => {
+            script.set_cvar_host(&name, &value);
+            1
+        }
+        None => 0,
+    })
 }
 
 fn video_number(name: &str, default: f32) -> f32 {
@@ -10645,7 +11072,8 @@ fn note_vm_error(line: impl std::fmt::Display) {
 /// Advance the loaded UI (OnUpdate handlers, hover re-pick, queued events) and
 /// apply the menu host's pending ops (realm list, screen transitions, roster).
 /// `elapsed` is seconds since the last call. Returns 1 with a session, 0
-/// without.
+/// without; bit 1 is set when this tick changed UI state (a frame opened or
+/// closed), so the host can redraw that frame.
 #[no_mangle]
 pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10654,12 +11082,13 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
             let Some(script) = slot.as_mut() else {
                 return 0u32;
             };
+            let mut changed = false;
             if script.vm_kind() == benilla_ui::script::VmKind::Glue {
                 sync_menu(script);
             } else {
                 // Live session state in (unit tokens, money, actions, auras,
                 // loot, party, death), before the frame's OnUpdates read it.
-                ui_feed::sync(script, elapsed);
+                changed = ui_feed::sync(script, elapsed);
             }
             script.tick(elapsed);
             // This VM is the whole client: a Lua write lands in the table itself
@@ -10678,7 +11107,7 @@ pub extern "C" fn bn_ui_tick(elapsed: f32) -> u32 {
             for e in script.take_errors() {
                 note_vm_error(format!("tick: {e}"));
             }
-            1u32
+            1u32 | (changed as u32) << 1
         })
     }));
     out.unwrap_or(0)
