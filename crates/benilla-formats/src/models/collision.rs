@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 use anyhow::{Context, Result};
 use benilla_m2::parse_m2;
-use benilla_wmo::{parse_wmo, ParsedWmo};
+use benilla_wmo::{parse_wmo, ParsedWmo, WmoGroup};
 
 use crate::Chain;
 
@@ -97,15 +97,36 @@ pub fn load_wmo_collision_tris(chain: &mut Chain, raw_path: &str) -> Result<Coll
     };
     let stem = root_path.strip_suffix(".wmo").unwrap_or(&root_path);
     let (mut positions, mut indices): (Vec<[f32; 3]>, Vec<u32>) = (Vec::new(), Vec::new());
+    // Two-sided surfaces (MOMT flag 0x04) are drawn from both sides by the
+    // renderer, but collision kept only the authored winding, and the mover's
+    // one-sided wall test (`0x632700`) skips a face approached from its back -
+    // a body inside Goldshire Inn walked out through its walls. The back-face
+    // winding is added wherever the drawn surface is two-sided.
+    let two_sided: Vec<bool> = root.materials.iter().map(|m| m.flags & 0x04 != 0).collect();
     for gi in 0..root.n_groups {
         let group_path = format!("{stem}_{gi:03}.wmo");
         let Ok(gbytes) = chain.read_file(&group_path) else {
             continue;
         };
-        accumulate_wmo_group_collision(&gbytes, &mut positions, &mut indices);
+        let Ok(ParsedWmo::Group(group)) = parse_wmo(&mut Cursor::new(&gbytes)) else {
+            continue;
+        };
+        // Interior groups (`MOGI` flags `& 0x48 == 0`) are the rooms a body walks
+        // inside; their shell is authored outward, so the room-facing side is a
+        // back face the one-sided mover ignores. Two-sided materials (MOMT 0x04)
+        // get the same treatment wherever they are drawn.
+        let interior = group.flags & 0x48 == 0;
+        append_group_faces(&group, MOPY_DETAIL, 0, interior, Some(&two_sided), &mut positions,
+                           &mut indices);
     }
     Ok(CollisionMesh { positions, indices })
 }
+
+/// Steepness gate for the back-face pass, the mover's own `GROUND_COS`
+/// (`benilla-ffi/src/player.rs:33`): faces at least this vertical get the
+/// reversed winding; floors and ceilings keep their authored side, so the
+/// ground/ceiling probes cannot see a phantom plane.
+const WMO_WALL_GROUND_COS: f32 = 0.642_788;
 
 /// Append one WMO group file's walking-collidable triangles: every face but `DETAIL`.
 pub fn accumulate_wmo_group_collision(
@@ -154,6 +175,21 @@ fn accumulate_wmo_group_faces(
     let Ok(ParsedWmo::Group(group)) = parse_wmo(&mut Cursor::new(group_bytes)) else {
         return;
     };
+    append_group_faces(&group, skip_mask, require_mask, false, None, positions, indices);
+}
+
+/// Append one parsed group's kept faces. `group_two_sided` / `two_sided_mats`
+/// (MOMT two-sided, one entry per material) also append each steep face's
+/// reversed winding, so a one-sided mover stops from either side.
+fn append_group_faces(
+    group: &WmoGroup,
+    skip_mask: u8,
+    require_mask: u8,
+    group_two_sided: bool,
+    two_sided_mats: Option<&[bool]>,
+    positions: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+) {
     let n_tri = group.vertex_indices.len() / 3;
     let mut map: HashMap<u16, u32> = HashMap::new();
     for t in 0..n_tri {
@@ -163,18 +199,41 @@ fn accumulate_wmo_group_faces(
         if mopy.flags & skip_mask != 0 || mopy.flags & require_mask != require_mask {
             continue;
         }
+        let mut tri = [0u32; 3];
+        let mut pts = [[0.0f32; 3]; 3];
+        let mut complete = true;
         for k in 0..3 {
             let Some(&vidx) = group.vertex_indices.get(t * 3 + k) else {
-                continue;
+                complete = false;
+                break;
             };
             let Some(p) = group.vertex_positions.get(vidx as usize) else {
-                continue;
+                complete = false;
+                break;
             };
-            let global = *map.entry(vidx).or_insert_with(|| {
+            pts[k] = [p.x, p.y, p.z];
+            tri[k] = *map.entry(vidx).or_insert_with(|| {
                 positions.push([p.x, p.y, p.z]);
                 (positions.len() - 1) as u32
             });
-            indices.push(global);
+        }
+        if !complete {
+            continue;
+        }
+        indices.extend_from_slice(&tri);
+        let two_sided = group_two_sided
+            || two_sided_mats
+                .and_then(|m| m.get(mopy.material_id as usize))
+                .copied()
+                .unwrap_or(false);
+        if two_sided {
+            let a = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2]];
+            let b = [pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2]];
+            let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 0.0 && (n[2] / len).abs() < WMO_WALL_GROUND_COS {
+                indices.extend_from_slice(&[tri[2], tri[1], tri[0]]);
+            }
         }
     }
 }

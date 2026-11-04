@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
 
@@ -26,6 +27,13 @@ const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
 const GRAVITY: f32 = 19.291_105;
 const JUMP_SPEED: f32 = 7.955_547;
 const TERMINAL_VELOCITY: f32 = 60.148_003;
+
+/// `bn.SweptMover` (host CVar, default on): the horizontal travel is swept in
+/// passes no longer than half a capsule radius, so a long frame (a streaming
+/// hitch) cannot hand the mover a step that lands past a wall the point test
+/// never saw. `0` restores the old one-destination point test exactly; kept as
+/// the one-line rollback for comparison.
+static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
 /// How far below the last real floor the void guard lets a body fall before it
 /// is restored there (yd). A real floor anywhere below is found by `ground`
 /// long before this; only a true hole in the collision data gets here.
@@ -1708,17 +1716,26 @@ impl Player {
     }
 
     /// The horizontal normal of a steep face the travel enters at (`x`, `y`),
-    /// or `None`. One-sided (`0x632700`): a face the motion approaches from
-    /// its back is skipped, so walking along or away from a wall is not a hit
-    /// and only the faces before the body stop it. Faces entirely below
-    /// `feet + STEP_UP_HEIGHT` are steps, not walls.
-    fn wall_normal(&self, x: f32, y: f32, feet: f32, dirx: f32, diry: f32) -> Option<[f32; 2]> {
+    /// and that face's top, or `None`. One-sided (`0x632700`): a face the motion
+    /// approaches from its back is skipped, so walking along or away from a wall
+    /// is not a hit and only the faces before the body stop it. Faces entirely
+    /// below `feet + STEP_UP_HEIGHT` are steps, not walls. The top lets the
+    /// caller tell a step it may climb (`top` at or under the landing) from a
+    /// wall a floor behind a table must not certify a climb over.
+    fn wall_normal(
+        &self,
+        x: f32,
+        y: f32,
+        feet: f32,
+        dirx: f32,
+        diry: f32,
+    ) -> Option<([f32; 2], f32)> {
         let lo = feet + CAPSULE_RADIUS;
         let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
         let r2 = CAPSULE_RADIUS * CAPSULE_RADIUS;
         for k in 0..3 {
             let p = [x, y, lo + (hi - lo) * (k as f32 / 2.0)];
-            let mut found: Option<[f32; 2]> = None;
+            let mut found: Option<([f32; 2], f32)> = None;
             self.any_tri_near(p, |t| {
                 if t.n[2].abs() >= GROUND_COS {
                     return false; // a floor or a ceiling
@@ -1742,7 +1759,7 @@ impl Player {
                 if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2 {
                     return false;
                 }
-                found = Some(n);
+                found = Some((n, top));
                 true
             });
             if found.is_some() {
@@ -1752,12 +1769,48 @@ impl Player {
         None
     }
 
-    /// One frame's horizontal travel through the collision set: the step, less
-    /// what a wall the travel enters absorbs, with the remainder sliding along
-    /// the face (`slide_mover`'s behaviour). Returns whether the body moved.
-    /// The floor gate rides a step or certifies a step-up; a taller one is a
-    /// wall. Three passes cover the plane changes one frame can meet.
+    /// Whether the face hit at (`nx`, `ny`) may be climbed instead of blocking:
+    /// a foot-cone ride or a certified step-up clears it only when the landing
+    /// is at or above the face's own top. A floor *behind* a table or a railing
+    /// certifies a step the reference's swept certify volume would reject, so
+    /// without the top check the body climbs into the face and wedges.
+    fn climb_clears_face(
+        &self,
+        nx: f32,
+        ny: f32,
+        dirx: f32,
+        diry: f32,
+        feet: f32,
+        top: f32,
+    ) -> bool {
+        if let Some(z) = self.step_up_landing(nx, ny, dirx, diry) {
+            if z + 0.05 >= top {
+                return true;
+            }
+        }
+        if self.destination_ride(nx, ny) {
+            if let Some((z, nz)) = self.ground(nx, ny, feet + STEP_UP_HEIGHT) {
+                if nz >= GROUND_COS && z + 0.05 >= top {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn horizontal_step(&mut self, step: [f32; 2]) -> bool {
+        if SWEPT_MOVER.load(Ordering::Relaxed) {
+            self.horizontal_step_swept(step)
+        } else {
+            self.horizontal_step_point(step)
+        }
+    }
+
+    /// The one-destination point test the mover used before `bn.SweptMover`:
+    /// the whole frame's step is tested only at its end, so a step longer than
+    /// the capsule radius can land beyond a wall and be waved through. Kept
+    /// verbatim as the rollback.
+    fn horizontal_step_point(&mut self, step: [f32; 2]) -> bool {
         let start = [self.pos[0], self.pos[1]];
         let mut rem = step;
         for _ in 0..3 {
@@ -1767,9 +1820,7 @@ impl Player {
             }
             let (dirx, diry) = (rem[0] / len, rem[1] / len);
             let (nx, ny) = (self.pos[0] + rem[0], self.pos[1] + rem[1]);
-            if let Some(n) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
-                // A certified step-up or a foot-cone ride clears the face;
-                // otherwise the step stops there and the rest slides along it.
+            if let Some((n, _top)) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
                 if self.destination_ride(nx, ny)
                     || self.step_up_landing(nx, ny, dirx, diry).is_some()
                 {
@@ -1787,6 +1838,58 @@ impl Player {
             self.pos[0] = nx;
             self.pos[1] = ny;
             return true;
+        }
+        self.pos[0] != start[0] || self.pos[1] != start[1]
+    }
+
+    /// One frame's horizontal travel through the collision set: the step, less
+    /// what a wall the travel enters absorbs, with the remainder sliding along
+    /// the face (`slide_mover`'s behaviour). Returns whether the body moved.
+    /// The floor gate rides a step or certifies a step-up; a taller one is a
+    /// wall.
+    ///
+    /// The travel is swept in passes of at most half a capsule radius: a
+    /// destination more than a radius past the face could never be seen by the
+    /// point test at the end of a long frame (a streaming hitch hands the mover
+    /// a multi-yard step), so the body would cross the wall unseen. Halving the
+    /// radius keeps every pass inside the test's reach, which is the swept
+    /// cylinder the reference's mover uses. The loop is a little longer than
+    /// the three passes the old point test needed because a slid pass can meet
+    /// a second face at a corner.
+    fn horizontal_step_swept(&mut self, step: [f32; 2]) -> bool {
+        let start = [self.pos[0], self.pos[1]];
+        let mut rem = step;
+        for _ in 0..48 {
+            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
+            if len < 1.0e-6 {
+                break;
+            }
+            let (dirx, diry) = (rem[0] / len, rem[1] / len);
+            let sub = len.min(CAPSULE_RADIUS * 0.5);
+            let (nx, ny) = (self.pos[0] + dirx * sub, self.pos[1] + diry * sub);
+            if let Some((n, top)) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
+                // A certified step-up or a foot-cone ride clears the face when
+                // the landing reaches its top; otherwise the step stops there
+                // and the rest slides along it.
+                if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], top) {
+                    self.pos[0] = nx;
+                    self.pos[1] = ny;
+                    rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
+                    continue;
+                }
+                let into = rem[0] * n[0] + rem[1] * n[1];
+                if into >= 0.0 {
+                    break;
+                }
+                rem = [rem[0] - into * n[0], rem[1] - into * n[1]];
+                continue;
+            }
+            if self.floor_blocks(nx, ny, dirx, diry) {
+                break;
+            }
+            self.pos[0] = nx;
+            self.pos[1] = ny;
+            rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
         }
         self.pos[0] != start[0] || self.pos[1] != start[1]
     }
@@ -3324,6 +3427,15 @@ pub(crate) fn drive_mouselook(script: &mut benilla_ui::script::UiScript) {
         BN_LOOK.with(|l| l.borrow_mut().set_channel(on, true));
     }
     script.set_turn_or_action_held(look_turn());
+}
+
+/// `bn.SweptMover` host gate: 1 = the swept mover (passes of at most half a
+/// capsule radius, default), 0 = the old one-destination point test. Returns
+/// the previous value, so the caller's log line can show what changed.
+#[no_mangle]
+pub extern "C" fn bn_player_swept_mover(on: u32) -> u32 {
+    let prev = SWEPT_MOVER.swap(on != 0, Ordering::Relaxed);
+    u32::from(prev)
 }
 
 /// Roam mode on/off: free flight for touring the map (no gravity, collision or
