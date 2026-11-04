@@ -229,6 +229,25 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         })?,
     )?;
 
+    // GetAlphaGradient() → (start, length), or no values when no reveal is set. Not a stock 1.12
+    // method: the host dump needs the write-on progress to repaint it, because the client applies
+    // the gradient inside its own glyph pass and the dump carries only the final string.
+    m.set(
+        "GetAlphaGradient",
+        lua.create_function(|lua, this: Table| {
+            let rh = region_handle_of(lua, &this)?;
+            let model = lua.app_data_ref::<Model>().expect("model");
+            let g = model.region_data.get(&rh).and_then(|d| d.alpha_gradient);
+            Ok(match g {
+                Some((start, length)) => MultiValue::from_vec(vec![
+                    Value::Number(start as f64),
+                    Value::Number(length as f64),
+                ]),
+                None => MultiValue::new(),
+            })
+        })?,
+    )?;
+
     // SetBlendMode (`0x79a950`, the alphaMode enum `0x811aa8`) stores the mode as given; an
     // unknown name leaves it alone, as the enum lookup does. Only ADD draws differently here, the
     // others as straight alpha.

@@ -545,7 +545,7 @@ pub fn rasterize(
     let font = font_for(chain, font_path)?;
     let size = size_px.max(1.0);
     let thick = outline >= 2;
-    rasterize_rows(&font, size, thick, outline, &clean, size)
+    rasterize_rows(&font, size, thick, outline, &clean, size, None)
 }
 
 /// Rasterize one `FontString` wrapped to `wrap_px` drawn pixels wide (the
@@ -561,6 +561,24 @@ pub fn rasterize_wrapped(
     text: &str,
     wrap_px: f32,
     spacing_px: f32,
+) -> Option<TextBitmap> {
+    rasterize_wrapped_gradient(
+        chain, font_path, size_px, outline, text, wrap_px, spacing_px, None,
+    )
+}
+
+/// [`rasterize_wrapped`] with the FontString's `SetAlphaGradient` reveal applied per drawn
+/// character (`start`, `length` in the same units the Lua API takes). The raster bakes each
+/// glyph's alpha, so a whole-string host can draw the write-on effect with one quad.
+pub fn rasterize_wrapped_gradient(
+    chain: &benilla_formats::Chain,
+    font_path: &str,
+    size_px: f32,
+    outline: u32,
+    text: &str,
+    wrap_px: f32,
+    spacing_px: f32,
+    gradient: Option<(f32, f32)>,
 ) -> Option<TextBitmap> {
     let clean = strip_escapes(text);
     if clean.trim().is_empty() || size_px <= 0.5 {
@@ -597,7 +615,20 @@ pub fn rasterize_wrapped(
     let sf = font.as_scaled(PxScale::from(size));
     let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).max(size);
     let pitch = line_h + spacing_px.max(0.0);
-    rasterize_rows(&font, size, thick, outline, &laid, pitch)
+    rasterize_rows(&font, size, thick, outline, &laid, pitch, gradient)
+}
+
+/// `SetAlphaGradient`'s alpha at a drawn character: opaque before `start`, linear to 0 over
+/// `length`, matching `benilla-app`'s `ui_text` layout so the host raster and the VM agree.
+fn gradient_alpha(index: usize, start: f32, length: f32) -> f32 {
+    let i = index as f32;
+    if i < start {
+        1.0
+    } else if length > 0.0 && i < start + length {
+        1.0 - (i - start) / length
+    } else {
+        0.0
+    }
 }
 
 /// Shared body of [`rasterize`] / [`rasterize_wrapped`]: `text` is already laid
@@ -609,6 +640,7 @@ fn rasterize_rows(
     outline: u32,
     text: &str,
     pitch: f32,
+    gradient: Option<(f32, f32)>,
 ) -> Option<TextBitmap> {
     let sf = font.as_scaled(PxScale::from(size));
     let pad = if outline == 0 {
@@ -676,10 +708,16 @@ fn rasterize_rows(
     let yi = y0 as i32;
 
     // ---- coverage pass ----
+    // `line` holds one glyph per drawn character (`shape` drops '\n'/'\r'), so a running count
+    // across lines is exactly `SetAlphaGradient`'s character index: markup stripped, wrapping
+    // whitespace that the break ate not counted.
+    let mut gradient_ci: usize = 0;
     let mut g_cov = vec![0.0f32; (w * h) as usize];
     for (li, line) in lines.iter().enumerate() {
         let dy = li as f32 * pitch;
         for g0 in line {
+            let alpha = gradient.map_or(1.0, |(s, l)| gradient_alpha(gradient_ci, s, l));
+            gradient_ci += 1;
             let mut g = g0.clone();
             g.position.y += dy;
             let Some(og) = sf.outline_glyph(g) else {
@@ -693,8 +731,9 @@ fn rasterize_rows(
                 let py = by + y as i32;
                 if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
                     let idx = (py as u32 * w + px as u32) as usize;
+                    let c = (c * alpha).min(1.0);
                     if c > g_cov[idx] {
-                        g_cov[idx] = c.min(1.0);
+                        g_cov[idx] = c;
                     }
                 }
             });

@@ -406,7 +406,7 @@ pub(crate) const TEXTURE_ONLY_METHODS: [&str; 12] = [
 
 /// FontString-only: the font, text, justify, shadow and spacing block and the string metrics.
 /// `GetStringHeight`, `SetFormattedText` and `SetSize` are not 1.12 FontString methods.
-pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
+pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 24] = [
     "SetFont",
     "GetFont",
     "SetFontObject",
@@ -430,6 +430,7 @@ pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 23] = [
     "SetNonSpaceWrap",
     "CanNonSpaceWrap",
     "SetAlphaGradient",
+    "GetAlphaGradient",
 ];
 
 /// The Region method map (`0xcf54b4`): the 19 names every region leaf reaches on a miss.

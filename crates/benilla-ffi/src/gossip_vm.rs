@@ -192,6 +192,34 @@ fn lock() -> std::sync::MutexGuard<'static, GossipState> {
     state().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The squared interaction distance (`INTERACTION_DISTANCE`, 5 yd): past it the client's
+/// own close core runs, so walking away shuts the frame without a click.
+const INTERACTION_RANGE_SQ: f32 = 25.0;
+
+/// Close the open menu when the player has left the NPC's interaction range, or when the
+/// NPC has left the stream (the reference answers "gone" the same way). Returns whether it
+/// closed; the owed `GOSSIP_CLOSED` then fires in [`feed`] on the same tick.
+pub(crate) fn close_out_of_range() -> bool {
+    let npc = lock().npc;
+    if npc == 0 {
+        return false;
+    }
+    let Some(own) = crate::net::ui_player().map(|p| p.pos) else {
+        return false;
+    };
+    let far = match crate::net::ui_unit_pose(npc) {
+        None => true,
+        Some(pos) => {
+            let d = [pos[0] - own[0], pos[1] - own[1], pos[2] - own[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > INTERACTION_RANGE_SQ
+        }
+    };
+    if far {
+        lock().close();
+    }
+    far
+}
+
 /// Our own name is the greeting's `$N`; the reference substitutes it client-side, and this crate
 /// has no macro engine, so the one macro every 1.12 greeting uses is expanded here.
 fn expand_name(text: &str, name: &str) -> String {
@@ -250,29 +278,32 @@ pub(crate) fn quest_at(pos: u32) -> Option<QuestOption> {
 }
 
 /// Push the menu into the VM and fire its events: the show on a change, the close the core owes.
-pub(crate) fn feed(script: &mut UiScript) {
+/// Returns whether this tick changed the frame (opened or closed).
+pub(crate) fn feed(script: &mut UiScript) -> bool {
     let mut st = lock();
+    let mut changed = false;
     if st.owe_closed {
         st.owe_closed = false;
         st.shown = None;
         st.shown_name = None;
         script.set_gossip(None);
         script.fire_event("GOSSIP_CLOSED", Vec::new());
+        changed = true;
     }
     // While the text query is out fire nothing and keep the last snapshot: the reference returns at
     // `0x4e2068` with no write and no event, so its frame keeps what it last showed.
     if st.text_pending() {
-        return;
+        return changed;
     }
     if st.npc == 0 {
         st.shown = None;
         st.shown_name = None;
-        return;
+        return changed;
     }
     let mut fresh = match st.snapshot() {
         Some(menu) => menu,
         // A menu with no greeting and no query out: nothing to show.
-        None => return,
+        None => return changed,
     };
     if fresh.greeting.contains("$N") {
         let names = crate::net::ui_names();
@@ -284,12 +315,14 @@ pub(crate) fn feed(script: &mut UiScript) {
     }
     let npc_name = crate::net::ui_creature_name(st.npc);
     if st.shown.as_ref() == Some(&fresh) && st.shown_name == npc_name {
-        return;
+        return changed;
     }
     st.shown = Some(fresh.clone());
     st.shown_name = npc_name;
     script.set_gossip(Some(fresh));
     script.fire_event("GOSSIP_SHOW", Vec::new());
+    changed = true;
+    changed
 }
 
 /// Drain the frame's own close verb: `CloseGossip` (`0x4e2b20`) is the core with a zero guid and

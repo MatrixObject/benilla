@@ -29,10 +29,10 @@ use benilla_ui::script::{
     ActionSlot, ActionState, AuraState, BindingInput, ChatSend, ContainerSlot, ContainerState,
     ContainerUse, DeathAction, DeathUiState, FiredInput, HeldInput, InvSlotView, InventorySlots,
     LootRow, LootState, MerchantItem, MerchantState, NearestMode, PartyMemberInfo, PartyRequest,
-    PartyState, PlayerRecord, QuestAction, ScriptCall, ScriptValue, SelectionRequest,
-    SessionRequest, SpellBookState, SpellSlotView, SpellTabView, UiScript, UnitBase,
-    UnitCombatStats, UnitGuids, UnitState, UnitTokenParse, UseArm, UseFork, VmKind, WornDisplay,
-    EQUIPMENT_BAG,
+    PartyState, PlayerRecord, QuestAction, QuestPanel, QuestState, ScriptCall, ScriptValue,
+    SelectionRequest, SessionRequest, ShapeshiftFormView, SpellBookState, SpellSlotView,
+    SpellTabView, UiScript, UnitBase, UnitCombatStats, UnitGuids, UnitState, UnitTokenParse,
+    UseArm, UseFork, VmKind, WornDisplay, EQUIPMENT_BAG,
 };
 
 use crate::item_vm::ItemVm;
@@ -294,6 +294,13 @@ struct Feed {
     /// remaining stock, per-buy count, template display id)`.
     merchant_key: Option<(u64, Vec<(u32, u32, u32, u32, u32)>)>,
     party_key: Option<Vec<(u64, String)>>,
+    /// The questgiver greeting last pushed, so an unchanged list costs no Lua and a
+    /// re-open fires `QUEST_GREETING` once. `None` while a detail/progress/reward
+    /// panel is live: the host pushes those, and this pass owns only the list.
+    quest_shown: Option<QuestState>,
+    /// The greeting's NPC name: the stock `QuestFrame` titles itself with
+    /// `UnitName("npc")`, so the name's landing alone re-fires the show.
+    quest_shown_name: Option<String>,
 
     /// The bag containers last pushed, diffed per bag for `BAG_UPDATE`.
     containers: HashMap<i64, ContainerState>,
@@ -318,6 +325,9 @@ struct Feed {
 
     /// The talent window's pages and learn clicks.
     talent_vm: crate::talent_vm::TalentVm,
+
+    /// The stance bar's last pushed rows: the stock `ShapeshiftBar` rebuilds from these.
+    forms: Vec<ShapeshiftFormView>,
 }
 
 /// Which binding-held movement axes are down; the world frame's `MoveForwardStart`/`Stop` pair
@@ -389,6 +399,8 @@ impl Feed {
             loot: None,
             merchant_key: None,
             party_key: None,
+            quest_shown: None,
+            quest_shown_name: None,
             containers: HashMap::new(),
             last_inv: None,
             last_stats: None,
@@ -401,6 +413,7 @@ impl Feed {
             held: HeldAxes::default(),
             item_vm: ItemVm::default(),
             talent_vm: crate::talent_vm::TalentVm::default(),
+            forms: Vec::new(),
         }
     }
 }
@@ -461,6 +474,65 @@ fn spell_action_texture(
         d.icon.clone()
     };
     norm_icon(face)
+}
+
+/// `SPELL_ATTR_EX2_NOT_SHAPESHIFT` (Spell.dbc `AttributesEx2` bit 1): stances and forms only,
+/// the bar's membership test (`0x4f9e90`).
+const ATTR_EX2_NOT_SHAPESHIFT: u32 = 0x2;
+/// `SPELL_ATTR_EX2_STANCE_BAR_FORCE` (bit 4): a paladin aura, which has no shapeshift form byte
+/// but still takes a stance-bar slot.
+const ATTR_EX2_STANCE_BAR_FORCE: u32 = 0x10;
+
+/// `GetNumShapeshiftForms`/`GetShapeshiftFormInfo`'s list (`0x4f9d30`): only the player's own
+/// learned stance spells, ordered by `StanceBarOrder`, with the live `UNIT_FIELD_BYTES_1` byte
+/// picking the checked ring. The stock `ShapeshiftBar` hides every button past the count, so a
+/// level-1 warrior's one known Battle Stance is the whole bar. Membership comes from the spellbook
+/// (`SMSG_INITIAL_SPELLS`), never from the level.
+fn build_forms(
+    spells: &[u32],
+    own: Option<&ObjectFields>,
+    cats: Option<&Catalogs>,
+) -> Vec<ShapeshiftFormView> {
+    let Some(catalog) = cats.and_then(|c| c.spells.as_ref()) else {
+        return Vec::new();
+    };
+    let form_byte = own.map(|f| f.unit_shapeshift_form()).unwrap_or(0);
+    let mut rows: Vec<(i32, u32, ShapeshiftFormView)> = Vec::new();
+    for &id in spells {
+        let Some(d) = catalog.get(id) else {
+            continue;
+        };
+        if d.attributes_ex2 & ATTR_EX2_NOT_SHAPESHIFT != 0 {
+            continue;
+        }
+        if d.shapeshift_form.is_none() && d.attributes_ex2 & ATTR_EX2_STANCE_BAR_FORCE == 0 {
+            continue;
+        }
+        let active = match d.shapeshift_form {
+            Some(form) if form != 0 => form_byte != 0 && u32::from(form_byte) == form,
+            // No form byte: the reference asks whether its `ActiveIconID` aura is live.
+            _ => aura_toggles(d.active_icon_id, id, own),
+        };
+        let texture = norm_icon(if active {
+            d.active_icon.clone().or_else(|| d.icon.clone())
+        } else {
+            d.icon.clone()
+        });
+        rows.push((
+            d.stance_bar_order,
+            id,
+            ShapeshiftFormView {
+                spell_id: id,
+                texture,
+                name: d.name.clone(),
+                active,
+                castable: true,
+                cooldown: None,
+            },
+        ));
+    }
+    rows.sort_by_key(|(order, id, _)| (*order, *id));
+    rows.into_iter().map(|(_, _, view)| view).collect()
 }
 
 /// The coin row's text (`ui_loot`'s `format_money`): 1.12's `GOLD`, `SILVER` and `COPPER`
@@ -1441,7 +1513,7 @@ impl Feed {
         if spells != self.spells {
             let book = build_book(&spells, cats, own);
             script.set_spellbook(book);
-            self.spells = spells;
+            self.spells = spells.clone();
             if !self.first {
                 fire(script, "SPELLS_CHANGED", Vec::new());
             }
@@ -1457,6 +1529,18 @@ impl Feed {
                 if !self.first {
                     fire(script, "UNIT_AURA", vec![ev_str("player")]);
                 }
+            }
+        }
+
+        // Stance bar: the stock `ShapeshiftBar` asks for the form list on load and again on
+        // `UPDATE_SHAPESHIFT_FORMS`. The checked ring is part of the rows, so fire on any change
+        // (a stance swap only flips `active`; the list's ids stay put).
+        let forms = build_forms(&spells, own, cats);
+        if forms != self.forms {
+            script.set_shapeshift_forms(forms.clone());
+            self.forms = forms;
+            if !self.first {
+                fire(script, "UPDATE_SHAPESHIFT_FORMS", Vec::new());
             }
         }
         if selection != 0 {
@@ -2190,17 +2274,19 @@ fn build_book(
     SpellBookState { tabs, slots }
 }
 
-/// Push the live session into the interface. `dt` is seconds since the last tick.
-pub(crate) fn sync(script: &mut UiScript, dt: f32) {
+/// Push the live session into the interface. `dt` is seconds since the last tick. Returns
+/// whether this tick changed UI state the host must draw now (a frame opened or closed).
+pub(crate) fn sync(script: &mut UiScript, dt: f32) -> bool {
     if script.vm_kind() != VmKind::InGame {
-        return;
+        return false;
     }
     if net::ui_self_guid() == 0 {
-        return;
+        return false;
     }
     let Some(own) = net::ui_self_fields() else {
-        return;
+        return false;
     };
+    let mut ui_changed = false;
     // The model files the interface's panes named with no facts yet. The stock UI's only such
     // ask is the bag buttons' `ItemAnimTemplate` card: its pane sizes from the file's box and
     // seeds its Stand arm once the facts land, and the HUD poses the icon from the same file.
@@ -2224,9 +2310,16 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     for reason in net::take_inv_fails() {
         fire_error(script, crate::equip_error::equip_error_key(reason));
     }
+    // Walking out of the NPC's 5-yard interaction range closes the menu the way the
+    // client's own close core does; the owed GOSSIP_CLOSED then fires below on this tick.
+    if crate::gossip_vm::close_out_of_range() {
+        ui_changed = true;
+    }
     // The gossip menu likewise shows itself here: the latch holds it until its greeting lands, so
     // the stock `GossipFrame` opens with its greeting, options and quest rows in one go.
-    crate::gossip_vm::feed(script);
+    if crate::gossip_vm::feed(script) {
+        ui_changed = true;
+    }
     CATS.with(|c| {
         let cats = c.borrow();
         // The bag buttons' item animation: `ITEM_PUSH` fires once the pushed item's template has
@@ -2259,6 +2352,12 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
             }
         });
     });
+    // The questgiver list has no host panel of its own: the stock `QuestFrame`'s greeting
+    // is pushed here, after the feed latched `guids.npc`, so its `UnitName("npc")` reads
+    // the giver. Row clicks then land in `giver_intents` against the same `BnNetGiver`.
+    if feed_quest_greeting(script) {
+        ui_changed = true;
+    }
     // The world map's per-frame feed: the explored bits, the player's zone and the blips the
     // stock `WorldMapFrame` projects (`crates/benilla-app/src/ui_world_map.rs`, across the
     // boundary).
@@ -2266,6 +2365,7 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) {
     // The plates seat on this frame's world and the stock `NAMEPLATES_ON` verbs, so they ride the
     // same tick the feed does (`crates/benilla-app/src/vplates.rs`, across the boundary).
     crate::nameplates::drive(WORLD.with(|w| w.get()), script);
+    ui_changed
 }
 
 /// The OS window deactivate, the reference's `0x514490` (`and eax,0xfffff00f`, sole caller
@@ -2448,6 +2548,23 @@ pub(crate) fn intents(script: &mut UiScript) {
             spell,
             target: if on_self { 0 } else { selection },
         });
+    }
+    // `CastShapeshiftForm` (`0x4f9b10`): a stance-bar click casts the form spell, except the
+    // already-active one, which the reference makes a silent no-op for the warrior stances
+    // (`SpellShapeshiftForm` flags1 0x2). The stock bar queues these separately from spell casts.
+    for spell in script.take_shapeshift_casts() {
+        let active = FEED.with(|f| {
+            f.borrow()
+                .forms
+                .iter()
+                .any(|v| v.spell_id == spell && v.active)
+        });
+        if active {
+            net::note(format!("stance: cast {spell} skipped, already active"));
+            continue;
+        }
+        let sent = net::send_cmd(Cmd::Cast { spell, target: 0 });
+        net::note(format!("stance: cast {spell} sent={sent}"));
     }
     if script.take_spell_stop() {
         if let Some((spell, _, _)) = net::ui_self_cast() {
@@ -2878,6 +2995,96 @@ fn quest_row_cmd(npc: u64, quest: u32, icon: u32) -> Cmd {
     } else {
         Cmd::GossipQuest { npc, quest }
     }
+}
+
+/// `SMSG_QUESTGIVER_QUEST_LIST` → the stock `QuestFrame`'s greeting panel, the port
+/// of `crates/benilla-app/src/ui_quest::feed_quest`'s `QuestView::Greeting` leg. A
+/// questgiver with no gossip menu (the trial valley's foreman is one) reaches the
+/// client by this packet alone, so without this pass the marker shows but no frame
+/// opens. The host pushes the detail, progress and reward panels from the same
+/// latch, so this pass owns only mode 1. Returns whether this tick changed the panel.
+fn feed_quest_greeting(script: &mut UiScript) -> bool {
+    let giver = net::ui_giver();
+    // `SMSG_GOSSIP_MESSAGE` latches a mode-1 giver too, but its menu - options and quest
+    // rows - belongs to the stock `GossipFrame`, which `gossip_vm` owns and shows. A
+    // `QuestFrame` greeting only comes from a giver with no gossip menu, i.e. the
+    // `SMSG_QUESTGIVER_QUEST_LIST` leg (`gossip_vm` has no menu latched for this NPC).
+    let gossip_owns = crate::gossip_vm::npc() == giver.npc;
+    if giver.npc == 0 || giver.mode >= 2 || gossip_owns {
+        // Nothing to show, or the host's panel is live: drop the memo so a return
+        // to the list fires `QUEST_GREETING` again instead of reading as unchanged.
+        FEED.with(|f| {
+            let mut feed = f.borrow_mut();
+            feed.quest_shown = None;
+            feed.quest_shown_name = None;
+        });
+        return false;
+    }
+    let mut active_titles = Vec::new();
+    let mut available_titles = Vec::new();
+    let mut active_levels = Vec::new();
+    let mut available_levels = Vec::new();
+    for q in giver.quests.iter().take(giver.quest_count as usize) {
+        // The reference's `row_is_active` (`0x5012db`): incomplete and reward rows
+        // are the turn-ins, everything else is the offer list.
+        if matches!(q.icon, 3 | 4) {
+            active_titles.push(cstr(&q.title));
+            active_levels.push(q.level);
+        } else {
+            available_titles.push(cstr(&q.title));
+            available_levels.push(q.level);
+        }
+    }
+    let mut greeting = cstr(&giver.body);
+    // The wire text's `$N` is expanded client-side; this crate has no macro engine,
+    // so the one macro a 1.12 quest greeting uses expands here, as the gossip pass does.
+    if greeting.contains("$N") {
+        let names = net::ui_names();
+        let player = names
+            .get(&net::ui_self_guid())
+            .cloned()
+            .unwrap_or_default();
+        greeting = greeting.replace("$N", &player);
+    }
+    let fresh = QuestState {
+        panel: QuestPanel::Greeting,
+        greeting,
+        active_titles,
+        available_titles,
+        active_levels,
+        available_levels,
+        ..Default::default()
+    };
+    let npc_name = net::ui_creature_name(giver.npc);
+    let unchanged = FEED.with(|f| {
+        let feed = f.borrow();
+        feed.quest_shown.as_ref() == Some(&fresh) && feed.quest_shown_name == npc_name
+    });
+    if unchanged {
+        return false;
+    }
+    let same_panel = FEED.with(|f| {
+        f.borrow()
+            .quest_shown
+            .as_ref()
+            .is_some_and(|s| s.panel == QuestPanel::Greeting)
+    });
+    FEED.with(|f| {
+        let mut feed = f.borrow_mut();
+        feed.quest_shown = Some(fresh.clone());
+        feed.quest_shown_name = npc_name;
+    });
+    script.set_quest(Some(fresh));
+    // The events carry no argument: `QuestFrame` names the NPC with `UnitName("npc")`.
+    script.fire_event(
+        if same_panel {
+            "QUEST_ITEM_UPDATE"
+        } else {
+            "QUEST_GREETING"
+        },
+        Vec::new(),
+    );
+    true
 }
 
 /// The questgiver chain's Lua intents. The stock `GossipFrame` and `QuestFrame`
