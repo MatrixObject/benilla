@@ -535,6 +535,10 @@ pub struct TerrainChunkRange {
 /// per chunk. Also keeps the tile's WMO/doodad placements for later phases.
 pub struct TileFlat {
     verts: Vec<BnVertex>,
+    /// Baked MCSH shade per vertex, parallel to `verts`, RGBA8: the reference's
+    /// `0.3·shadow + 0.7` diffuse factor (terrain.wgsl), so the host can draw
+    /// the ground unlit in `bn.LightMode 1`.
+    tcolors: Vec<[u8; 4]>,
     idx: Vec<u16>,
     chunks: Vec<TerrainChunkRange>,
     /// WMO instances (MODF) in raw WoW world coords.
@@ -600,6 +604,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
 
     let mut out = TileFlat {
         verts: Vec::new(),
+        tcolors: Vec::new(),
         idx: Vec::new(),
         chunks: Vec::new(),
         wmos: tile.wmos.clone(),
@@ -616,6 +621,10 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             break;
         }
         let vtx0 = out.verts.len() as u32;
+        // MCSH reads the same grid `ChunkMesh::mcsh_shadowed_at` walks: row from
+        // the north-west corner toward +x (south), column toward +y (east).
+        let nw = c.positions.first().copied().unwrap_or([0.0, 0.0, 0.0]);
+        let shadow_n = benilla_formats::SHADOW_MAP_SIZE as usize;
         for (i, p) in c.positions.iter().enumerate() {
             let (nx, ny, nz) = if c.normals.len() == c.positions.len() {
                 wow_vec_to_ue(c.normals[i][0], c.normals[i][1], c.normals[i][2])
@@ -635,6 +644,22 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
                 u: uv[0] * benilla_formats::TERRAIN_LAYER_TILES,
                 v: uv[1] * benilla_formats::TERRAIN_LAYER_TILES,
             });
+            // Baked ground shade: MCSH 255 = shadowed, 0 = lit (terrain.rs), and
+            // the reference combines it as `0.3·shadow_lit + 0.7`.
+            let lit = match c.shadow.as_ref() {
+                Some(sh) => {
+                    let south = (nw[0] - p[0]) / benilla_formats::TILE_SIZE;
+                    let east = (nw[1] - p[1]) / benilla_formats::TILE_SIZE;
+                    let row = ((south * shadow_n as f32) as isize)
+                        .clamp(0, shadow_n as isize - 1) as usize;
+                    let col = ((east * shadow_n as f32) as isize)
+                        .clamp(0, shadow_n as isize - 1) as usize;
+                    1.0 - sh.get(row * shadow_n + col).copied().unwrap_or(0) as f32 / 255.0
+                }
+                None => 1.0,
+            };
+            let shade = (255.0 * (0.7 + 0.3 * lit)).round().clamp(0.0, 255.0) as u8;
+            out.tcolors.push([shade, shade, shade, 255]);
         }
         let idx0 = out.idx.len() as u32;
         for &i in &c.indices {
@@ -1429,6 +1454,29 @@ pub extern "C" fn bn_terrain_fill_vertices(
     // SAFETY: caller pre-allocated `cap` BnVertex slots at `out`.
 
     unsafe { std::ptr::copy_nonoverlapping(t.verts.as_ptr(), out, n) };
+
+    n as u32
+}
+
+/// Fill `out` (pre-allocated, 4 RGBA bytes per vertex) with the terrain's baked
+/// MCSH shade. Returns the byte count written.
+
+#[no_mangle]
+
+pub extern "C" fn bn_terrain_fill_colors(world: *const BnWorld, out: *mut u8, cap: u32) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let w = unsafe { &*world };
+
+    let Some(t) = w.tile.as_ref() else { return 0 };
+
+    let n = t.tcolors.len().min(cap as usize);
+
+    // SAFETY: caller pre-allocated `cap` bytes at `out`; [u8; 4] is contiguous.
+
+    unsafe { std::ptr::copy_nonoverlapping(t.tcolors.as_ptr() as *const u8, out, n * 4) };
 
     n as u32
 }

@@ -111,6 +111,7 @@ pub extern "C" fn bn_unit_shadows(
         return clear();
     }
     let eye = net::ui_unit_pose(net::ui_self_guid());
+    let self_guid = net::ui_self_guid();
 
     // Resolve each unit's display bounds first: that needs the mutable chain, while the ground
     // projection below holds the player immutably for its whole loop.
@@ -119,6 +120,7 @@ pub extern "C" fn bn_unit_shadows(
         radius: f32,
         feet: [f32; 3],
         up: f32,
+        is_self: bool,
     }
     let mut pending: Vec<Pending> = Vec::new();
     for guid in net::ui_unit_guids() {
@@ -154,7 +156,17 @@ pub extern "C" fn bn_unit_shadows(
         if radius <= 0.0 {
             continue;
         }
-        let pose = net::ui_unit_pose(guid).unwrap_or(unit.pos);
+        let is_self = guid == self_guid;
+        // The local body is drawn from the mover's own feet, and `ui_unit_pose` is the wire
+        // snapshot: it lags by the whole distance walked, so a blob anchored on it stays where
+        // the character used to be. Every other unit keeps the snapshot (that is what is drawn).
+        let pose = if is_self {
+            crate::player::ui_pos(w as *mut BnWorld)
+        } else {
+            None
+        }
+        .or_else(|| net::ui_unit_pose(guid))
+        .unwrap_or(unit.pos);
         // Blob decals only matter around the client; farther units are already faded by the host.
         if let Some(eye) = eye {
             let dx = pose[0] - eye[0];
@@ -170,6 +182,7 @@ pub extern "C" fn bn_unit_shadows(
             radius,
             feet: pose,
             up,
+            is_self,
         });
     }
 
@@ -177,8 +190,9 @@ pub extern "C" fn bn_unit_shadows(
     let mut verts: Vec<BnShadowVertex> = Vec::new();
     for item in pending {
         // The body is drawn on benilla's ground clamp, so the decal reads the same feet the ring
-        // does: a creature's translation is clamped before its ring sees it.
-        let feet = if item.kind == 3 {
+        // does: a creature's translation is clamped before its ring sees it. The local body
+        // already comes from the mover, so clamping it again would fight the host's own sweep.
+        let feet = if item.kind == 3 && !item.is_self {
             crate::player::clamped_feet(p, item.feet)
         } else {
             item.feet
