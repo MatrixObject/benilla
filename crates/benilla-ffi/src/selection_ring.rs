@@ -181,12 +181,12 @@ fn held_fade(fresh: Option<f32>) -> f32 {
     }
 }
 
-/// One display's model-local `ring_footprint` - the box the reference sizes from the model's Stand
-/// sequence (`0x60aee0`) - with the display row's own scale. Cached per display id, since the answer
-/// needs an M2 read. A display with no row takes the degenerate-box footprint at scale 1, so a unit
-/// always gets a ring.
-fn ring_local(world: &mut BnWorld, display_id: u32) -> (f32, f32) {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, (f32, f32)>>> = OnceLock::new();
+/// One display's model-local Stand box: the ring's `ring_footprint`, the display row's own scale and
+/// the box's Z extent (the blob shadow's vertical reach). Cached per display id, since the answer
+/// needs an M2 read. A display with no row takes the degenerate-box footprint at scale 1 and no
+/// height, so a unit always gets a ring.
+pub(crate) fn display_bounds(world: &mut BnWorld, display_id: u32) -> (f32, f32, f32) {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, (f32, f32, f32)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(r) = cache
         .lock()
@@ -199,19 +199,25 @@ fn ring_local(world: &mut BnWorld, display_id: u32) -> (f32, f32) {
     let answer = match cat.as_ref().and_then(|c| c.model(display_id)) {
         Some(model) => {
             let path = m2_path(&model.model_path);
-            let footprint = crate::doodad_rig::model_bytes(world, &path)
+            let bounds = crate::doodad_rig::model_bytes(world, &path)
                 .as_deref()
-                .and_then(|bytes| benilla_formats::parse_m2_bounds(bytes).ok())
-                .map_or(RING_FALLBACK_RADIUS, |bounds| bounds.ring_footprint);
-            (footprint, model.scale)
+                .and_then(|bytes| benilla_formats::parse_m2_bounds(bytes).ok());
+            let footprint = bounds.map_or(RING_FALLBACK_RADIUS, |b| b.ring_footprint);
+            let height = bounds.map_or(0.0, |b| b.stand_box_z);
+            (footprint, model.scale, height)
         }
-        None => (RING_FALLBACK_RADIUS, 1.0),
+        None => (RING_FALLBACK_RADIUS, 1.0, 0.0),
     };
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(display_id, answer);
     answer
+}
+
+fn ring_local(world: &mut BnWorld, display_id: u32) -> (f32, f32) {
+    let (footprint, scale, _) = display_bounds(world, display_id);
+    (footprint, scale)
 }
 
 /// The ring's box (`0x608e00`): the texture square, yawed by the fade, laid over the ground.
