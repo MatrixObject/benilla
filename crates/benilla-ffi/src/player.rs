@@ -107,6 +107,22 @@ const TURN_RATE_MOVING: f32 = 0.75;
 /// `turnRate × 8` rad/s, clamped to the gap (`0x607ed0`); while steering,
 /// only the 90° ceiling moves it (`0x60818a`-`0x6081bf`).
 const STATIONARY_CHASE_RATE: f32 = 8.0;
+/// Terrain conform (`entities/conform.rs`): the downward probe starts this far
+/// above the feet, and only a face whose world-up component reaches
+/// `TILT_WALKABLE_UP` (cos 89°) counts as ground at all - a miss or anything
+/// steeper tilts the model back to world up. Between that and
+/// `TILT_FREEZE_UP` (cos 69°) the previous pose is held, so a ledge lip never
+/// flips the body; past it the face's normal is the target. The smoothed
+/// normal closes 10% per frame at 60 fps (`0.0018^dt`), the reference's own
+/// soft follow.
+const TILT_PROBE_UP: f32 = 2.0;
+const TILT_WALKABLE_UP: f32 = 0.0175;
+const TILT_FREEZE_UP: f32 = 0.3572;
+const TILT_DECAY: f32 = 0.0018;
+/// The model the host renders for a local preview mount (no server display):
+/// `EnsureMountBody` falls back to it, so the conform mode is read from the
+/// same file.
+const PREVIEW_MOUNT_MODEL: &str = "Creature\\RidingHorse\\RidingHorse.m2";
 /// Roam-mode flight speed (yd/s): a zone tour without waiting on terrain.
 const FLY_SPEED: f32 = 30.0;
 
@@ -238,6 +254,13 @@ pub struct BnPlayerState {
     pub cam_yaw: f32,
     /// The held axes this frame (forward, strafe, turn), readback for probes.
     pub axes: [f32; 3],
+    /// The mount node's terrain conform, radians, UE FRotator sign: pitch only
+    /// for a model whose `GlobalModelFlags & 3` is 1 (a horse), pitch and roll
+    /// for 3 (kodo-like), and 0 for everything else (`entities/conform.rs`).
+    /// The rider is not tilted on its own: it hangs off the mount's seat, so
+    /// the mount node carries the whole combination.
+    pub mount_pitch: f32,
+    pub mount_roll: f32,
 }
 
 /// Wrap an angle to (-π, π].
@@ -297,6 +320,51 @@ fn twist_shares(gap: f32) -> (f32, f32) {
 fn armed_twist_shares(gap: f32, mounted: bool) -> (f32, f32) {
     let (spine, head) = twist_shares(gap);
     (if mounted { 0.0 } else { spine }, head)
+}
+
+/// `conform.rs`'s `tilt_target`: `Some(normal)` when the sampled face is
+/// walkable, `Some(world up)` for a miss or a face steeper than 89°, and
+/// `None` inside the freeze band (cos 69°..cos 89°) so the previous pose holds.
+fn tilt_target(sampled: Option<[f32; 3]>) -> Option<[f32; 3]> {
+    match sampled {
+        Some(n) if n[2] >= TILT_WALKABLE_UP => {
+            if n[2] < TILT_FREEZE_UP {
+                None
+            } else {
+                Some(n)
+            }
+        }
+        _ => Some([0.0, 0.0, 1.0]),
+    }
+}
+
+/// The mount node's pitch/roll from the smoothed ground normal, in the host's
+/// UE axes: forward +X, right +Y, up +Z (WoW (x, y, z) maps to (x, -y, z), so
+/// a WoW yaw `y` looks along `(cos y, -sin y)`). `mode` is
+/// `GlobalModelFlags & 3`: 1 = pitch only (`conform.rs`'s mode 1), 3 = pitch
+/// and roll, anything else = upright.
+fn conform_angles(mode: u32, yaw: f32, up: [f32; 3]) -> (f32, f32) {
+    if mode == 0 {
+        return (0.0, 0.0);
+    }
+    let (s, c) = (yaw.sin(), yaw.cos());
+    let len = (up[0] * up[0] + up[1] * up[1] + up[2] * up[2])
+        .sqrt()
+        .max(1.0e-6);
+    let (nx, ny, nu) = (up[0] / len, -up[1] / len, up[2] / len);
+    // Forward is `(cos y, -sin y)`, right is `(sin y, cos y)` in these axes.
+    let f = nx * c - ny * s;
+    let r = nx * s + ny * c;
+    // A `FRotator(P, Y, R)` puts the local up at
+    // `(-cosR·sinP, -sinR, cosR·cosP)`: the reference's mode 1
+    // `Quat::from_rotation_x(atan2(n_local.z, n_local.y))` in UE's axes.
+    let pitch = (-f).atan2(nu);
+    let roll = if mode == 3 {
+        -r.clamp(-1.0, 1.0).asin()
+    } else {
+        0.0
+    };
+    (pitch, roll)
 }
 
 /// The standing body's own turn for one frame (`player/gait.rs`'s stationary
@@ -1033,6 +1101,18 @@ pub struct Player {
     /// the standing chase; 0 unless standing. The shuffle animation keys on
     /// it (`0x5fd3f0`), not on the turn keys.
     body_turn_step: f32,
+    /// The mount model's terrain-conform mode (`GlobalModelFlags & 3`): 1 =
+    /// pitch only, 3 = pitch + roll, 0 = upright. Resolved by
+    /// `bn_player_tick` when the display changes.
+    mount_tilt_mode: u32,
+    /// The display the mode was resolved for (a preview mount reports its
+    /// fallback file as `u32::MAX`); 0 = nothing mounted / no answer yet.
+    mount_tilt_display: u32,
+    /// The smoothed ground normal under the mount (WoW world axes, up = +Z).
+    tilt_up: [f32; 3],
+    /// The mount node's pitch/roll for the host, radians (UE FRotator sign).
+    mount_pitch: f32,
+    mount_roll: f32,
 }
 
 impl Player {
@@ -1089,6 +1169,11 @@ impl Player {
             look_active: false,
             look_steer: false,
             body_turn_step: 0.0,
+            mount_tilt_mode: 0,
+            mount_tilt_display: 0,
+            tilt_up: [0.0, 0.0, 1.0],
+            mount_pitch: 0.0,
+            mount_roll: 0.0,
         }
     }
 
@@ -1346,10 +1431,16 @@ impl Player {
         }
     }
 
-    /// The highest walkable surface under (x, y) at or below `ceil`.
-    pub(crate) fn ground(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, f32)> {
+    /// The highest walkable surface under (x, y) at or below `ceil`, with the
+    /// triangle's own world normal (WoW axes, up = +Z).
+    pub(crate) fn ground_with_normal(
+        &self,
+        x: f32,
+        y: f32,
+        ceil: f32,
+    ) -> Option<(f32, [f32; 3])> {
         let (tx, ty) = Self::tile_of(x, y);
-        let mut best: Option<(f32, f32)> = None;
+        let mut best: Option<(f32, [f32; 3])> = None;
         let mut consider = |t: &Tri| {
             // The reference's one-sided trace (`0x632700`): a downward probe
             // keeps only faces wound up at it. A beam's underside is a ceiling
@@ -1359,7 +1450,7 @@ impl Player {
             }
             if let Some(z) = t.height_at(x, y, ceil) {
                 if best.map_or(true, |(bz, _)| z > bz) {
-                    best = Some((z, t.n[2]));
+                    best = Some((z, t.n));
                 }
             }
         };
@@ -1397,6 +1488,12 @@ impl Player {
             }
         }
         best
+    }
+
+    /// The highest walkable surface under (x, y) at or below `ceil`.
+    pub(crate) fn ground(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, f32)> {
+        self.ground_with_normal(x, y, ceil)
+            .map(|(z, n)| (z, n[2]))
     }
 
     /// The lowest downward-facing surface at or above `above` over (x, y): the
@@ -2617,6 +2714,10 @@ impl Player {
             self.model_yaw = wrap_pi(self.model_yaw + self.body_turn_step);
         }
 
+        // The mount's terrain conform (`entities/conform.rs`), on this frame's
+        // heading and floor.
+        self.update_mount_tilt(dt);
+
         self.attack_left = (self.attack_left - dt).max(0.0);
 
         // Zoom glide (`camera_zoom`: constant 8.33 yd/s toward the target).
@@ -2877,6 +2978,41 @@ impl Player {
         }
     }
 
+    /// The mount node's terrain conform, from `entities/conform.rs`: only a
+    /// model whose `GlobalModelFlags & 3` is 1 (pitch; mounts, quadrupeds) or 3
+    /// (pitch and roll; kodo-like) tilts at all. The rider is not tilted on its
+    /// own - it hangs off the mount's seat, so this rotation carries the whole
+    /// combination (`entities/attach/mod.rs:485`).
+    fn update_mount_tilt(&mut self, dt: f32) {
+        if !self.mounted || self.mount_tilt_mode == 0 {
+            self.tilt_up = [0.0, 0.0, 1.0];
+            self.mount_pitch = 0.0;
+            self.mount_roll = 0.0;
+            return;
+        }
+        // The probe the reference casts from just above the feet: the body's
+        // own XY over the floor it stands on, on the same collision triangles
+        // the floor resolve walks.
+        let sampled = self.ground_with_normal(
+            self.pos[0],
+            self.pos[1],
+            self.pos[2] + TILT_PROBE_UP,
+        );
+        // `tilt_target`: a miss or a face too steep to stand on snaps to world
+        // up; inside the freeze band the previous pose is kept; past it the
+        // face's normal is the target.
+        if let Some(t) = tilt_target(sampled.map(|(_, n)| n)) {
+            let decay = TILT_DECAY.powf(dt);
+            for i in 0..3 {
+                self.tilt_up[i] = t[i] + (self.tilt_up[i] - t[i]) * decay;
+            }
+        }
+        // The local frame the host applies (see [`conform_angles`]).
+        let (pitch, roll) = conform_angles(self.mount_tilt_mode, self.model_yaw, self.tilt_up);
+        self.mount_pitch = pitch;
+        self.mount_roll = roll;
+    }
+
     /// The mount's own gait: the rider holds Mount (91) while the mount walks
     /// or runs beneath it, on the same speed split the walk cycle uses.
     fn mount_anim(&self) -> u32 {
@@ -2885,7 +3021,17 @@ impl Player {
         }
         let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
         if hs < 0.1 {
-            0
+            // Turning in place plays the shuffle, keyed on the body's own turn
+            // (`creature_anim/select.rs:398-405`: TURN_LEFT -> 11, TURN_RIGHT
+            // -> 12, falling back to Stand). The mount child reads its host's
+            // movement flags, so the host's step is the mount's.
+            if self.body_turn_step > 1.0e-5 {
+                return 11;
+            }
+            if self.body_turn_step < -1.0e-5 {
+                return 12;
+            }
+            return 0;
         } else if hs > 2.0 * 2.5 {
             5 // Run
         } else {
@@ -3007,6 +3153,8 @@ impl Player {
             aim_yaw: self.yaw,
             cam_yaw: self.cam_yaw,
             axes: [self.input.forward, self.input.strafe, self.input.turn],
+            mount_pitch: self.mount_pitch,
+            mount_roll: self.mount_roll,
         }
     }
 }
@@ -3601,9 +3749,37 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
             }
         }
     }
-    let Some(p) = w.player.as_mut() else { return 0 };
+    // The mount's terrain-conform mode is model data (`GlobalModelFlags & 3`),
+    // so it is resolved only when what is ridden changes. A preview mount has
+    // no display and reads the host's fallback horse; `0` = nothing mounted.
+    let display = crate::net::ui_self_mount_display();
+    let preview = w.player.as_ref().is_some_and(|p| p.mount_preview);
+    let key = if display != 0 {
+        display
+    } else if preview {
+        u32::MAX
+    } else {
+        0
+    };
+    if w.player.as_ref().is_some_and(|p| p.mount_tilt_display != key) {
+        let mode = if key == 0 {
+            0
+        } else if key == u32::MAX {
+            crate::model_terrain_tilt(&w.archives, PREVIEW_MOUNT_MODEL)
+        } else {
+            let path = crate::creature::catalog(w)
+                .and_then(|cat| cat.model(key))
+                .map(|m| crate::creature::m2_path(&m.model_path));
+            path.map_or(0, |p| crate::model_terrain_tilt(&w.archives, &p))
+        };
+        if let Some(p) = w.player.as_mut() {
+            p.mount_tilt_display = key;
+            p.mount_tilt_mode = mode;
+        }
+    }
     // Split borrows: the tile load reads the archives, the WMO build the chain
     // and its shared model cache.
+    let Some(p) = w.player.as_mut() else { return 0 };
     let t0 = std::time::Instant::now();
     p.ensure_tiles(&w.archives);
     let t1 = std::time::Instant::now();
@@ -3656,6 +3832,133 @@ pub extern "C" fn bn_player_state(world: *const BnWorld, out: *mut BnPlayerState
     let Some(p) = w.player.as_ref() else { return 0 };
     unsafe {
         *out = p.state();
+    }
+    1
+}
+
+/// Collision evidence probe for the indoor-leak report: at a WoW-space point,
+/// write the tile's WMO bookkeeping, the cell triangle counts, the nearest
+/// steep face and a four-direction blocked mask. `out` layout (16 f32):
+///   [0] wmos, [1] wmo_inst built, [2] wmo_ready, [3] wmo_mliq built,
+///   [4] cell WMO tris, [5] cell doodad tris, [6] nearest steep distance (yd, -1 none),
+///   [7..10] nearest steep normal, [10] nearest steep top z,
+///   [11..15] blocked toward +X, +Y, -X, -Y
+#[no_mangle]
+pub extern "C" fn bn_player_collision_probe(
+    world: *const BnWorld,
+    x: f32,
+    y: f32,
+    z: f32,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() || cap < 16 {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w.player.as_ref() else { return 0 };
+    let (tx, ty) = Player::tile_of(x, y);
+    let mut o = [0.0f32; 16];
+    o[6] = -1.0;
+    if let Some(t) = p.tiles.get(&(tx, ty)) {
+        o[0] = t.wmos.len() as f32;
+        o[1] = t.wmo_inst as f32;
+        o[2] = i32::from(t.wmo_ready) as f32;
+        o[3] = t.wmo_mliq as f32;
+        if let Some(i) = TileCol::wmo_cell(tx, ty, x, y) {
+            o[4] = t.wmo_cells[i].len() as f32;
+            o[5] = t.doodad_cells[i].len() as f32;
+        }
+    }
+    let lo = z + CAPSULE_RADIUS;
+    let hi = z + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+    let mut best = f32::MAX;
+    let mut best_n = [0.0f32; 3];
+    let mut best_top = 0.0f32;
+    for k in 0..3 {
+        let q = [x, y, lo + (hi - lo) * (k as f32 / 2.0)];
+        p.any_tri_near(q, |t| {
+            if t.n[2].abs() >= GROUND_COS {
+                return false;
+            }
+            let c = closest_on_tri(q, t);
+            let d = ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2)).sqrt();
+            if d < best {
+                best = d;
+                best_n = t.n;
+                best_top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            }
+            false
+        });
+    }
+    if best < f32::MAX {
+        o[6] = best;
+        o[7] = best_n[0];
+        o[8] = best_n[1];
+        o[9] = best_n[2];
+        o[10] = best_top;
+    }
+    for (k, (dx, dy)) in [(1.0f32, 0.0f32), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]
+        .iter()
+        .enumerate()
+    {
+        o[11 + k] = f32::from(u8::from(p.wall_normal(x, y, z, *dx, *dy).is_some()));
+    }
+    // SAFETY: the caller passes room for 16 floats.
+    unsafe {
+        for (i, v) in o.iter().enumerate() {
+            *out.add(i) = *v;
+        }
+    }
+    1
+}
+
+/// One WMO instance of the tile under a WoW point: `out` gets 8 f32
+/// `[collision triangles, min x,y,z, max x,y,z]`, `name` the model path (UTF-8,
+/// up to `name_cap` bytes). Returns 1 when instance `i` exists in that tile.
+#[no_mangle]
+pub extern "C" fn bn_player_collision_model(
+    world: *const BnWorld,
+    x: f32,
+    y: f32,
+    i: u32,
+    out: *mut f32,
+    name: *mut u8,
+    name_cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w.player.as_ref() else { return 0 };
+    let (tx, ty) = Player::tile_of(x, y);
+    let Some(t) = p.tiles.get(&(tx, ty)) else { return 0 };
+    let Some(inst) = t.wmos.get(i as usize) else { return 0 };
+    let mut o = [0.0f32; 8];
+    if let Some(mesh) = w.wmo_collision.get(&inst.model) {
+        o[0] = (mesh.indices.len() / 3) as f32;
+        if !mesh.positions.is_empty() {
+            let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in &mesh.positions {
+                for k in 0..3 {
+                    mn[k] = mn[k].min(v[k]);
+                    mx[k] = mx[k].max(v[k]);
+                }
+            }
+            o[1..4].copy_from_slice(&mn);
+            o[4..7].copy_from_slice(&mx);
+        }
+    }
+    // SAFETY: the caller passes room for 8 floats.
+    unsafe {
+        for (k, v) in o.iter().enumerate() {
+            *out.add(k) = *v;
+        }
+        if !name.is_null() && name_cap > 0 {
+            let bytes = inst.model.as_bytes();
+            let n = bytes.len().min(name_cap as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), name, n);
+        }
     }
     1
 }
@@ -6143,4 +6446,54 @@ mod tests {
         }
         p.input.forward = 0.0;
     }
+
+    #[test]
+    fn tilt_target_follows_the_conform_three_bands() {
+        // A miss and a face steeper than 89° both snap to world up.
+        assert_eq!(tilt_target(None), Some([0.0, 0.0, 1.0]));
+        assert_eq!(
+            tilt_target(Some([0.17, 0.0, 0.01])),
+            Some([0.0, 0.0, 1.0])
+        );
+        // Inside the freeze band the previous pose holds.
+        assert_eq!(tilt_target(Some([0.9, 0.0, 0.2])), None);
+        // Past it the face's own normal is the target.
+        let n = [0.35, 0.0, 0.937];
+        assert_eq!(tilt_target(Some(n)), Some(n));
+    }
+
+    #[test]
+    fn conform_pitch_is_up_on_a_climb_and_down_on_a_descent() {
+        let s = 0.5f32;
+        let c = (1.0 - s * s).sqrt();
+        // A climb toward +X puts the normal backward; a descent forward.
+        let (pitch_up, roll_up) = conform_angles(1, 0.0, [-s, 0.0, c]);
+        let (pitch_down, _) = conform_angles(1, 0.0, [s, 0.0, c]);
+        assert!((pitch_up - s.asin()).abs() < 1.0e-5, "climbing pitches up");
+        assert!(
+            (pitch_down + s.asin()).abs() < 1.0e-5,
+            "descending pitches down"
+        );
+        assert_eq!(roll_up, 0.0, "mode 1 never rolls");
+        // Mode 3 rolls the top toward the low side's opposite (the high side).
+        let (_, roll3) = conform_angles(3, 0.0, [0.0, -s, c]);
+        assert!((roll3 + s.asin()).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn a_mounted_body_shuffles_turning_in_place_and_keeps_its_gait_moving() {
+        let mut p = player_on_flat();
+        p.mounted = true;
+        p.vel = [0.0; 3];
+        p.body_turn_step = 0.01;
+        assert_eq!(p.mount_anim(), 11, "turning left shuffles left");
+        p.body_turn_step = -0.01;
+        assert_eq!(p.mount_anim(), 12, "turning right shuffles right");
+        p.body_turn_step = 0.0;
+        assert_eq!(p.mount_anim(), 0, "standing still");
+        p.vel = [3.0, 0.0, 0.0];
+        p.body_turn_step = 0.01;
+        assert_eq!(p.mount_anim(), 4, "a moving turn keeps the gait");
+    }
+
 }
