@@ -644,22 +644,50 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
                 u: uv[0] * benilla_formats::TERRAIN_LAYER_TILES,
                 v: uv[1] * benilla_formats::TERRAIN_LAYER_TILES,
             });
-            // Baked ground shade: MCSH 255 = shadowed, 0 = lit (terrain.rs), and
-            // the reference combines it as `0.3·shadow_lit + 0.7`.
-            let lit = match c.shadow.as_ref() {
+            // Baked ground shade: MCSH 255 = shadowed, 0 = lit (terrain.rs).
+            // The UE bake material composes the light itself (ambient + sun ·
+            // (1 - shade) · N·L), so the vertex colour carries *occlusion*, not
+            // a final brightness: R = shade (0 lit .. 255 fully shadowed),
+            // G/B unused, A = 255 when the chunk has MCSH (0 = no data).
+            // MCSH is 64×64 per 33.3 yd chunk (~0.52 yd a texel); a point
+            // sample quantises the boundary to half-yard blocks, so bilinear
+            // over the four surrounding texels keeps the edge continuous.
+            let (shade, valid) = match c.shadow.as_ref() {
                 Some(sh) => {
-                    let south = (nw[0] - p[0]) / benilla_formats::TILE_SIZE;
-                    let east = (nw[1] - p[1]) / benilla_formats::TILE_SIZE;
-                    let row = ((south * shadow_n as f32) as isize)
-                        .clamp(0, shadow_n as isize - 1) as usize;
-                    let col = ((east * shadow_n as f32) as isize)
-                        .clamp(0, shadow_n as isize - 1) as usize;
-                    1.0 - sh.get(row * shadow_n + col).copied().unwrap_or(0) as f32 / 255.0
+                    // *16 scales the chunk-local offset (0..CHUNK_SIZE) to the
+                    // 0..1 tile fraction the MCSH grid is indexed by.
+                    let south = (nw[0] - p[0]) / benilla_formats::TILE_SIZE * 16.0;
+                    let east = (nw[1] - p[1]) / benilla_formats::TILE_SIZE * 16.0;
+                    let n = shadow_n as f32;
+                    let fx = (south * n - 0.5).clamp(0.0, n - 1.0);
+                    let fy = (east * n - 0.5).clamp(0.0, n - 1.0);
+                    let x0 = fx.floor() as usize;
+                    let y0 = fy.floor() as usize;
+                    let x1 = (x0 + 1).min(shadow_n - 1);
+                    let y1 = (y0 + 1).min(shadow_n - 1);
+                    let tx = fx - x0 as f32;
+                    let ty = fy - y0 as f32;
+                    // MCSH stores row = south (the grid `mcsh_shadowed_at` walks
+                    // as `shadow[row * n + col]`), column = east. `fx` runs along
+                    // south and `fy` along east, so the row index is `x*` and the
+                    // column index is `y*` - swapping them transposes the map and
+                    // lands the dark patches on the wrong ground.
+                    let at = |row: usize, col: usize| {
+                        sh.get(row * shadow_n + col).copied().unwrap_or(0) as f32 / 255.0
+                    };
+                    let s00 = at(x0, y0);
+                    let s10 = at(x1, y0);
+                    let s01 = at(x0, y1);
+                    let s11 = at(x1, y1);
+                    let top = s00 * (1.0 - tx) + s10 * tx;
+                    let bot = s01 * (1.0 - tx) + s11 * tx;
+                    let shadowed = top * (1.0 - ty) + bot * ty;
+                    (shadowed, 255u8)
                 }
-                None => 1.0,
+                None => (0.0, 0u8),
             };
-            let shade = (255.0 * (0.7 + 0.3 * lit)).round().clamp(0.0, 255.0) as u8;
-            out.tcolors.push([shade, shade, shade, 255]);
+            let shade_u8 = (255.0 * shade).round().clamp(0.0, 255.0) as u8;
+            out.tcolors.push([shade_u8, 255, 255, valid]);
         }
         let idx0 = out.idx.len() as u32;
         for &i in &c.indices {
