@@ -3913,6 +3913,94 @@ pub extern "C" fn bn_player_collision_probe(
     1
 }
 
+/// Read-only penetration probe for the leak matrix: the deepest overlap of the
+/// capsule's three rings with any steep face around the body, in yards, counted
+/// with no one-sided filter so both windings answer. `out` layout (10 f32):
+/// [0] max penetration depth (0 = clear), [1] nearest ring-to-face distance
+/// (-1 = none), [2..5] the deepest face's world normal, [5] its top z, [6] faces
+/// within one radius, [7] feet z, [8] dead flag, [9] stock-binding latch flag.
+/// Writes nothing into the player and no movement decision reads it.
+#[no_mangle]
+pub extern "C" fn bn_player_penetration(
+    world: *const BnWorld,
+    out: *mut f32,
+    cap: u32,
+) -> u32 {
+    if world.is_null() || out.is_null() || cap < 10 {
+        return 0;
+    }
+    let w = unsafe { &*world };
+    let Some(p) = w.player.as_ref() else { return 0 };
+    let feet = p.pos[2];
+    let lo = feet + CAPSULE_RADIUS;
+    let hi = feet + CAPSULE_HEIGHT - CAPSULE_RADIUS;
+    let r = CAPSULE_RADIUS;
+    let mut max_depth = 0.0f32;
+    let mut nearest = f32::MAX;
+    let mut best_n = [0.0f32; 3];
+    let mut best_top = 0.0f32;
+    let mut faces = 0usize;
+    for k in 0..3 {
+        let q = [p.pos[0], p.pos[1], lo + (hi - lo) * (k as f32 / 2.0)];
+        p.any_tri_near(q, |t| {
+            if t.n[2].abs() >= GROUND_COS {
+                return false; // a floor or a ceiling
+            }
+            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            if top <= feet + STEP_UP_HEIGHT {
+                return false; // a curb the mover steps over
+            }
+            let c = closest_on_tri(q, t);
+            let d = ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2))
+                .sqrt();
+            if d < nearest {
+                nearest = d;
+            }
+            if d < r {
+                faces += 1;
+            }
+            let depth = r - d;
+            if depth > max_depth {
+                max_depth = depth;
+                best_n = t.n;
+                best_top = top;
+            }
+            false
+        });
+    }
+    let mut o = [0.0f32; 10];
+    o[0] = max_depth;
+    o[1] = if nearest < f32::MAX { nearest } else { -1.0 };
+    o[2..5].copy_from_slice(&best_n);
+    o[5] = best_top;
+    o[6] = faces as f32;
+    o[7] = feet;
+    // Diagnostics for the matrix driver: whether the body is a corpse and
+    // whether a stock binding owns the axes this frame (both zero the input).
+    o[8] = if p.dead { 1.0 } else { 0.0 };
+    o[9] = if p.ui_input.is_some() { 1.0 } else { 0.0 };
+    // SAFETY: the caller passes room for 10 floats.
+    unsafe {
+        for (i, v) in o.iter().enumerate() {
+            *out.add(i) = *v;
+        }
+    }
+    1
+}
+
+/// Drop the stock UI's parked movement latch (measurement driver only). With
+/// no binding started the UI writes `[0,0,0]` every tick and that latch wins
+/// over the raw axes, so a scripted matrix cell could never move. Returns 1
+/// when a player exists. No movement rule reads this.
+#[no_mangle]
+pub extern "C" fn bn_player_ui_release(world: *mut BnWorld) -> u32 {
+    let Some(p) = player_mut(world) else { return 0 };
+    p.ui_input = None;
+    p.ui_walk = None;
+    p.ui_jump = false;
+    1
+}
+
 /// One WMO instance of the tile under a WoW point: `out` gets 8 f32
 /// `[collision triangles, min x,y,z, max x,y,z]`, `name` the model path (UTF-8,
 /// up to `name_cap` bytes). Returns 1 when instance `i` exists in that tile.
