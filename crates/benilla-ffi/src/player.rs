@@ -2092,6 +2092,33 @@ impl Player {
                 if top <= feet + STEP_UP_HEIGHT {
                     return false; // a curb the mover steps over
                 }
+                // A grazing slide leaves the capsule exactly `r` from the face
+                // at the start of the next frame. The plane/edge quadratics
+                // then have no positive root (they start at the answer) and
+                // the body would take the whole step through the wall, so the
+                // contact counts as a hit now and only the into-face component
+                // is absorbed - the tangential part still slides.
+                let q0 = closest_on_tri(c, t);
+                let dx0 = c[0] - q0[0];
+                let dy0 = c[1] - q0[1];
+                let dist0 = (dx0 * dx0 + dy0 * dy0).sqrt();
+                if dist0 <= CAPSULE_RADIUS + 1.0e-3 {
+                    let hl = (dx0 * dx0 + dy0 * dy0).sqrt();
+                    let n = if hl > 1.0e-4 {
+                        [dx0 / hl, dy0 / hl]
+                    } else {
+                        let pl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                        if pl < 1.0e-6 {
+                            return false;
+                        }
+                        [t.n[0] / pl, t.n[1] / pl]
+                    };
+                    let into = dir[0] * n[0] + dir[1] * n[1];
+                    if into < -1.0e-4 && best.is_none_or(|(b, _, _)| b > 1.0e-9) {
+                        best = Some((0.0, n, top));
+                    }
+                    return false;
+                }
                 if let Some((tt, n)) = sweep_sphere_tri(c, d, CAPSULE_RADIUS, t) {
                     let hl = (n[0] * n[0] + n[1] * n[1]).sqrt();
                     if hl > 1.0e-6 && best.is_none_or(|(b, _, _)| tt < b) {
@@ -2186,10 +2213,16 @@ impl Player {
                 break;
             };
             if t <= 1.0e-4 {
-                // Already touching: the slide below cannot make progress, so
-                // settle the body out of the face and stop this frame.
+                // Already touching: settle out of the face, then slide the
+                // travel below with the same normal instead of taking the
+                // whole step (a grazing slide must not tunnel).
                 self.depenetrate();
-                break;
+                let into = rem[0] * n[0] + rem[1] * n[1];
+                if into >= 0.0 {
+                    break;
+                }
+                rem = [rem[0] - into * n[0], rem[1] - into * n[1]];
+                continue;
             }
             let nx = self.pos[0] + dirx * len * t;
             let ny = self.pos[1] + diry * len * t;
