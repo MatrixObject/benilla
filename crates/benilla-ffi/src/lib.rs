@@ -10699,7 +10699,7 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| script.cvar("realmlist").filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "127.0.0.1:3724".to_string());
+            .unwrap_or_else(|| "127.0.0.1:3725".to_string());
         BN_MENU.with(|m| {
             *m.borrow_mut() = MenuSync {
                 realm_address,

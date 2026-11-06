@@ -11,7 +11,7 @@
 /// Every host-backed row, then the reference's other script-visible ones.
 pub(crate) const DEFAULTS: &[(&str, &str)] = &[
     ("realmName", ""),
-    ("realmList", "localhost"),
+    ("realmList", "127.0.0.1:3725"),
     ("autoClearAFK", "1"),
     ("MasterVolume", "1"),
     ("SoundVolume", "1"),

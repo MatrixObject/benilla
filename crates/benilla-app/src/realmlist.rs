@@ -40,7 +40,9 @@ pub(crate) const CVAR_REALMLIST: &str = "realmList";
 
 /// Deviation: the local machine's server, not the reference's
 /// `us.logon.worldofwarcraft.com:3724`, because that host no longer resolves.
-pub(crate) const DEFAULT_REALMLIST: &str = "localhost";
+/// The port is explicit: the CMaNGOS realm runs on 3725, so the bare default
+/// must not fall back to the protocol's 3724.
+pub(crate) const DEFAULT_REALMLIST: &str = "127.0.0.1:3725";
 
 /// The dialog box's `letters` cap. Deviation: 64, where the reference's login boxes cap at 16
 /// (`AccountLogin.xml`), because a hostname needs more.
@@ -235,8 +237,8 @@ mod tests {
     fn the_default_is_a_host_the_protocol_can_split() {
         let (host, port) =
             benilla_protocol::host_port(DEFAULT_REALMLIST, benilla_protocol::AUTH_PORT);
-        assert_eq!(host, "localhost");
-        assert_eq!(port, benilla_protocol::AUTH_PORT);
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 3725);
     }
 
     #[test]
