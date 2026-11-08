@@ -598,6 +598,7 @@ version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "benilla-adt",
+ "benilla-app",
  "benilla-blp",
  "benilla-cull",
  "benilla-formats",

@@ -28,6 +28,7 @@ benilla-ui = { path = "../benilla-ui" }
 # Wire protocol (SRP6 logon, realm list, world session) for the network
 # middle layer. Protocol only: no Bevy, no app runtime.
 benilla-protocol = { path = "../benilla-protocol" }
+benilla-app = { path = "../benilla-app" }
 # Glyph outlines for `bn_ui_text_bitmap` (FontString -> RGBA for the UE HUD).
 ab_glyph = "0.2"
 # The client's audio: kira's mix with a cpal output written here (kira's own cpal

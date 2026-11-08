@@ -21,6 +21,7 @@ use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
 use crate::{placement_quat, q_rot, BnWorld};
 
 // ---- state constants (read-only port) ----
+use benilla_app::{MoverMesh, MoverSession};
 const RUN_SPEED: f32 = 7.0;
 const WALK_RATIO: f32 = 2.5 / 7.0;
 const RUN_BACK_RATIO: f32 = 4.5 / 7.0;
@@ -34,6 +35,16 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
+/// `bn.CollisionSolver`（临时开关）：1 = 玩家步进整段交给 benilla 的
+/// `MoverSession::step`（默认），0 = 本文件的自写求解。旧路径保留到回归全绿。
+static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
+/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1）。
+fn collision_solver_on() -> bool {
+    match crate::video_cvar("bn.CollisionSolver") {
+        Some(v) => !matches!(v.trim(), "0" | "false" | "off"),
+        None => COLLISION_SOLVER.load(Ordering::Relaxed),
+    }
+}
 /// How far below the last real floor the void guard lets a body fall before it
 /// is restored there (yd). A real floor anywhere below is found by `ground`
 /// long before this; only a true hole in the collision data gets here.
@@ -1557,6 +1568,13 @@ pub struct Player {
     /// The mount node's pitch/roll for the host, radians (UE FRotator sign).
     mount_pitch: f32,
     mount_roll: f32,
+    /// Phase 2: benilla 自己的玩家步进（无窗口物理世界 + `MoverSession::step`）。
+    /// `bn.CollisionSolver` = 1 时由它解析水平/竖直/台阶/贴地，0 时走本文件的自写求解。
+    mover: MoverSession,
+    /// 碰撞面集合变了（tile 进出、WMO 折叠、传送换图），下一帧重新 `install`。
+    mover_dirty: bool,
+    /// 上一帧喂给 `mover` 的碰撞面签名（tile 键 + 各格三角数 + `wmo_ready`）。
+    mover_sig: u64,
 }
 
 impl Player {
@@ -1619,6 +1637,9 @@ impl Player {
             tilt_up: [0.0, 0.0, 1.0],
             mount_pitch: 0.0,
             mount_roll: 0.0,
+            mover: MoverSession::new(),
+            mover_dirty: true,
+            mover_sig: 0,
         }
     }
 
@@ -1647,6 +1668,92 @@ impl Player {
         self.snap_pending = true;
         self.last_ground = pos;
         self.void_time = 0.0;
+        // benilla 的步进体也重seat：清速度与贴地状态，下一帧由它重新分类。
+        self.mover.set_pose(pos);
+        self.mover_dirty = true;
+    }
+
+    /// 把当前 tile 集折叠成 benilla 的碰撞面并 `install`。只做数据搬运：
+    /// WoW 轴顶点原样传递，轴向变换在 `MoverSession::install` 内完成。
+    fn rebuild_mover_world(&mut self) {
+        let mut body = MoverMesh {
+            layer: 0,
+            verts: Vec::new(),
+            tris: Vec::new(),
+        };
+        let mut cam = MoverMesh {
+            layer: 2,
+            verts: Vec::new(),
+            tris: Vec::new(),
+        };
+        fn push(mesh: &mut MoverMesh, tri: &Tri) {
+            let b = mesh.verts.len() as u32;
+            mesh.verts.extend_from_slice(&tri.v);
+            mesh.tris.push([b, b + 1, b + 2]);
+        }
+        for t in self.tiles.values() {
+            for tri in t.buckets.iter().flatten() {
+                push(&mut body, tri);
+            }
+            for tri in t.wmo_cells.iter().flatten() {
+                push(&mut body, tri);
+            }
+            for tri in t.doodad_cells.iter().flatten() {
+                push(&mut body, tri);
+            }
+            for tri in t.cam_cells.iter().flatten() {
+                push(&mut cam, tri);
+            }
+        }
+        let mut meshes = Vec::new();
+        if !body.tris.is_empty() {
+            meshes.push(body);
+        }
+        if !cam.tris.is_empty() {
+            meshes.push(cam);
+        }
+        self.mover.install(&meshes);
+        self.mover_dirty = false;
+    }
+
+    /// 一帧步进交给 benilla：本帧速度折成 `dir/speed`，位置、竖直速度与着地全部取回。
+    fn mover_tick(&mut self, dt: f32, jump: bool, surface: Option<f32>) {
+        // 碰撞面每变一次（tile 进出、WMO 折完、传送换图）重建一次，其余帧零成本。
+        let mut sig = 0u64;
+        for (k, t) in &self.tiles {
+            sig = sig
+                .wrapping_mul(31)
+                .wrapping_add((k.0 as u64) << 32 ^ k.1 as u64 as u64);
+            for b in &t.buckets {
+                sig = sig.wrapping_mul(31).wrapping_add(b.len() as u64);
+            }
+            for c in &t.wmo_cells {
+                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
+            }
+            for c in &t.doodad_cells {
+                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
+            }
+            for c in &t.cam_cells {
+                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
+            }
+            sig = sig.wrapping_mul(31).wrapping_add(t.wmo_ready as u64);
+        }
+        if self.mover_dirty || sig != self.mover_sig {
+            self.mover_sig = sig;
+            self.rebuild_mover_world();
+        }
+        let prev_z = self.pos[2];
+        let dir = [self.vel[0], self.vel[1]];
+        let speed = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+        let frame = self.mover.step(dt, dir, speed, jump, surface);
+        self.pos = frame.pos;
+        self.vel = [frame.horiz_vel[0], frame.horiz_vel[1], frame.vel_y];
+        self.grounded = frame.grounded;
+        if self.grounded {
+            self.last_ground = self.pos;
+            self.void_time = 0.0;
+        }
+        self.tick_arc(dt, jump, prev_z);
     }
 
     /// Load the tile under the player plus its neighbours, at most one new ADT
@@ -3211,6 +3318,12 @@ impl Player {
         // surface press breaches out.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
+        let use_mover = collision_solver_on() && !self.swimming;
+        if use_mover {
+            // `bn.CollisionSolver` = 1：水平、台阶、贴地吸附、重力与竖直扫描整段交给
+            // benilla 的 `MoverSession::step`；jump 由它起跳，这里不再自己写 `vel[2]`。
+            self.mover_tick(dt, jump, surface);
+        } else {
         if jump {
             if self.swimming {
                 self.swimming = false;
@@ -3488,6 +3601,7 @@ impl Player {
                     floor_z
                 );
             }
+        }
         }
 
         // The rendered body heading (`player/gait.rs`'s `drive_body_heading`,
@@ -7844,4 +7958,12 @@ mod tests {
         bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
         crate::bn_shutdown(w);
     }
+}
+
+/// `bn.CollisionSolver` 的宿主设置入口：1 = benilla 的 `MoverSession::step`，
+/// 0 = 本文件的自写求解。返回设置后生效的值。
+#[no_mangle]
+pub extern "C" fn bn_player_collision_solver(mode: i32) -> i32 {
+    COLLISION_SOLVER.store(mode != 0, Ordering::Relaxed);
+    i32::from(collision_solver_on())
 }
