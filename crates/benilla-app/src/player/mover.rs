@@ -7,7 +7,8 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use super::{
-    move_trace, Player, CAPSULE_HEIGHT, FEATHER_TERMINAL_VELOCITY, FOOT_CONE_HEIGHT, GRAVITY,
+    move_trace, Player, CAPSULE_HEIGHT, CAPSULE_RADIUS, FEATHER_TERMINAL_VELOCITY,
+    FOOT_CONE_HEIGHT, GRAVITY,
     GROUND_COS, GROUND_PROBE, HOVER_CLIMB_RATE, HOVER_HEIGHT, JUMP_SPEED, LAND_PROBE, SKIN_WIDTH,
     STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE_PER_YARD, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
     WATER_WALK_PITCH_FLOOR, WEDGE_MIN_FALL, WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
@@ -2399,5 +2400,159 @@ mod tests {
         let v = Vec3::new(7.0, -4.0, 0.0);
         let out = steep_contact_shear(face(90.0), v).expect("must strip");
         assert!(out.x.abs() < 1e-6 && (out.y - v.y).abs() < 1e-6);
+    }
+}
+
+// ─── 外部宿主（UE）驱动的公开入口 ──────────────────────────────────────────
+//
+// 宿主（`benilla-ffi`）只做数据搬运：喂入碰撞面与一帧 usercmd，取回位置/速度。
+// 这里的函数体只做坐标转换与顺序转调既有实现，不含任何移动算法：
+// - 一帧步进 → [`step`]（本文件 :58），它内部依次转调
+//   [`grounded_step`](:410) / [`step_up`](:766) / [`fall_step`](:589) / [`airborne_step`](:608)；
+// - 无窗口初始化 → 与本文件测试用的 [`world_from_profile`](:848) 同一份插件配方。
+
+/// 宿主交给引擎的一块碰撞面，顶点为 Bevy 坐标。`layer` 取碰撞层的判别值：
+/// 0 = 地形（Default），1 = WMO 可行走面（Walk），2 = WMO 相机面（Camera，身体不查询）。
+pub struct MoverMesh {
+    pub layer: u8,
+    pub verts: Vec<Vec3>,
+    pub tris: Vec<[u32; 3]>,
+}
+
+/// 一帧解析结果，位置/速度回到 WoW 轴（脚底）。
+pub struct MoverFrame {
+    pub pos: [f32; 3],
+    pub vel_y: f32,
+    pub horiz_vel: [f32; 2],
+    pub grounded: bool,
+    pub jumped: bool,
+    pub knocked: bool,
+}
+
+/// 无窗口的 mover 会话。宿主逐帧喂输入，引擎跑完整段 `step`。
+pub struct MoverSession {
+    app: App,
+    player: Player,
+    capsule: Collider,
+    meshes: Vec<Entity>,
+}
+
+impl Default for MoverSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MoverSession {
+    /// 按 [`world_from_profile`](:848) 的配方建一个无窗口世界：没有窗口、渲染与音频。
+    pub fn new() -> Self {
+        let mut app = App::new();
+        // `WorldCollision` 需要 mover 的 trace 排除表，由世界插件插入。
+        app.init_resource::<benilla_world::collision::MoverTraceExclusions>();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::transform::TransformPlugin,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+            PhysicsPlugins::new(bevy::app::PostUpdate),
+        ));
+        app.init_asset::<Mesh>();
+        Self {
+            app,
+            player: Player::default(),
+            // 与 setup.rs 的玩家胶囊同一构造。
+            capsule: Collider::capsule(CAPSULE_RADIUS, CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS),
+            meshes: Vec::new(),
+        }
+    }
+
+    /// 用宿主这一批碰撞面整体替换场景（流式换 tile / WMO / doodad）。
+    pub fn install(&mut self, meshes: &[MoverMesh]) {
+        for e in self.meshes.drain(..) {
+            self.app.world_mut().despawn(e);
+        }
+        for m in meshes {
+            let mut e = self.app.world_mut().spawn((
+                RigidBody::Static,
+                Collider::trimesh(m.verts.clone(), m.tris.clone()),
+                Transform::default(),
+            ));
+            if m.layer != 0 {
+                e.insert(CollisionLayers::new(LayerMask(1 << m.layer), LayerMask::ALL));
+            }
+        }
+        // 一帧重建 Position/Rotation 与空间查询树。
+        self.app.update();
+    }
+
+    /// 采纳一个外部位姿（登录/传送/服务端强制校正）：清速度与贴地状态，下一帧由 `step` 重新分类。
+    pub fn set_pose(&mut self, feet_wow: [f32; 3]) {
+        let p = &mut self.player;
+        p.active = true;
+        p.pos = Vec3::new(-feet_wow[1], feet_wow[2], -feet_wow[0]);
+        p.vel_y = 0.0;
+        p.horiz_vel = Vec3::ZERO;
+        p.airborne_since = None;
+        p.wedged = false;
+        p.steep_support = false;
+        p.settling = false;
+    }
+
+    /// 推进一帧。`dir_wow` 为 WoW 水平朝向（未归一化亦可），`water_floor_wow` 为液体表面高度。
+    pub fn step(
+        &mut self,
+        dt: f32,
+        dir_wow: [f32; 2],
+        speed: f32,
+        jump: bool,
+        water_floor_wow: Option<f32>,
+    ) -> MoverFrame {
+        let dir = Vec3::new(-dir_wow[1], 0.0, -dir_wow[0]);
+        let moving = speed > 0.0 && dir.length_squared() > 0.0;
+        let cap = self.capsule.clone();
+        use bevy::ecs::system::RunSystemOnce;
+        // `step` wants `&mut Player` while `WorldCollision` borrows the world, so the body rides in
+        // as a resource for the one system run and comes straight back out.
+        self.app
+            .world_mut()
+            .insert_resource(std::mem::take(&mut self.player));
+        let out = self
+            .app
+            .world_mut()
+            .run_system_once(
+                move |world: benilla_world::collision::WorldCollision<'_, '_>,
+                      mut player: ResMut<Player>,
+                      mut time: ResMut<Time>| {
+                    time.advance_by(std::time::Duration::from_secs_f32(dt));
+                    step(
+                        &mut player,
+                        &time,
+                        &world,
+                        &cap,
+                        moving,
+                        dir,
+                        speed,
+                        jump,
+                        jump,
+                        None,
+                        water_floor_wow,
+                        0.0,
+                    )
+                },
+            )
+            .expect("mover step system");
+        self.player = self
+            .app
+            .world_mut()
+            .remove_resource::<Player>()
+            .expect("player resource");
+        MoverFrame {
+            pos: [-self.player.pos.z, -self.player.pos.x, self.player.pos.y],
+            vel_y: self.player.vel_y,
+            horiz_vel: [-self.player.horiz_vel.z, -self.player.horiz_vel.x],
+            grounded: out.grounded,
+            jumped: out.jumped,
+            knocked: out.knocked,
+        }
     }
 }

@@ -199,6 +199,10 @@ pub use bevy::app::AppExit;
 pub use benilla_protocol::{messages::ObjectType, ObjectFields};
 pub use net::Objects;
 pub use target::Interact;
+// An external host (the UE client's `benilla-ffi`) drives the engine's own mover: it feeds
+// collider meshes and one frame of usercmd, and reads back the resolved pose. The wrapper's body
+// only converts coordinates and calls `player::mover::step`; no movement logic lives outside.
+pub use player::mover::{MoverFrame, MoverMesh, MoverSession};
 
 /// Builds and runs the client app. `build` is the launcher's compile-time git stamp, passed in as
 /// data so the sha lives in the shim's fingerprint and a commit does not recompile this crate.
