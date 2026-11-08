@@ -35,10 +35,10 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver`（临时开关）：1 = 玩家步进整段交给 benilla 的
-/// `MoverSession::step`（默认），0 = 本文件的自写求解。旧路径保留到回归全绿。
-static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1）。
+/// `bn.CollisionSolver`（临时开关）：0 = 本文件的自写求解（**当前默认**，回归未全绿），
+/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(1)` 可开）。
+static COLLISION_SOLVER: AtomicBool = AtomicBool::new(false);
+/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（0 = 自写求解）。
 fn collision_solver_on() -> bool {
     match crate::video_cvar("bn.CollisionSolver") {
         Some(v) => !matches!(v.trim(), "0" | "false" | "off"),
