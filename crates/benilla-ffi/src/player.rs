@@ -63,6 +63,22 @@ const STEP_SNAP_SLACK: f32 = 1.0 / 36.0;
 /// downward probe and the wall test read it the same way, so a beam's
 /// underside is a ceiling to the head and no floor to the feet.
 const FACE_FACING_EPS: f32 = 1.0e-5;
+/// The backface band, 1/36 yd (`one_sided::BACKFACE_BAND`, `[0x7ff9c8]`): a
+/// face the capsule already overlaps is a contact only while not every one of
+/// its vertices is deeper than this behind the sweep's leading plane. When all
+/// three are behind it the face is behind the body and is walked through - the
+/// reference's `behind_the_band` for a penetrating hit.
+const BACKFACE_BAND: f32 = 1.0 / 36.0;
+/// avian's shape-cast skin width (`benilla-app`'s `SKIN_WIDTH`, yd): the
+/// sweep stops this far short of the surface, so the next frame starts free
+/// of it instead of resolving the same face twice.
+const SKIN_WIDTH: f32 = 0.02;
+/// How long the mover waits for a tile's WMO collision set to finish folding
+/// before it stops gating on it. The reference's set is complete before the
+/// body can move in; ours folds over ticks, and a gate that never lifts (an
+/// instance whose cells never stream) freezes the body on ground that looks
+/// empty - the "nothing here and I cannot walk" report.
+const WMO_GATE_MAX_S: f32 = 2.0;
 /// The water kinds' accept margin for a submerged point (yd): the reference's camera probe
 /// compares `z < surface + 0.01` at `0x69ba23` (the f32 `0x3c23d70a`), so the view turns
 /// submerged as the near rectangle's lowest corner reaches the surface. Magma and slime
@@ -84,12 +100,6 @@ const CAM_PITCH_LIMIT: f32 = 89.0 * std::f32::consts::PI / 180.0;
 /// `pitch_speed × Δy / 90`, which at the default 180 and 90 both land here.
 const LOOK_SENSITIVITY: f32 = 0.003;
 const CAM_DIST_DEFAULT: f32 = 15.0; // camera_zoom's deviation, for a wider view
-/// The shortest boom the collision probe will pull to. A wall the player backs into cuts the
-/// camera to the head, as the client's sweep does (`seat = head + boom · frac`, `frac` reaching 0),
-/// so the eye never ends up behind the surface it stopped at: the PVS seed is the camera, and an
-/// eye inside the wall seeds nothing and culls the room it was in. The floor only keeps the eye off
-/// the pivot exactly, since the host derives its forward from `target - eye`.
-const CAM_BOOM_MIN: f32 = 1.0 / 64.0;
 /// `benilla-world`'s `CAMERA_PROBE_RADIUS` (collision.rs): the camera's sweep
 /// sphere, which keeps the near plane out of the surface it stops at.
 const CAM_PROBE_RADIUS: f32 = 0.3;
@@ -195,6 +205,11 @@ const JUMP_ENTER_MS: f32 = 833.0;
 /// the mount (Orc authors 1500) and JumpLandRun 833 on Human, so one window fits
 /// the arcs the player actually sees.
 const LAND_MS: f32 = 1000.0;
+/// Shortest time off the ground that counts as a landing. The capsule sweep
+/// misses the floor for a single frame on a slope, and treating every such gap
+/// as a takeoff+landing restarted the gait ~20x/s (the `5 -> 187 -> 5` burst);
+/// a real hop or step-off is far longer than this.
+const LAND_MIN_AIR_S: f32 = 0.08;
 
 /// The state the host applies (plain C; yaw/pitch radians, positions yards).
 #[repr(C)]
@@ -491,6 +506,14 @@ fn parked_wmo_cols() -> &'static std::sync::Mutex<HashMap<String, benilla_format
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// The camera/LOS meshes, parked the same way and taken once by the body tile.
+fn parked_wmo_cams() -> &'static std::sync::Mutex<HashMap<String, benilla_formats::CollisionMesh>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, benilla_formats::CollisionMesh>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// Park one model's collision hull (`None` = the model ships none).
 pub(crate) fn doodad_hull_park(path: &str, hull: Option<benilla_formats::CollisionMesh>) {
     if let Ok(mut m) = parked_doodad_hulls().lock() {
@@ -525,8 +548,28 @@ pub(crate) fn wmo_collision_parked(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the tile worker already parked this model's camera/LOS mesh.
+pub(crate) fn wmo_camera_parked(path: &str) -> bool {
+    parked_wmo_cams()
+        .lock()
+        .map(|m| m.contains_key(path))
+        .unwrap_or(false)
+}
+
 fn wmo_collision_take(path: &str) -> Option<benilla_formats::CollisionMesh> {
     parked_wmo_cols().lock().ok()?.remove(path)
+}
+
+/// Park one WMO's camera/LOS collision mesh for the body tile that lists it:
+/// `benilla-assets`' `collision_camera` (every face but `NOCAMCOLLIDE`).
+pub(crate) fn wmo_camera_park(path: &str, mesh: benilla_formats::CollisionMesh) {
+    if let Ok(mut m) = parked_wmo_cams().lock() {
+        m.insert(path.to_string(), mesh);
+    }
+}
+
+fn wmo_camera_take(path: &str) -> Option<benilla_formats::CollisionMesh> {
+    parked_wmo_cams().lock().ok()?.remove(path)
 }
 
 /// One ADT tile's collision: terrain triangles bucketed by the chunk they
@@ -538,6 +581,11 @@ pub(crate) struct TileCol {
     /// lands in every cell its XY bounds overlap, so the huge city floors
     /// answer from any point instead of a full-scan every frame.
     wmo_cells: Vec<Vec<Tri>>,
+    /// The camera's own triangles on the same grid: every face but `NOCAMCOLLIDE`,
+    /// `DETAIL` included (`benilla-assets`' `collision_camera`). The camera sweeps a
+    /// sphere against this set, never against the walking one - a `DETAIL` beam or
+    /// eave stops the eye although the body walks under it.
+    cam_cells: Vec<Vec<Tri>>,
     /// Doodad collision-hull triangles on the same grid: each placement's M2
     /// hull, placed and scaled (`load_m2_collision_hull`).
     doodad_cells: Vec<Vec<Tri>>,
@@ -559,6 +607,15 @@ pub(crate) struct TileCol {
     wmo_tri: usize,
     wmo_vtx: usize,
     wmo_world: Vec<[f32; 3]>,
+    /// Camera-set fold cursor, mirrored from the walking one: `cam_inst` is the
+    /// instance, `cam_tri`/`cam_vtx` the slices, `cam_world` the transformed
+    /// vertices of the instance in flight. `cam_ready` latches when every
+    /// instance is folded (then `boom_hit` stops falling back to `wmo_cells`).
+    cam_inst: usize,
+    cam_tri: usize,
+    cam_vtx: usize,
+    cam_world: Vec<[f32; 3]>,
+    cam_ready: bool,
     /// WMO MLIQ cursor: one model's water groups per slice (each is an MPQ
     /// read and parse; a city tile holds a dozen).
     wmo_mliq: usize,
@@ -580,6 +637,9 @@ impl TileCol {
             wmo_cells: (0..(WMO_GRID * WMO_GRID) as usize)
                 .map(|_| Vec::new())
                 .collect(),
+            cam_cells: (0..(WMO_GRID * WMO_GRID) as usize)
+                .map(|_| Vec::new())
+                .collect(),
             doodad_cells: (0..(WMO_GRID * WMO_GRID) as usize)
                 .map(|_| Vec::new())
                 .collect(),
@@ -592,6 +652,11 @@ impl TileCol {
             wmo_tri: 0,
             wmo_vtx: 0,
             wmo_world: Vec::new(),
+            cam_inst: 0,
+            cam_tri: 0,
+            cam_vtx: 0,
+            cam_world: Vec::new(),
+            cam_ready: false,
             wmo_mliq: 0,
             doodad_next: 0,
             modd: Vec::new(),
@@ -803,6 +868,93 @@ fn build_wmo_collision_step(
             t.wmo_world = Vec::new();
         }
     }
+    // The camera's own set: every face but `NOCAMCOLLIDE`, `DETAIL` included
+    // (`benilla-assets`' `collision_camera`), folded on the same budget. It runs
+    // after the floor set so the body's spawn snap is never delayed by it, and
+    // `boom_hit` keeps reading `wmo_cells` until `cam_ready` latches.
+    while t.cam_inst < t.wmos.len() {
+        let model = t.wmos[t.cam_inst].model.clone();
+        let key = format!("cam:{model}");
+        if !cache.contains_key(&key) {
+            if start.elapsed() >= budget {
+                break;
+            }
+            let mesh = wmo_camera_take(&model).unwrap_or_else(|| {
+                benilla_formats::load_wmo_camera_tris(chain, &model).unwrap_or_default()
+            });
+            cache.insert(key.clone(), mesh);
+        }
+        let total = cache[&key].indices.len() / 3;
+        if total == 0 || cache[&key].positions.is_empty() {
+            t.cam_inst += 1;
+            t.cam_tri = 0;
+            t.cam_vtx = 0;
+            t.cam_world.clear();
+            continue;
+        }
+        if t.cam_tri == 0 {
+            let mesh = &cache[&key];
+            if t.cam_vtx == 0 {
+                t.cam_world.clear();
+                t.cam_world.reserve(mesh.positions.len());
+            }
+            let (q, base) = {
+                let inst = &t.wmos[t.cam_inst];
+                (placement_quat(inst.rotation), inst.position)
+            };
+            let end = (t.cam_vtx + 4096).min(mesh.positions.len());
+            for p in &mesh.positions[t.cam_vtx..end] {
+                let r = q_rot(q, *p);
+                t.cam_world
+                    .push([r[0] + base[0], r[1] + base[1], r[2] + base[2]]);
+            }
+            t.cam_vtx = end;
+            if t.cam_vtx < mesh.positions.len() {
+                break;
+            }
+        }
+        let mut i = t.cam_tri;
+        {
+            let world = &t.cam_world;
+            let mesh = &cache[&key];
+            let cells = &mut t.cam_cells;
+            while i < total {
+                let mesh_i = &mesh.indices[i * 3..i * 3 + 3];
+                let (a, b, c) = (mesh_i[0] as usize, mesh_i[1] as usize, mesh_i[2] as usize);
+                let (Some(&va), Some(&vb), Some(&vc)) = (world.get(a), world.get(b), world.get(c))
+                else {
+                    i += 1;
+                    continue;
+                };
+                let tri_c = Tri::new(va, vb, vc);
+                let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &tri_c);
+                for ly in y0..=y1 {
+                    for lx in x0..=x1 {
+                        cells[(ly * WMO_GRID + lx) as usize].push(tri_c);
+                    }
+                }
+                i += 1;
+                if i % 128 == 0 && start.elapsed() >= budget {
+                    break;
+                }
+            }
+        }
+        t.cam_tri = i;
+        if i < total {
+            break;
+        }
+        t.cam_inst += 1;
+        t.cam_tri = 0;
+        t.cam_vtx = 0;
+        t.cam_world.clear();
+        if start.elapsed() >= budget {
+            break;
+        }
+    }
+    if t.cam_inst >= t.wmos.len() {
+        t.cam_ready = true;
+        t.cam_world = Vec::new();
+    }
     built
 }
 
@@ -895,6 +1047,141 @@ fn keep_nearest(best: &mut Option<f32>, d: Option<f32>, max: f32) {
     }
 }
 
+/// Slab test: does the segment `a..b` touch the axis-aligned box `mn..mx`?
+fn segment_hits_box(a: [f32; 3], b: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for k in 0..3 {
+        let d = b[k] - a[k];
+        if d.abs() < 1.0e-9 {
+            if a[k] < mn[k] || a[k] > mx[k] {
+                return false;
+            }
+        } else {
+            let inv = 1.0 / d;
+            let mut ta = (mn[k] - a[k]) * inv;
+            let mut tb = (mx[k] - a[k]) * inv;
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The distance along `d` (a unit vector) at which the probe sphere of radius
+/// `r`, starting at `o`, first touches `t`, within `max` - the query
+/// `benilla-world`'s `cast_camera` asks `parry`: a ball swept against the
+/// triangle, not a ray. A ray misses a wall it passes beside; the ball grazes
+/// its edge, which is the "turning against a wall" frame the eye has to stop on.
+///
+/// `f(s) = |o + s*d - closest_on_tri(o + s*d)|² - r²` is convex (squared
+/// distance to a convex set), so the first crossing is found in two steps: when
+/// the ray itself crosses the face the hit is a bisection on `[0, ray_t]`;
+/// otherwise a ternary search over the boom finds the closest approach and a
+/// bisection finds the crossing before it.
+///
+/// An origin that already overlaps the ball is the reference's
+/// `ignore_origin_penetration` case (`avian3d` `move_and_slide.rs:798-800`,
+/// `shape_caster.rs:255-261`): the cast keeps going while the boom will
+/// eventually free the ball from the face, and only stops at `0` when the whole
+/// arm stays inside the penetration. Without that split a head grazing a camera
+/// face (a WMO DETAIL face the walk capsule skips) pins the eye to the head for
+/// as long as the player stands there - the arm never gets out.
+fn sphere_hit(o: [f32; 3], d: [f32; 3], t: &Tri, r: f32, max: f32) -> Option<f32> {
+    let f = |s: f32| {
+        let p = [o[0] + d[0] * s, o[1] + d[1] * s, o[2] + d[2] * s];
+        let q = closest_on_tri(p, t);
+        let dx = p[0] - q[0];
+        let dy = p[1] - q[1];
+        let dz = p[2] - q[2];
+        dx * dx + dy * dy + dz * dz - r * r
+    };
+    if f(0.0) <= 0.0 {
+        // parry discards a t = 0 impact only while the cast is *separating* from
+        // the face at the origin (`stop_at_penetration: false`,
+        // `shape_cast.rs:115-118`), which is the reference's camera sweep
+        // (`avian3d` `move_and_slide.rs:798-800`). Moving away the arm keeps
+        // going - a head grazing a surface still casts outward - while a boom
+        // driving into the face stays at the head.
+        let q = closest_on_tri(o, t);
+        let out = [o[0] - q[0], o[1] - q[1], o[2] - q[2]];
+        let sep = if out[0] * out[0] + out[1] * out[1] + out[2] * out[2] > 1.0e-12 {
+            out[0] * d[0] + out[1] * d[1] + out[2] * d[2]
+        } else {
+            // Centre exactly on the face: the outward direction is the triangle's
+            // own normal, as parry's contact normal is there.
+            t.n[0] * d[0] + t.n[1] * d[1] + t.n[2] * d[2]
+        };
+        return if sep > 0.0 { None } else { Some(0.0) };
+    }
+    // A face the ray crosses: the sphere touched it earlier, still on the ray.
+    if let Some(t_ray) = ray_tri(o, d, t) {
+        if t_ray <= max {
+            let (mut lo, mut hi) = (0.0f32, t_ray);
+            for _ in 0..18 {
+                let mid = (lo + hi) * 0.5;
+                if f(mid) <= 0.0 {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return Some(hi);
+        }
+    }
+    // No crossing: the boom can still graze the face. Reject by the segment's
+    // distance to the triangle before spending the search on it.
+    let end = [o[0] + d[0] * max, o[1] + d[1] * max, o[2] + d[2] * max];
+    let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in &t.v {
+        for k in 0..3 {
+            mn[k] = mn[k].min(v[k] - r);
+            mx[k] = mx[k].max(v[k] + r);
+        }
+    }
+    if !segment_hits_box(o, end, mn, mx) {
+        return None;
+    }
+    let (p, q, inside) = capsule_tri_closest(o, end, t);
+    if !inside {
+        let dx = p[0] - q[0];
+        let dy = p[1] - q[1];
+        let dz = p[2] - q[2];
+        if dx * dx + dy * dy + dz * dz >= r * r {
+            return None;
+        }
+    }
+    let (mut lo, mut hi) = (0.0f32, max);
+    for _ in 0..18 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if f(m1) < f(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    let t_min = (lo + hi) * 0.5;
+    if f(t_min) > 0.0 {
+        return None;
+    }
+    let (mut lo, mut hi) = (0.0f32, t_min);
+    for _ in 0..18 {
+        let mid = (lo + hi) * 0.5;
+        if f(mid) <= 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
 /// Closest point on a triangle to `p` (Ericson's barycentric regions).
 fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
     let [a, b, c] = t.v;
@@ -947,6 +1234,163 @@ fn closest_on_tri(p: [f32; 3], t: &Tri) -> [f32; 3] {
         a[1] + ab[1] * v + ac[1] * w,
         a[2] + ab[2] * v + ac[2] * w,
     ]
+}
+
+/// A face the horizontal sweep meets, in the reference's shape-cast terms
+/// (`benilla-world::collision::one_sided::cast_move`): how far the axis may
+/// travel before the capsule touches it, the face's own normal, and its top
+/// for the step-up certificate. There is no depenetration - the reference's
+/// resolver is a sweep with no push-out, so a body inside geometry walks out
+/// through the faces wound away from it rather than being shoved sideways.
+struct WallContact {
+    /// Travel along the sweep to contact (yd, >= 0).
+    dist: f32,
+    /// Unit horizontal face normal, out of the solid.
+    n: [f32; 2],
+    /// The face's highest vertex, for the step-up certificate.
+    top: f32,
+}
+
+/// A contact of the capsule swept straight up or down (`Player::capsule_sweep_z`).
+struct VerticalHit {
+    /// Travel along the sweep to contact (yd, >= 0).
+    dist: f32,
+    /// The face's own world up component.
+    nz: f32,
+}
+
+/// Closest points between segments `p1-q1` and `p2-q2` (Ericson).
+fn closest_seg_seg(
+    p1: [f32; 3],
+    q1: [f32; 3],
+    p2: [f32; 3],
+    q2: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let d1 = sub(q1, p1);
+    let d2 = sub(q2, p2);
+    let r = sub(p1, p2);
+    let a = dot(d1, d1);
+    let e = dot(d2, d2);
+    let f = dot(d2, r);
+    let eps = 1.0e-9;
+    let (s, t);
+    if a <= eps && e <= eps {
+        return (p1, p2);
+    }
+    if a <= eps {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = dot(d1, r);
+        if e <= eps {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = dot(d1, d2);
+            let denom = a * e - b * b;
+            let mut ss = if denom.abs() > eps {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut tt = (b * ss + f) / e;
+            if tt < 0.0 {
+                tt = 0.0;
+                ss = (-c / a).clamp(0.0, 1.0);
+            } else if tt > 1.0 {
+                tt = 1.0;
+                ss = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            s = ss;
+            t = tt;
+        }
+    }
+    (
+        [p1[0] + d1[0] * s, p1[1] + d1[1] * s, p1[2] + d1[2] * s],
+        [p2[0] + d2[0] * t, p2[1] + d2[1] * t, p2[2] + d2[2] * t],
+    )
+}
+
+/// Whether `p`, known to lie on the triangle's plane, is inside it.
+fn on_tri(p: [f32; 3], t: &Tri) -> bool {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let cross = |u: [f32; 3], v: [f32; 3]| {
+        [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ]
+    };
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let e = |i: usize, j: usize| cross(sub(t.v[j], t.v[i]), sub(p, t.v[i]));
+    dot(e(0, 1), t.n) >= -1.0e-6
+        && dot(e(1, 2), t.n) >= -1.0e-6
+        && dot(e(2, 0), t.n) >= -1.0e-6
+}
+
+/// Closest pair between the capsule's axis segment `a-b` and the triangle.
+/// Returns (axis point, surface point, axis crosses the face). The crossing
+/// arm is what catches a vertical capsule standing in a near-vertical wall,
+/// where every endpoint/edge pair is farther than the radius.
+fn capsule_tri_closest(
+    a: [f32; 3],
+    b: [f32; 3],
+    t: &Tri,
+) -> ([f32; 3], [f32; 3], bool) {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let mut best_p = a;
+    let mut best_q = closest_on_tri(a, t);
+    let mut best_d2 = {
+        let d = sub(best_p, best_q);
+        dot(d, d)
+    };
+    let mut consider = |p: [f32; 3], q: [f32; 3]| {
+        let d = sub(p, q);
+        let d2 = dot(d, d);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_p = p;
+            best_q = q;
+        }
+    };
+    consider(b, closest_on_tri(b, t));
+    for i in 0..3 {
+        let v = t.v[i];
+        let p = {
+            let ab = sub(b, a);
+            let len2 = dot(ab, ab);
+            if len2 <= 1.0e-12 {
+                a
+            } else {
+                let s = (dot(sub(v, a), ab) / len2).clamp(0.0, 1.0);
+                [a[0] + ab[0] * s, a[1] + ab[1] * s, a[2] + ab[2] * s]
+            }
+        };
+        consider(p, v);
+        let (p2, q2) = closest_seg_seg(a, b, t.v[i], t.v[(i + 1) % 3]);
+        consider(p2, q2);
+    }
+    // The axis crossing the face: full-radius overlap, pushed along the authored
+    // winding. `a` is at the feet and `b` at the shoulders, so a floor cannot
+    // reach here (the caller's band filter has already dropped it).
+    let n = t.n;
+    if n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 0.5 {
+        let ab = sub(b, a);
+        let denom = dot(n, ab);
+        if denom.abs() > 1.0e-9 {
+            let s = dot(n, sub(t.v[0], a)) / denom;
+            if (0.0..=1.0).contains(&s) {
+                let p = [a[0] + ab[0] * s, a[1] + ab[1] * s, a[2] + ab[2] * s];
+                if on_tri(p, t) {
+                    return (p, p, true);
+                }
+            }
+        }
+    }
+    (best_p, best_q, false)
 }
 
 /// Input held this frame (axes -1..1, buttons as 0/1).
@@ -1074,11 +1518,6 @@ pub struct Player {
     /// Set when a tile's WMO floors are built: the spawn sits on the terrain
     /// under a city, so climb to the lowest walkable WMO floor over it.
     snap_pending: bool,
-    /// A server pose was adopted and the body has not settled on a floor since.
-    /// While the tile's WMO set is still folding, the room's floor is not in it
-    /// yet; the body holds the server's Z instead of dropping through the hole
-    /// the ADT leaves under an interior.
-    hold_pose: bool,
     /// Last feet position that stood on a floor. The void guard restores it if
     /// the body ever falls far below: a hole in the collision data must never
     /// drop the player out of the world.
@@ -1087,6 +1526,11 @@ pub struct Player {
     void_time: f32,
     /// Seconds since the last falling-trace line (diagnostics).
     fall_time: f32,
+    /// Seconds the current tile has waited for its WMO collision fold to land
+    /// (`collision_folding_here`). Bounded by [`WMO_GATE_MAX_S`].
+    wmo_gate_wait: f32,
+    /// The tile `wmo_gate_wait` is charged to.
+    wmo_gate_tile: (i32, i32),
     /// Roam mode (F8): no gravity, no collision, no water - free flight for
     /// inspecting the world. The ICC/M2 body still follows the pose.
     fly: bool,
@@ -1135,7 +1579,7 @@ impl Player {
             cam_target_distance: CAM_DIST_DEFAULT,
             pivot_height: CAM_PIVOT_STAND,
             surface: None,
-            cam_live: CAM_DIST_DEFAULT,
+            cam_live: f32::MAX,
             server_mount: 0,
             mount_preview: false,
             mounted: false,
@@ -1161,10 +1605,11 @@ impl Player {
             hulls: HashMap::new(),
             missing: Vec::new(),
             snap_pending: false,
-            hold_pose: false,
             last_ground: [x, y, 0.0],
             void_time: 0.0,
             fall_time: 0.0,
+            wmo_gate_wait: 0.0,
+            wmo_gate_tile: (i32::MIN, i32::MIN),
             fly: false,
             look_active: false,
             look_steer: false,
@@ -1200,7 +1645,6 @@ impl Player {
         // teleport into a spot the maps cut a step below); the snap lifts the
         // body once the floor set under it is whole.
         self.snap_pending = true;
-        self.hold_pose = true;
         self.last_ground = pos;
         self.void_time = 0.0;
     }
@@ -1275,7 +1719,7 @@ impl Player {
             return;
         };
         let Some(chain) = chain.as_mut() else { return };
-        if !t.wmo_ready {
+        if !t.wmo_ready || !t.cam_ready {
             let owed = t.wmo_inst < t.wmos.len();
             build_wmo_collision_step(t, tx, ty, chain, cache, std::time::Duration::from_millis(2));
             // The spawn snap is one decision, taken when the floor set is whole.
@@ -1431,6 +1875,36 @@ impl Player {
         }
     }
 
+    /// Run `f` over the terrain triangles in the chunk under (x, y) and its
+    /// eight neighbours. A tile's buckets hold only their own chunks, and the
+    /// capsule is a third of a yard wide, so it sits on both sides of a chunk
+    /// seam; the reference's queries span every chunk the shape touches. With
+    /// a single bucket the floor (or the surface over the head) vanished for
+    /// the last fraction of a yard before a seam - the `-8800` chunk edge is
+    /// exactly on such a seam, where a body walked into terrain standing 2.5
+    /// yd over its head.
+    fn for_each_terrain_tri(&self, x: f32, y: f32, mut f: impl FnMut(&Tri)) {
+        let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                // `world_to_chunk` names its first component after world y.
+                let gx = cx as i32 + dx;
+                let gy = cy as i32 + dy;
+                if gx < 0 || gy < 0 {
+                    continue;
+                }
+                let k = (gx / 16, gy / 16);
+                let Some(tile) = self.tiles.get(&k) else {
+                    continue;
+                };
+                let b = ((gy % 16) * 16 + (gx % 16)) as usize;
+                for t in &tile.buckets[b] {
+                    f(t);
+                }
+            }
+        }
+    }
+
     /// The highest walkable surface under (x, y) at or below `ceil`, with the
     /// triangle's own world normal (WoW axes, up = +Z).
     pub(crate) fn ground_with_normal(
@@ -1454,12 +1928,8 @@ impl Player {
                 }
             }
         };
+        self.for_each_terrain_tri(x, y, |t| consider(t));
         if let Some(tile) = self.tiles.get(&(tx, ty)) {
-            let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
-            let b = ((cy % 16) * 16 + (cx % 16)) as usize;
-            for t in &tile.buckets[b] {
-                consider(t);
-            }
             if let Some(i) = TileCol::wmo_cell(tx, ty, x, y) {
                 for t in &tile.wmo_cells[i] {
                     consider(t);
@@ -1470,18 +1940,13 @@ impl Player {
             }
         } else {
             // Crossing a border before the neighbour finished loading: any
-            // loaded tile still answers in world coords.
+            // loaded tile's WMO still answers in world coords.
             for (&(k0, k1), tile) in &self.tiles {
                 if let Some(i) = TileCol::wmo_cell(k0, k1, x, y) {
                     for t in &tile.wmo_cells[i] {
                         consider(t);
                     }
                     for t in &tile.doodad_cells[i] {
-                        consider(t);
-                    }
-                }
-                for bucket in &tile.buckets {
-                    for t in bucket {
                         consider(t);
                     }
                 }
@@ -1499,7 +1964,10 @@ impl Player {
     /// The lowest downward-facing surface at or above `above` over (x, y): the
     /// head's ceiling. The same one-sided law from the other side, an upward
     /// probe keeping only faces wound down at it (`0x632700`), so a floor is
-    /// never a ceiling and a beam's underside is always one.
+    /// never a ceiling and a beam's underside is always one. The mover itself
+    /// sweeps the capsule ([`Self::capsule_sweep_z`]); this point probe stays
+    /// for the beam tests.
+    #[cfg(test)]
     fn ceiling(&self, x: f32, y: f32, above: f32) -> Option<f32> {
         let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<f32> = None;
@@ -1513,12 +1981,8 @@ impl Player {
                 }
             }
         };
+        self.for_each_terrain_tri(x, y, |t| consider(t));
         if let Some(tile) = self.tiles.get(&(tx, ty)) {
-            let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
-            let b = ((cy % 16) * 16 + (cx % 16)) as usize;
-            for t in &tile.buckets[b] {
-                consider(t);
-            }
             if let Some(i) = TileCol::wmo_cell(tx, ty, x, y) {
                 for t in &tile.wmo_cells[i] {
                     consider(t);
@@ -1534,11 +1998,6 @@ impl Player {
                         consider(t);
                     }
                     for t in &tile.doodad_cells[i] {
-                        consider(t);
-                    }
-                }
-                for bucket in &tile.buckets {
-                    for t in bucket {
                         consider(t);
                     }
                 }
@@ -1577,23 +2036,7 @@ impl Player {
                 best = Some(best.map_or(z, |bz| bz.max(z)));
             }
         };
-        if let Some(tile) = self.tiles.get(&(tx, ty)) {
-            let (cx, cy) = world_to_chunk(x.clamp(-17066.0, 17066.0), y.clamp(-17066.0, 17066.0));
-            let b = ((cy % 16) * 16 + (cx % 16)) as usize;
-            for t in &tile.buckets[b] {
-                consider(t);
-            }
-        } else {
-            // Crossing a border before the neighbour finished loading (or off
-            // this body's tiles): every loaded bucket answers in world coords.
-            for tile in self.tiles.values() {
-                for bucket in &tile.buckets {
-                    for t in bucket {
-                        consider(t);
-                    }
-                }
-            }
-        }
+        self.for_each_terrain_tri(x, y, |t| consider(t));
         best
     }
 
@@ -1903,6 +2346,325 @@ impl Player {
         }
     }
 
+    /// The first face the capsule's horizontal sweep meets within `span` along
+    /// (`dirx`,`diry`): the reference's shape cast (`0x632700`), the same
+    /// one-sided gates as [`Self::capsule_sweep_z`] (floors and ceilings by
+    /// their up component, steps under the feet, a face approached from its
+    /// back skipped) run over a conservative advance. The nearest contact
+    /// wins, not the deepest overlap: the reference stops at the first face and
+    /// never pushes the body out of one it already overlaps.
+    fn sweep_wall_contact(
+        &self,
+        feet: [f32; 3],
+        dirx: f32,
+        diry: f32,
+        span: f32,
+    ) -> Option<WallContact> {
+        // The step-up certificate only exists for a body on its feet: an
+        // airborne one has no step to ride, and at the top of a jump the extra
+        // yard let the capsule cross a fence's upper rail - the `d_jump*`
+        // leaks. In the air only a face whose top is already below the feet
+        // counts as cleared.
+        let step_top = if self.grounded {
+            feet[2] + STEP_UP_HEIGHT
+        } else {
+            feet[2]
+        };
+        let mut adv = 0.0f32;
+        for _ in 0..8 {
+            let x = feet[0] + dirx * adv;
+            let y = feet[1] + diry * adv;
+            let a = [x, y, feet[2] + CAPSULE_RADIUS];
+            let b = [x, y, feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+            let mut touch: Option<([f32; 2], f32)> = None;
+            let mut bound = span - adv;
+            self.any_tri_near([x, y, feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false; // a floor or a ceiling (the vertical sweep's)
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                if top <= step_top {
+                    return false; // a curb the mover steps over
+                }
+                let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                if hl < 1.0e-6 {
+                    return false;
+                }
+                let n2 = [t.n[0] / hl, t.n[1] / hl];
+                if n2[0] * dirx + n2[1] * diry > -FACE_FACING_EPS {
+                    return false; // approached from its back
+                }
+                let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                if inside {
+                    touch = Some((n2, top));
+                    return true;
+                }
+                let dx = sp[0] - ap[0];
+                let dy = sp[1] - ap[1];
+                let dz = sp[2] - ap[2];
+                // The capsule's own reach is the full 3D gap to the axis. Only
+                // the horizontal part tracks the sweep, but a face the body can
+                // only reach by rising - the wall above a doorway, an eave
+                // overhead - sits directly over the axis with the horizontal
+                // gap under the radius, and the 2D test called it a wall at
+                // dist 0: the body stopped dead in the door frame. `top` is
+                // still read 2D, for the one-sided band below.
+                let d2 = dx * dx + dy * dy;
+                let gap = (d2 + dz * dz).sqrt();
+                let along = dx * dirx + dy * diry;
+                if gap < CAPSULE_RADIUS {
+                    // Already within the capsule: the reference keeps this face
+                    // only when a vertex is not more than `BACKFACE_BAND` behind
+                    // the leading plane (`one_sided::behind_the_band`, run for a
+                    // penetrating hit). Measured on the triangle's vertices, not
+                    // on the nearest point: taking the closest point - or the
+                    // capsule radius - as the band turns a seam sliver grazing
+                    // the side into a wall, and the step then stops at dist 0 and
+                    // the caller zeroes the velocity. That is the seam grab.
+                    let lead = ap[0] * dirx + ap[1] * diry + CAPSULE_RADIUS;
+                    let ahead = t
+                        .v
+                        .iter()
+                        .fold(f32::MIN, |m, v| m.max(v[0] * dirx + v[1] * diry - lead));
+                    if ahead >= -BACKFACE_BAND {
+                        touch = Some((n2, top));
+                        return true;
+                    }
+                    return false;
+                }
+                if along <= 0.0 {
+                    return false; // its nearest part is not ahead of the sweep
+                }
+                // The radius closes at `-n·dir`; cap by the along-track
+                // distance so an edge's moving closest point is re-asked on
+                // the next pass instead of being overshot.
+                let closing = -(n2[0] * dirx + n2[1] * diry);
+                if closing <= 1.0e-4 {
+                    return false;
+                }
+                let reach = ((gap - CAPSULE_RADIUS) / closing).min(along);
+                if reach < bound {
+                    bound = reach;
+                }
+                false
+            });
+            if let Some((n, top)) = touch {
+                return Some(WallContact { dist: adv, n, top });
+            }
+            let advance = bound.min(span - adv);
+            if advance <= 1.0e-5 || adv + advance >= span - 1.0e-6 {
+                return None;
+            }
+            adv += advance;
+        }
+        None
+    }
+
+    /// The capsule swept straight up or down by `delta` (negative falls): the
+    /// reference's shape cast (`0x632700`), the axis closed against the
+    /// one-sided set in one pass instead of sampling the height under one
+    /// point. The point probe misses two things a sweep meets: a floor only the
+    /// capsule's rim overhangs, and a floor the feet cross between two ticks on
+    /// a long frame (a streaming hitch at terminal velocity jumps six yards).
+    ///
+    /// Each pass asks every face near the body for the closest distance from the
+    /// capsule's axis. A face already within the radius is the contact; the
+    /// others bound how far the capsule may go before any of them could be
+    /// touched, `(gap - radius) / |n_z|`, capped by the vertical distance to
+    /// that face's closest point (which no fall can pass unseen), and the
+    /// closest bound is taken. A plane settles in one pass; an edge or a vertex
+    /// needs a few.
+    fn capsule_sweep_z(&self, feet: [f32; 3], delta: f32) -> Option<VerticalHit> {
+        if delta.abs() < 1.0e-6 {
+            return None;
+        }
+        let down = delta < 0.0;
+        let span = delta.abs();
+        let r = CAPSULE_RADIUS;
+        let lo = feet[2] + r;
+        let hi = feet[2] + CAPSULE_HEIGHT - r;
+        let mid = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5];
+        let mut d = 0.0f32;
+        for _ in 0..8 {
+            let (a, b) = if down {
+                ([feet[0], feet[1], lo - d], [feet[0], feet[1], hi - d])
+            } else {
+                ([feet[0], feet[1], lo + d], [feet[0], feet[1], hi + d])
+            };
+            let mut advance = span - d;
+            let mut lim_nz = 0.0f32;
+            let mut hit: Option<VerticalHit> = None;
+            self.any_tri_near(mid, |t| {
+                // The one-sided law from the cast's own side: a falling body
+                // keeps the faces wound up at it and a rising one the faces
+                // wound down, so a floor is never the head's ceiling and a
+                // beam's underside is never ground. A near-vertical face is a
+                // wall the horizontal pass owns, not something a vertical
+                // sweep can end on.
+                let nz = t.n[2];
+                if down {
+                    if nz < 0.15 {
+                        return false;
+                    }
+                } else if nz > -0.15 {
+                    return false;
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                // A face entirely outside the swept capsule's band cannot be
+                // touched; the cheap test saves the closest-point scan.
+                if bot > feet[2] + CAPSULE_HEIGHT || top < feet[2] - span {
+                    return false;
+                }
+                let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                let gap = {
+                    let dx = ap[0] - sp[0];
+                    let dy = ap[1] - sp[1];
+                    let dz = ap[2] - sp[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                };
+                // Only the cap facing the travel can be touched: a face whose
+                // nearest point is level with or above the bottom sphere's
+                // centre is a graze, not support. Walking off a kerb, the ledge
+                // corner sat exactly at the sphere's equator (gap == r), the
+                // advance converged to zero and the body rested on its own edge
+                // instead of falling.
+                let cap_ok = if down {
+                    sp[2] <= feet[2] + CAPSULE_RADIUS + 1.0e-4
+                } else {
+                    sp[2] >= feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS - 1.0e-4
+                };
+                if !inside && !cap_ok {
+                    return false;
+                }
+                if inside || gap <= r {
+                    if inside || cap_ok {
+                        hit = Some(VerticalHit { dist: d, nz });
+                        return true;
+                    }
+                    return false;
+                }
+                // The vertical gap to the closest feature caps the advance:
+                // whatever the feature's own normal says, the capsule cannot
+                // pass a point it is falling toward without covering that.
+                let vgap = if down { ap[2] - sp[2] } else { sp[2] - ap[2] };
+                let closing = nz.abs().max(0.15);
+                // A feature level with or beside the capsule bounds nothing.
+                let cap = if vgap > 0.0 { vgap } else { f32::MAX };
+                let bound = ((gap - r) / closing * 0.9).min(cap);
+                if bound < advance {
+                    advance = bound;
+                    lim_nz = nz;
+                }
+                false
+            });
+            if let Some(h) = hit {
+                return Some(h);
+            }
+            if advance <= 1.0e-6 {
+                // The passes converged onto a face without entering its
+                // radius: that is the contact.
+                return Some(VerticalHit { dist: d, nz: lim_nz });
+            }
+            d += advance;
+            if d >= span - 1.0e-6 {
+                // The whole travel is clear. (Returning a contact here made
+                // every fall and every jump end on its first frame.)
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Whether this tile's own WMO collision set is still folding: the world
+    /// query gate ([`Self::capsule_sweep_z`]'s `may_resolve` counterpart). The
+    /// reference loads a model's collision before the body can move into it;
+    /// ours is folded over several ticks, and until it lands a query under the
+    /// building answers with the terrain below it - a worse answer than none.
+    ///
+    /// The wait is bounded by [`WMO_GATE_MAX_S`]: a fold that never lands (a
+    /// leftover instance whose cells never stream) must not hold the body on
+    /// ground that looks empty forever. After the bound the already-folded
+    /// part answers; the worst case is a couple of frames on the terrain under
+    /// a building, which beats never walking again.
+    fn collision_folding_here(&mut self, dt: f32) -> bool {
+        let here = Self::tile_of(self.pos[0], self.pos[1]);
+        let folding = matches!(
+            self.tiles.get(&here),
+            Some(t) if t.wmo_inst < t.wmos.len()
+        );
+        if !folding {
+            self.wmo_gate_wait = 0.0;
+            self.wmo_gate_tile = here;
+            return false;
+        }
+        if self.wmo_gate_tile != here {
+            self.wmo_gate_tile = here;
+            self.wmo_gate_wait = 0.0;
+        }
+        self.wmo_gate_wait += dt;
+        self.wmo_gate_wait < WMO_GATE_MAX_S
+    }
+
+    /// One frame's horizontal travel through the collision set, the
+    /// reference's `move_and_slide` over the one-sided faces: sweep the whole
+    /// step, stop `skin / |n·dir|` short of the first face unless a foot cone
+    /// or a certified step-up clears it, project the rest along that face, and
+    /// repeat. No depenetration: a body already overlapping a face is stopped
+    /// at it and the travel slides, so one inside geometry walks out through
+    /// the faces wound away from it instead of being shoved sideways - the
+    /// old push-out teleported a body brushing a thin fence rail. Returns
+    /// whether the body moved.
+    fn horizontal_step_swept(&mut self, step: [f32; 2]) -> bool {
+        let start = [self.pos[0], self.pos[1]];
+        let mut rem = step;
+        for _ in 0..6 {
+            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
+            if len < 1.0e-6 {
+                break;
+            }
+            let (dirx, diry) = (rem[0] / len, rem[1] / len);
+            if let Some(c) = self.sweep_wall_contact(self.pos, dirx, diry, len) {
+                // avian's skin pull-back: stop short of the surface by
+                // `skin / |n·dir|`, so the next frame starts free of it.
+                let closing = -(c.n[0] * dirx + c.n[1] * diry);
+                let skin = if closing > 1.0e-4 {
+                    SKIN_WIDTH / closing
+                } else {
+                    0.0
+                };
+                let travel = (c.dist - skin).max(0.0);
+                let (nx, ny) = (self.pos[0] + dirx * travel, self.pos[1] + diry * travel);
+                // A certified step-up or a foot-cone ride clears the face when
+                // the landing reaches its top; otherwise the step stops there
+                // and the rest slides along it.
+                if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], c.top) {
+                    self.pos[0] = nx;
+                    self.pos[1] = ny;
+                    rem = [rem[0] - dirx * travel, rem[1] - diry * travel];
+                    continue;
+                }
+                self.pos[0] = nx;
+                self.pos[1] = ny;
+                let rest = [rem[0] - dirx * travel, rem[1] - diry * travel];
+                let into = rest[0] * c.n[0] + rest[1] * c.n[1];
+                if into >= 0.0 {
+                    break; // already separating: nothing left to slide
+                }
+                rem = [rest[0] - into * c.n[0], rest[1] - into * c.n[1]];
+                continue;
+            }
+            if self.floor_blocks(self.pos[0] + rem[0], self.pos[1] + rem[1], dirx, diry) {
+                break;
+            }
+            self.pos[0] += rem[0];
+            self.pos[1] += rem[1];
+            break;
+        }
+        self.pos[0] != start[0] || self.pos[1] != start[1]
+    }
+
+
     /// The one-destination point test the mover used before `bn.SweptMover`:
     /// the whole frame's step is tested only at its end, so a step longer than
     /// the capsule radius can land beyond a wall and be waved through. Kept
@@ -1939,58 +2701,6 @@ impl Player {
         self.pos[0] != start[0] || self.pos[1] != start[1]
     }
 
-    /// One frame's horizontal travel through the collision set: the step, less
-    /// what a wall the travel enters absorbs, with the remainder sliding along
-    /// the face (`slide_mover`'s behaviour). Returns whether the body moved.
-    /// The floor gate rides a step or certifies a step-up; a taller one is a
-    /// wall.
-    ///
-    /// The travel is swept in passes of at most half a capsule radius: a
-    /// destination more than a radius past the face could never be seen by the
-    /// point test at the end of a long frame (a streaming hitch hands the mover
-    /// a multi-yard step), so the body would cross the wall unseen. Halving the
-    /// radius keeps every pass inside the test's reach, which is the swept
-    /// cylinder the reference's mover uses. The loop is a little longer than
-    /// the three passes the old point test needed because a slid pass can meet
-    /// a second face at a corner.
-    fn horizontal_step_swept(&mut self, step: [f32; 2]) -> bool {
-        let start = [self.pos[0], self.pos[1]];
-        let mut rem = step;
-        for _ in 0..48 {
-            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
-            if len < 1.0e-6 {
-                break;
-            }
-            let (dirx, diry) = (rem[0] / len, rem[1] / len);
-            let sub = len.min(CAPSULE_RADIUS * 0.5);
-            let (nx, ny) = (self.pos[0] + dirx * sub, self.pos[1] + diry * sub);
-            if let Some((n, top)) = self.wall_normal(nx, ny, self.pos[2], dirx, diry) {
-                // A certified step-up or a foot-cone ride clears the face when
-                // the landing reaches its top; otherwise the step stops there
-                // and the rest slides along it.
-                if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], top) {
-                    self.pos[0] = nx;
-                    self.pos[1] = ny;
-                    rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
-                    continue;
-                }
-                let into = rem[0] * n[0] + rem[1] * n[1];
-                if into >= 0.0 {
-                    break;
-                }
-                rem = [rem[0] - into * n[0], rem[1] - into * n[1]];
-                continue;
-            }
-            if self.floor_blocks(nx, ny, dirx, diry) {
-                break;
-            }
-            self.pos[0] = nx;
-            self.pos[1] = ny;
-            rem = [rem[0] - dirx * sub, rem[1] - diry * sub];
-        }
-        self.pos[0] != start[0] || self.pos[1] != start[1]
-    }
-
     /// The framing pivot for this frame: the standing/swimming preset above
     /// the feet, run through the water corridor.
     fn camera_pivot(&self) -> [f32; 3] {
@@ -2018,31 +2728,52 @@ impl Player {
     /// arch stones) instead of stopping under it. The terrain buckets and the
     /// doodads' hulls are solid the same way, so the camera's ray sweeps one
     /// world, not just the building the player stands in.
-    fn boom_hit(&self, pivot: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
+    fn boom_hit(&self, from: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
         let end = [
-            pivot[0] + dir[0] * max,
-            pivot[1] + dir[1] * max,
-            pivot[2] + dir[2] * max,
+            from[0] + dir[0] * max,
+            from[1] + dir[1] * max,
+            from[2] + dir[2] * max,
         ];
         let mut best: Option<f32> = None;
         let mut scan = |tx: i32, ty: i32, tile: &TileCol| {
-            let (ax, ay) = TileCol::wmo_local(tx, ty, pivot[0], pivot[1]);
+            let (ax, ay) = TileCol::wmo_local(tx, ty, from[0], from[1]);
             let (bx, by) = TileCol::wmo_local(tx, ty, end[0], end[1]);
             for gy in (ay.min(by) - WMO_MARGIN)..=(ay.max(by) + WMO_MARGIN) {
                 for gx in (ax.min(bx) - WMO_MARGIN)..=(ax.max(bx) + WMO_MARGIN) {
                     if !(0..WMO_GRID).contains(&gx) || !(0..WMO_GRID).contains(&gy) {
                         continue;
                     }
-                    for t in &tile.wmo_cells[(gy * WMO_GRID + gx) as usize] {
-                        keep_nearest(&mut best, ray_tri(pivot, dir, t), max);
+                    let i = (gy * WMO_GRID + gx) as usize;
+                    for t in &tile.cam_cells[i] {
+                        keep_nearest(
+                            &mut best,
+                            sphere_hit(from, dir, t, CAM_PROBE_RADIUS, max),
+                            max,
+                        );
                     }
-                    for d in &tile.doodad_cells[(gy * WMO_GRID + gx) as usize] {
-                        keep_nearest(&mut best, ray_tri(pivot, dir, d), max);
+                    // The camera set folds after the floor set; until it latches,
+                    // the walking faces still stop the eye (a superset is safe,
+                    // an empty set would let the boom through the building).
+                    if !tile.cam_ready {
+                        for t in &tile.wmo_cells[i] {
+                            keep_nearest(
+                                &mut best,
+                                sphere_hit(from, dir, t, CAM_PROBE_RADIUS, max),
+                                max,
+                            );
+                        }
+                    }
+                    for d in &tile.doodad_cells[i] {
+                        keep_nearest(
+                            &mut best,
+                            sphere_hit(from, dir, d, CAM_PROBE_RADIUS, max),
+                            max,
+                        );
                     }
                 }
             }
         };
-        let k0 = Self::tile_of(pivot[0], pivot[1]);
+        let k0 = Self::tile_of(from[0], from[1]);
         let k1 = Self::tile_of(end[0], end[1]);
         match self.tiles.get(&k0) {
             Some(tile) => {
@@ -2063,8 +2794,8 @@ impl Player {
         // Terrain: the chunks the segment's XY span crosses, in whichever
         // tile owns them. A hillside stops the eye like a wall does.
         let (c0x, c0y) = world_to_chunk(
-            pivot[0].clamp(-17066.0, 17066.0),
-            pivot[1].clamp(-17066.0, 17066.0),
+            from[0].clamp(-17066.0, 17066.0),
+            from[1].clamp(-17066.0, 17066.0),
         );
         let (c1x, c1y) = world_to_chunk(
             end[0].clamp(-17066.0, 17066.0),
@@ -2078,27 +2809,56 @@ impl Player {
                 };
                 let b = ((cy % 16) * 16 + (cx % 16)) as usize;
                 for t in &tile.buckets[b] {
-                    keep_nearest(&mut best, ray_tri(pivot, dir, t), max);
+                    keep_nearest(
+                        &mut best,
+                        sphere_hit(from, dir, t, CAM_PROBE_RADIUS, max),
+                        max,
+                    );
                 }
             }
         }
         best
     }
 
-    /// The longest clear boom up to `max`: the first solid face along it, less
-    /// the probe's radius (`CAMERA_PROBE_RADIUS`), so the eye keeps clear of
-    /// the surface it stops at; floored at [`CAM_BOOM_MIN`] so the eye never
-    /// lands on the pivot exactly.
-    fn solid_boom(&self, pivot: [f32; 3], fwd: [f32; 3], max: f32) -> f32 {
-        if max <= 0.0 {
-            return 0.0;
+    /// The camera arm as benilla lays it out: from the capsule's top hemisphere
+    /// centre (`benilla-app`'s `head`) to the seat behind the pivot. The eye is
+    /// `head + boom * frac`, so a fully pulled-in arm sits on the head, never on
+    /// the pivot.
+    fn camera_boom(&self) -> ([f32; 3], [f32; 3], f32) {
+        let pivot = self.camera_pivot();
+        let fwd = self.camera_fwd();
+        let head = [
+            self.pos[0],
+            self.pos[1],
+            self.pos[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS,
+        ];
+        let seat = [
+            pivot[0] - fwd[0] * self.cam_distance,
+            pivot[1] - fwd[1] * self.cam_distance,
+            pivot[2] - fwd[2] * self.cam_distance,
+        ];
+        let boom = [seat[0] - head[0], seat[1] - head[1], seat[2] - head[2]];
+        (head, seat, (boom[0] * boom[0] + boom[1] * boom[1] + boom[2] * boom[2]).sqrt())
+    }
+
+    /// `benilla-world`'s `cast_camera`: the solid sphere sweep, then the
+    /// waterline ray, whichever is nearer. The waterline has no radius in the
+    /// reference, so the eye parks exactly on the surface.
+    fn camera_hit(&self, from: [f32; 3], boom: [f32; 3], len: f32) -> Option<f32> {
+        if len <= 0.0 {
+            return Some(0.0);
         }
-        let dir = [-fwd[0], -fwd[1], -fwd[2]];
-        let floor = CAM_BOOM_MIN.min(max);
-        match self.boom_hit(pivot, dir, max) {
-            Some(t) => (t - CAM_PROBE_RADIUS).max(floor),
-            None => max,
+        let dir = [boom[0] / len, boom[1] / len, boom[2] / len];
+        let mut best = self.boom_hit(from, dir, len);
+        if let Some(s) = self.surface {
+            if from[2] > s {
+                let end_z = from[2] + boom[2];
+                if end_z < s {
+                    keep_nearest(&mut best, Some((from[2] - s) / (from[2] - end_z) * len), len);
+                }
+            }
         }
+        best
     }
 
     /// The lowest upward-facing WMO surface over (x, y) between `floor` and
@@ -2178,7 +2938,7 @@ impl Player {
         self.attack_left = (self.attack_left - dt).max(0.0);
         let step_d = 8.33 * dt;
         self.cam_distance += (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
-        self.cam_live = self.cam_distance;
+        self.cam_live = self.camera_boom().2;
     }
 
     /// Read the server's combat, cast and death state for our own guid, and
@@ -2465,13 +3225,27 @@ impl Player {
             }
         }
 
+        // The world query gate, `benilla-app/src/player/edge.rs`'s
+        // `may_resolve`: the reference grows a swept box over the step, gathers
+        // the world inside it, and resolves nothing when the query cannot be
+        // answered (a chunk that is not resident). The body keeps its pose, its
+        // speed and its fall clock; the next frame asks again. Our collision
+        // set is folded asynchronously (the reference's WMO set is complete
+        // before the body can move into it), so the same gate has to cover the
+        // tile's own fold: until the room's floor is in, a query under the
+        // building answers with the terrain below it, which is a worse answer
+        // than none. This replaces the old `stale`/`hang` freezes, which only
+        // reacted after a hole had already been found and never held the
+        // horizontal step.
+        let gated = self.collision_folding_here(dt);
+
         // Horizontal step with the client's wall response: a face the travel
         // enters stops the step and the rest slides along it (`0x632700`'s
         // one-sided trace + avian's move-and-slide). The old direction-blind
         // test held a body walking along a kerb, whose bevel is inside the
         // capsule's radius from either side.
         let step = [self.vel[0] * dt, self.vel[1] * dt];
-        if (step[0] != 0.0 || step[1] != 0.0) && !self.horizontal_step(step) {
+        if !gated && (step[0] != 0.0 || step[1] != 0.0) && !self.horizontal_step(step) {
             self.vel[0] = 0.0;
             self.vel[1] = 0.0;
         }
@@ -2485,11 +3259,17 @@ impl Player {
             let mut z = self.pos[2] + self.vel[2] * dt;
             if let Some(s) = surface {
                 let rest = s - enter;
-                // Read the bed from the feet's own ceiling, so a fast dive
-                // cannot carry the candidate under it and miss it.
+                // Read the bed from the surface's ceiling, not the feet's: a body
+                // the latch already put at `surface - 0.75·h` over a bed only a
+                // hand's width under the surface sits *below* that bed, and
+                // `feet + STEP_UP_HEIGHT` cannot see it, so it stayed sunk and
+                // kept swimming on dry land. The surface is always above the
+                // feet, so a fast dive cannot carry the candidate past the bed
+                // either. A bed above the surface is not under the water.
                 let bed = self
-                    .ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
-                    .map(|(b, _)| b);
+                    .ground(self.pos[0], self.pos[1], s + STEP_UP_HEIGHT)
+                    .map(|(b, _)| b)
+                    .filter(|b| *b <= s);
                 z = z.min(rest);
                 if let Some(b) = bed {
                     z = z.max(b);
@@ -2501,6 +3281,21 @@ impl Player {
             // Water ends the arc: the swim picks are their own clips and the
             // bracket clock (`tick_arc`) does not run here.
             self.airborne = false;
+        } else if gated || self.snap_pending {
+            // The query is owed (the gate above) - or the spawn snap is still
+            // waiting for the tile's floor set (`snap_pending` is cleared only
+            // once `floors_folding` is false). `gated` is bounded by
+            // `WMO_GATE_MAX_S` so an unlanded fold cannot freeze the mover; the
+            // spawn hold must outlive that bound, or the body falls through a
+            // floor that is not in the set yet (2026-11-09: login at 63.82 fell
+            // into the under-storey crawlspace while `built=0`, then every
+            // heading but one was walled). Horizontal travel still follows
+            // `gated` above, so R6 (walking after the bound) is untouched.
+            // The pose, the speed and the fall clock are kept, so a body caught
+            // mid-air resumes its arc from where it hung once the tile's set
+            // lands, and a standing body keeps its seat.
+            self.void_time = 0.0;
+            self.tick_arc(dt, jump, self.pos[2]);
         } else if self.standing_still(jump) {
             // A body on its feet and committed to no motion keeps its seat:
             // the reference integrates gravity only for a moving or airborne
@@ -2513,145 +3308,153 @@ impl Player {
             self.void_time = 0.0;
             self.tick_arc(dt, jump, self.pos[2]);
         } else {
-            // Vertical: gravity then the floor probe (benilla's order).
-            // The probe's ceiling has to cover the whole step, not just the
-            // new feet: at terminal velocity a hitched 0.1s frame drops 6 yd,
-            // so probing from `pos.z + STEP_UP_HEIGHT` lets the feet pass a
-            // floor by more than 1 yd in one tick - the floor is then above
-            // the ceiling, `ground` misses it and the body leaves the world.
-            // Probing from the pre-gravity feet finds every surface crossed
-            // this frame, and the `pos.z <= z` test below snaps onto it.
+            // Vertical: gravity, then a capsule sweep of the whole travel.
+            // The sweep is the reference's shape cast (`0x632700`); the old code
+            // sampled the height under one point, which misses a floor only the
+            // capsule's rim overhangs and, on a hitched frame, a floor the feet
+            // cross between two ticks - the "jumped the fence and dropped
+            // through the room" report.
             let prev_z = self.pos[2];
+            let was_grounded = self.grounded;
             self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
-            self.pos[2] += self.vel[2] * dt;
-            // The head is solid too: a rise stops where the capsule's top meets
-            // a downward-facing face (`0x632700`'s upward probe), and the arc
-            // falls back from there. A jump under a beam used to leave the
-            // body standing on the beam's underside, wedged in the wall.
-            if self.vel[2] > 0.0 {
-                if let Some(c) = self.ceiling(self.pos[0], self.pos[1], prev_z + 0.01) {
-                    if self.pos[2] + CAPSULE_HEIGHT > c {
-                        self.pos[2] = (c - CAPSULE_HEIGHT).max(prev_z);
-                        self.vel[2] = 0.0;
-                    }
-                }
-            }
-            // A step-down follows the surface only as far as the foot cone
-            // reaches this frame (`0x6367b0`: `travel · STEP_SLOPE_RATIO +
-            // 1/36`); a floor deeper than a step is a drop, and the body falls
-            // onto it. The one-frame snap buried the capsule in the face and
-            // the wall test then held it there.
+            let dz = self.vel[2] * dt;
+            // A grounded body also looks `travel · slope + slack` down, the
+            // reference's step-vs-fall election (`0x6367b0`); an airborne one
+            // only as far as it falls, so the arc ends where the slide meets
+            // the floor.
             let travel = ((self.pos[0] - feet[0]).powi(2) + (self.pos[1] - feet[1]).powi(2)).sqrt();
             let cone = travel * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
-            let ceil = self.pos[2].max(prev_z) + STEP_UP_HEIGHT;
-            let found = self.ground(self.pos[0], self.pos[1], ceil);
-            // A tile's WMO floor set folds over many ticks and the terrain under
-            // an interior is holed, so a body that walks into a room during the
-            // fold finds no floor (or only the ground far below it) and drops
-            // through a hole the data does not have. While the set is still
-            // owed, a standing body holds its seat - the rule `bn_ground_clamp_z`
-            // gives units - and `snap_pending` settles it on the baked floor.
-            // A body the server just placed holds its seat for the whole fold:
-            // under a city street the ADT lies more than a step below the
-            // pavement, so one terrain-only tick buries the feet for good.
-            let stale = self.floors_folding(self.pos[0], self.pos[1])
-                && (self.hold_pose
-                    || (self.grounded && found.map_or(true, |(z, _)| prev_z - z > STEP_UP_HEIGHT)));
-            if stale {
-                self.pos[2] = prev_z;
+            let reach = if self.grounded { (-dz).max(cone) } else { -dz };
+            let mut floor_z: Option<f32> = None;
+            if dz > 0.0 {
+                // Rising: the head is solid too. The up-sweep stops where the
+                // capsule's top meets a downward-facing face, and the arc falls
+                // back from there.
+                if let Some(hit) = self.capsule_sweep_z(self.pos, dz) {
+                    self.pos[2] += hit.dist;
+                    if hit.dist <= dz {
+                        self.vel[2] = 0.0;
+                    }
+                } else {
+                    self.pos[2] += dz;
+                }
+                self.grounded = false;
+            } else if let Some(hit) = self.capsule_sweep_z(self.pos, -reach) {
+
+
+
+
+                let contact = self.pos[2] - hit.dist;
+                // The sweep already keeps only faces with a real up component,
+                // so whatever it meets is a surface to stand on. A sweep that
+                // starts already overlapping (`dist` 0) means the body is
+                // inside the face: push it out onto the surface it crosses
+                // instead of leaving it buried, the walk-out the reference's
+                // one-sided law gives.
+                floor_z = Some(if hit.dist <= 1.0e-4 && hit.nz >= GROUND_COS {
+                    self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                        .filter(|(z, nz)| *nz >= GROUND_COS && *z > contact)
+                        .map_or(contact, |(z, _)| z)
+                } else {
+                    contact
+                });
+            } else {
+                // The cast can crawl to a stop on a face the capsule only
+                // grazes at the rim (a kerb beside the feet), running out of
+                // its passes before the floor the body is standing on. That is
+                // the reference's step-vs-fall election, not a fall: while the
+                // body was already seated, re-seat it on the height under it
+                // when that is inside the same step cone. A real ledge is
+                // deeper than the cone and still falls.
+                let reseat = if was_grounded {
+                    self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                        .filter(|(z, nz)| *nz >= GROUND_COS && *z <= prev_z && prev_z - *z <= cone)
+                        .map(|(z, _)| z)
+                } else {
+                    None
+                };
+                if let Some(z) = reseat {
+                    floor_z = Some(z);
+                } else {
+                    self.pos[2] += dz;
+                    self.grounded = false;
+                }
+            }
+            if let Some(z) = floor_z {
+                self.pos[2] = z;
                 self.vel[2] = 0.0;
                 self.grounded = true;
                 self.last_ground = self.pos;
                 self.void_time = 0.0;
-            } else {
-                self.hold_pose = false;
-                match found {
-                    Some((z, _)) => {
-                        self.void_time = 0.0;
-                        let step_down =
-                            self.grounded && z <= prev_z && prev_z - z <= STEP_UP_HEIGHT;
-                        if self.pos[2] <= z || step_down {
-                            // A step-down follows the surface at the cone's slope,
-                            // one frame at a time, and only settles onto it once the
-                            // feet are close; a whole ledge at once buried the
-                            // capsule in the face.
-                            self.pos[2] = if self.pos[2] <= z {
-                                z
-                            } else {
-                                z.max(prev_z - cone)
-                            };
-                            self.vel[2] = 0.0;
-                            self.grounded = true;
-                            self.last_ground = self.pos;
-                        } else {
-                            self.grounded = false;
-                        }
-                    }
-                    None => {
-                        // No floor under the feet at all: a hole in the terrain
-                        // (a tunnel mouth), a tile that has not streamed in yet, or
-                        // a body that is already below the world. Never keep
-                        // falling forever - report the spot once and restore the
-                        // last floor when the fall is clearly out of the map.
-                        self.grounded = false;
-                        self.void_time += dt;
-                        if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
-                            let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
-                            let state = match self.tiles.get(&(tx, ty)) {
-                                None => "missing",
-                                Some(t) if t.wmo_ready => "ready",
-                                Some(_) => "loading",
-                            };
-                            eprintln!(
-                                "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
-                             {state} resident={}",
-                                self.pos[0],
-                                self.pos[1],
-                                self.pos[2],
-                                self.tiles.len()
-                            );
-                        }
-                        if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH
-                            // A tile whose floor set is complete (or will never
-                            // arrive) holds every surface it will ever have: a
-                            // body with nothing under it there is out of the
-                            // world, and the 100-yd plunge only makes the exit
-                            // longer.
-                            || (self.void_time > 0.5
-                                && !self.floors_folding(self.pos[0], self.pos[1]))
-                        {
-                            // The last seat may itself be in the void - a login
-                            // pose saved under the terrain by a client that had
-                            // already left the map - so restore onto a floor
-                            // that is still real there, not blindly there.
-                            let seat = self
-                                .ground(
-                                    self.last_ground[0],
-                                    self.last_ground[1],
-                                    self.last_ground[2] + STEP_UP_HEIGHT,
-                                )
-                                .or_else(|| {
-                                    self.ground(self.last_ground[0], self.last_ground[1], f32::MAX)
-                                })
-                                .map_or(self.last_ground, |(z, _)| {
-                                    [self.last_ground[0], self.last_ground[1], z]
-                                });
-                            eprintln!(
-                            "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
-                            self.pos[0], self.pos[1], self.pos[2],
-                            seat[0], seat[1], seat[2]
-                        );
-                            self.pos = seat;
-                            self.last_ground = seat;
-                            self.vel = [0.0; 3];
-                            self.grounded = true;
-                            self.void_time = 0.0;
-                        }
-                    }
-                }
             }
-            if self.grounded {
-                self.pos[2] = self.pos[2].max(feet[2] - STEP_UP_HEIGHT);
+            if !self.grounded {
+                // No floor this frame: a hole in the terrain (a tunnel mouth),
+                // a tile that has not streamed in yet, or a body that is
+                // already below the world. Never keep falling forever - report
+                // the spot once and restore the last floor when the fall is
+                // clearly out of the map.
+                self.void_time += dt;
+                if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
+                    let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                    let state = match self.tiles.get(&(tx, ty)) {
+                        None => "missing",
+                        Some(t) if t.wmo_ready => "ready",
+                        Some(_) => "loading",
+                    };
+                    eprintln!(
+                        "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
+                     {state} resident={} reach={reach:.2}",
+                        self.pos[0],
+                        self.pos[1],
+                        self.pos[2],
+                        self.tiles.len()
+                    );
+                }
+                // A body with the terrain standing over its head and no floor
+                // under its feet is buried, not falling: a login pose saved
+                // inside a hill, or a hole in the data. Lift it onto the
+                // surface above it. Only a surface *above* the feet qualifies,
+                // so an ordinary fall off a cliff is never touched.
+                let buried = self.void_time > 0.5
+                    && !self.floors_folding(self.pos[0], self.pos[1])
+                    && self.ground(self.pos[0], self.pos[1], self.pos[2]).is_none()
+                    && self
+                        .terrain_z(self.pos[0], self.pos[1])
+                        .is_some_and(|t| t > self.pos[2] + 1.0e-3);
+                if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH || buried {
+                    let seat = if buried {
+                        let z = self
+                            .terrain_z(self.pos[0], self.pos[1])
+                            .unwrap_or(self.pos[2]);
+                        [self.pos[0], self.pos[1], z]
+                    } else {
+                        // The last seat may itself be in the void - a login
+                        // pose saved under the terrain by a client that had
+                        // already left the map - so restore onto a floor
+                        // that is still real there, not blindly there.
+                        self.ground(
+                            self.last_ground[0],
+                            self.last_ground[1],
+                            self.last_ground[2] + STEP_UP_HEIGHT,
+                        )
+                        .or_else(|| {
+                            self.ground(self.last_ground[0], self.last_ground[1], f32::MAX)
+                        })
+                        .map_or(self.last_ground, |(z, _)| {
+                            [self.last_ground[0], self.last_ground[1], z]
+                        })
+                    };
+                    eprintln!(
+                        "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
+                        self.pos[0], self.pos[1], self.pos[2],
+                        seat[0], seat[1], seat[2]
+                    );
+                    self.pos = seat;
+                    self.last_ground = seat;
+                    self.vel = [0.0; 3];
+                    self.grounded = true;
+                    self.void_time = 0.0;
+                }
             }
             self.tick_arc(dt, jump, prev_z);
             // Falling-trace: a body that drops through a city floor lands on the
@@ -2682,7 +3485,7 @@ impl Player {
                     self.pos[0],
                     self.pos[1],
                     self.pos[2],
-                    found.map(|(z, _)| z)
+                    floor_z
                 );
             }
         }
@@ -2725,8 +3528,12 @@ impl Player {
         self.cam_distance += (self.cam_target_distance - self.cam_distance).clamp(-step_d, step_d);
 
         // Boom collision: snap in at once when geometry intrudes (a wall the
-        // player turns into), ease back out at the zoom glide's 8.33 yd/s.
-        let want = self.solid_boom(self.camera_pivot(), self.camera_fwd(), self.cam_distance);
+        // player turns into), ease back out at the zoom glide's 8.33 yd/s. The
+        // cast is `benilla-world`'s `cast_camera`: a sphere sweep from the head
+        // against the camera set, so a wall the boom only grazes still stops it.
+        let (head, seat, len) = self.camera_boom();
+        let boom = [seat[0] - head[0], seat[1] - head[1], seat[2] - head[2]];
+        let want = self.camera_hit(head, boom, len).unwrap_or(len);
         self.cam_live = if want <= self.cam_live {
             want
         } else {
@@ -2735,31 +3542,23 @@ impl Player {
     }
 
     /// The camera eye/target for this frame: the framing pivot at the model
-    /// preset above the feet (clamped by the water corridor), the eye on the
-    /// orbit at the current pitch/yaw, at the boom length the collision probe
-    /// settled on, clipped by the waterline.
+    /// preset above the feet (clamped by the water corridor), and the eye on the
+    /// arm from the capsule's head to the seat behind it, at the fraction the
+    /// collision sweep settled on - `head + boom * frac`, exactly as
+    /// `benilla-app` seats it. The waterline is part of the sweep, not a clip.
     pub(crate) fn camera(&self) -> ([f32; 3], [f32; 3]) {
         let pivot = self.camera_pivot();
-        let fwd = self.camera_fwd();
-        let mut dist = self.cam_live.min(self.cam_distance);
-        let mut eye = [
-            pivot[0] - fwd[0] * dist,
-            pivot[1] - fwd[1] * dist,
-            pivot[2] - fwd[2] * dist,
+        let (head, seat, len) = self.camera_boom();
+        let frac = if len > 0.0 {
+            (self.cam_live / len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let eye = [
+            head[0] + (seat[0] - head[0]) * frac,
+            head[1] + (seat[1] - head[1]) * frac,
+            head[2] + (seat[2] - head[2]) * frac,
         ];
-        // `cameraWaterCollision`'s ray: the waterline is solid, so a boom that
-        // would put the eye under the surface stops at it instead.
-        if let Some(s) = self.surface {
-            if eye[2] < s && pivot[2] > s {
-                let t = (pivot[2] - s) / (pivot[2] - eye[2]);
-                dist *= t.max(0.0);
-                eye = [
-                    pivot[0] - fwd[0] * dist,
-                    pivot[1] - fwd[1] * dist,
-                    pivot[2] - fwd[2] * dist,
-                ];
-            }
-        }
         (eye, pivot)
     }
 
@@ -2932,6 +3731,11 @@ impl Player {
             self.land_id = 0;
             self.land_left_s = 0.0;
         } else if !airborne && self.airborne {
+            // How long the body was actually off the ground. On sloping ADT
+            // ground the capsule sweep misses the floor for a frame here and
+            // there, and a takeoff/landing pair per blip restarted the run clip
+            // about twenty times a second (`BnCharacter: anim 5 -> 187 -> 5`).
+            let arc_s = self.airborne_s;
             self.airborne = false;
             self.jump_zspeed = 0.0;
             self.fall_far = false;
@@ -2939,7 +3743,7 @@ impl Player {
             // Touchdown from a bracketed arc takes `jump_land_pick`'s one-shot
             // (`0x602c60`): JumpEnd 39 stopped, JumpLandRun 187 running forward,
             // nothing backpedaling or walking; an arc that kept its gait lands in it.
-            self.land_id = if jumped {
+            self.land_id = if jumped || arc_s < LAND_MIN_AIR_S {
                 0
             } else {
                 let hs = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
@@ -3572,7 +4376,12 @@ pub(crate) fn ui_turn_held(on: bool) {
 /// the channel's state handed to `IsMouselooking` for it to read.
 pub(crate) fn drive_mouselook(script: &mut benilla_ui::script::UiScript) {
     for on in script.take_mouselook_calls() {
-        BN_LOOK.with(|l| l.borrow_mut().set_channel(on, true));
+        // Only `MouselookStop` drops the undecided press (`0x514810(0)` stores
+        // mode 0). `MouselookStart` runs from the right button's own
+        // `TurnOrActionStart` on the press frame; arming the disarm there wiped
+        // the click the release was about to settle, so every right click came
+        // out as `BnClick: up ... pair=0 fired=0`.
+        BN_LOOK.with(|l| l.borrow_mut().set_channel(on, !on));
     }
     script.set_turn_or_action_held(look_turn());
 }
@@ -3780,6 +4589,13 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
     // Split borrows: the tile load reads the archives, the WMO build the chain
     // and its shared model cache.
     let Some(p) = w.player.as_mut() else { return 0 };
+    // Our own same-map teleport (`MSG_MOVE_TELEPORT_ACK`): benilla-app's
+    // `SessionEvent::Teleport` branch, landed here. `set_server_pose` drops the
+    // predictor's velocity and adopts the server's feet; the tick's spawn hold
+    // keeps that Z until the tile's floor set is whole.
+    if let Some((pos, yaw)) = crate::net::take_self_teleport() {
+        p.set_server_pose(pos, yaw);
+    }
     let t0 = std::time::Instant::now();
     p.ensure_tiles(&w.archives);
     let t1 = std::time::Instant::now();
@@ -4406,7 +5222,9 @@ mod tests {
             name_set: 0,
         });
         p.tiles.insert((tx, ty), col);
-        for _ in 0..50 {
+        // The gate is bounded (`WMO_GATE_MAX_S`): an unbounded one froze the
+        // mover forever on a tile whose fold never finished. Stay inside it.
+        for _ in 0..18 {
             p.tick(0.1);
             assert!(
                 (p.pos[2] - 63.8).abs() < 1.0e-3,
@@ -4480,11 +5298,11 @@ mod tests {
         p.pos = [-8797.0, -800.0, 0.0];
         p.tick(0.1);
         assert!(
-            (p.cam_live - 2.6).abs() < 0.5,
-            "the boom stops at the wall: {}",
+            (p.cam_live - 2.7).abs() < 0.2,
+            "the boom stops one probe radius short of the wall: {}",
             p.cam_live
         );
-        assert!(p.cam_live >= CAM_BOOM_MIN, "never past the floor");
+        assert!(p.cam_live > 0.0, "never past the wall");
         // Turn the orbit away from the wall: the boom eases out at 8.33 yd/s,
         // not in one frame.
         p.cam_yaw = std::f32::consts::FRAC_PI_2;
@@ -4506,8 +5324,8 @@ mod tests {
         p.pos = [-8799.7, -800.0, 0.0];
         p.tick(0.1);
         assert!(
-            (p.cam_live - CAM_BOOM_MIN).abs() < 1.0e-6,
-            "the boom falls to the floor at the wall: {}",
+            p.cam_live.abs() < 1.0e-6,
+            "a probe already on the wall parks the eye on the head: {}",
             p.cam_live
         );
         let (eye, _) = p.camera();
@@ -4516,6 +5334,62 @@ mod tests {
             "the eye stays on the player's side of the wall: {}",
             eye[0]
         );
+    }
+
+    /// A head already inside a camera-set face (a WMO `DETAIL` panel the walk
+    /// capsule skips) used to be a hit at `0` from `sphere_hit`, so `want` was
+    /// 0 every frame, `cam_live` snapped to 0 and the eye parked on the head -
+    /// inside the model's head - for as long as the player stood there. The
+    /// reference's cast ignores origin penetration while the motion frees the
+    /// ball (`avian3d` `move_and_slide.rs:798-800`), so the arm must keep going.
+    #[test]
+    fn a_head_inside_a_camera_face_still_casts_the_boom_out() {
+        let head = [0.0f32, 0.0, CAPSULE_HEIGHT - CAPSULE_RADIUS];
+        let len = CAM_DIST_DEFAULT + 10.0;
+        // A thin DETAIL panel 0.1 yd *behind* the head, tall enough that the
+        // 0.3-yd probe overlaps it at the origin; the boom runs away from it,
+        // which is the frame that used to stay pinned to the head.
+        let panel = Tri::new([-0.1, -2.0, 0.0], [-0.1, 2.0, 0.0], [-0.1, -2.0, 4.0]);
+        let dir = [1.0, 0.0, 0.0];
+        let before = 0.0f32; // the old `f(0) <= 0 { Some(0.0) }` branch
+        let after = sphere_hit(head, dir, &panel, CAM_PROBE_RADIUS, len).unwrap_or(len);
+        println!(
+            "camera self-lock: boom={len:.3} want_before={before:.3} frac_before={:.3} \
+             want_after={after:.3} frac_after={:.3}",
+            before / len,
+            after / len
+        );
+        assert!(
+            (after - len).abs() < 1.0e-3,
+            "the cast leaves the face and reaches the seat: {after}"
+        );
+    }
+
+    /// The same origin overlap with the whole arm staying inside the
+    /// penetration is a real `open = 0` (the reference stops immediately when
+    /// the sweep never frees the shape), so the fix must not push the eye
+    /// through geometry.
+    #[test]
+    fn an_arm_that_never_leaves_the_penetration_still_stops_on_the_head() {
+        let head = [0.0f32, 0.0, CAPSULE_HEIGHT - CAPSULE_RADIUS];
+        let len = CAM_DIST_DEFAULT + 10.0;
+        let z = head[2] - 0.1;
+        let slab = [
+            Tri::new([-100.0, -100.0, z], [100.0, -100.0, z], [100.0, 100.0, z]),
+            Tri::new([-100.0, -100.0, z], [100.0, 100.0, z], [-100.0, 100.0, z]),
+        ];
+        let dir = [1.0, 0.0, 0.0];
+        let mut want = len;
+        for t in &slab {
+            if let Some(s) = sphere_hit(head, dir, t, CAM_PROBE_RADIUS, len) {
+                want = want.min(s);
+            }
+        }
+        println!(
+            "camera head-on: boom={len:.3} want={want:.3} frac={:.3}",
+            want / len
+        );
+        assert_eq!(want, 0.0, "the arm never leaves the slab, eye stays on the head");
     }
 
     /// World x of the profiles' own x = 0; every profile is authored around it.
@@ -6370,8 +7244,8 @@ mod tests {
         assert!(p.wall_normal(PROFILE_X0, -800.0, 0.0, 0.0, 1.0).is_none());
         assert!(p.wall_normal(PROFILE_X0, -800.0, 0.0, -1.0, 0.0).is_some());
 
-        let walk = |p: &mut Player, yaw: f32, frames: usize| {
-            p.pos = [PROFILE_X0, -800.0, 0.0];
+        let walk = |p: &mut Player, yaw: f32, frames: usize, from_x: f32| {
+            p.pos = [from_x, -800.0, 0.0];
             p.vel = [0.0; 3];
             p.grounded = true;
             p.last_ground = p.pos;
@@ -6386,17 +7260,20 @@ mod tests {
             p.input.forward = 0.0;
             (p.pos[0] - start[0], p.pos[1] - start[1])
         };
-        let (dx, dy) = walk(&mut p, PI, 30);
+        // A body already overlapping a face is the graze the reference drops
+        // (`one_sided::behind_the_band`), so the into-the-wall walk starts
+        // clear of the capsule and proves the stop on the way in.
+        let (dx, dy) = walk(&mut p, PI, 30, PROFILE_X0 + 0.2);
         assert!(
-            dx.abs() < 1.0e-3 && dy.abs() < 1.0e-3,
-            "walking into the wall still stops: ({dx:.3}, {dy:.3})"
+            dx > -0.2 && dx < -0.1 && dy.abs() < 1.0e-3,
+            "walking into the wall stops short: ({dx:.3}, {dy:.3})"
         );
-        let (dx, dy) = walk(&mut p, FRAC_PI_2, 30);
+        let (dx, dy) = walk(&mut p, FRAC_PI_2, 30, PROFILE_X0);
         assert!(
             dy > 3.0 && dx.abs() < 0.02,
             "along the wall the walk moves: ({dx:.3}, {dy:.3})"
         );
-        let (dx, dy) = walk(&mut p, 0.0, 30);
+        let (dx, dy) = walk(&mut p, 0.0, 30, PROFILE_X0);
         assert!(
             dx > 3.0 && dy.abs() < 0.02,
             "away from it too: ({dx:.3}, {dy:.3})"
@@ -6584,4 +7461,387 @@ mod tests {
         assert_eq!(p.mount_anim(), 4, "a moving turn keeps the gait");
     }
 
+    /// The reported Goldshire doorway: the body climbs the wooden steps and
+    /// must walk through the stone opening into the room. The wall face over
+    /// the opening (z 62.24..62.92, 3.9-4.6 yards above the feet) used to stop
+    /// it dead in the frame, because `sweep_wall_contact` measured the capsule
+    /// gap horizontally only and a face directly overhead read as a wall at
+    /// dist 0.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn goldshire_doorway_block() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+
+        // The bottom of the wooden steps; walk up them and into the doorway.
+        let spawn = [-9459.65f32, 76.00f32, 56.95f32];
+        let mut p = Player::new("Azeroth", spawn[0], spawn[1]);
+        p.pos = spawn;
+        p.grounded = true;
+        p.last_ground = spawn;
+        p.ensure_tiles(&w.archives);
+        let key = Player::tile_of(spawn[0], spawn[1]);
+        for _ in 0..6000 {
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            let done = p
+                .tiles
+                .get(&key)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len());
+            if done {
+                break;
+            }
+        }
+
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        p.input.forward = 1.0;
+        for _ in 0..180 {
+            p.ensure_tiles(&w.archives);
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            p.tick(1.0 / 60.0);
+        }
+        p.input.forward = 0.0;
+        let end = p.pos;
+        crate::bn_shutdown(w);
+        assert!(end[1] > 85.0, "still stuck at the doorway: {end:?}");
+    }
+
+    /// The reported "dragging leg, Space does nothing": running the Goldshire
+    /// road, the capsule cast crawled to a stop on a face it only grazed at the
+    /// rim and returned no floor for 1-6 frames on end, ten times a second. The
+    /// body then played the fall/landing bracket (the limp) and refused a jump
+    /// because it was airborne. Measured on this spot: 93 airborne frames and
+    /// 58 grounded transitions in 20 s before, 0 and 0 after.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn the_goldshire_road_never_blips_the_body_airborne() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+
+        let spawn = [-9360.0f32, 0.0f32, 63.51f32];
+        let mut p = Player::new("Azeroth", spawn[0], spawn[1]);
+        p.pos = spawn;
+        p.grounded = true;
+        p.last_ground = spawn;
+        p.ensure_tiles(&w.archives);
+        let key = Player::tile_of(spawn[0], spawn[1]);
+        for _ in 0..6000 {
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            let done = p
+                .tiles
+                .get(&key)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len());
+            if done {
+                break;
+            }
+        }
+
+        p.yaw = 0.0;
+        p.model_yaw = 0.0;
+        p.input.forward = 1.0;
+        let mut air = 0u32;
+        let mut landings = 0u32;
+        let mut was = p.grounded;
+        for i in 0..1200 {
+            p.ensure_tiles(&w.archives);
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            p.tick(1.0 / 60.0);
+            if i > 60 && !p.grounded {
+                air += 1;
+            }
+            if p.grounded != was {
+                landings += 1;
+                was = p.grounded;
+            }
+        }
+        p.input.forward = 0.0;
+        let end = p.pos;
+        crate::bn_shutdown(w);
+        assert_eq!(
+            air, 0,
+            "the body left the ground {air} frames and landed {landings} times on the road: {end:?}"
+        );
+    }
+
+    /// A wall that ends: the boom runs past its edge 0.2 yd clear, so the ray
+    /// never crosses a face while the 0.3-yd probe sphere grazes the edge.
+    /// With a ray probe the eye ran the whole 15 yd through the gap and the
+    /// near plane cut the wall; `cast_camera` is a sphere sweep, so it stops.
+    #[test]
+    fn a_wall_the_ray_misses_still_stops_the_boom() {
+        let mut p = Player::new("Azeroth", -8797.0, -799.8);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let mut col = TileCol::new();
+        // A wall panel that ends at y = -800 (the boom runs at -799.8).
+        let quads = [
+            Tri::new(
+                [-8800.0, -806.0, 0.0],
+                [-8800.0, -800.0, 0.0],
+                [-8800.0, -800.0, 4.0],
+            ),
+            Tri::new(
+                [-8800.0, -806.0, 0.0],
+                [-8800.0, -800.0, 4.0],
+                [-8800.0, -806.0, 4.0],
+            ),
+        ];
+        for wall in &quads {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, wall);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(*wall);
+                }
+            }
+        }
+        p.tiles.insert((tx, ty), col);
+        p.pos = [-8797.0, -799.8, 0.0];
+        p.grounded = true;
+        p.cam_yaw = 0.0;
+        p.cam_pitch = 0.0;
+        p.tick(0.01);
+        assert!(
+            p.cam_live < 15.0,
+            "the probe grazed the wall end, the boom must stop: {}",
+            p.cam_live
+        );
+        let (eye, _) = p.camera();
+        assert!(
+            eye[0] > -8800.0,
+            "the eye stays on the player's side: {}",
+            eye[0]
+        );
+    }
+
+    /// The camera reads its own set (every face but `NOCAMCOLLIDE`, `DETAIL`
+    /// kept). With the walking set empty, a wall present only in `cam_cells`
+    /// must still cut the boom.
+    #[test]
+    fn the_camera_set_alone_stops_the_boom() {
+        let mut p = Player::new("Azeroth", -8797.0, -800.0);
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let mut col = TileCol::new();
+        col.cam_ready = true;
+        let wall = Tri::new(
+            [-8800.0, -810.0, 0.0],
+            [-8800.0, -790.0, 0.0],
+            [-8800.0, -810.0, 4.0],
+        );
+        let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, &wall);
+        for ly in y0..=y1 {
+            for lx in x0..=x1 {
+                col.cam_cells[(ly * WMO_GRID + lx) as usize].push(wall);
+            }
+        }
+        p.tiles.insert((tx, ty), col);
+        p.pos = [-8797.0, -800.0, 0.0];
+        p.grounded = true;
+        p.cam_yaw = 0.0;
+        p.cam_pitch = 0.0;
+        p.tick(0.01);
+        assert!(
+            (p.cam_live - 2.7).abs() < 0.2,
+            "the camera set's wall stops the boom: {}",
+            p.cam_live
+        );
+    }
+
+    /// Turning the camera through a full circle inside the reported Goldshire
+    /// room must never leave the eye inside a wall: the probe sphere keeps the
+    /// near plane at least its radius off the surface it stops on.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn camera_boom_does_not_enter_the_goldshire_wall() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+        let spawn = [-9459.0f32, 90.0f32, 58.30f32];
+        let mut p = Player::new("Azeroth", spawn[0], spawn[1]);
+        p.pos = spawn;
+        p.grounded = true;
+        p.last_ground = spawn;
+        p.ensure_tiles(&w.archives);
+        let key = Player::tile_of(spawn[0], spawn[1]);
+        for _ in 0..8000 {
+            p.ensure_tiles(&w.archives);
+            p.ensure_wmo(&mut w.chain, &mut cache);
+            let done = p
+                .tiles
+                .get(&key)
+                .is_some_and(|t| t.cam_ready && t.doodad_next >= t.doodads.len());
+            if done {
+                break;
+            }
+        }
+        let mut worst = f32::MAX;
+        let mut worst_yaw = 0.0f32;
+        for step in 0..24 {
+            p.cam_yaw = step as f32 * std::f32::consts::TAU / 24.0;
+            p.cam_pitch = 0.0;
+            for _ in 0..3 {
+                p.tick(1.0 / 60.0);
+            }
+            let (eye, _) = p.camera();
+            let Some(t) = p.tiles.get(&key) else { continue };
+            let mut near = f32::MAX;
+            for t2 in t.cam_cells.iter().flatten().chain(t.wmo_cells.iter().flatten()) {
+                let q = closest_on_tri(eye, t2);
+                let d = ((eye[0] - q[0]).powi(2) + (eye[1] - q[1]).powi(2) + (eye[2] - q[2]).powi(2))
+                    .sqrt();
+                near = near.min(d);
+            }
+            if near < worst {
+                worst = near;
+                worst_yaw = p.cam_yaw;
+            }
+        }
+        crate::bn_shutdown(w);
+        assert!(
+            worst > 0.25,
+            "the eye came {worst} yd from a face at yaw {worst_yaw}"
+        );
+    }
+
+    /// Offline replay of the 2026-11-09 stuck spot. `Saved/bnfall.log`
+    /// 54.518-101.190 s sits at feet (-9471.92, 24.93, 61.41) with
+    /// `blocked=1111`, `near=0.10..0.24`, nearest steep face
+    /// `n=(-0.99 0.13 -0.11) top=63.12` (and its mirror image). The tile is
+    /// loaded from the real data, the body is seated with `bn_player_reset`,
+    /// then every steep face the sweep can see is printed and the swept step is
+    /// replayed in eight headings.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stuck_pose_replay_20261109() {
+        use crate::bn_init;
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        let (sx, sy, server_z) = (-9471.92f32, 24.93f32, 61.41f32);
+        println!(
+            "geom radius={CAPSULE_RADIUS} height={CAPSULE_HEIGHT} step={STEP_UP_HEIGHT} \
+             facing_eps={FACE_FACING_EPS} band={BACKFACE_BAND}"
+        );
+        assert_eq!(bn_player_reset(w, map.as_ptr(), sx, sy), 1);
+        let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+        for _ in 0..180 {
+            bn_player_tick(w, 1.0 / 60.0, &mut st);
+        }
+        println!(
+            "reset seated at ({:.3} {:.3} {:.3}) grounded={}",
+            w.player.as_ref().unwrap().pos[0],
+            w.player.as_ref().unwrap().pos[1],
+            w.player.as_ref().unwrap().pos[2],
+            w.player.as_ref().unwrap().grounded
+        );
+        // The logged pose is under the roof `bn_player_reset` lands on, so put
+        // the body back at the feet z the live client had and let it settle.
+        bn_player_teleport(w, map.as_ptr(), sx, sy, server_z, 0.0);
+        for _ in 0..30 {
+            bn_player_tick(w, 1.0 / 60.0, &mut st);
+        }
+        let p = w.player.as_ref().unwrap();
+        println!(
+            "stuck pose=({:.3} {:.3} {:.3}) yaw={:.3} grounded={} (server z {server_z})",
+            p.pos[0], p.pos[1], p.pos[2], p.yaw, p.grounded
+        );
+        let feet = p.pos;
+        let mut near: Vec<(f32, Tri)> = Vec::new();
+        p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+            let q = closest_on_tri([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], t);
+            let d = ((q[0] - feet[0]).powi(2) + (q[1] - feet[1]).powi(2) + (q[2] - feet[2]).powi(2))
+                .sqrt();
+            if d < 3.0 {
+                near.push((d, *t));
+            }
+            false
+        });
+        near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        println!("near faces (d<3 yd from mid-capsule): {}", near.len());
+        for (d, t) in near.iter().take(40) {
+            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+            let dn = [feet[0] - t.v[0][0], feet[1] - t.v[0][1]];
+            println!(
+                "d={d:.3} n=({:.4} {:.4} {:.4}) top={:.3} v0=({:.3} {:.3} {:.3}) \
+                 v1=({:.3} {:.3} {:.3}) v2=({:.3} {:.3} {:.3}) dx={:.3} dy={:.3}",
+                t.n[0], t.n[1], t.n[2], top,
+                t.v[0][0], t.v[0][1], t.v[0][2],
+                t.v[1][0], t.v[1][1], t.v[1][2],
+                t.v[2][0], t.v[2][1], t.v[2][2],
+                dn[0], dn[1]
+            );
+        }
+        // ---- login-spawn probe: the saved server pose in `bnfall.log` ----
+        // t=0 DROP pos=(-9470.76 25.15 63.82) with wmos=9 built=0 ready=0; the
+        // body then fell to 61.52 while the fold was still running.
+        for (label, (px, py, pz)) in [
+            ("log t=0 spawn", (-9470.76f32, 25.15f32, 63.82f32)),
+            ("stuck feet", (sx, sy, server_z)),
+        ] {
+            let p = w.player.as_ref().unwrap();
+            let g_step = p.ground(px, py, pz + STEP_UP_HEIGHT);
+            let g_any = p.ground(px, py, f32::MAX);
+            let lift = p.lowest_floor_above(px, py, pz, 60.0);
+            let terr = p.terrain_z(px, py);
+            let seat = g_step.filter(|(z, _)| pz - z <= STEP_UP_HEIGHT);
+            println!(
+                "{label} ({px:.2} {py:.2} {pz:.2}) step-seat={seat:?} ground_any={g_any:?} \
+                 lift60={lift:?} terrain={terr:?} folding={}",
+                p.floors_folding(px, py)
+            );
+            // Replay login: teleport to the server pose on the folded set and
+            // let the mover run, printing every frame's z for the first second.
+            bn_player_teleport(w, map.as_ptr(), px, py, pz, 0.0);
+            for n in 0..60 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+                if n < 20 || n % 10 == 9 {
+                    println!(
+                        "  {label} f{n} z={:.3} grounded={} speed={:.2}",
+                        st.pos[2], st.grounded, st.speed
+                    );
+                }
+            }
+        }
+        for k in 0..8 {
+            let ang = k as f32 * std::f32::consts::FRAC_PI_4;
+            let (dx, dy) = (ang.cos(), ang.sin());
+            bn_player_teleport(w, map.as_ptr(), sx, sy, server_z, ang);
+            bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+            for _ in 0..30 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+            let p = w.player.as_ref().unwrap();
+            let fp = p.pos;
+            let c = p.sweep_wall_contact(fp, dx, dy, 1.0);
+            println!(
+                "dir {k} yaw={:.3} pos=({:.3} {:.3} {:.3}) grounded={} contact={:?}",
+                p.yaw, fp[0], fp[1], fp[2], p.grounded,
+                c.map(|c| (c.dist, c.n, c.top))
+            );
+            bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
+            for n in 0..120 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+                if n % 30 == 29 {
+                    println!(
+                        "dir {k} t={:.2}s pos=({:.3} {:.3} {:.3}) grounded={} speed={:.2}",
+                        (n + 1) as f32 / 60.0,
+                        st.pos[0], st.pos[1], st.pos[2], st.grounded, st.speed
+                    );
+                }
+            }
+        }
+        bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+        crate::bn_shutdown(w);
+    }
 }

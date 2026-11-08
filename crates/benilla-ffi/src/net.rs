@@ -1567,6 +1567,10 @@ struct Shared {
     /// echo it back to the server on every heartbeat. None before the host
     /// starts its tick, (pos, yaw) afterward.
     last_pose: Mutex<Option<([f32; 3], f32)>>,
+    /// A same-map teleport the server sent for our own guid (`MSG_MOVE_TELEPORT_ACK`),
+    /// waiting for the game thread's next `bn_player_tick` to snap the body. Taken
+    /// once; `None` on an ordinary frame.
+    self_teleport: Mutex<Option<([f32; 3], f32)>>,
     /// The server has told us where this session's character stands (its own
     /// create). Until then `last_pose` is the host's placeholder - after a
     /// character switch it still holds the previous body's feet - and must not
@@ -1723,6 +1727,7 @@ fn shared() -> &'static Shared {
         quest_finish_owed: AtomicBool::new(false),
         quest_close_on_cancel: AtomicU32::new(0),
         last_pose: Mutex::new(None),
+        self_teleport: Mutex::new(None),
         self_pose_from_server: AtomicBool::new(false),
         last_input: Mutex::new((0.0f32, 0.0f32, 0.0f32)),
     })
@@ -1797,6 +1802,72 @@ pub(crate) fn take_self_cast_release() -> Option<u32> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
+}
+
+/// The server's same-map teleport for our own body, taken once by the player
+/// tick: benilla-app's `SessionEvent::Teleport` snap in this middle layer.
+pub(crate) fn take_self_teleport() -> Option<([f32; 3], f32)> {
+    shared()
+        .self_teleport
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+#[cfg(test)]
+mod self_teleport_tests {
+    use super::*;
+    use benilla_protocol::wire::Vector3d;
+
+    /// Both tests mutate the process-wide `Shared`.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn own_teleport_is_queued_once() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sh = shared();
+        let old = sh.self_guid.swap(0x5E1F_0000_0000_0001, Ordering::SeqCst);
+        *sh.self_teleport.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        handle_packet(
+            &ServerPacket::Teleport {
+                guid: 0x5E1F_0000_0000_0001,
+                counter: 7,
+                position: Vector3d {
+                    x: 1.5,
+                    y: -2.25,
+                    z: 3.0,
+                },
+                orientation: 1.25,
+            },
+            sh,
+        );
+        assert_eq!(take_self_teleport(), Some(([1.5, -2.25, 3.0], 1.25)));
+        assert_eq!(take_self_teleport(), None);
+        sh.self_guid.store(old, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn other_guid_is_ignored() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sh = shared();
+        let old = sh.self_guid.swap(0x5E1F_0000_0000_0002, Ordering::SeqCst);
+        *sh.self_teleport.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        handle_packet(
+            &ServerPacket::Teleport {
+                guid: 9,
+                counter: 1,
+                position: Vector3d {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                orientation: 0.0,
+            },
+            sh,
+        );
+        assert_eq!(take_self_teleport(), None);
+        sh.self_guid.store(old, Ordering::SeqCst);
+    }
 }
 
 /// Queue one `|`-joined line for the host's net-event reader.
@@ -2639,6 +2710,8 @@ fn worker(
                 // overwrite this session's login pose before the host reads it
                 // (and the host places its pawn from that record).
                 *sh.last_pose.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                // A teleport left over from the previous body must not snap this one.
+                *sh.self_teleport.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *sh.last_input.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0, 0.0);
                 sh.self_pose_from_server.store(false, Ordering::SeqCst);
                 *sh.game_time.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -3626,6 +3699,18 @@ fn run_world(
                             sh.event("worldport_ack");
                         }
                     }
+                    // A same-map teleport must be acked at once or the server keeps
+                    // the old position and freezes our movement (`WorldSession::
+                    // teleport_ack`). Only our own guid; observers' moves arrive as
+                    // `PlayerMove`.
+                    ServerPacket::Teleport { guid, counter, .. }
+                        if *guid == sh.self_guid.load(Ordering::SeqCst) =>
+                    {
+                        match session.teleport_ack(*guid, *counter) {
+                            Ok(()) => sh.event(format!("teleport_ack|{guid}|{counter}")),
+                            Err(e) => sh.event(format!("error|teleport_ack|{e}")),
+                        }
+                    }
                     // The leaving answers: `ui_logout.rs`'s `LogoutState` decision table, in the
                     // same wire order. They are intercepted here rather than in `handle_packet`,
                     // which cannot hand a verdict back to the loop.
@@ -4294,6 +4379,39 @@ fn refresh_player(sh: &Shared) {
 
 fn handle_packet(packet: &ServerPacket, sh: &Shared) {
     match packet {
+        // Our own same-map teleport: the body is client-authoritative, so the
+        // server's pose must be adopted here or the local predictor overwrites it
+        // (`last_pose` below). `bn_player_tick` takes the pose once and calls
+        // `set_server_pose`; `last_pose` is written too so the next heartbeat
+        // cannot echo the old spot back.
+        ServerPacket::Teleport {
+            guid,
+            position,
+            orientation,
+            ..
+        } => {
+            if *guid == sh.self_guid.load(Ordering::SeqCst) {
+                let pos = [position.x, position.y, position.z];
+                *sh.self_teleport
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((pos, *orientation));
+                *sh.last_pose.lock().unwrap_or_else(|e| e.into_inner()) = Some((pos, *orientation));
+                if let Some(rec) = sh
+                    .units
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(guid)
+                {
+                    rec.pos = pos;
+                    rec.facing = *orientation;
+                    rec.spline = None;
+                }
+                sh.event(format!(
+                    "self_teleport|{:.2},{:.2},{:.2}|{:.2}",
+                    pos[0], pos[1], pos[2], orientation
+                ));
+            }
+        }
         // The unit frames' names: `CMSG_NAME_QUERY` is asked once per player guid
         // (queue_player_names); an empty name is the server's unknown answer.
         ServerPacket::NameQueryResponse { guid, name, .. } => {
