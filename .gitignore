@@ -41,3 +41,15 @@ __pycache__/
 # The vanilla addon corpus the UI engine's real-addon tests read (third-party content): a symlink
 # beside `WoW`, or `BENILLA_ADDON_CORPUS`.
 /wow-addons-vanilla
+
+# --- Local scratch (never commit) ---
+# Throwaway probes, captured logs and WIP patches that a session drops in the checkout.
+/.tmp/
+# Build/test capture logs from `cargo ... > build_ffi.log 2>&1`.
+/build_ffi*.log
+# Stderr capture from a probe run.
+/meta.err
+# Dev-only probe binaries under `cargo run --example`; these three are one-off diagnostics.
+/crates/benilla-ffi/examples/limp_probe.rs
+/crates/benilla-ffi/examples/mcsh_alpha_probe.rs
+/crates/benilla-ffi/examples/winprobe.rs
