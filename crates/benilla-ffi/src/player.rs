@@ -35,10 +35,16 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver`：0 = 本文件的自写求解（一行回退），
-/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(0)` 可关）。
-static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1 = benilla 求解）。
+/// `bn.CollisionSolver`：0 = 本文件的自写求解（默认），
+/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(1)` 可开）。
+///
+/// 保持 0：`MoverSession::step` 每帧重建整张 avian 世界并跑一套完整
+/// `PhysicsSchedule`，单帧 1.5–2.3 s（客户端 BnPerf `ptick=2259ms`，帧时间
+/// 7–15 s、0.1 fps），输入在帧里排不到，表现为鼠标完全不可用。求解器语义已
+/// 对齐（`cargo test -p benilla-ffi --lib` 150 passed），待把每帧开销压到可
+/// 接受范围后再翻默认。
+static COLLISION_SOLVER: AtomicBool = AtomicBool::new(false);
+/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（0 = 自写求解）。
 fn collision_solver_on() -> bool {
     match crate::video_cvar("bn.CollisionSolver") {
         Some(v) => !matches!(v.trim(), "0" | "false" | "off"),
