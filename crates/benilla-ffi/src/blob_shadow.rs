@@ -46,6 +46,12 @@ fn shadows_enabled() -> bool {
 }
 
 /// One unit's shadow grid: 5x5 lattice points over the box, fan-unrolled.
+///
+/// A lattice point whose ground is outside the box (`[feet-down, feet+up]`) has
+/// no receiver there, and the cell is skipped - the reference's decal projector
+/// (`benilla-app/src/blob_shadow.rs`) answers `projected = false` in exactly
+/// that case and hides the blob. Falling back to the feet height instead drew
+/// the shadow as a flat patch under a swimmer, hanging in mid water.
 fn shadow_box(
     feet: [f32; 3],
     radius: f32,
@@ -54,33 +60,33 @@ fn shadow_box(
     ground: impl Fn(f32, f32) -> Option<f32>,
 ) -> Vec<BnShadowVertex> {
     const CELLS: usize = 4;
-    let mut lattice = [[BnShadowVertex::default(); CELLS + 1]; CELLS + 1];
+    let mut lattice = [[None; CELLS + 1]; CELLS + 1];
     for (i, row) in lattice.iter_mut().enumerate() {
         let sx = -1.0 + 2.0 * (i as f32 / CELLS as f32);
         for (j, cell) in row.iter_mut().enumerate() {
             let sz = -1.0 + 2.0 * (j as f32 / CELLS as f32);
             let x = feet[0] + radius * sx;
             let y = feet[1] + radius * sz;
-            let z = ground(x, y)
+            *cell = ground(x, y)
                 .filter(|z| (*z >= feet[2] - down) && (*z <= feet[2] + up))
-                .unwrap_or(feet[2]);
-            *cell = BnShadowVertex {
-                pos: [x, y, z],
-                uv: [(sx + 1.0) * 0.5, (sz + 1.0) * 0.5],
-                color: [0.0, 0.0, 0.0, 1.0],
-            };
+                .map(|z| BnShadowVertex {
+                    pos: [x, y, z],
+                    uv: [(sx + 1.0) * 0.5, (sz + 1.0) * 0.5],
+                    color: [0.0, 0.0, 0.0, 1.0],
+                });
         }
     }
     let mut out = Vec::with_capacity(CELLS * CELLS * 6);
     for i in 0..CELLS {
         for j in 0..CELLS {
-            let (a, b, c, d) = (
+            if let (Some(a), Some(b), Some(c), Some(d)) = (
                 lattice[i][j],
                 lattice[i + 1][j],
                 lattice[i + 1][j + 1],
                 lattice[i][j + 1],
-            );
-            out.extend_from_slice(&[a, b, c, a, c, d]);
+            ) {
+                out.extend_from_slice(&[a, b, c, a, c, d]);
+            }
         }
     }
     out

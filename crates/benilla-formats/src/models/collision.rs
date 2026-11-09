@@ -122,6 +122,32 @@ pub fn load_wmo_collision_tris(chain: &mut Chain, raw_path: &str) -> Result<Coll
     Ok(CollisionMesh { positions, indices })
 }
 
+/// A WMO's camera and line-of-sight triangles across every group file, in raw WMO-local
+/// coordinates: a face counts unless it is `NOCAMCOLLIDE` ([`MOPY_NOCAMCOLLIDE`]), so the `DETAIL`
+/// overhangs, beams and trims the walking gather skips still stop the camera. The camera's sweep is
+/// two-sided, so no reversed windings are added.
+pub fn load_wmo_camera_tris(chain: &mut Chain, raw_path: &str) -> Result<CollisionMesh> {
+    let root_path = raw_path.to_ascii_lowercase();
+    let bytes = chain
+        .read_file(&root_path)
+        .with_context(|| format!("reading WMO {root_path}"))?;
+    let ParsedWmo::Root(root) = parse_wmo(&mut Cursor::new(&bytes))
+        .map_err(|e| anyhow::anyhow!("parsing {root_path}: {e}"))?
+    else {
+        anyhow::bail!("{root_path} is not a WMO root file");
+    };
+    let stem = root_path.strip_suffix(".wmo").unwrap_or(&root_path);
+    let (mut positions, mut indices): (Vec<[f32; 3]>, Vec<u32>) = (Vec::new(), Vec::new());
+    for gi in 0..root.n_groups {
+        let group_path = format!("{stem}_{gi:03}.wmo");
+        let Ok(gbytes) = chain.read_file(&group_path) else {
+            continue;
+        };
+        accumulate_wmo_group_camera_collision(&gbytes, &mut positions, &mut indices);
+    }
+    Ok(CollisionMesh { positions, indices })
+}
+
 /// Steepness gate for the back-face pass, the mover's own `GROUND_COS`
 /// (`benilla-ffi/src/player.rs:33`): faces at least this vertical get the
 /// reversed winding; floors and ceilings keep their authored side, so the

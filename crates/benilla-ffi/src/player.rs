@@ -35,10 +35,10 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver`（临时开关）：0 = 本文件的自写求解（一行回退），
-/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(1)` 可开）。
-static COLLISION_SOLVER: AtomicBool = AtomicBool::new(false);
-/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（0 = 自写求解）。
+/// `bn.CollisionSolver`：0 = 本文件的自写求解（一行回退），
+/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(0)` 可关）。
+static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
+/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1 = benilla 求解）。
 fn collision_solver_on() -> bool {
     match crate::video_cvar("bn.CollisionSolver") {
         Some(v) => !matches!(v.trim(), "0" | "false" | "off"),
@@ -3449,7 +3449,11 @@ impl Player {
             // lands, and a standing body keeps its seat.
             self.void_time = 0.0;
             self.tick_arc(dt, jump, self.pos[2]);
-        } else if self.standing_still(jump) {
+        } else if self.standing_still(jump)
+            // 脚下完全没有碰撞数据（hole）时不能"保持 server's Z"——应让重力接管自然下落，
+            // 避免地形空洞里悬空的抖动。WMO upper storey（有天花板/墙壁但无地板）不属于此情况。
+            && self.ground(self.pos[0], self.pos[1], f32::MAX).is_some()
+        {
             // A body on its feet and committed to no motion keeps its seat:
             // the reference integrates gravity only for a moving or airborne
             // mover, so standing on a spot the collision set has no floor for

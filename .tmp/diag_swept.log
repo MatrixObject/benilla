@@ -1,0 +1,752 @@
+   Compiling autocfg v1.5.1
+   Compiling windows-link v0.2.1
+   Compiling cfg-if v1.0.4
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling bitflags v2.11.1
+   Compiling smallvec v1.15.1
+   Compiling bytemuck v1.25.0
+   Compiling simd-adler32 v0.3.9
+   Compiling crc32fast v1.5.0
+   Compiling version_check v0.9.5
+   Compiling windows-sys v0.61.2
+   Compiling adler2 v2.0.1
+   Compiling log v0.4.29
+   Compiling lazy_static v1.5.0
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling miniz_oxide v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling rustversion v1.0.22
+   Compiling zerocopy v0.8.48
+   Compiling once_cell_polyfill v1.70.2
+   Compiling num-traits v0.2.19
+   Compiling typenum v1.20.0
+   Compiling heck v0.5.0
+   Compiling utf8parse v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling cc v1.2.62
+   Compiling flate2 v1.1.9
+   Compiling anstyle-wincon v3.0.11
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle-query v1.1.5
+   Compiling windows-strings v0.5.1
+   Compiling windows-result v0.4.1
+   Compiling libm v0.2.16
+   Compiling colorchoice v1.0.5
+   Compiling which v8.0.4
+   Compiling syn v2.0.117
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling lua-src v550.0.0 (I:\AI游戏\benilla\third_party\lua-src)
+   Compiling num-complex v0.4.6
+   Compiling luajit-src v210.6.6+707c12b
+   Compiling anstream v1.0.0
+   Compiling getrandom v0.2.17
+   Compiling anyhow v1.0.102
+   Compiling strsim v0.11.1
+   Compiling symphonia-core v0.6.1
+   Compiling parking_lot_core v0.9.12
+   Compiling clap_lex v1.1.0
+   Compiling pkg-config v0.3.33
+   Compiling libc v0.2.186
+   Compiling clap_builder v4.6.0
+   Compiling rand_core v0.6.4
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling fdeflate v0.3.7
+   Compiling scopeguard v1.2.0
+   Compiling pxfm v0.1.29
+   Compiling regex-lite v0.1.9
+   Compiling crossbeam-utils v0.8.21
+   Compiling png v0.18.1
+   Compiling symphonia-metadata v0.6.1
+   Compiling digest v0.10.7
+   Compiling lock_api v0.4.14
+   Compiling texpresso v2.0.2
+   Compiling num-integer v0.1.46
+   Compiling mlua-sys v0.10.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling windows-threading v0.2.1
+   Compiling rand_chacha v0.3.1
+   Compiling memchr v2.8.0
+   Compiling extended v0.1.0
+   Compiling cpufeatures v0.2.17
+   Compiling byteorder-lite v0.1.0
+   Compiling symphonia-format-riff v0.6.1
+   Compiling sha1 v0.10.6
+   Compiling rand v0.8.6
+   Compiling bstr v1.12.3
+   Compiling num-bigint v0.4.6
+   Compiling parking_lot v0.12.5
+   Compiling benilla-blp v0.2.0 (I:\AI游戏\benilla\crates\benilla-blp)
+   Compiling moxcms v0.8.1
+   Compiling symphonia-codec-adpcm v0.6.1
+   Compiling symphonia-bundle-mp3 v0.6.1
+   Compiling symphonia-codec-pcm v0.6.1
+   Compiling benilla-mpq v0.2.0 (I:\AI游戏\benilla\crates\benilla-mpq)
+   Compiling mint v0.5.9
+   Compiling ttf-parser v0.25.1
+   Compiling rustc-hash v2.1.2
+   Compiling cpal v0.17.1
+   Compiling either v1.16.0
+   Compiling symphonia v0.6.1
+   Compiling glam v0.33.2
+   Compiling benilla-srp v0.2.0 (I:\AI游戏\benilla\crates\benilla-srp)
+   Compiling triple_buffer v9.0.0
+   Compiling roxmltree v0.20.0
+   Compiling atomic-arena v0.1.2
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling owned_ttf_parser v0.25.1
+   Compiling pastey v0.2.3
+   Compiling rtrb v0.3.4
+   Compiling image v0.25.10
+   Compiling glam v0.30.10
+   Compiling dasp_sample v0.11.0
+   Compiling ab_glyph v0.2.32
+   Compiling mlua v0.11.6
+   Compiling kira v0.12.4 (I:\AI游戏\benilla\third_party\kira)
+   Compiling benilla-ui v0.2.0 (I:\AI游戏\benilla\crates\benilla-ui)
+   Compiling windows-implement v0.60.2
+   Compiling windows-interface v0.59.3
+   Compiling clap_derive v4.6.1
+   Compiling strum_macros v0.26.4
+   Compiling windows-core v0.62.2
+   Compiling windows-collections v0.3.2
+   Compiling windows-future v0.3.2
+   Compiling windows-numerics v0.3.1
+   Compiling windows v0.62.2
+   Compiling clap v4.6.1
+   Compiling benilla-formats v0.2.0 (I:\AI游戏\benilla\crates\benilla-formats)
+   Compiling strum v0.26.3
+   Compiling benilla-protocol v0.2.0 (I:\AI游戏\benilla\crates\benilla-protocol)
+   Compiling benilla-cull v0.2.0 (I:\AI游戏\benilla\crates\benilla-cull)
+   Compiling benilla-ffi v0.2.0 (I:\AI游戏\benilla\crates\benilla-ffi)
+warning: value assigned to `out` is never read
+   --> crates\benilla-ffi\src\loading_screen.rs:642:23
+    |
+642 |         let mut out = state.tick(step, &mut art);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+643 |         out = state.tick(step, &mut art);
+    |         -------------------------------- `out` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `out` is never read
+   --> crates\benilla-ffi\src\loading_screen.rs:643:9
+    |
+643 |         out = state.tick(step, &mut art);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+644 |         out = state.tick(step, &mut art);
+    |         -------------------------------- `out` is overwritten here before the previous value is read
+
+warning: value assigned to `local` is never read
+   --> crates\benilla-ffi\src\model_particles.rs:171:21
+    |
+171 |     let mut local = [0.0f32; 3];
+    |                     ^^^^^^^^^^^ this value is reassigned later and never used
+...
+177 |         local = spline.eval(t);
+    |         ---------------------- `local` is overwritten here before the previous value is read
+
+warning: variable does not need to be mutable
+    --> crates\benilla-ffi\src\player.rs:5912:17
+     |
+5912 |             let mut crossed = 0usize;
+     |                 ----^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `crossed`
+    --> crates\benilla-ffi\src\player.rs:5912:17
+     |
+5912 |             let mut crossed = 0usize;
+     |                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_crossed`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `session` is never read
+    --> crates\benilla-ffi\src\net.rs:2521:45
+     |
+2521 |     let mut session: Option<WorldSession> = None;
+     |                                             ^^^^ this value is reassigned later and never used
+...
+2594 |                                 session = Some(s);
+     |                                 ------- `session` is overwritten here before the previous value is read
+
+warning: variable `last_move_flags` is assigned to, but never used
+    --> crates\benilla-ffi\src\net.rs:2909:9
+     |
+2909 |     let mut last_move_flags: u32 = 0;
+     |         ^^^^^^^^^^^^^^^^^^^
+     |
+     = note: consider using `_last_move_flags` instead
+
+warning: variable `sent_flags` is assigned to, but never used
+    --> crates\benilla-ffi\src\net.rs:3473:17
+     |
+3473 |             let mut sent_flags: u32 = 0;
+     |                 ^^^^^^^^^^^^^^
+     |
+     = note: consider using `_sent_flags` instead
+
+warning: value assigned to `last_move_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3612:13
+     |
+3612 |             last_move_flags = cur_flags;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3479:17
+     |
+3479 |                 sent_flags |= MF_FORWARD;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3487 |                 sent_flags |= MF_BACKWARD;
+     |                 ------------------------- `sent_flags` is overwritten here before the previous value is read
+
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3487:17
+     |
+3487 |                 sent_flags |= MF_BACKWARD;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3505 |                 sent_flags |= MF_STRAFE_RIGHT;
+     |                 ----------------------------- `sent_flags` is overwritten here before the previous value is read
+
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3505:17
+     |
+3505 |                 sent_flags |= MF_STRAFE_RIGHT;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3513 |                 sent_flags |= MF_STRAFE_LEFT;
+     |                 ---------------------------- `sent_flags` is overwritten here before the previous value is read
+
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3513:17
+     |
+3513 |                 sent_flags |= MF_STRAFE_LEFT;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unreachable pattern
+   --> crates\benilla-ffi\src\lib.rs:910:29
+    |
+908 | ...                   benilla_adt::ParsedAdt::Root(root) => root.mcnk_chunks,
+    |                       ---------------------------------- matches all the relevant values
+909 | ...
+910 | ...                   _ => return None,
+    |                       ^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `if let` pattern
+    --> crates\benilla-ffi\src\lib.rs:1268:20
+     |
+1268 |                 if let benilla_adt::ParsedAdt::Root(root) = parsed {
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+     = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: type `BnBone` is more private than the item `m2_skinned_positions_rig`
+    --> crates\benilla-ffi\src\lib.rs:7374:1
+     |
+7374 | / pub fn m2_skinned_positions_rig(
+7375 | |     model: &benilla_m2::M2Model,
+7376 | |
+7377 | |     global_seqs: &[u32],
+...    |
+7385 | |     twist: (f32, f32),
+7386 | | ) -> Vec<[f32; 3]> {
+     | |__________________^ function `m2_skinned_positions_rig` is reachable at visibility `pub`
+     |
+note: but type `BnBone` is only usable at visibility `pub(crate)`
+    --> crates\benilla-ffi\src\lib.rs:6636:1
+     |
+6636 | pub(crate) struct BnBone {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `BnBone` is more private than the item `m2_skinned_positions_rig_masked`
+    --> crates\benilla-ffi\src\lib.rs:7407:1
+     |
+7407 | / pub fn m2_skinned_positions_rig_masked(
+7408 | |     model: &benilla_m2::M2Model,
+7409 | |
+7410 | |     global_seqs: &[u32],
+...    |
+7420 | |     twist: (f32, f32),
+7421 | | ) -> Vec<[f32; 3]> {
+     | |__________________^ function `m2_skinned_positions_rig_masked` is reachable at visibility `pub`
+     |
+note: but type `BnBone` is only usable at visibility `pub(crate)`
+    --> crates\benilla-ffi\src\lib.rs:6636:1
+     |
+6636 | pub(crate) struct BnBone {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `net::ItemTemplate` is more private than the item `item_info_row`
+    --> crates\benilla-ffi\src\net.rs:3879:1
+     |
+3879 | pub(crate) fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetItemInfo {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `item_info_row` is reachable at visibility `pub(crate)`
+     |
+note: but type `net::ItemTemplate` is only usable at visibility `pub(self)`
+    --> crates\benilla-ffi\src\net.rs:319:1
+     |
+ 319 | struct ItemTemplate {
+     | ^^^^^^^^^^^^^^^^^^^
+
+warning: type `net::Shared` is more private than the item `inventory_rows`
+    --> crates\benilla-ffi\src\net.rs:4044:1
+     |
+4044 | pub(crate) fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `inventory_rows` is reachable at visibility `pub(crate)`
+     |
+note: but type `net::Shared` is only usable at visibility `pub(self)`
+    --> crates\benilla-ffi\src\net.rs:1402:1
+     |
+1402 | struct Shared {
+     | ^^^^^^^^^^^^^
+
+warning: function `wow_to_ue` is never used
+   --> crates\benilla-ffi\src\lib.rs:344:4
+    |
+344 | fn wow_to_ue(px: f32, py: f32, pz: f32) -> BnVertex {
+    |    ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Parse` is never constructed
+    --> crates\benilla-ffi\src\lib.rs:2470:5
+     |
+2469 | enum WmoJob {
+     |      ------ variant in this enum
+2470 |     Parse {
+     |     ^^^^^
+
+warning: associated items `identity` and `to_array` are never used
+   --> crates\benilla-ffi\src\coords.rs:47:12
+    |
+ 40 | impl Mat4 {
+    | --------- associated items in this implementation
+...
+ 47 |     pub fn identity() -> Self {
+    |            ^^^^^^^^
+...
+144 |     pub fn to_array(&self) -> [f32; 16] {
+    |            ^^^^^^^^
+
+warning: function `quat_slerp` is never used
+   --> crates\benilla-ffi\src\coords.rs:242:8
+    |
+242 | pub fn quat_slerp(r: f32, a: Quat, b: Quat) -> Quat {
+    |        ^^^^^^^^^^
+
+warning: function `normal` is never used
+   --> crates\benilla-ffi\src\coords.rs:166:12
+    |
+166 |     pub fn normal(v: Vec3) -> Vec3 {
+    |            ^^^^^^
+
+warning: function `scale` is never used
+   --> crates\benilla-ffi\src\coords.rs:181:12
+    |
+181 |     pub fn scale(v: Vec3) -> Vec3 {
+    |            ^^^^^
+
+warning: function `translation` is never used
+   --> crates\benilla-ffi\src\coords.rs:186:12
+    |
+186 |     pub fn translation(v: Vec3) -> Vec3 {
+    |            ^^^^^^^^^^^
+
+warning: function `scale` is never used
+   --> crates\benilla-ffi\src\coords.rs:224:12
+    |
+224 |     pub fn scale(v: Vec3) -> Vec3 {
+    |            ^^^^^
+
+warning: fields `end_text` and `reward_spell` are never read
+   --> crates\benilla-ffi\src\net.rs:466:9
+    |
+456 | pub(crate) struct QuestTemplateLite {
+    |                   ----------------- fields in this struct
+...
+466 |     pub end_text: String,
+    |         ^^^^^^^^
+467 |     pub src_item_id: u32,
+468 |     pub reward_spell: u32,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `QuestTemplateLite` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: variant `QuestAbandon` is never constructed
+    --> crates\benilla-ffi\src\net.rs:1129:5
+     |
+1080 | pub(crate) enum Cmd {
+     |                 --- variant in this enum
+...
+1129 |     QuestAbandon {
+     |     ^^^^^^^^^^^^
+
+warning: field `facing` is never read
+    --> crates\benilla-ffi\src\net.rs:1755:9
+     |
+1751 | pub(crate) struct UiUnitRec {
+     |                   --------- field in this struct
+...
+1755 |     pub facing: f32,
+     |         ^^^^^^
+
+warning: function `uptime_ms` is never used
+    --> crates\benilla-ffi\src\net.rs:2896:8
+     |
+2896 |     fn uptime_ms() -> u32 {
+     |        ^^^^^^^^^
+
+warning: field `alive` is never read
+    --> crates\benilla-ffi\src\net.rs:5376:9
+     |
+5371 | pub(crate) struct MenuSnapshot {
+     |                   ------------ field in this struct
+...
+5376 |     pub alive: bool,
+     |         ^^^^^
+
+warning: field `sample_rate` is never read
+  --> crates\benilla-ffi\src\audio_out.rs:52:5
+   |
+48 | pub(crate) struct CpalBackend {
+   |                   ----------- field in this struct
+...
+52 |     sample_rate: u32,
+   |     ^^^^^^^^^^^
+
+warning: `benilla-ffi` (lib test) generated 33 warnings (run `cargo fix --lib -p benilla-ffi --tests` to apply 2 suggestions)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3m 06s
+     Running unittests src\lib.rs (target\debug\deps\benilla-07ec2102f9791028.exe)
+
+running 1 test
+bn_player: collision tile (32,49) SYNC 35.5ms
+bn_player: collision tile (31,49) SYNC 35.4ms
+bn_player: collision tile (32,48) SYNC 37.4ms
+bn_player: collision tile (32,50) SYNC 36.6ms
+bn_player: collision tile (33,49) SYNC 32.1ms
+bn_player: collision tile (31,48) SYNC 21.5ms
+bn_player: collision tile (31,50) SYNC 33.5ms
+bn_player: collision tile (33,48) SYNC 28.2ms
+bn_player: collision tile (33,50) SYNC 30.3ms
+wmo world\wmo\azeroth\buildings\goldshireinn\goldshireinn.wmo tile(32,49) pos [-9464.25, 24.398438, 56.52633] rot [0.0, -97.0, 0.0]
+wmo world\wmo\azeroth\buildings\goldshireblacksmith\goldshireblacksmith.wmo tile(31,49) pos [-9460.035, 94.203125, 56.533516] rot [0.0, 91.5, 0.0]
+wmo world\wmo\azeroth\buildings\goldshireinn\goldshireinn.wmo tile(31,49) pos [-9464.25, 24.398438, 56.52633] rot [0.0, -97.0, 0.0]
+inn tile(32,49) pos [-9464.25, 24.398438, 56.52633] rot [0.0, -97.0, 0.0]
+ground probes (ground floor band ceil 60.5):
+bn_player: collision tile (30,49) SYNC 26.4ms
+bn_player: collision tile (30,48) SYNC 10.9ms
+bn_player: collision tile (30,50) SYNC 31.5ms
+bn_player: tile (31,49) modd: 6620 placements, 47001 doodad grid tris
+  local(0,0) world(-9464.25,24.40) ground60=Some((56.33938, 1.0)) groundMax=Some((74.52531, 0.9864493)) terrain=None
+  local(-20,5) world(-9471.65,5.16) ground60=Some((57.521458, 1.0)) groundMax=Some((68.17971, 0.5784391)) terrain=Some(56.464542)
+  local(12,-6) world(-9456.83,35.58) ground60=Some((59.603348, 0.94959563)) groundMax=Some((70.74021, 0.9203898)) terrain=Some(56.529312)
+  local(-8,-10) world(-9455.30,15.24) ground60=Some((58.048492, 1.0)) groundMax=Some((73.40781, 0.9735905)) terrain=Some(56.529305)
+  local(0,10) world(-9474.18,25.62) ground60=Some((56.33938, 1.0)) groundMax=Some((74.66487, 0.9990876)) terrain=None
+  local(10,10) world(-9472.96,35.54) ground60=Some((57.693817, 0.9998686)) groundMax=Some((74.98482, 0.9915751)) terrain=Some(56.52931)
+starts: [(-9464.25, 24.398438, 56.33938), (-9471.65, 5.156864, 57.521458), (-9456.832, 35.577774, 59.603348), (-9455.3, 15.239373, 58.048492)]
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw   0: end world(-9453.47,25.02,56.90) local(1.9,-10.6) moved=10.80 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw  45: end world(-9462.82,25.52,57.07) local(1.3,-1.3) moved=1.82 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw  90: end world(-9464.65,29.23,56.34) local(4.7,1.0) moved=4.85 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw 135: end world(-9468.30,30.51,56.97) local(5.6,4.8) moved=7.33 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw 180: end world(-9478.54,23.65,57.19) local(-2.5,14.1) moved=14.31 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw 225: end world(-9469.67,18.90,56.96) local(-6.1,4.7) moved=7.72 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw 270: end world(-9464.13,23.92,56.34) local(-0.5,-0.2) moved=0.50 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(0.0,0.0) z=56.34 yaw 315: end world(-9463.09,23.32,57.07) local(-0.9,-1.3) moved=1.59 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.30,7.68,57.52) local(-17.5,5.0) moved=2.55 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.03,10.46,57.52) local(-14.7,5.0) moved=5.34 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw  90: end world(-9473.21,10.67,57.51) local(-14.7,7.2) moved=5.73 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw 135: end world(-9479.45,11.27,57.50) local(-14.9,13.5) moved=9.91 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw 180: end world(-9492.45,5.16,58.16) local(-22.5,25.6) moved=20.80 exit_tick=Some(124) pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw 225: end world(-9486.33,-9.61,57.21) local(-36.4,17.8) moved=20.82 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.25,-15.65,57.12) local(-40.7,3.1) moved=20.82 exit_tick=Some(158) pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-20.0,5.0) z=57.52 yaw 315: end world(-9463.51,-8.80,57.52) local(-32.9,-4.8) moved=16.16 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.48,35.66,60.24) local(12.4,-8.3) moved=2.35 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.75,35.66,60.59) local(12.1,-6.1) dir=(0.71,0.71)
+    tri n=(0.122,0.984,0.129) ndir=0.789 top=61.95 v0=(-9456.47,35.76,60.82)
+    tri n=(0.125,0.984,0.130) ndir=0.791 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw  45: end world(-9456.75,35.66,60.59) local(12.1,-6.1) moved=0.12 exit_tick=None pen_ticks=179 first_pen=Some((1, [-9456.75, 35.66027, 60.58921]))
+  PEN tick 1 at world(-9456.83,35.69,60.50) local(12.1,-6.0) dir=(-0.00,1.00)
+    tri n=(0.128,0.983,0.132) ndir=0.992 top=61.87 v0=(-9456.47,35.76,60.82)
+    tri n=(0.122,0.984,0.129) ndir=0.992 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw  90: end world(-9456.83,35.69,60.50) local(12.1,-6.0) moved=0.12 exit_tick=None pen_ticks=179 first_pen=Some((1, [-9456.832, 35.69444, 60.496758]))
+  PEN tick 1 at world(-9456.91,35.66,60.43) local(12.1,-5.9) dir=(-0.71,0.71)
+    tri n=(0.128,0.983,0.132) ndir=0.610 top=61.87 v0=(-9456.47,35.76,60.82)
+    tri n=(0.122,0.984,0.129) ndir=0.615 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw 135: end world(-9456.91,35.73,60.41) local(12.1,-5.9) moved=0.17 exit_tick=None pen_ticks=179 first_pen=Some((1, [-9456.914, 35.66027, 60.430923]))
+  PEN tick 23 at world(-9456.95,35.64,60.41) local(12.0,-5.9) dir=(-1.00,-0.00)
+    tri n=(0.128,0.983,0.132) ndir=-0.129 top=61.87 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw 180: end world(-9456.95,35.73,60.36) local(12.1,-5.9) moved=0.19 exit_tick=None pen_ticks=157 first_pen=Some((23, [-9456.946, 35.640465, 60.407623]))
+  PEN tick 32 at world(-9456.90,35.63,60.45) local(12.0,-5.9) dir=(-0.71,-0.71)
+    tri n=(0.128,0.983,0.132) ndir=-0.792 top=61.87 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.90,35.74,60.41) local(12.1,-5.9) moved=0.17 exit_tick=None pen_ticks=148 first_pen=Some((32, [-9456.902, 35.62849, 60.454433]))
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw 270: end world(-9456.82,35.58,60.56) local(12.0,-6.0) moved=0.01 exit_tick=None pen_ticks=0 first_pen=None
+bn_player: falling (-9454.8,32.2) z=57.33 floor=Some(56.966053) tile=(31,49) wmo_ready=true wmos=9 celltris=1088
+dt=0.017 swept=true start local(12.0,-6.0) z=59.60 yaw 315: end world(-9454.75,32.21,56.97) local(8.9,-8.5) moved=3.96 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9436.51,16.90,58.38) local(-4.1,-28.4) moved=18.86 exit_tick=Some(35) pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9440.63,29.91,57.67) local(8.4,-22.8) moved=20.75 exit_tick=Some(57) pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.87,58.05) local(-6.4,-9.8) moved=1.63 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9455.46,16.92,58.05) local(-6.3,-9.6) moved=1.69 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.99,12.76,58.05) local(-10.5,-9.6) moved=2.58 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9456.08,12.28,58.05) local(-11.0,-9.6) moved=3.06 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,-5.64,56.66) local(-28.7,-12.5) moved=20.88 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=true start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9440.62,0.47,58.61) local(-20.9,-26.4) moved=20.82 exit_tick=Some(44) pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw   0: end world(-9453.47,25.02,56.90) local(1.9,-10.6) moved=10.80 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 35 at world(-9461.55,27.35,56.40) local(3.3,-2.3) dir=(0.71,0.71)
+    tri n=(-0.139,-0.988,0.071) ndir=-0.799 top=57.61 v0=(-9462.49,27.53,56.80)
+    tri n=(0.979,-0.148,-0.140) ndir=0.593 top=57.61 v0=(-9461.53,27.65,57.60)
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw  45: end world(-9459.62,29.06,56.97) local(5.2,-4.0) moved=6.57 exit_tick=None pen_ticks=123 first_pen=Some((35, [-9461.547, 27.35411, 56.404938]))
+  PEN tick 44 at world(-9464.25,29.53,56.34) local(5.1,0.6) dir=(-0.00,1.00)
+    tri n=(-0.123,-0.992,0.000) ndir=-0.992 top=58.16 v0=(-9454.99,28.47,58.16)
+    tri n=(0.123,0.992,-0.000) ndir=0.992 top=58.16 v0=(-9464.93,29.71,56.97)
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw  90: end world(-9464.25,29.65,56.97) local(5.2,0.6) moved=5.25 exit_tick=None pen_ticks=136 first_pen=Some((44, [-9464.25, 29.531776, 56.33938]))
+  PEN tick 63 at world(-9468.69,29.51,56.71) local(4.5,5.0) dir=(-0.71,0.71)
+    tri n=(0.993,-0.122,0.000) ndir=-0.788 top=58.18 v0=(-9468.68,30.17,58.18)
+    tri n=(-0.993,0.122,0.000) ndir=0.788 top=58.18 v0=(-9468.68,30.17,56.97)
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw 135: end world(-9469.08,30.06,56.94) local(5.0,5.5) moved=7.45 exit_tick=None pen_ticks=2 first_pen=Some((63, [-9468.691, 29.506142, 56.71467]))
+  PEN tick 124 at world(-9478.66,24.40,56.89) local(-1.8,14.3) dir=(-1.00,-0.00)
+    tri n=(0.992,-0.115,0.057) ndir=-0.993 top=58.45 v0=(-9479.12,21.26,58.44)
+    tri n=(-0.992,0.115,-0.057) ndir=0.993 top=58.45 v0=(-9478.06,30.38,58.45)
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw 180: end world(-9478.89,24.40,56.33) local(-1.8,14.5) moved=14.64 exit_tick=None pen_ticks=2 first_pen=Some((124, [-9478.66, 24.398438, 56.892815]))
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw 225: end world(-9469.67,18.90,56.96) local(-6.1,4.7) moved=7.72 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw 270: end world(-9463.53,21.40,56.34) local(-2.9,-1.1) moved=3.08 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(0.0,0.0) z=56.34 yaw 315: end world(-9463.18,23.33,57.07) local(-0.9,-1.2) moved=1.51 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.30,7.68,57.52) local(-17.5,5.0) moved=2.55 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.03,10.45,57.52) local(-14.7,5.0) moved=5.33 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw  90: end world(-9473.21,10.67,57.51) local(-14.7,7.2) moved=5.73 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw 135: end world(-9479.45,11.27,57.50) local(-14.9,13.5) moved=9.91 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw 180: end world(-9492.45,5.16,58.16) local(-22.5,25.6) moved=20.80 exit_tick=Some(124) pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw 225: end world(-9486.33,-9.61,57.21) local(-36.4,17.8) moved=20.82 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.25,-15.65,57.12) local(-40.7,3.1) moved=20.82 exit_tick=Some(158) pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-20.0,5.0) z=57.52 yaw 315: end world(-9463.51,-8.80,57.52) local(-32.9,-4.8) moved=16.16 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.48,35.67,60.24) local(12.4,-8.3) moved=2.35 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.75,35.66,60.59) local(12.1,-6.1) dir=(0.71,0.71)
+    tri n=(0.122,0.984,0.129) ndir=0.789 top=61.95 v0=(-9456.47,35.76,60.82)
+    tri n=(0.125,0.984,0.130) ndir=0.791 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw  45: end world(-9456.67,35.74,61.15) local(12.2,-6.1) moved=0.23 exit_tick=None pen_ticks=1 first_pen=Some((1, [-9456.75, 35.66027, 60.58921]))
+  PEN tick 1 at world(-9456.83,35.69,60.50) local(12.1,-6.0) dir=(-0.00,1.00)
+    tri n=(0.128,0.983,0.132) ndir=0.992 top=61.87 v0=(-9456.47,35.76,60.82)
+    tri n=(0.122,0.984,0.129) ndir=0.992 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw  90: end world(-9456.83,35.81,60.79) local(12.2,-6.0) moved=0.23 exit_tick=None pen_ticks=179 first_pen=Some((1, [-9456.832, 35.69444, 60.496758]))
+  PEN tick 1 at world(-9456.91,35.66,60.43) local(12.1,-5.9) dir=(-0.71,0.71)
+    tri n=(0.128,0.983,0.132) ndir=0.610 top=61.87 v0=(-9456.47,35.76,60.82)
+    tri n=(0.122,0.984,0.129) ndir=0.615 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw 135: end world(-9456.99,35.82,60.91) local(12.2,-5.8) moved=0.28 exit_tick=None pen_ticks=2 first_pen=Some((1, [-9456.914, 35.66027, 60.430923]))
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw 180: end world(-9456.95,35.59,60.43) local(12.0,-5.9) moved=0.12 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.83,35.58,60.54) local(12.0,-6.0) moved=0.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw 270: end world(-9456.83,35.58,60.54) local(12.0,-6.0) moved=0.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(12.0,-6.0) z=59.60 yaw 315: end world(-9456.74,35.57,59.53) local(12.0,-6.1) moved=0.09 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9434.74,15.47,58.72) local(-5.3,-30.4) moved=20.56 exit_tick=Some(35) pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9440.63,29.91,57.67) local(8.4,-22.8) moved=20.75 exit_tick=Some(57) pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.87,58.05) local(-6.4,-9.8) moved=1.63 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 19 at world(-9455.86,16.68,58.05) local(-6.6,-9.3) dir=(-0.71,0.71)
+    tri n=(0.993,-0.122,0.000) ndir=-0.788 top=60.67 v0=(-9456.14,14.69,60.67)
+    tri n=(0.993,-0.122,0.000) ndir=-0.788 top=60.67 v0=(-9456.14,14.69,60.67)
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9456.35,17.18,58.05) local(-6.2,-8.7) moved=2.21 exit_tick=None pen_ticks=159 first_pen=Some((19, [-9455.859, 16.683487, 58.048496]))
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.99,12.76,58.05) local(-10.5,-9.6) moved=2.58 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9456.08,12.28,58.05) local(-11.0,-9.6) moved=3.06 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,-5.64,56.66) local(-28.7,-12.5) moved=20.88 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.017 swept=false start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9440.62,0.47,58.61) local(-20.9,-26.4) moved=20.82 exit_tick=Some(44) pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw   0: end world(-9453.49,24.97,56.90) local(1.9,-10.6) moved=10.77 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw  45: end world(-9458.56,28.44,56.34) local(4.7,-5.2) moved=6.98 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw  90: end world(-9464.60,29.31,56.34) local(4.8,0.9) moved=4.92 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw 135: end world(-9468.22,30.57,56.97) local(5.6,4.7) moved=7.34 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw 180: end world(-9478.37,23.60,57.52) local(-2.5,13.9) moved=14.14 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw 225: end world(-9474.18,18.00,56.96) local(-7.6,9.1) moved=11.82 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw 270: end world(-9464.22,23.90,56.34) local(-0.5,-0.1) moved=0.50 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(0.0,0.0) z=56.34 yaw 315: end world(-9459.62,19.91,56.34) local(-3.9,-5.1) moved=6.45 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.33,7.70,57.52) local(-17.4,5.0) moved=2.56 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.00,10.42,57.52) local(-14.7,5.0) moved=5.30 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw  90: end world(-9473.54,10.61,57.51) local(-14.8,7.5) moved=5.77 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw 135: end world(-9479.37,11.29,57.50) local(-14.9,13.4) moved=9.86 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw 180: end world(-9492.69,5.16,58.17) local(-22.6,25.9) moved=21.04 exit_tick=Some(21) pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw 225: end world(-9486.53,-9.69,57.23) local(-36.6,18.0) moved=21.02 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.34,-15.76,57.14) local(-40.8,3.1) moved=20.93 exit_tick=Some(27) pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-20.0,5.0) z=57.52 yaw 315: end world(-9463.35,-8.89,57.52) local(-32.9,-4.9) moved=16.31 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.45,35.64,60.23) local(12.3,-8.4) moved=2.38 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.34,36.07,59.41) local(12.6,-6.4) dir=(0.71,0.71)
+    tri n=(0.123,0.992,-0.002) ndir=0.789 top=60.64 v0=(-9455.98,36.09,59.50)
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw  45: end world(-9455.68,37.25,56.97) local(13.8,-6.9) moved=2.03 exit_tick=None pen_ticks=1 first_pen=Some((1, [-9456.336, 36.07275, 59.41044]))
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw  90: end world(-9457.22,37.42,56.97) local(13.8,-5.4) moved=1.88 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw 135: end world(-9457.21,37.44,56.97) local(13.8,-5.4) moved=1.90 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 4 at world(-9456.83,35.61,60.53) local(12.0,-6.0) dir=(-1.00,-0.00)
+    tri n=(0.122,0.984,0.129) ndir=-0.123 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw 180: end world(-9456.83,35.61,60.53) local(12.0,-6.0) moved=0.03 exit_tick=None pen_ticks=27 first_pen=Some((4, [-9456.829, 35.612644, 60.531296]))
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.83,35.58,60.54) local(12.0,-6.0) moved=0.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw 270: end world(-9455.99,29.70,56.97) local(6.3,-7.6) moved=5.93 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(12.0,-6.0) z=59.60 yaw 315: end world(-9454.87,32.29,56.97) local(9.0,-8.3) moved=3.83 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9436.59,17.13,58.35) local(-3.8,-28.3) moved=18.81 exit_tick=Some(6) pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9440.46,29.80,57.68) local(8.3,-23.0) moved=20.79 exit_tick=Some(10) pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.81,58.05) local(-6.4,-9.8) moved=1.57 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9455.49,16.90,58.05) local(-6.4,-9.6) moved=1.67 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.95,12.74,58.05) local(-10.6,-9.7) moved=2.58 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9456.09,12.39,58.05) local(-10.9,-9.6) moved=2.96 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,-5.76,56.66) local(-28.8,-12.6) moved=21.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=true start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9440.42,0.39,58.66) local(-20.9,-26.6) moved=21.02 exit_tick=Some(8) pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw   0: end world(-9453.67,24.99,56.91) local(1.9,-10.4) moved=10.59 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw  45: end world(-9455.47,28.87,56.97) local(5.5,-8.2) moved=9.85 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw  90: end world(-9465.27,33.62,56.97) local(9.0,2.1) moved=9.28 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw 135: end world(-9469.10,30.20,56.96) local(5.2,5.5) moved=7.56 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 25 at world(-9481.75,24.40,56.69) local(-2.1,17.4) dir=(-1.00,-0.00)
+    tri n=(0.993,-0.122,0.000) ndir=-0.993 top=57.74 v0=(-9481.57,25.77,57.74)
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw 180: end world(-9485.26,24.40,57.43) local(-2.6,20.8) moved=21.01 exit_tick=Some(28) pen_ticks=1 first_pen=Some((25, [-9481.755, 24.398438, 56.693977]))
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw 225: end world(-9473.68,19.66,56.96) local(-5.9,8.8) moved=10.56 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 14 at world(-9463.68,19.42,56.34) local(-4.9,-1.2) dir=(0.00,-1.00)
+    tri n=(0.984,-0.115,-0.133) ndir=0.116 top=57.85 v0=(-9463.90,19.53,56.35)
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw 270: end world(-9462.40,18.56,56.96) local(-5.6,-2.5) moved=6.12 exit_tick=None pen_ticks=17 first_pen=Some((14, [-9463.677, 19.417727, 56.33938]))
+  PEN tick 29 at world(-9456.33,16.00,57.04) local(-7.4,-8.9) dir=(0.71,-0.71)
+    tri n=(-0.993,0.122,0.000) ndir=-0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=0.788 top=60.67 v0=(-9456.57,14.68,60.67)
+    tri n=(-0.993,0.122,0.000) ndir=-0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=0.788 top=60.67 v0=(-9456.57,14.68,60.67)
+dt=0.100 swept=false start local(0.0,0.0) z=56.34 yaw 315: end world(-9455.83,15.50,56.53) local(-7.8,-9.4) moved=12.25 exit_tick=None pen_ticks=1 first_pen=Some((29, [-9456.328, 15.998021, 57.044624]))
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.33,7.70,57.52) local(-17.4,5.0) moved=2.56 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.38,7.34,57.52) local(-17.8,5.0) moved=2.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw  90: end world(-9473.59,10.30,57.51) local(-15.1,7.6) moved=5.49 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw 135: end world(-9478.98,11.22,57.50) local(-14.9,13.0) moved=9.52 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw 180: end world(-9492.66,5.16,58.17) local(-22.6,25.8) moved=21.01 exit_tick=Some(21) pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw 225: end world(-9486.50,-9.69,57.23) local(-36.5,17.9) moved=21.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.25,-15.77,57.14) local(-40.8,3.0) moved=20.94 exit_tick=Some(27) pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-20.0,5.0) z=57.52 yaw 315: end world(-9462.82,-8.95,57.52) local(-32.9,-5.5) moved=16.64 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.72,35.66,60.31) local(12.3,-8.1) moved=2.11 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.34,36.07,59.41) local(12.6,-6.4) dir=(0.71,0.71)
+    tri n=(0.123,0.992,-0.002) ndir=0.789 top=60.64 v0=(-9455.98,36.09,59.50)
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw  45: end world(-9455.70,37.15,56.97) local(13.7,-6.9) moved=1.94 exit_tick=None pen_ticks=1 first_pen=Some((1, [-9456.337, 36.07275, 59.41044]))
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw  90: end world(-9457.26,37.09,56.97) local(13.4,-5.4) moved=1.57 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw 135: end world(-9456.78,36.01,60.43) local(12.4,-6.0) moved=0.43 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw 180: end world(-9457.82,33.56,60.95) local(9.9,-5.3) moved=2.24 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.91,35.02,60.46) local(11.4,-6.0) moved=0.56 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw 270: end world(-9456.83,34.88,60.52) local(11.3,-6.1) moved=0.70 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 7 at world(-9454.46,32.24,58.05) local(9.0,-8.8) dir=(0.71,-0.71)
+    tri n=(-0.993,0.118,0.000) ndir=-0.785 top=60.67 v0=(-9454.16,34.37,58.05)
+    tri n=(0.993,-0.118,-0.000) ndir=0.785 top=60.67 v0=(-9454.47,31.73,60.67)
+    tri n=(-0.993,0.118,0.000) ndir=-0.785 top=60.67 v0=(-9454.16,34.37,58.05)
+    tri n=(0.993,-0.118,-0.000) ndir=0.785 top=60.67 v0=(-9454.47,31.73,60.67)
+dt=0.100 swept=false start local(12.0,-6.0) z=59.60 yaw 315: end world(-9443.07,20.86,57.36) local(-0.9,-21.5) moved=20.15 exit_tick=Some(17) pen_ticks=1 first_pen=Some((7, [-9454.458, 32.24236, 58.048508]))
+  PEN tick 25 at world(-9437.79,15.24,58.29) local(-5.9,-27.4) dir=(1.00,0.00)
+    tri n=(0.888,0.249,0.386) ndir=0.963 top=61.17 v0=(-9437.63,16.25,58.18)
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9434.29,15.24,58.80) local(-5.4,-30.8) moved=21.01 exit_tick=Some(6) pen_ticks=1 first_pen=Some((25, [-9437.795, 15.239373, 58.288353]))
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9440.45,30.09,57.70) local(8.5,-22.9) moved=21.00 exit_tick=Some(10) pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.64,58.05) local(-6.6,-9.8) moved=1.40 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 4 at world(-9456.18,17.08,57.86) local(-6.3,-8.9) dir=(-0.71,0.71)
+    tri n=(-0.993,0.122,0.000) ndir=0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=-0.788 top=60.67 v0=(-9456.22,17.47,60.67)
+    tri n=(-0.993,0.122,0.000) ndir=0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=-0.788 top=60.67 v0=(-9456.22,17.47,60.67)
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9469.06,29.95,56.92) local(4.9,5.4) moved=20.14 exit_tick=None pen_ticks=1 first_pen=Some((4, [-9456.185, 17.084751, 57.855587]))
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.62,12.70,58.05) local(-10.6,-10.0) moved=2.56 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 6 at world(-9456.56,12.06,57.86) local(-11.3,-9.1) dir=(-0.71,-0.71)
+    tri n=(0.993,-0.122,0.000) ndir=-0.616 top=60.67 v0=(-9456.17,14.50,58.05)
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9467.36,8.94,56.96) local(-15.7,1.2) moved=13.61 exit_tick=None pen_ticks=2 first_pen=Some((6, [-9456.56, 12.059509, 57.855583]))
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,-5.76,56.66) local(-28.8,-12.6) moved=21.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.100 swept=false start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9440.45,0.39,58.65) local(-20.9,-26.6) moved=21.00 exit_tick=Some(8) pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw   0: end world(-9460.04,24.40,56.34) local(0.5,-4.2) moved=4.21 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw  45: end world(-9461.36,26.79,57.49) local(2.7,-2.6) moved=3.75 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw  90: end world(-9464.25,28.60,56.34) local(4.2,0.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw 135: end world(-9467.23,27.37,56.34) local(2.6,3.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw 180: end world(-9468.46,24.40,56.34) local(-0.5,4.2) moved=4.21 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw 225: end world(-9467.23,21.43,56.34) local(-3.3,2.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw 270: end world(-9464.22,23.89,56.34) local(-0.5,-0.1) moved=0.50 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(0.0,0.0) z=56.34 yaw 315: end world(-9461.25,22.00,56.34) local(-2.0,-3.3) moved=3.84 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.59,5.66,57.52) local(-19.5,5.0) moved=0.51 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.25,8.44,57.52) local(-16.7,5.0) moved=3.31 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw  90: end world(-9471.65,9.36,56.46) local(-15.8,5.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw 135: end world(-9474.63,8.13,56.89) local(-17.4,8.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw 180: end world(-9475.86,5.16,56.80) local(-20.5,9.2) moved=4.21 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw 225: end world(-9474.63,2.19,56.53) local(-23.3,7.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.17,1.02,57.52) local(-24.2,5.0) moved=4.17 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-20.0,5.0) z=57.52 yaw 315: end world(-9471.97,2.59,57.52) local(-22.6,5.0) moved=2.59 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.54,35.64,60.26) local(12.3,-8.3) moved=2.29 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.34,36.07,59.41) local(12.6,-6.4) dir=(0.71,0.71)
+    tri n=(0.123,0.992,-0.002) ndir=0.789 top=60.64 v0=(-9455.98,36.09,59.50)
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw  45: end world(-9455.70,37.17,56.97) local(13.7,-6.9) moved=1.95 exit_tick=None pen_ticks=1 first_pen=Some((1, [-9456.336, 36.07275, 59.41044]))
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw  90: end world(-9457.13,37.35,56.97) local(13.7,-5.5) moved=1.80 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw 135: end world(-9457.21,37.44,56.97) local(13.8,-5.4) moved=1.90 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 4 at world(-9456.83,35.61,60.53) local(12.0,-6.0) dir=(-1.00,-0.00)
+    tri n=(0.122,0.984,0.129) ndir=-0.123 top=61.95 v0=(-9456.47,35.76,60.82)
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw 180: end world(-9456.83,35.61,60.53) local(12.0,-6.0) moved=0.03 exit_tick=None pen_ticks=3 first_pen=Some((4, [-9456.829, 35.612644, 60.531296]))
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.83,35.58,60.54) local(12.0,-6.0) moved=0.00 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw 270: end world(-9456.74,32.07,57.55) local(8.5,-6.5) moved=3.51 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(12.0,-6.0) z=59.60 yaw 315: end world(-9454.72,33.58,59.00) local(10.3,-8.3) moved=2.91 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9451.09,15.24,56.54) local(-7.5,-14.2) moved=4.21 exit_tick=Some(6) pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9452.32,18.21,57.47) local(-4.7,-12.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.81,58.05) local(-6.4,-9.8) moved=1.57 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9455.49,16.90,58.05) local(-6.4,-9.6) moved=1.67 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.69,14.77,58.05) local(-8.5,-9.7) moved=0.61 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9456.09,12.39,58.05) local(-10.9,-9.6) moved=2.96 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,11.04,58.05) local(-12.2,-10.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=true start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9452.32,12.27,56.89) local(-10.6,-13.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw   0: end world(-9460.05,24.40,56.34) local(0.5,-4.2) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw  45: end world(-9461.28,27.37,56.34) local(3.3,-2.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw  90: end world(-9464.25,28.60,56.34) local(4.2,0.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw 135: end world(-9467.22,27.37,56.34) local(2.6,3.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw 180: end world(-9468.45,24.40,56.34) local(-0.5,4.2) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw 225: end world(-9467.22,21.43,56.34) local(-3.3,2.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw 270: end world(-9463.67,24.32,56.34) local(-0.0,-0.6) moved=0.59 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(0.0,0.0) z=56.34 yaw 315: end world(-9463.26,23.41,57.07) local(-0.9,-1.1) moved=1.40 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw   0: end world(-9471.59,5.66,57.52) local(-19.5,5.0) moved=0.51 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw  45: end world(-9471.38,7.35,57.52) local(-17.8,5.0) moved=2.21 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw  90: end world(-9471.65,9.36,56.46) local(-15.8,5.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw 135: end world(-9474.62,8.13,56.89) local(-17.4,8.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw 180: end world(-9475.85,5.16,56.80) local(-20.5,9.2) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw 225: end world(-9474.62,2.19,56.53) local(-23.3,7.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw 270: end world(-9472.16,1.02,57.52) local(-24.2,5.0) moved=4.17 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-20.0,5.0) z=57.52 yaw 315: end world(-9471.97,2.59,57.52) local(-22.6,5.0) moved=2.59 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw   0: end world(-9454.72,35.66,60.31) local(12.3,-8.1) moved=2.11 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 1 at world(-9456.34,36.07,59.41) local(12.6,-6.4) dir=(0.71,0.71)
+    tri n=(0.123,0.992,-0.002) ndir=0.789 top=60.64 v0=(-9455.98,36.09,59.50)
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw  45: end world(-9455.70,37.15,56.97) local(13.7,-6.9) moved=1.94 exit_tick=None pen_ticks=1 first_pen=Some((1, [-9456.337, 36.07275, 59.41044]))
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw  90: end world(-9457.17,37.02,56.97) local(13.4,-5.5) moved=1.48 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw 135: end world(-9456.78,36.01,60.43) local(12.4,-6.0) moved=0.43 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw 180: end world(-9457.59,35.17,61.28) local(11.5,-5.3) moved=0.86 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw 225: end world(-9456.91,35.02,60.46) local(11.4,-6.0) moved=0.56 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw 270: end world(-9456.83,34.88,60.52) local(11.3,-6.1) moved=0.70 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(12.0,-6.0) z=59.60 yaw 315: end world(-9454.95,32.74,57.49) local(9.4,-8.2) moved=3.41 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw   0: end world(-9451.10,15.24,56.54) local(-7.5,-14.2) moved=4.20 exit_tick=Some(6) pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw  45: end world(-9452.33,18.21,57.47) local(-4.7,-12.6) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw  90: end world(-9455.30,16.64,58.05) local(-6.6,-9.8) moved=1.40 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 4 at world(-9456.18,17.08,57.86) local(-6.3,-8.9) dir=(-0.71,0.71)
+    tri n=(-0.993,0.122,0.000) ndir=0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=-0.788 top=60.67 v0=(-9456.22,17.47,60.67)
+    tri n=(-0.993,0.122,0.000) ndir=0.788 top=60.67 v0=(-9456.23,17.42,58.05)
+    tri n=(0.993,-0.122,-0.000) ndir=-0.788 top=60.67 v0=(-9456.22,17.47,60.67)
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw 135: end world(-9457.17,18.07,57.42) local(-5.4,-7.8) moved=3.40 exit_tick=None pen_ticks=1 first_pen=Some((4, [-9456.185, 17.084751, 57.855587]))
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw 180: end world(-9455.36,14.73,58.05) local(-8.5,-10.0) moved=0.51 exit_tick=None pen_ticks=0 first_pen=None
+  PEN tick 6 at world(-9456.56,12.06,57.86) local(-11.3,-9.1) dir=(-0.71,-0.71)
+    tri n=(0.993,-0.122,0.000) ndir=-0.616 top=60.67 v0=(-9456.17,14.50,58.05)
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw 225: end world(-9456.56,12.06,57.86) local(-11.3,-9.1) moved=3.42 exit_tick=None pen_ticks=1 first_pen=Some((6, [-9456.56, 12.059509, 57.855583]))
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw 270: end world(-9455.30,11.04,58.05) local(-12.2,-10.5) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+dt=0.500 swept=false start local(-8.0,-10.0) z=58.05 yaw 315: end world(-9452.33,12.27,56.89) local(-10.6,-13.3) moved=4.20 exit_tick=None pen_ticks=0 first_pen=None
+=== four angle classes ===
+ANGLE face-on local(4.2,0) yaw 90 dt=0.017 swept=true: start world(-9463.74,28.57,56.34) end world(-9464.65,29.26,56.34) local(4.8,1.0)
+ANGLE face-on local(4.2,0) yaw 90 dt=0.100 swept=true: start world(-9463.74,28.57,56.34) end world(-9464.62,29.18,56.34) local(4.7,1.0)
+ANGLE face-on local(4.2,0) yaw 90 dt=0.100 swept=false: start world(-9463.74,28.57,56.34) end world(-9465.18,33.64,56.97) local(9.1,2.1)
+ANGLE diagonal45 local(4.2,-3) yaw 45 dt=0.017 swept=true: start world(-9460.76,28.20,56.34) end world(-9458.49,28.47,56.34) local(4.7,-5.2)
+ANGLE diagonal45 local(4.2,-3) yaw 45 dt=0.100 swept=true: start world(-9460.76,28.20,56.34) end world(-9458.47,28.55,56.34) local(4.8,-5.2)
+ANGLE diagonal45 local(4.2,-3) yaw 45 dt=0.100 swept=false: start world(-9460.76,28.20,56.34) end world(-9459.77,29.19,56.97) local(5.3,-3.9)
+ANGLE corner local(4,12.5) yaw 135 dt=0.017 swept=true: start world(-9476.17,29.89,56.34) end world(-9477.53,30.92,56.34) local(4.9,14.0)
+ANGLE corner local(4,12.5) yaw 135 dt=0.100 swept=true: start world(-9476.17,29.89,56.34) end world(-9477.49,30.91,56.34) local(4.8,13.9)
+ANGLE corner local(4,12.5) yaw 135 dt=0.100 swept=false: start world(-9476.17,29.89,56.34) end world(-9477.21,30.55,56.34) local(4.5,13.6)
+ANGLE slide local(4.7,0) yaw 0 dt=0.017 swept=true: start world(-9463.68,29.06,56.34) end world(-9458.49,28.55,56.34) local(4.8,-5.2)
+ANGLE slide local(4.7,0) yaw 0 dt=0.100 swept=true: start world(-9463.68,29.06,56.34) end world(-9458.53,28.54,56.34) local(4.8,-5.2)
+ANGLE slide local(4.7,0) yaw 0 dt=0.100 swept=false: start world(-9463.68,29.06,56.34) end world(-9457.39,28.81,56.97) local(5.2,-6.3)
+test player::tests::diag_inn_collision ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 16.85s
+

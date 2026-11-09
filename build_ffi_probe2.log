@@ -1,0 +1,340 @@
+cargo :    Compiling benilla-ffi v0.2.0 (I:\AI游戏\benilla\crates\benilla-ffi)
+At I:\AI游戏\benilla\build_ffi.ps1:5 char:1
++ cargo build --release 2>&1
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Com...es\benilla-ffi):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: value assigned to `local` is never read
+   --> crates\benilla-ffi\src\model_particles.rs:171:21
+    |
+171 |     let mut local = [0.0f32; 3];
+    |                     ^^^^^^^^^^^ this value is reassigned later and never used
+...
+177 |         local = spline.eval(t);
+    |         ---------------------- `local` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+warning: value assigned to `session` is never read
+    --> crates\benilla-ffi\src\net.rs:2521:45
+     |
+2521 |     let mut session: Option<WorldSession> = None;
+     |                                             ^^^^ this value is reassigned later and never used
+...
+2594 |                                 session = Some(s);
+     |                                 ------- `session` is overwritten here before the previous value is read
+warning: variable `last_move_flags` is assigned to, but never used
+    --> crates\benilla-ffi\src\net.rs:2909:9
+     |
+2909 |     let mut last_move_flags: u32 = 0;
+     |         ^^^^^^^^^^^^^^^^^^^
+     |
+     = note: consider using `_last_move_flags` instead
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+warning: variable `sent_flags` is assigned to, but never used
+    --> crates\benilla-ffi\src\net.rs:3473:17
+     |
+3473 |             let mut sent_flags: u32 = 0;
+     |                 ^^^^^^^^^^^^^^
+     |
+     = note: consider using `_sent_flags` instead
+warning: value assigned to `last_move_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3612:13
+     |
+3612 |             last_move_flags = cur_flags;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3479:17
+     |
+3479 |                 sent_flags |= MF_FORWARD;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3487 |                 sent_flags |= MF_BACKWARD;
+     |                 ------------------------- `sent_flags` is overwritten here before the previous value is read
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3487:17
+     |
+3487 |                 sent_flags |= MF_BACKWARD;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3505 |                 sent_flags |= MF_STRAFE_RIGHT;
+     |                 ----------------------------- `sent_flags` is overwritten here before the previous value is read
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3505:17
+     |
+3505 |                 sent_flags |= MF_STRAFE_RIGHT;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3513 |                 sent_flags |= MF_STRAFE_LEFT;
+     |                 ---------------------------- `sent_flags` is overwritten here before the previous value is read
+warning: value assigned to `sent_flags` is never read
+    --> crates\benilla-ffi\src\net.rs:3513:17
+     |
+3513 |                 sent_flags |= MF_STRAFE_LEFT;
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+warning: unreachable pattern
+   --> crates\benilla-ffi\src\lib.rs:963:29
+    |
+961 | ...                   benilla_adt::ParsedAdt::Root(root) => root.mcnk_chunks,
+    |                       ---------------------------------- matches all the relevant values
+962 | ...
+963 | ...                   _ => return None,
+    |                       ^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+warning: irrefutable `if let` pattern
+    --> crates\benilla-ffi\src\lib.rs:1321:20
+     |
+1321 |                 if let benilla_adt::ParsedAdt::Root(root) = parsed {
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+     = note: `#[warn(irrefutable_let_patterns)]` on by default
+warning: type `BnBone` is more private than the item `m2_skinned_positions_rig`
+    --> crates\benilla-ffi\src\lib.rs:7450:1
+     |
+7450 | / pub fn m2_skinned_positions_rig(
+7451 | |     model: &benilla_m2::M2Model,
+7452 | |
+7453 | |     global_seqs: &[u32],
+...    |
+7461 | |     twist: (f32, f32),
+7462 | | ) -> Vec<[f32; 3]> {
+     | |__________________^ function `m2_skinned_positions_rig` is reachable at visibility `pub`
+     |
+note: but type `BnBone` is only usable at visibility `pub(crate)`
+    --> crates\benilla-ffi\src\lib.rs:6712:1
+     |
+6712 | pub(crate) struct BnBone {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+warning: type `BnBone` is more private than the item `m2_skinned_positions_rig_masked`
+    --> crates\benilla-ffi\src\lib.rs:7483:1
+     |
+7483 | / pub fn m2_skinned_positions_rig_masked(
+7484 | |     model: &benilla_m2::M2Model,
+7485 | |
+7486 | |     global_seqs: &[u32],
+...    |
+7496 | |     twist: (f32, f32),
+7497 | | ) -> Vec<[f32; 3]> {
+     | |__________________^ function `m2_skinned_positions_rig_masked` is reachable at visibility `pub`
+     |
+note: but type `BnBone` is only usable at visibility `pub(crate)`
+    --> crates\benilla-ffi\src\lib.rs:6712:1
+     |
+6712 | pub(crate) struct BnBone {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^
+warning: type `net::ItemTemplate` is more private than the item `item_info_row`
+    --> crates\benilla-ffi\src\net.rs:3879:1
+     |
+3879 | pub(crate) fn item_info_row(entry: u32, templates: &HashMap<u32, ItemTemplate>) -> BnNetItemInfo {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^ function `item_info_row` is reachable at visibility `pub(crate)`
+     |
+note: but type `net::ItemTemplate` is only usable at visibility `pub(self)`
+    --> crates\benilla-ffi\src\net.rs:319:1
+     |
+ 319 | struct ItemTemplate {
+     | ^^^^^^^^^^^^^^^^^^^
+warning: type `net::Shared` is more private than the item `inventory_rows`
+    --> crates\benilla-ffi\src\net.rs:4044:1
+     |
+4044 | pub(crate) fn inventory_rows(sh: &Shared) -> Vec<BnNetInvItem> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `inve
+ntory_rows` is reachable at visibility `pub(crate)`
+     |
+note: but type `net::Shared` is only usable at visibility `pub(self)`
+    --> crates\benilla-ffi\src\net.rs:1402:1
+     |
+1402 | struct Shared {
+     | ^^^^^^^^^^^^^
+warning: function `wow_to_ue` is never used
+   --> crates\benilla-ffi\src\lib.rs:344:4
+    |
+344 | fn wow_to_ue(px: f32, py: f32, pz: f32) -> BnVertex {
+    |    ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+warning: variant `Parse` is never constructed
+    --> crates\benilla-ffi\src\lib.rs:2546:5
+     |
+2545 | enum WmoJob {
+     |      ------ variant in this enum
+2546 |     Parse {
+     |     ^^^^^
+warning: struct `Vec3` is never constructed
+  --> crates\benilla-ffi\src\coords.rs:19:12
+   |
+19 | pub struct Vec3 {
+   |            ^^^^
+warning: struct `Quat` is never constructed
+  --> crates\benilla-ffi\src\coords.rs:27:12
+   |
+27 | pub struct Quat {
+   |            ^^^^
+warning: struct `Mat4` is never constructed
+  --> crates\benilla-ffi\src\coords.rs:36:12
+   |
+36 | pub struct Mat4 {
+   |            ^^^^
+warning: multiple associated items are never used
+   --> crates\benilla-ffi\src\coords.rs:41:15
+    |
+ 40 | impl Mat4 {
+    | --------- associated items in this implementation
+ 41 |     pub const IDENTITY: Mat4 = Mat4 {
+    |               ^^^^^^^^
+...
+ 47 |     pub fn identity() -> Self {
+    |            ^^^^^^^^
+...
+ 52 |     pub fn mul(a: &Mat4, b: &Mat4) -> Mat4 {
+    |            ^^^
+...
+ 67 |     pub fn apply_point(m: &Mat4, v: Vec3) -> Vec3 {
+    |            ^^^^^^^^^^^
+...
+ 76 |     pub fn translation(v: Vec3) -> Mat4 {
+    |            ^^^^^^^^^^^
+...
+ 85 |     pub fn scale(v: Vec3) -> Mat4 {
+    |            ^^^^^
+...
+ 97 |     pub fn rotation(q: Quat) -> Mat4 {
+    |            ^^^^^^^^
+...
+127 |     pub fn bone_local(pivot: Vec3, trans: Vec3, rot: Quat, scale: Vec3) -> Mat4 {
+    |            ^^^^^^^^^^
+...
+144 |     pub fn to_array(&self) -> [f32; 16] {
+    |            ^^^^^^^^
+warning: function `quat_slerp` is never used
+   --> crates\benilla-ffi\src\coords.rs:242:8
+    |
+242 | pub fn quat_slerp(r: f32, a: Quat, b: Quat) -> Quat {
+    |        ^^^^^^^^^^
+warning: constant `UNIT_CM` is never used
+   --> crates\benilla-ffi\src\coords.rs:154:15
+    |
+154 |     pub const UNIT_CM: f32 = 100.0;
+    |               ^^^^^^^
+warning: function `vec` is never used
+   --> crates\benilla-ffi\src\coords.rs:157:12
+    |
+157 |     pub fn vec(v: Vec3) -> Vec3 {
+    |            ^^^
+warning: function `normal` is never used
+   --> crates\benilla-ffi\src\coords.rs:166:12
+    |
+166 |     pub fn normal(v: Vec3) -> Vec3 {
+    |            ^^^^^^
+warning: function `quat` is never used
+   --> crates\benilla-ffi\src\coords.rs:171:12
+    |
+171 |     pub fn quat(q: Quat) -> Quat {
+    |            ^^^^
+warning: function `scale` is never used
+   --> crates\benilla-ffi\src\coords.rs:181:12
+    |
+181 |     pub fn scale(v: Vec3) -> Vec3 {
+    |            ^^^^^
+warning: function `translation` is never used
+   --> crates\benilla-ffi\src\coords.rs:186:12
+    |
+186 |     pub fn translation(v: Vec3) -> Vec3 {
+    |            ^^^^^^^^^^^
+warning: function `to_world` is never used
+   --> crates\benilla-ffi\src\coords.rs:192:12
+    |
+192 |     pub fn to_world(v: Vec3) -> Vec3 {
+    |            ^^^^^^^^
+warning: function `vec` is never used
+   --> crates\benilla-ffi\src\coords.rs:207:12
+    |
+207 |     pub fn vec(v: Vec3) -> Vec3 {
+    |            ^^^
+warning: function `quat` is never used
+   --> crates\benilla-ffi\src\coords.rs:215:12
+    |
+215 |     pub fn quat(q: Quat) -> Quat {
+    |            ^^^^
+warning: function `scale` is never used
+   --> crates\benilla-ffi\src\coords.rs:224:12
+    |
+224 |     pub fn scale(v: Vec3) -> Vec3 {
+    |            ^^^^^
+warning: function `from_world` is never used
+   --> crates\benilla-ffi\src\coords.rs:230:12
+    |
+230 |     pub fn from_world(v: Vec3) -> Vec3 {
+    |            ^^^^^^^^^^
+warning: function `rasterize_wrapped` is never used
+   --> crates\benilla-ffi\src\ui_font.rs:556:8
+    |
+556 | pub fn rasterize_wrapped(
+    |        ^^^^^^^^^^^^^^^^^
+warning: fields `end_text` and `reward_spell` are never read
+   --> crates\benilla-ffi\src\net.rs:466:9
+    |
+456 | pub(crate) struct QuestTemplateLite {
+    |                   ----------------- fields in this struct
+...
+466 |     pub end_text: String,
+    |         ^^^^^^^^
+467 |     pub src_item_id: u32,
+468 |     pub reward_spell: u32,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `QuestTemplateLite` has a derived impl for the trait `Clone`, but this is intenti
+onally ignored during dead code analysis
+warning: variant `QuestAbandon` is never constructed
+    --> crates\benilla-ffi\src\net.rs:1129:5
+     |
+1080 | pub(crate) enum Cmd {
+     |                 --- variant in this enum
+...
+1129 |     QuestAbandon {
+     |     ^^^^^^^^^^^^
+warning: field `facing` is never read
+    --> crates\benilla-ffi\src\net.rs:1755:9
+     |
+1751 | pub(crate) struct UiUnitRec {
+     |                   --------- field in this struct
+...
+1755 |     pub facing: f32,
+     |         ^^^^^^
+warning: function `uptime_ms` is never used
+    --> crates\benilla-ffi\src\net.rs:2896:8
+     |
+2896 |     fn uptime_ms() -> u32 {
+     |        ^^^^^^^^^
+warning: field `alive` is never read
+    --> crates\benilla-ffi\src\net.rs:5376:9
+     |
+5371 | pub(crate) struct MenuSnapshot {
+     |                   ------------ field in this struct
+...
+5376 |     pub alive: bool,
+     |         ^^^^^
+warning: field `sample_rate` is never read
+  --> crates\benilla-ffi\src\audio_out.rs:52:5
+   |
+48 | pub(crate) struct CpalBackend {
+   |                   ----------- field in this struct
+...
+52 |     sample_rate: u32,
+   |     ^^^^^^^^^^^
+warning: linker stdout:   正在创建库 I:\AI游戏\benilla\target\release\deps\benilla.dll.lib 和对象 I:\AI游戏\b
+enilla\target\release\deps\benilla.dll.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+warning: `benilla-ffi` (lib) generated 41 warnings
+    Finished `release` prof
+ile [optimized] target(s) in 18.21s
+Exit: 0

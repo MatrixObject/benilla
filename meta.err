@@ -1,0 +1,18 @@
+error: failed to select a version for `alsa-sys`.
+    ... required by package `alsa v0.11.0`
+    ... which satisfies dependency `alsa = "^0.11"` of package `cpal v0.18.1`
+    ... which satisfies dependency `cpal = "^0.18.1"` of package `kira v0.12.4 (I:\AI游戏\benilla\third_party\kira)`
+    ... which satisfies dependency `kira = "^0.12"` of package `benilla-ffi v0.2.0 (I:\AI游戏\benilla\crates\benilla-ffi)`
+versions that meet the requirements `^0.4.0` are: 0.4.0
+
+package `alsa-sys` links to the native library `alsa`, but it conflicts with a previous package which links to `alsa` as well:
+package `alsa-sys v0.3.1`
+    ... which satisfies dependency `alsa-sys = "^0.3.1"` (locked to 0.3.1) of package `alsa v0.10.0`
+    ... which satisfies dependency `alsa = "^0.10"` (locked to 0.10.0) of package `cpal v0.17.1`
+    ... which satisfies dependency `cpal = "^0.17"` (locked to 0.17.1) of package `benilla-app v0.2.0 (I:\AI游戏\benilla\crates\benilla-app)`
+    ... which satisfies path dependency `benilla-app` (locked to 0.2.0) of package `benilla v0.2.0 (I:\AI游戏\benilla\crates\benilla)`
+note: only one package in the dependency graph may specify the same links value to ensure that only one copy of a native library is linked in the final binary
+for more information, see https://doc.rust-lang.org/cargo/reference/resolver.html#links
+help: try to adjust your dependencies so that only one package uses the `links = "alsa"` value
+
+failed to select a version for `alsa-sys` which could resolve this conflict

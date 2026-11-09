@@ -527,6 +527,10 @@ pub struct TerrainChunkRange {
     layers: Vec<String>,
     /// Combined 64x64 RGBA alpha map for layers 1..3 (None with a single layer).
     alpha: Option<Vec<u8>>,
+    /// The chunk's MCSH shade, one byte per 64x64 texel (255 shadowed, 0 lit).
+    /// Kept at native resolution so `bn_terrain_chunk_alpha` can hand it to the
+    /// host's per-pixel splat sampler instead of the old per-vertex average.
+    shadow: Option<Vec<u8>>,
 }
 
 /// Flattened real ADT terrain, built once in `bn_load_tile` via the official
@@ -701,6 +705,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             tex: c.base_texture.clone().unwrap_or_default(),
             layers: c.layer_textures.clone(),
             alpha: c.alpha_map.clone(),
+            shadow: c.shadow.clone(),
         });
     }
     // ADT liquid (MCLQ): own buffer, same tile-local + WoW->UE mirror as the
@@ -1054,11 +1059,18 @@ fn tile_worker() {
                         // tick free of an MPQ parse. One parking per model is
                         // enough until the body takes it.
                         for m in &wmo_models {
-                            if player::wmo_collision_parked(m) {
-                                continue;
+                            if !player::wmo_collision_parked(m) {
+                                if let Ok(mesh) = benilla_formats::load_wmo_collision_tris(c, m) {
+                                    player::wmo_collision_park(m, mesh);
+                                }
                             }
-                            if let Ok(mesh) = benilla_formats::load_wmo_collision_tris(c, m) {
-                                player::wmo_collision_park(m, mesh);
+                            // The camera's own set (every face but `NOCAMCOLLIDE`,
+                            // `DETAIL` kept) is parked too, so the body's camera
+                            // fold never parses a WMO on the tick.
+                            if !player::wmo_camera_parked(m) {
+                                if let Ok(mesh) = benilla_formats::load_wmo_camera_tris(c, m) {
+                                    player::wmo_camera_park(m, mesh);
+                                }
                             }
                         }
                     }
@@ -2027,9 +2039,15 @@ pub extern "C" fn bn_terrain_chunk_layer(
 }
 
 /// Chunk `i` combined 64x64 RGBA alpha map (R/G/B = layers 1/2/3 blend
-/// weights, A unused). Returns the byte count written (0 = single-layer
-/// chunk, caller should bind a black alpha). Channels for absent layers are
-/// forced to 0 so a partial layer stack blends correctly.
+/// weights, **A = the chunk's MCSH shade**: 0 lit, 255 shadowed). Returns the
+/// byte count written (0 = neither an alpha map nor a shadow map; the caller
+/// binds a black alpha then). Channels for absent layers are forced to 0 so a
+/// partial layer stack blends correctly.
+///
+/// A carries the baked static shadow at the MCSH's native 64x64 so the host
+/// material can sample it per pixel. Sampling that map per vertex (the old
+/// `bn_terrain_fill_colors` path) collapses 64x64 binary bits onto a 9x9
+/// vertex grid (~7x coarser) and the tree/building shadows average away.
 #[no_mangle]
 pub extern "C" fn bn_terrain_chunk_alpha(
     world: *const BnWorld,
@@ -2044,12 +2062,26 @@ pub extern "C" fn bn_terrain_chunk_alpha(
     let Some(c) = w.tile.as_ref().and_then(|t| t.chunks.get(i as usize)) else {
         return 0;
     };
-    let Some(alpha) = c.alpha.as_ref() else {
+    if c.alpha.is_none() && c.shadow.is_none() {
         return 0;
-    };
-    let n = (64 * 64 * 4).min(alpha.len()).min(cap as usize);
+    }
+    let n = (64 * 64 * 4).min(cap as usize);
+    if n == 0 {
+        return 0;
+    }
     unsafe {
-        std::ptr::copy_nonoverlapping(alpha.as_ptr(), out, n);
+        std::ptr::write_bytes(out, 0, n);
+        if let Some(alpha) = c.alpha.as_ref() {
+            std::ptr::copy_nonoverlapping(alpha.as_ptr(), out, n.min(alpha.len()));
+        }
+        // A = MCSH shade (the byte form `adt_to_tile_mesh` already made:
+        // 255 inside a shadow bit, 0 outside). Absent map leaves A = 0 = lit.
+        if let Some(sh) = c.shadow.as_ref() {
+            let m = (n / 4).min(sh.len());
+            for k in 0..m {
+                *out.add(k * 4 + 3) = sh[k];
+            }
+        }
     }
     // R/G/B serve layers 1..3; zero the channels whose layer is absent.
     let layers = c.layers.len().min(4);
@@ -2131,6 +2163,10 @@ pub struct WmoSub {
     /// 1 when every vertex carried MOCV. Without it the host must keep the
     /// batch on the dynamic-lit path (the bake has no data to show).
     has_colors: bool,
+    /// MOMT flags 0x20 (WINDOW): the reference draws this batch with the
+    /// interior `lit_window` light and its authored blend, never the opaque
+    /// interior bake.
+    window: bool,
 }
 
 /// One WMO instance baked into tile-local UE axes: `world = position + in_wow·v`,
@@ -2344,6 +2380,7 @@ fn build_wmo_flat_q(
                 None => 3,
             },
             has_colors: sm.vertex_colors.len() == sm.positions.len(),
+            window: sm.window,
             tex,
             two_sided: sm.two_sided,
             blend: match sm.blend {
@@ -3401,7 +3438,7 @@ pub extern "C" fn bn_wmo_instance_submesh(
         *out.add(4) = u32::from(sm.group);
         *out.add(5) = sm.class;
         *out.add(6) = u32::from(sm.interior) | (u32::from(sm.has_colors) << 1);
-        *out.add(7) = 0;
+        *out.add(7) = u32::from(sm.window);
     }
     1
 }

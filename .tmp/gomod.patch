@@ -1,0 +1,13 @@
+diff --git a/crates/benilla-ffi/src/lib.rs b/crates/benilla-ffi/src/lib.rs
+--- a/crates/benilla-ffi/src/lib.rs
++++ b/crates/benilla-ffi/src/lib.rs
+@@ -72,3 +72,7 @@
+ // ---- CreatureDisplayInfo -> model path / scale / skins (host render inputs) ----
+ 
+ mod creature;
+ 
++// ---- GameObjectDisplayInfo -> model path (a lootable object's look) ----
++
++mod gameobject;
++
+ // ---- A unit's virtual weapon slots -> attach point, item model and object skin ----

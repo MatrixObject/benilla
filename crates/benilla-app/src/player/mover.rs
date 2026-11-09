@@ -224,7 +224,6 @@ pub(super) fn step(
                 offset: hover_offset,
                 water: water_floor,
                 steep: player.steep_support,
-                ground_reach,
             },
         );
         // Only this mover has a fall to elect, so it spends the no-floor drop (`pos.z -= achieved`
@@ -370,11 +369,6 @@ pub(crate) struct Support {
     /// The support entering the frame is a certified steep contact, the reference's `0x4000000`,
     /// which opens the step-down's deep reach.
     pub(crate) steep: bool,
-    /// The classify's ground reach this frame ([`LAND_PROBE`] airborne, [`GROUND_PROBE`] grounded).
-    /// A landing body was airborne, so its classify reached past the step-down cone; the snap must
-    /// match or the body perches a [`STEP_SNAP_SLACK`] above the floor (a straight fall's cone is
-    /// only the slack).
-    pub(crate) ground_reach: f32,
 }
 
 impl Default for Support {
@@ -385,7 +379,6 @@ impl Default for Support {
             offset: 0.0,
             water: None,
             steep: false,
-            ground_reach: GROUND_PROBE,
         }
     }
 }
@@ -519,21 +512,14 @@ pub(crate) fn grounded_step(
     // hover offset (`0x633e35`), and settles only onto a walkable floor. A deeper drop is a fall,
     // and a body at rest reaches only the slack, so it falls instead of being pulled down.
     let d = slid - start;
-    let base_reach = support.ground_reach - surface_offset;
-    // A landing body was airborne: its classify reached [`LAND_PROBE`] (+ skin), which can be past
-    // the step-down cone of a straight fall (only [`STEP_SNAP_SLACK`]). Open the snap to the
-    // classify's reach so the body settles onto the floor in one frame instead of perching a slack
-    // above it. A grounded walker keeps the small cone so ledges step down gradually.
-    let landing = base_reach <= LAND_PROBE + 1e-6;
-    let reach = (d.x.hypot(d.z) * STEP_SLOPE_RATIO
+    let reach = d.x.hypot(d.z) * STEP_SLOPE_RATIO
         + STEP_SNAP_SLACK
         + if support.steep || popped.is_some() {
             support.rise
         } else {
             0.0
         }
-        + surface_offset)
-        .max(if landing { support.ground_reach } else { 0.0 });
+        + surface_offset;
     let hit = cast(slid, Vec3::NEG_Y * reach);
     // The water is one more candidate within the same reach, flat, nearest wins, as in the
     // reference's one masked trace; with no entity it keeps the caller's support.
@@ -561,17 +547,12 @@ pub(crate) fn grounded_step(
     // Our capsule hangs clear and would spend the whole drop at once; the cap ports the cone's
     // effect. A steep landing stays grounded with the steep bit set, as the reference's multipass
     // returns (`0x636f21`), and the deep reach keeps the ground in sight.
-    let cone_reach = (d.x.hypot(d.z) * STEP_SLOPE_RATIO + STEP_SNAP_SLACK)
-        .max(if landing { support.ground_reach } else { 0.0 });
+    let cone_reach = d.x.hypot(d.z) * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
     if let Some((distance, normal_y, entity)) = floor {
         let drop = (distance - surface_offset).max(0.0);
         let walkable = normal_y >= GROUND_COS;
         if !(rode && walkable && drop >= ride_rise) {
-            // The cast stops a skin above the floor; close that gap so the feet rest on it, not a
-            // `SKIN_WIDTH` perch above it (a straight fall's snap would otherwise leave the body
-            // some 0.02–0.03 up and fail the "never stand off the floor" check).
-            let descent = drop.min(cone_reach) + SKIN_WIDTH;
-            slid.y -= descent;
+            slid.y -= drop.min(cone_reach);
             if drop > cone_reach {
                 // Further down than a cone's worth but in sight: a step-down in progress, so stay
                 // grounded with the deep reach open and finish it over the next frames.

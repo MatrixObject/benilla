@@ -1,0 +1,75 @@
+check: '.tmp/probe_inn.log' is outside the crate map — the whole workspace could be affected.
+check: escalating to the full chain: scripts/gates.sh
+gating: I:/AI游戏/benilla
+gate ok: fmt (11 s)
+GATE FAILED: clippy (128 s)
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty line after outer attribute
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty line after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty lines after doc comment
+error: empty line after outer attribute
+error: empty line after outer attribute
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+     --> crates\benilla-ffi\src\lib.rs:11304:59
+      |
+11304 |     unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), out, N as usize) };
+      |                                                           ^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+     --> crates\benilla-ffi\src\lib.rs:11327:28
+      |
+11327 |     let w = unsafe { &mut *world };
+      |                            ^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#not_unsafe_ptr_arg_deref
+
+error: this public function might dereference a raw pointer but is not marked `unsafe`
+     --> crates\benilla-ffi\src\lib.rs:11347:10
+      |
+11347 |         *buf.add(n) = 0;
+      |          ^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#not_unsafe_ptr_arg_deref
+
+error: could not compile `benilla-ffi` (lib) due to 386 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `benilla-ffi` (lib test) due to 379 previous errors
