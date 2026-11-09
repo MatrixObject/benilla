@@ -224,6 +224,7 @@ pub(super) fn step(
                 offset: hover_offset,
                 water: water_floor,
                 steep: player.steep_support,
+                ground_reach,
             },
         );
         // Only this mover has a fall to elect, so it spends the no-floor drop (`pos.z -= achieved`
@@ -369,6 +370,11 @@ pub(crate) struct Support {
     /// The support entering the frame is a certified steep contact, the reference's `0x4000000`,
     /// which opens the step-down's deep reach.
     pub(crate) steep: bool,
+    /// The classify's ground reach this frame ([`LAND_PROBE`] airborne, [`GROUND_PROBE`] grounded).
+    /// A landing body was airborne, so its classify reached past the step-down cone; the snap must
+    /// match or the body perches a [`STEP_SNAP_SLACK`] above the floor (a straight fall's cone is
+    /// only the slack).
+    pub(crate) ground_reach: f32,
 }
 
 impl Default for Support {
@@ -379,6 +385,7 @@ impl Default for Support {
             offset: 0.0,
             water: None,
             steep: false,
+            ground_reach: GROUND_PROBE,
         }
     }
 }
@@ -512,14 +519,21 @@ pub(crate) fn grounded_step(
     // hover offset (`0x633e35`), and settles only onto a walkable floor. A deeper drop is a fall,
     // and a body at rest reaches only the slack, so it falls instead of being pulled down.
     let d = slid - start;
-    let reach = d.x.hypot(d.z) * STEP_SLOPE_RATIO
+    let base_reach = support.ground_reach - surface_offset;
+    // A landing body was airborne: its classify reached [`LAND_PROBE`] (+ skin), which can be past
+    // the step-down cone of a straight fall (only [`STEP_SNAP_SLACK`]). Open the snap to the
+    // classify's reach so the body settles onto the floor in one frame instead of perching a slack
+    // above it. A grounded walker keeps the small cone so ledges step down gradually.
+    let landing = base_reach <= LAND_PROBE + 1e-6;
+    let reach = (d.x.hypot(d.z) * STEP_SLOPE_RATIO
         + STEP_SNAP_SLACK
         + if support.steep || popped.is_some() {
             support.rise
         } else {
             0.0
         }
-        + surface_offset;
+        + surface_offset)
+        .max(if landing { support.ground_reach } else { 0.0 });
     let hit = cast(slid, Vec3::NEG_Y * reach);
     // The water is one more candidate within the same reach, flat, nearest wins, as in the
     // reference's one masked trace; with no entity it keeps the caller's support.
@@ -547,12 +561,17 @@ pub(crate) fn grounded_step(
     // Our capsule hangs clear and would spend the whole drop at once; the cap ports the cone's
     // effect. A steep landing stays grounded with the steep bit set, as the reference's multipass
     // returns (`0x636f21`), and the deep reach keeps the ground in sight.
-    let cone_reach = d.x.hypot(d.z) * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
+    let cone_reach = (d.x.hypot(d.z) * STEP_SLOPE_RATIO + STEP_SNAP_SLACK)
+        .max(if landing { support.ground_reach } else { 0.0 });
     if let Some((distance, normal_y, entity)) = floor {
         let drop = (distance - surface_offset).max(0.0);
         let walkable = normal_y >= GROUND_COS;
         if !(rode && walkable && drop >= ride_rise) {
-            slid.y -= drop.min(cone_reach);
+            // The cast stops a skin above the floor; close that gap so the feet rest on it, not a
+            // `SKIN_WIDTH` perch above it (a straight fall's snap would otherwise leave the body
+            // some 0.02–0.03 up and fail the "never stand off the floor" check).
+            let descent = drop.min(cone_reach) + SKIN_WIDTH;
+            slid.y -= descent;
             if drop > cone_reach {
                 // Further down than a cone's worth but in sight: a step-down in progress, so stay
                 // grounded with the deep reach open and finish it over the next frames.
@@ -2411,11 +2430,11 @@ mod tests {
 //   [`grounded_step`](:410) / [`step_up`](:766) / [`fall_step`](:589) / [`airborne_step`](:608)；
 // - 无窗口初始化 → 与本文件测试用的 [`world_from_profile`](:848) 同一份插件配方。
 
-/// 宿主交给引擎的一块碰撞面，顶点为 Bevy 坐标。`layer` 取碰撞层的判别值：
+/// 宿主交给引擎的一块碰撞面，顶点为 WoW 轴（`[x, y, z]`）。`layer` 取碰撞层的判别值：
 /// 0 = 地形（Default），1 = WMO 可行走面（Walk），2 = WMO 相机面（Camera，身体不查询）。
 pub struct MoverMesh {
     pub layer: u8,
-    pub verts: Vec<Vec3>,
+    pub verts: Vec<[f32; 3]>,
     pub tris: Vec<[u32; 3]>,
 }
 
@@ -2457,6 +2476,13 @@ impl MoverSession {
             PhysicsPlugins::new(bevy::app::PostUpdate),
         ));
         app.init_asset::<Mesh>();
+        // `ColliderTreeDiagnostics` 等 avian 资源在 `Plugin::finish` 里注册
+        // （`avian3d-0.6.1/src/collider_tree/mod.rs:96-98`），而 `App::update()` 不跑 finish。
+        // 完整客户端由 `App::run()` 走到 finish，这个手搭的无窗口世界必须自己补，
+        // 否则 `update_moved_collider_aabbs`（`collider_tree/update.rs:688`）会 panic。
+        // 必须按 `App::run()` 的顺序补完 finish → cleanup，否则插件停在半初始化状态。
+        app.finish();
+        app.cleanup();
         Self {
             app,
             player: Player::default(),
@@ -2472,9 +2498,15 @@ impl MoverSession {
             self.app.world_mut().despawn(e);
         }
         for m in meshes {
+            // WoW 轴 → Bevy（`benilla-assets/src/coords.rs:10` 的同一映射）。
+            let verts: Vec<Vec3> = m
+                .verts
+                .iter()
+                .map(|v| Vec3::new(-v[1], v[2], -v[0]))
+                .collect();
             let mut e = self.app.world_mut().spawn((
                 RigidBody::Static,
-                Collider::trimesh(m.verts.clone(), m.tris.clone()),
+                Collider::trimesh(verts, m.tris.clone()),
                 Transform::default(),
             ));
             if m.layer != 0 {
@@ -2510,6 +2542,8 @@ impl MoverSession {
         let dir = Vec3::new(-dir_wow[1], 0.0, -dir_wow[0]);
         let moving = speed > 0.0 && dir.length_squared() > 0.0;
         let cap = self.capsule.clone();
+        // 起跳高度取步进前的脚底（`arc.rs:21` 的 `launch_y`）。
+        let launch_y = self.player.pos.y;
         use bevy::ecs::system::RunSystemOnce;
         // `step` wants `&mut Player` while `WorldCollision` borrows the world, so the body rides in
         // as a resource for the one system run and comes straight back out.
@@ -2536,7 +2570,8 @@ impl MoverSession {
                         jump,
                         None,
                         water_floor_wow,
-                        0.0,
+                        // 站立起跳的空中微调速度是默认行走速度 `min(walk, run)`（state.rs:106）。
+                        super::AIR_NUDGE_SPEED,
                     )
                 },
             )
@@ -2546,6 +2581,19 @@ impl MoverSession {
             .world_mut()
             .remove_resource::<Player>()
             .expect("player resource");
+        // 真实客户端每帧在 mover 之后跑 `flags::this_frame` → `Player::advance_airborne_arc`
+        // （`benilla-app/src/player/flags.rs:98`、`arc.rs:25-66`），由它维护 `airborne_since`
+        // （`mover.rs:91` 据此在空中的 `LAND_PROBE = 0.05` 与地面的 `GROUND_PROBE = 0.2`
+        // 之间选择）、`jump_zspeed`、`fall_start_y`、`fall_far`、`arc_dirs_set`、`knock_arc`。
+        // 只跑 mover 会让 `airborne_since` 永远停在 `set_pose` 清掉的 `None`，空中落点按地面
+        // 0.2 的探测分类，人停在离地 0.13~0.19 处（`a_beam_over_the_head…` 的 z=0.1367625）。
+        let now = self.app.world().resource::<Time>().elapsed_secs();
+        self.player.advance_airborne_arc(
+            !out.grounded || out.jumped,
+            out.jumped,
+            now,
+            launch_y,
+        );
         MoverFrame {
             pos: [-self.player.pos.z, -self.player.pos.x, self.player.pos.y],
             vel_y: self.player.vel_y,

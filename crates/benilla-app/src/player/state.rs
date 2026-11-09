@@ -64,7 +64,7 @@ pub(crate) const HOVER_CLIMB_RATE: f32 = 7.0;
 /// Walkable iff the surface normal is within 50° of up, the reference's limit; steeper slides back.
 pub(super) const GROUND_COS: f32 = 0.642_788;
 /// Downward probe distance (yd) to decide whether we're standing on ground.
-pub(super) const GROUND_PROBE: f32 = 0.2;
+pub(crate) const GROUND_PROBE: f32 = 0.2;
 /// The snap's slope ratio, `[0x80c740]` (atan ≈ 61.6°): the reference's step-vs-fall election
 /// `0x6367b0` probes `travel · ratio + slack` below the moved body, plus the rise budget `H` only
 /// on a steep support (`0x4000000`, `0x636dfc`). The foot cone's waist (`0x631c0b`) shares it.

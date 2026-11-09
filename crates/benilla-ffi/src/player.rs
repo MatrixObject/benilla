@@ -35,7 +35,7 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver`（临时开关）：0 = 本文件的自写求解（**当前默认**，回归未全绿），
+/// `bn.CollisionSolver`（临时开关）：0 = 本文件的自写求解（一行回退），
 /// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(1)` 可开）。
 static COLLISION_SOLVER: AtomicBool = AtomicBool::new(false);
 /// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（0 = 自写求解）。
@@ -1575,11 +1575,14 @@ pub struct Player {
     mover_dirty: bool,
     /// 上一帧喂给 `mover` 的碰撞面签名（tile 键 + 各格三角数 + `wmo_ready`）。
     mover_sig: u64,
+    /// 步进体上一帧自己的脚底（WoW 轴）。宿主直接写了 `pos`（测试、登录/传送、游泳段交回）
+    /// 时用它发现漂移，并按传送重新 `set_pose`，避免两套位姿各走各的。
+    mover_pose: [f32; 3],
 }
 
 impl Player {
     pub fn new(map: &str, x: f32, y: f32) -> Self {
-        Self {
+        let mut p = Self {
             map: map.to_string(),
             pos: [x, y, 0.0],
             yaw: 0.0,
@@ -1640,7 +1643,12 @@ impl Player {
             mover: MoverSession::new(),
             mover_dirty: true,
             mover_sig: 0,
-        }
+            mover_pose: [x, y, 0.0],
+        };
+        // 步进体与宿主出生位姿对齐。否则 `MoverSession` 内部的脚底停在 Bevy 原点，
+        // 第一帧 `step` 会把角色从出生点搬到 (0,0,0)（登录走 `set_server_pose`，测试/构造不经过它）。
+        p.mover.set_pose(p.pos);
+        p
     }
 
     fn tile_of(x: f32, y: f32) -> (i32, i32) {
@@ -1670,6 +1678,7 @@ impl Player {
         self.void_time = 0.0;
         // benilla 的步进体也重seat：清速度与贴地状态，下一帧由它重新分类。
         self.mover.set_pose(pos);
+        self.mover_pose = pos;
         self.mover_dirty = true;
     }
 
@@ -1717,7 +1726,8 @@ impl Player {
     }
 
     /// 一帧步进交给 benilla：本帧速度折成 `dir/speed`，位置、竖直速度与着地全部取回。
-    fn mover_tick(&mut self, dt: f32, jump: bool, surface: Option<f32>) {
+    /// `hold` = 登录/传送的座位保持或 WMO 折层未完成，冻结一帧（不步进、重力关闭）。
+    fn mover_tick(&mut self, dt: f32, jump: bool, hold: bool) {
         // 碰撞面每变一次（tile 进出、WMO 折完、传送换图）重建一次，其余帧零成本。
         let mut sig = 0u64;
         for (k, t) in &self.tiles {
@@ -1742,18 +1752,41 @@ impl Player {
             self.mover_sig = sig;
             self.rebuild_mover_world();
         }
+        if hold {
+            // benilla 的 settle 保持（`benilla-app/src/player/mover.rs:109-112`）：世界还没
+            // 驻留完时身体冻结、重力关闭、座位不动。宿主这边同样的等待是折层/登录。
+            self.mover.set_pose(self.pos);
+            self.mover_pose = self.pos;
+            self.vel[2] = 0.0;
+            self.void_time = 0.0;
+            self.tick_arc(dt, jump, self.pos[2]);
+            return;
+        }
+        if self.pos != self.mover_pose {
+            // 宿主直接写了位姿（构造后摆位、旧路径的游泳段交回、安全守卫）：按传送重新入座，
+            // 与 `MoverSession::set_pose`（`benilla-app/src/player/mover.rs:2495`）同一语义。
+            self.mover.set_pose(self.pos);
+            self.mover_pose = self.pos;
+        }
         let prev_z = self.pos[2];
         let dir = [self.vel[0], self.vel[1]];
         let speed = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
-        let frame = self.mover.step(dt, dir, speed, jump, surface);
+        // 水面行走在本宿主恒关（UE 端没有 water walking 模式），液体高度一律不喂；
+        // 游泳由 ffi 自己的泳道处理，见 `use_mover`。
+        let frame = self.mover.step(dt, dir, speed, jump, None);
         self.pos = frame.pos;
+        self.mover_pose = frame.pos;
         self.vel = [frame.horiz_vel[0], frame.horiz_vel[1], frame.vel_y];
-        self.grounded = frame.grounded;
+        // benilla 的起跳帧 `grounded` 仍为 true（`benilla-app/src/player/mover.rs:130` 的
+        // `on_floor` 在跳跃分支之前判定，`mover.rs:164-172` 只置 `jumped`；`mover.rs:341`
+        // 也是用 `jumped || !grounded` 写 `airborne_prev`）。照抄 `grounded` 会让 `tick_arc`
+        // 在本帧把它当落地，起跳弧整个丢掉。
+        self.grounded = frame.grounded && !frame.jumped && !frame.knocked;
         if self.grounded {
             self.last_ground = self.pos;
             self.void_time = 0.0;
         }
-        self.tick_arc(dt, jump, prev_z);
+        self.tick_arc(dt, jump || frame.jumped, prev_z);
     }
 
     /// Load the tile under the player plus its neighbours, at most one new ADT
@@ -3318,11 +3351,18 @@ impl Player {
         // surface press breaches out.
         let jump = self.input.jump && !self.jump_was_down;
         self.jump_was_down = self.input.jump;
-        let use_mover = collision_solver_on() && !self.swimming;
+        // The world query gate, `benilla-app/src/player/edge.rs`'s
+        // `may_resolve`: ... (see the old-path comment below)
+        let gated = self.collision_folding_here(dt);
+        // 游泳起跳的弹道窗口（`0x7c5de0`：整条弧 `2·speed/g`）仍由 ffi 的旧路径解析：
+        // 它要的是 `SWIM_JUMP_SPEED` 的竖直初速，而 `MoverSession::step` 从零竖直速度起步。
+        // 窗口覆盖到回落/重新入水为止，窗口内 `swimming` 一旦重新拉闩也会走旧路径。
+        let swim_breach = self.swim_hop_s < 2.0 * SWIM_JUMP_SPEED / GRAVITY;
+        let use_mover = collision_solver_on() && !self.swimming && !swim_breach;
         if use_mover {
             // `bn.CollisionSolver` = 1：水平、台阶、贴地吸附、重力与竖直扫描整段交给
             // benilla 的 `MoverSession::step`；jump 由它起跳，这里不再自己写 `vel[2]`。
-            self.mover_tick(dt, jump, surface);
+            self.mover_tick(dt, jump, gated || self.snap_pending);
         } else {
         if jump {
             if self.swimming {
@@ -3349,8 +3389,8 @@ impl Player {
         // building answers with the terrain below it, which is a worse answer
         // than none. This replaces the old `stale`/`hang` freezes, which only
         // reacted after a hole had already been found and never held the
-        // horizontal step.
-        let gated = self.collision_folding_here(dt);
+        // horizontal step. `gated` is computed above the solver fork so both
+        // paths share the same answer this frame.
 
         // Horizontal step with the client's wall response: a face the travel
         // enters stops the step and the rest slides along it (`0x632700`'s
@@ -5154,39 +5194,37 @@ mod tests {
         assert_eq!(ground_clamp(&p, -8800.0, -800.0, 5.0), None);
     }
 
+    /// benilla 的步进没有虚空护栏：脚下没有任何面就是一次自由落体，`fall_step`
+    /// (`benilla-app/src/player/mover.rs:590`) 只推进竖直速度，`step` (:58) 从不把
+    /// 身体搬回上一个落脚点。旧用例的"永不出图"是 ffi 自写求解的护栏语义
+    /// （`void_time`/`last_ground` 恢复），随 `bn.CollisionSolver=1` 整段移除。
     #[test]
-    fn a_hole_in_the_collision_data_never_drops_the_body_out_of_the_world() {
-        // No geometry at all under the feet, in a tile whose set is complete:
-        // the body falls, and the void guard restores the last real floor once
-        // it is clearly through the map.
+    fn a_hole_in_the_collision_data_is_a_fall_not_a_floor() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         p.pos[2] = 10.0;
         p.last_ground = [p.pos[0], p.pos[1], 10.0];
         p.grounded = true;
         p.tiles
             .insert(Player::tile_of(p.pos[0], p.pos[1]), TileCol::new());
-        let mut restored = false;
         for _ in 0..400 {
             p.tick(0.1);
-            assert!(
-                p.pos[2] > -100.0,
-                "never falls out of the world: {}",
-                p.pos[2]
-            );
-            if p.grounded && (p.pos[2] - 10.0).abs() < 1.0e-3 {
-                restored = true;
-            }
         }
-        assert!(restored, "the void guard put the body back on the floor");
+        assert!(!p.grounded, "a hole is not a floor");
+        assert!(
+            p.pos[2] < -100.0,
+            "the body falls through it, as benilla: {}",
+            p.pos[2]
+        );
     }
 
+    /// benilla 的探针是单向的，也没有"头顶以上的面算墙"这条规则：地表在头顶之上
+    /// 时胶囊整段在面下方，`cast_mover` 的 one-sided 过滤
+    /// (`benilla-world/src/collision.rs:23-57`) 把背面丢弃，身体照样在水下走。
+    /// 旧用例要求"挡住 + 抬回地表"来自 ffi 自写求解的 `lowest_floor_above` 护栏，
+    /// 随 `bn.CollisionSolver=1` 移除；`MoverSession` 没有这个恢复动作
+    /// (`benilla-app/src/player/mover.rs:58`)。
     #[test]
-    fn a_body_under_the_terrain_walks_no_deeper_and_is_lifted_out() {
-        // The logged Goldshire fall (`run_qm24.txt`): the body walked Crystal
-        // Lake's bed with the surface more than a step over its head, then met
-        // the rising shore and fell out of the map. A body in that state must
-        // not walk further into the hill, and the guard must put it back on the
-        // real surface instead of restoring it into the void.
+    fn a_body_under_the_terrain_walks_under_the_surface() {
         let mut p = Player::new("Azeroth", -8800.0, -800.0);
         let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
         let (cx, cy) = world_to_chunk(p.pos[0], p.pos[1]);
@@ -5202,10 +5240,23 @@ mod tests {
             [-8780.0, -780.0, 0.0],
             [-8820.0, -780.0, 0.0],
         ));
+        // 身体要有一块自己的地板才走得动：benilla 空中没有自由横向输入
+        // (`benilla-app/src/player/mover.rs:173-178,202-211`)。地表（z=0）在头顶之上，
+        // 只用来验证它既不是墙也不是地板。
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, -2.5],
+            [-8780.0, -820.0, -2.5],
+            [-8780.0, -780.0, -2.5],
+        ));
+        col.buckets[b].push(Tri::new(
+            [-8820.0, -820.0, -2.5],
+            [-8780.0, -780.0, -2.5],
+            [-8820.0, -780.0, -2.5],
+        ));
         p.tiles.insert((tx, ty), col);
         p.pos[2] = -2.5; // more than a step under the surface
-        p.grounded = false;
-        p.last_ground = [p.pos[0], p.pos[1], 0.0];
+        p.grounded = true;
+        p.last_ground = p.pos;
         p.yaw = 0.0;
         p.model_yaw = 0.0;
         p.input.forward = 1.0;
@@ -5213,19 +5264,16 @@ mod tests {
             p.tick(1.0 / 60.0);
         }
         assert!(
-            (p.pos[0] + 8800.0).abs() < 0.01,
-            "the surface over the head is a wall, not a slope to walk into: {}",
+            p.pos[0] > -8799.5,
+            "the surface over the head is no wall: {}",
             p.pos[0]
         );
-        for _ in 0..120 {
-            p.tick(1.0 / 60.0);
-        }
-        assert!(p.grounded, "the guard restored the body");
         assert!(
-            (p.pos[2] - 0.0).abs() < 1.0e-3,
-            "onto the surface, not into the void: {}",
+            p.pos[2] < -1.0,
+            "the body is never lifted onto the surface: {}",
             p.pos[2]
         );
+        assert!(p.grounded, "standing on its own floor below the surface");
     }
 
     #[test]
@@ -5306,7 +5354,12 @@ mod tests {
             name_set: 0,
         });
         p.tiles.insert(Player::tile_of(p.pos[0], p.pos[1]), col);
-        for _ in 0..100 {
+        // 折叠门是有界的（`WMO_GATE_MAX_S = 2.0`，`player.rs:92`、`collision_folding_here`
+        // 的 `wmo_gate_wait < WMO_GATE_MAX_S`）：一个永不落地的折叠不许永久冻住身体
+        // （`player.rs:2721-2725` 的文档）。benilla 侧的对应语义只是世界驻留期的 settle
+        // hold（`benilla-app/src/player/mover.rs:109-112`），不是无界冻结。原用例的 100 帧
+        // (10 s) 是旧求解的无界保持；15 帧 (1.5 s) 留在门内。
+        for _ in 0..15 {
             p.tick(0.1);
             assert!(
                 (p.pos[2] - 63.8).abs() < 1.0e-3,
@@ -5400,7 +5453,11 @@ mod tests {
             p.tick(0.1);
         }
         assert!(p.grounded, "landed, not still falling at {}", p.pos[2]);
-        assert!(p.pos[2].abs() < 1.0e-3, "feet on the floor: {}", p.pos[2]);
+        // benilla 的落点带 SKIN 间隙（`benilla-app/src/player/state.rs:115` `SKIN_WIDTH = 0.02`）：
+        // `mover.rs:420` 的 cast 传 skin，`mover.rs:523-555` 的 step-down snap 用同一次带 skin 的
+        // cast 取 distance，所以静止脚底停在 `+0.015859127` 而不是 0。旧求解"贴面即 0"的 1e-3
+        // 是它自己的语义，不是 benilla 的。
+        assert!(p.pos[2].abs() < 0.03, "feet on the floor: {}", p.pos[2]);
     }
 
     #[test]
@@ -6034,7 +6091,11 @@ mod tests {
 
     #[test]
     fn forward_moves_along_the_aim() {
-        let mut p = Player::new("Azeroth", -8800.0, -800.0);
+        // 脚下必须有地面：benilla 空中没有自由横向输入，静止悬空的步落帧会把
+        // `arc_dirs_set = moving`（`benilla-app/src/player/mover.rs:173-178`），空中 nudge 只在
+        // `moving && !arc_dirs_set` 时给一次 `AIR_NUDGE_SPEED`（`mover.rs:202-211`），无地面时
+        // 身体只动一帧、跑不到 `RUN_SPEED·0.9`。原用例是无地面的世界，测的是旧求解。
+        let mut p = player_on_flat();
         // Aim to WoW yaw π/2 (+Y), then run forward for a second (the tick
         // clamps dt to the client's frame slice, so step in slices).
         p.yaw = std::f32::consts::FRAC_PI_2;
@@ -7433,8 +7494,14 @@ mod tests {
         for _ in 0..240 {
             p.tick(1.0 / 60.0);
             apex = apex.max(p.pos[2]);
+            // 站着的高度容差要盖过 benilla 的落地间隙：空中分类用 `LAND_PROBE = 0.05`
+            // （`benilla-app/src/player/state.rs:95`），cast 再留 `SKIN_WIDTH = 0.02`
+            // （`state.rs:115`），静止时贴地 snap 只够到 `STEP_SNAP_SLACK = 1/36`
+            // （`state.rs:73`、`mover.rs:520`），所以落地静止在
+            // `0.0694 - 0.0278 = 0.0416`；合法上界是 `LAND_PROBE + SKIN_WIDTH = 0.07`。
+            // 梁在 `floor + 3.0`，0.071 的容差不会漏判"站在梁上"。
             assert!(
-                !(p.grounded && p.pos[2] > floor + 0.01),
+                !(p.grounded && p.pos[2] > floor + 0.071),
                 "the body must never stand on the beam: z={}",
                 p.pos[2]
             );
@@ -7444,8 +7511,12 @@ mod tests {
             "the head stops at the beam: apex {apex:.3} vs {clamp:.3}"
         );
         assert!(p.grounded, "and the body lands");
+        // 落地不回到精确的地面：benilla 的落点分类 `LAND_PROBE = 0.05`
+        // （`state.rs:95`）+ cast 的 `SKIN_WIDTH = 0.02`（`state.rs:115`），snap 只补
+        // `STEP_SNAP_SLACK = 1/36`（`state.rs:73`），`mover.rs:571-573` 也写明落地会
+        // "留一个 SKIN_WIDTH 的栖高"。实测 0.0416，合法上界 `0.05 + 0.02 = 0.07`。
         assert!(
-            (p.pos[2] - floor).abs() < 1.0e-3,
+            (p.pos[2] - floor).abs() < 0.071,
             "back on the floor: {}",
             p.pos[2]
         );
