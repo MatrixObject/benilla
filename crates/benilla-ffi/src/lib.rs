@@ -625,6 +625,10 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             break;
         }
         let vtx0 = out.verts.len() as u32;
+        // MCSH bytes are the occlusion itself: `benilla-formats terrain.rs:409` turns a set bit
+        // into 255, and the reference reads that array as "255 shadowed, 0 lit" (`terrain.wgsl:213`).
+        // Inverting it here mirrors the countryside's shadows; a dark town is authored data.
+        let shadow_bytes: Option<&Vec<u8>> = c.shadow.as_ref();
         // MCSH reads the same grid `ChunkMesh::mcsh_shadowed_at` walks: row from
         // the north-west corner toward +x (south), column toward +y (east).
         let nw = c.positions.first().copied().unwrap_or([0.0, 0.0, 0.0]);
@@ -656,7 +660,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             // MCSH is 64×64 per 33.3 yd chunk (~0.52 yd a texel); a point
             // sample quantises the boundary to half-yard blocks, so bilinear
             // over the four surrounding texels keeps the edge continuous.
-            let (shade, valid) = match c.shadow.as_ref() {
+            let (shade, valid) = match shadow_bytes {
                 Some(sh) => {
                     // *16 scales the chunk-local offset (0..CHUNK_SIZE) to the
                     // 0..1 tile fraction the MCSH grid is indexed by.
@@ -705,7 +709,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             tex: c.base_texture.clone().unwrap_or_default(),
             layers: c.layer_textures.clone(),
             alpha: c.alpha_map.clone(),
-            shadow: c.shadow.clone(),
+            shadow: shadow_bytes.cloned(),
         });
     }
     // ADT liquid (MCLQ): own buffer, same tile-local + WoW->UE mirror as the
