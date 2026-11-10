@@ -62,6 +62,17 @@ lto = "off"
 
 # No debuginfo trimming: `debug = "line-tables-only"` measures no recurring win on macOS + sccache.
 
+# Release: thin LTO + strip keeps the cdylib under the 55 MB budget (the FFI crate
+# links `benilla-app`, which pulls Bevy and avian3d for the collision solver). Thin
+# LTO hits ~90 % of fat LTO's code-size win at a fraction of the link time, and
+# `strip` drops the unwind/debug tables that a cdylib does not need at runtime.
+# `codegen-units = 1` lets the optimizer see the whole crate (matches `dev`/`play`).
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+
 # The shipping build (`--profile ship`): fat LTO measures -1.0 cpu_ms (-5 %) against `release`,
 # which stays the measured profile because fat LTO's link time would tax every iteration.
 # `-Ctarget-cpu=native` is not set: it is not portable.

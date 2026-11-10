@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
 
@@ -35,22 +35,27 @@ const TERMINAL_VELOCITY: f32 = 60.148_003;
 /// never saw. `0` restores the old one-destination point test exactly; kept as
 /// the one-line rollback for comparison.
 static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
-/// `bn.CollisionSolver`：0 = 本文件的自写求解（默认），
-/// 1 = 玩家步进整段交给 benilla 的 `MoverSession::step`（`bn_player_collision_solver(1)` 可开）。
+/// `bn.CollisionSolver`：0 = 本文件的自写求解，1 = 玩家步进整段交给 benilla 的
+/// `MoverSession::step`（默认）。
 ///
-/// 保持 0：`MoverSession::step` 每帧重建整张 avian 世界并跑一套完整
-/// `PhysicsSchedule`，单帧 1.5–2.3 s（客户端 BnPerf `ptick=2259ms`，帧时间
-/// 7–15 s、0.1 fps），输入在帧里排不到，表现为鼠标完全不可用。求解器语义已
-/// 对齐（`cargo test -p benilla-ffi --lib` 150 passed），待把每帧开销压到可
-/// 接受范围后再翻默认。
-static COLLISION_SOLVER: AtomicBool = AtomicBool::new(false);
-/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（0 = 自写求解）。
+/// 翻默认的理由：本层抄写的滑移在 7 个实测冻结姿态上全部走不出去（45 帧位移
+/// 0.000），而 benilla 原装步进同一批姿态全部脱困（0.19–1.4 yd/12 帧）。原装
+/// lane 当年的 1.5–2.3 s/帧是 `install` 未做签名门控时每帧重建 avian 世界；签名
+/// 门控之后实测 600 帧连走（10 秒、四次转弯）平均 1.84 ms/帧，无一帧超过 30 ms，
+/// 重建只在 tile 进出与折层完成时发生。`bn.CollisionSolver 0` 仍可回到自写求解。
+static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
+/// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1 = benilla 原装 mover）。
 fn collision_solver_on() -> bool {
     match crate::video_cvar("bn.CollisionSolver") {
         Some(v) => !matches!(v.trim(), "0" | "false" | "off"),
         None => COLLISION_SOLVER.load(Ordering::Relaxed),
     }
 }
+/// Frames each solver spent in the "the world under me is not built yet" hold
+/// rather than in a collision: [0] = this file's solver, [1] = `MoverSession`.
+/// A walk that travels 0.000 reads the same either way, and only one of the two
+/// is the reported wall-corner freeze.
+static HOLD_FRAMES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// How far below the last real floor the void guard lets a body fall before it
 /// is restored there (yd). A real floor anywhere below is found by `ground`
 /// long before this; only a true hole in the collision data gets here.
@@ -90,6 +95,19 @@ const BACKFACE_BAND: f32 = 1.0 / 36.0;
 /// sweep stops this far short of the surface, so the next frame starts free
 /// of it instead of resolving the same face twice.
 const SKIN_WIDTH: f32 = 0.02;
+/// avian's `MoveAndSlideConfig::default()`, the set the reference's slide runs on
+/// (`benilla-app`'s `mover.rs:488` passes `MoveAndSlideConfig::default()` to
+/// `one_sided::move_and_slide`): 4 iterations, planes pruned at `COS_5_DEGREES`,
+/// at most 20 of them, and contacts gathered at `2 · skin_width`.
+const SLIDE_ITERATIONS: usize = 4;
+const SLIDE_PLANE_SIMILARITY: f32 = 0.996_194_7;
+const SLIDE_MAX_PLANES: usize = 20;
+const SLIDE_CONTACT_PREDICTION: f32 = SKIN_WIDTH * 2.0;
+/// avian's `DOT_EPSILON` (`one_sided.rs:40`): the floor under the skin term's
+/// divisor, so a grazing face backs the contact off by at most `skin/0.005`.
+const SLIDE_DOT_EPSILON: f32 = 0.005;
+/// avian's `MIN_DISTANCE` in the slide loop: a budget below this is spent.
+const SLIDE_MIN_TRAVEL: f32 = 1.0e-4;
 /// How long the mover waits for a tile's WMO collision set to finish folding
 /// before it stops gating on it. The reference's set is complete before the
 /// body can move in; ours folds over ticks, and a gate that never lifts (an
@@ -1268,6 +1286,80 @@ struct WallContact {
     top: f32,
 }
 
+/// The reference's `steep_contact_shear` (`benilla-app`'s `mover.rs:677`) for a
+/// horizontal travel: with the contact's 3D normal `n` and a travel that has no
+/// vertical part, `v - (v·n / |n_xy|²)·n_xy` is the same shear on the unit
+/// horizontal normal kept here. A contact the motion is already leaving is not
+/// this response's business, and only a steep face gets one - the wall sweep
+/// reports nothing else (`one_sided.rs:86`, floors and ceilings are the vertical
+/// mover's).
+fn shear_steep_contact(vel: &mut [f32; 2], n: [f32; 2]) {
+    let nv = n[0] * vel[0] + n[1] * vel[1];
+    if nv >= 0.0 {
+        return;
+    }
+    vel[0] -= nv * n[0];
+    vel[1] -= nv * n[1];
+}
+
+/// Keep the slide's plane set the way avian prunes it inside
+/// `move_and_slide`: a normal within `COS_5_DEGREES` of one already kept is not
+/// a new constraint, and of those two the more blocking one (the smaller
+/// `n·v`) is the one that stays. Beyond `max_planes` the set simply stops
+/// growing.
+fn push_slide_plane(planes: &mut Vec<[f32; 2]>, n: [f32; 2], vel: [f32; 2]) {
+    let into = |m: [f32; 2]| m[0] * vel[0] + m[1] * vel[1];
+    for existing in planes.iter_mut() {
+        if n[0] * existing[0] + n[1] * existing[1] >= SLIDE_PLANE_SIMILARITY {
+            if into(n) < into(*existing) {
+                *existing = n;
+            }
+            return;
+        }
+    }
+    if planes.len() < SLIDE_MAX_PLANES {
+        planes.push(n);
+    }
+}
+
+/// avian's `project_velocity` for a horizontal travel: the direction closest to
+/// `v` that points into none of the planes. In 2D the candidates are `v` itself,
+/// `v` projected onto one plane, or the apex - avian's edge case degenerates to
+/// the apex, which is why a body with two faces shut against it stops instead
+/// of jittering between them.
+fn project_travel_2d(v: [f32; 2], planes: &[[f32; 2]]) -> [f32; 2] {
+    if planes.is_empty() {
+        return v;
+    }
+    let inside = |w: [f32; 2]| {
+        planes
+            .iter()
+            .all(|n| n[0] * w[0] + n[1] * w[1] >= -SLIDE_DOT_EPSILON)
+    };
+    if inside(v) {
+        return v;
+    }
+    let mut best = [0.0f32; 2];
+    let mut best_d2 = f32::INFINITY;
+    for n in planes {
+        let nv = n[0] * v[0] + n[1] * v[1];
+        if nv >= -SLIDE_DOT_EPSILON {
+            continue;
+        }
+        let p = [v[0] - nv * n[0], v[1] - nv * n[1]];
+        let d2 = (p[0] - v[0]) * (p[0] - v[0]) + (p[1] - v[1]) * (p[1] - v[1]);
+        if d2 < best_d2 && inside(p) {
+            best_d2 = d2;
+            best = p;
+        }
+    }
+    if best_d2.is_finite() {
+        best
+    } else {
+        [0.0, 0.0]
+    }
+}
+
 /// A contact of the capsule swept straight up or down (`Player::capsule_sweep_z`).
 struct VerticalHit {
     /// Travel along the sweep to contact (yd, >= 0).
@@ -1277,12 +1369,7 @@ struct VerticalHit {
 }
 
 /// Closest points between segments `p1-q1` and `p2-q2` (Ericson).
-fn closest_seg_seg(
-    p1: [f32; 3],
-    q1: [f32; 3],
-    p2: [f32; 3],
-    q2: [f32; 3],
-) -> ([f32; 3], [f32; 3]) {
+fn closest_seg_seg(p1: [f32; 3], q1: [f32; 3], p2: [f32; 3], q2: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
     let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
     let d1 = sub(q1, p1);
@@ -1342,20 +1429,14 @@ fn on_tri(p: [f32; 3], t: &Tri) -> bool {
     };
     let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
     let e = |i: usize, j: usize| cross(sub(t.v[j], t.v[i]), sub(p, t.v[i]));
-    dot(e(0, 1), t.n) >= -1.0e-6
-        && dot(e(1, 2), t.n) >= -1.0e-6
-        && dot(e(2, 0), t.n) >= -1.0e-6
+    dot(e(0, 1), t.n) >= -1.0e-6 && dot(e(1, 2), t.n) >= -1.0e-6 && dot(e(2, 0), t.n) >= -1.0e-6
 }
 
 /// Closest pair between the capsule's axis segment `a-b` and the triangle.
 /// Returns (axis point, surface point, axis crosses the face). The crossing
 /// arm is what catches a vertical capsule standing in a near-vertical wall,
 /// where every endpoint/edge pair is farther than the radius.
-fn capsule_tri_closest(
-    a: [f32; 3],
-    b: [f32; 3],
-    t: &Tri,
-) -> ([f32; 3], [f32; 3], bool) {
+fn capsule_tri_closest(a: [f32; 3], b: [f32; 3], t: &Tri) -> ([f32; 3], [f32; 3], bool) {
     let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
     let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
     let mut best_p = a;
@@ -1759,6 +1840,7 @@ impl Player {
             self.rebuild_mover_world();
         }
         if hold {
+            HOLD_FRAMES[1].fetch_add(1, Ordering::Relaxed);
             // benilla 的 settle 保持（`benilla-app/src/player/mover.rs:109-112`）：世界还没
             // 驻留完时身体冻结、重力关闭、座位不动。宿主这边同样的等待是折层/登录。
             self.mover.set_pose(self.pos);
@@ -2053,12 +2135,7 @@ impl Player {
 
     /// The highest walkable surface under (x, y) at or below `ceil`, with the
     /// triangle's own world normal (WoW axes, up = +Z).
-    pub(crate) fn ground_with_normal(
-        &self,
-        x: f32,
-        y: f32,
-        ceil: f32,
-    ) -> Option<(f32, [f32; 3])> {
+    pub(crate) fn ground_with_normal(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, [f32; 3])> {
         let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<(f32, [f32; 3])> = None;
         let mut consider = |t: &Tri| {
@@ -2103,8 +2180,7 @@ impl Player {
 
     /// The highest walkable surface under (x, y) at or below `ceil`.
     pub(crate) fn ground(&self, x: f32, y: f32, ceil: f32) -> Option<(f32, f32)> {
-        self.ground_with_normal(x, y, ceil)
-            .map(|(z, n)| (z, n[2]))
+        self.ground_with_normal(x, y, ceil).map(|(z, n)| (z, n[2]))
     }
 
     /// The lowest downward-facing surface at or above `above` over (x, y): the
@@ -2171,7 +2247,6 @@ impl Player {
     /// building floor (`0x6822a2`), so an interior under a hill stays inside
     /// while one below the open ground is dropped.
     pub(crate) fn terrain_z(&self, x: f32, y: f32) -> Option<f32> {
-        let (tx, ty) = Self::tile_of(x, y);
         let mut best: Option<f32> = None;
         let mut consider = |t: &Tri| {
             // One-sided like `ground`: an overhanging face is a ceiling.
@@ -2495,8 +2570,10 @@ impl Player {
     /// The first face the capsule's horizontal sweep meets within `span` along
     /// (`dirx`,`diry`): the reference's shape cast (`0x632700`), the same
     /// one-sided gates as [`Self::capsule_sweep_z`] (floors and ceilings by
-    /// their up component, steps under the feet, a face approached from its
-    /// back skipped) run over a conservative advance. The nearest contact
+    /// their up component, a face approached from its back skipped) run over a
+    /// conservative advance. There is no height gate here: the reference's sweep
+    /// does not know a step from a railing, and which low face the body may walk
+    /// past is the step certificate's answer, in the caller. The nearest contact
     /// wins, not the deepest overlap: the reference stops at the first face and
     /// never pushes the body out of one it already overlaps.
     fn sweep_wall_contact(
@@ -2506,32 +2583,21 @@ impl Player {
         diry: f32,
         span: f32,
     ) -> Option<WallContact> {
-        // The step-up certificate only exists for a body on its feet: an
-        // airborne one has no step to ride, and at the top of a jump the extra
-        // yard let the capsule cross a fence's upper rail - the `d_jump*`
-        // leaks. In the air only a face whose top is already below the feet
-        // counts as cleared.
-        let step_top = if self.grounded {
-            feet[2] + STEP_UP_HEIGHT
-        } else {
-            feet[2]
-        };
         let mut adv = 0.0f32;
+        let mut prev_adv = 0.0f32;
         for _ in 0..8 {
             let x = feet[0] + dirx * adv;
             let y = feet[1] + diry * adv;
             let a = [x, y, feet[2] + CAPSULE_RADIUS];
             let b = [x, y, feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
-            let mut touch: Option<([f32; 2], f32)> = None;
+            let mut touch: Option<([f32; 2], f32, f32)> = None;
             let mut bound = span - adv;
+            let mut closed: Option<([f32; 2], f32)> = None;
             self.any_tri_near([x, y, feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
                 if t.n[2].abs() >= GROUND_COS {
                     return false; // a floor or a ceiling (the vertical sweep's)
                 }
                 let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
-                if top <= step_top {
-                    return false; // a curb the mover steps over
-                }
                 let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
                 if hl < 1.0e-6 {
                     return false;
@@ -2541,10 +2607,6 @@ impl Player {
                     return false; // approached from its back
                 }
                 let (ap, sp, inside) = capsule_tri_closest(a, b, t);
-                if inside {
-                    touch = Some((n2, top));
-                    return true;
-                }
                 let dx = sp[0] - ap[0];
                 let dy = sp[1] - ap[1];
                 let dz = sp[2] - ap[2];
@@ -2558,7 +2620,54 @@ impl Player {
                 let d2 = dx * dx + dy * dy;
                 let gap = (d2 + dz * dz).sqrt();
                 let along = dx * dirx + dy * diry;
+                let closing = -(n2[0] * dirx + n2[1] * diry);
+                // Where the contact is reported: the advance at which this face's
+                // gap equals the radius. The march's own time of impact is exact
+                // only for the closest feature pair at the position it measured,
+                // and that pair changes mid-sweep (the perpendicular foot
+                // entering the triangle), so a pass can land with the radius
+                // already inside the face. A contact reported at that position
+                // pins the body: the caller shortens the step to it, the next
+                // frame starts overlapping the same face, and the one-sided law
+                // then refuses every heading - measured live on the inn, 147-288
+                // frames at 0.035-0.070 yd with the speed at zero. Backing the
+                // contact off to the true touch point is what avian's shape cast
+                // answers, and there is nothing to back off when the landing is
+                // clean, so a face met head-on still stops the step at r+skin.
+                let touch_dist = |gap: f32| -> f32 {
+                    let rate = if closing > 1.0e-4 { closing } else { 1.0 };
+                    let back = ((CAPSULE_RADIUS - gap) / rate).max(0.0) + 1.0e-4;
+                    (adv - back).max(prev_adv)
+                };
+                if inside {
+                    // The axis is through the face: deeper than any back-off
+                    // computed from a gap, so the last probed-clear advance is
+                    // the answer. The reference keeps it because the travel gate
+                    // above already says this sweep drives into the plane, which
+                    // is parry's `normal_vel < 0` for a straddling body.
+                    touch = Some((n2, top, prev_adv));
+                    return true;
+                }
                 if gap < CAPSULE_RADIUS {
+                    // A face the travel is moving away from cannot be this
+                    // sweep's contact. avian's cast starts overlapping here, and
+                    // parry then answers `None` outright
+                    // (`shape_cast_support_map_support_map.rs:38-40`: with
+                    // `stop_at_penetration` off - `one_sided::cast_move:105` -
+                    // `normal_vel = normal1 . vel12 >= 0.0` is separating and
+                    // there is no hit). `normal1` runs from the face to the body,
+                    // so `normal_vel` is this file's `-along`: a body seated in
+                    // geometry walks out through the faces behind it, since the
+                    // reference resolver has no push-out to do it any other way.
+                    // Without this, the seam ribbon 0.186 yd west of the axis at
+                    // (-9479.55,19.06) is reported as a wall at dist 0 while the
+                    // walk heads east: the step is eaten, the caller zeroes the
+                    // velocity and the walk creeps - the reported corner stick,
+                    // where benilla's own mover covers 4.99 yd in two seconds and
+                    // this lane covered 0.20.
+                    if along <= 0.0 {
+                        return false;
+                    }
                     // Already within the capsule: the reference keeps this face
                     // only when a vertex is not more than `BACKFACE_BAND` behind
                     // the leading plane (`one_sided::behind_the_band`, run for a
@@ -2568,39 +2677,76 @@ impl Player {
                     // the side into a wall, and the step then stops at dist 0 and
                     // the caller zeroes the velocity. That is the seam grab.
                     let lead = ap[0] * dirx + ap[1] * diry + CAPSULE_RADIUS;
-                    let ahead = t
-                        .v
-                        .iter()
-                        .fold(f32::MIN, |m, v| m.max(v[0] * dirx + v[1] * diry - lead));
+                    let ahead =
+                        t.v.iter()
+                            .fold(f32::MIN, |m, v| m.max(v[0] * dirx + v[1] * diry - lead));
                     if ahead >= -BACKFACE_BAND {
-                        touch = Some((n2, top));
+                        touch = Some((n2, top, touch_dist(gap)));
                         return true;
                     }
                     return false;
                 }
-                if along <= 0.0 {
-                    return false; // its nearest part is not ahead of the sweep
-                }
-                // The radius closes at `-n·dir`; cap by the along-track
-                // distance so an edge's moving closest point is re-asked on
-                // the next pass instead of being overshot.
-                let closing = -(n2[0] * dirx + n2[1] * diry);
+                // The radius closes at `-n·dir`; the marching rate is that
+                // plane's own, never the current nearest point's track position.
                 if closing <= 1.0e-4 {
                     return false;
                 }
-                let reach = ((gap - CAPSULE_RADIUS) / closing).min(along);
+                // Which feature closes decides the time of impact, and the two
+                // close differently enough that mixing them costs the walk. If
+                // the shortest segment is perpendicular to the face, the
+                // triangle's closest point is the foot of that perpendicular: it
+                // slides with the body, so the gap shuts at the face's own rate
+                // and the foot's own track position says nothing about the reach.
+                // Capping that by `along` - the body-to-foot segment projected on
+                // the travel - reports the wall at the foot's distance ahead, and
+                // a face a couple yards to the side, angled 8 degrees off
+                // parallel, has a foot a few microns ahead: the reach is then
+                // `advance ~ 1e-5`, the zero-impact fallback names it as the
+                // contact, and the body is told a wall 2.4 yd away is at distance
+                // zero. Measured at (-9473.92,36.93,57.70) heading north, where
+                // `gap=2.396`, `n=(+0.989,-0.148)`, closing 0.148, reach `along` =
+                // 1e-5: a frozen frame, and the second wall of a corner supplies
+                // the other one. If the closest point is an edge or a vertex
+                // instead, the feature is fixed in space and the sweep passes it
+                // the way a line passes a point - `|d - dir t| = r`, which has no
+                // solution unless that line comes within the radius - and there
+                // `along` is a real bound, since the feature cannot slide.
+                let dn = dx * t.n[0] + dy * t.n[1] + dz * t.n[2];
+                let reach = if dn * dn >= gap * gap * (1.0 - 1.0e-6) {
+                    (gap - CAPSULE_RADIUS) / closing
+                } else {
+                    if along <= 0.0 {
+                        return false; // the fixed feature is not ahead of the sweep
+                    }
+                    let miss = along * along - (gap * gap - CAPSULE_RADIUS * CAPSULE_RADIUS);
+                    if miss < 0.0 {
+                        return false; // this sweep never brings the capsule to it
+                    }
+                    along - miss.sqrt()
+                };
                 if reach < bound {
                     bound = reach;
+                    closed = Some((n2, top));
                 }
                 false
             });
-            if let Some((n, top)) = touch {
-                return Some(WallContact { dist: adv, n, top });
+            if let Some((n, top, dist)) = touch {
+                return Some(WallContact { dist, n, top });
             }
             let advance = bound.min(span - adv);
-            if advance <= 1.0e-5 || adv + advance >= span - 1.0e-6 {
+            if advance <= 1.0e-5 {
+                // avian's shape cast answers a hit whose time of impact is zero,
+                // never a miss: the face that closed the sweep here is the
+                // contact. Reporting free travel instead drives the body through
+                // it - a diagonal into an indoor corner ended 0.059 yd from the
+                // wall, inside the 0.333 radius, where the one-sided sweep then
+                // refuses every heading and the body is wedged for good.
+                return closed.map(|(n, top)| WallContact { dist: adv, n, top });
+            }
+            if adv + advance >= span - 1.0e-6 {
                 return None;
             }
+            prev_adv = adv;
             adv += advance;
         }
         None
@@ -2710,7 +2856,10 @@ impl Player {
             if advance <= 1.0e-6 {
                 // The passes converged onto a face without entering its
                 // radius: that is the contact.
-                return Some(VerticalHit { dist: d, nz: lim_nz });
+                return Some(VerticalHit {
+                    dist: d,
+                    nz: lim_nz,
+                });
             }
             d += advance;
             if d >= span - 1.0e-6 {
@@ -2752,64 +2901,164 @@ impl Player {
         self.wmo_gate_wait < WMO_GATE_MAX_S
     }
 
-    /// One frame's horizontal travel through the collision set, the
-    /// reference's `move_and_slide` over the one-sided faces: sweep the whole
-    /// step, stop `skin / |n·dir|` short of the first face unless a foot cone
-    /// or a certified step-up clears it, project the rest along that face, and
-    /// repeat. No depenetration: a body already overlapping a face is stopped
-    /// at it and the travel slides, so one inside geometry walks out through
-    /// the faces wound away from it instead of being shoved sideways - the
-    /// old push-out teleported a body brushing a thin fence rail. Returns
-    /// whether the body moved.
+    /// One frame's horizontal travel through the collision set: the reference's
+    /// `one_sided::move_and_slide`, transcribed to the mover's 2D travel. A
+    /// sweep, the faces it meets kept as an accumulating set of slide planes
+    /// (this pass's contact *and* every face the capsule already touches), the
+    /// travel re-projected onto all of them at once, and the frame's budget
+    /// spent on what was actually travelled - so a junction resolves into a
+    /// slide along the second face instead of a re-sweep against the first. No
+    /// depenetration, and no height gate: only a certified step-up or foot-cone
+    /// ride (`climb_clears_face`, the reference's `step_probe`) walks past a low
+    /// face; everything else is a face. Returns whether the body moved.
     fn horizontal_step_swept(&mut self, step: [f32; 2]) -> bool {
         let start = [self.pos[0], self.pos[1]];
-        let mut rem = step;
-        for _ in 0..6 {
-            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt();
-            if len < 1.0e-6 {
+        // The frame's step is the reference's `delta_time * velocity`: it is the
+        // travel direction and the whole budget at once, so `time_left` counts
+        // the fraction of it still unspent.
+        let mut vel = step;
+        let mut time_left = 1.0f32;
+        for _ in 0..SLIDE_ITERATIONS {
+            // The reference re-seeds the plane set every pass
+            // (`one_sided::move_and_slide:285`, `planes = config.planes.clone()`):
+            // the faces that shut the previous direction do not hold the slide.
+            let mut planes: Vec<[f32; 2]> = Vec::new();
+            let speed = (vel[0] * vel[0] + vel[1] * vel[1]).sqrt();
+            let dist = time_left * speed;
+            if dist < SLIDE_MIN_TRAVEL {
                 break;
             }
-            let (dirx, diry) = (rem[0] / len, rem[1] / len);
-            if let Some(c) = self.sweep_wall_contact(self.pos, dirx, diry, len) {
-                // avian's skin pull-back: stop short of the surface by
-                // `skin / |n·dir|`, so the next frame starts free of it.
-                let closing = -(c.n[0] * dirx + c.n[1] * diry);
-                let skin = if closing > 1.0e-4 {
-                    SKIN_WIDTH / closing
-                } else {
-                    0.0
-                };
-                let travel = (c.dist - skin).max(0.0);
-                let (nx, ny) = (self.pos[0] + dirx * travel, self.pos[1] + diry * travel);
-                // A certified step-up or a foot-cone ride clears the face when
-                // the landing reaches its top; otherwise the step stops there
-                // and the rest slides along it.
-                if self.climb_clears_face(nx, ny, dirx, diry, self.pos[2], c.top) {
-                    self.pos[0] = nx;
-                    self.pos[1] = ny;
-                    rem = [rem[0] - dirx * travel, rem[1] - diry * travel];
-                    continue;
+            let (dirx, diry) = (vel[0] / speed, vel[1] / speed);
+            let Some(c) = self.sweep_wall_contact(self.pos, dirx, diry, dist) else {
+                let nx = self.pos[0] + vel[0] * time_left;
+                let ny = self.pos[1] + vel[1] * time_left;
+                if self.floor_blocks(nx, ny, dirx, diry) {
+                    break;
                 }
                 self.pos[0] = nx;
                 self.pos[1] = ny;
-                let rest = [rem[0] - dirx * travel, rem[1] - diry * travel];
-                let into = rest[0] * c.n[0] + rest[1] * c.n[1];
-                if into >= 0.0 {
-                    break; // already separating: nothing left to slide
-                }
-                rem = [rest[0] - into * c.n[0], rest[1] - into * c.n[1]];
-                continue;
-            }
-            if self.floor_blocks(self.pos[0] + rem[0], self.pos[1] + rem[1], dirx, diry) {
+                break;
+            };
+            // avian's skin pull-back, `skin / max(-n·dir, DOT_EPSILON)` short of
+            // the surface and never negative (`one_sided::cast_move:168`).
+            let closing = (-(c.n[0] * dirx + c.n[1] * diry)).max(SLIDE_DOT_EPSILON);
+            let travel = (c.dist - SKIN_WIDTH / closing).max(0.0);
+            // A face the step certificate clears is ridden, not stopped at: the
+            // reference's `on_hit` turns the velocity up over a certified low
+            // edge (`mover.rs:496`, `foot_cone_ride`) and keeps its travel - the
+            // rise is the vertical mover's job. Only a body on its feet has a
+            // step to certify, so this is also what stops a jump crossing a
+            // fence's upper rail.
+            if self.grounded
+                && self.climb_clears_face(
+                    self.pos[0] + dirx * dist,
+                    self.pos[1] + diry * dist,
+                    dirx,
+                    diry,
+                    self.pos[2],
+                    c.top,
+                )
+            {
+                self.pos[0] += dirx * dist;
+                self.pos[1] += diry * dist;
                 break;
             }
-            self.pos[0] += rem[0];
-            self.pos[1] += rem[1];
-            break;
+            // The budget is spent on what was travelled; the rest of the frame
+            // slides along the planes the rest of the loop collects.
+            time_left -= time_left * (travel / dist);
+            self.pos[0] += dirx * travel;
+            self.pos[1] += diry * travel;
+            // The reference's `on_hit` runs before the plane is pushed and
+            // shears the velocity on every steep contact it meets
+            // (`benilla-app`'s `mover.rs:677-688`, `steep_contact_shear`): the
+            // into-face horizontal component is taken out exactly, so the next
+            // pass's cast gate (`n·dir > FACING_EPS`, `one_sided.rs:92`) sees a
+            // tangent face and no hit at all. The plane projection below cannot
+            // do this on its own - its cone test tolerates `n·v` down to
+            // `-DOT_EPSILON` (`velocity_project.rs:36`), while the cast rejects
+            // a face from `n·dir = -1e-5` on: inside that band a face the body
+            // already touches blocks the sweep at distance zero and spends no
+            // budget, and the frame ends with nothing moved. Measured on the
+            // Trade District bevel at (-8625.03, 656.25), where the walk dead-
+            // locked in exactly this band.
+            shear_steep_contact(&mut vel, c.n);
+            push_slide_plane(&mut planes, c.n, vel);
+            for n in self.slide_planes_at(self.pos, vel) {
+                if planes.len() >= SLIDE_MAX_PLANES {
+                    break;
+                }
+                shear_steep_contact(&mut vel, n);
+                push_slide_plane(&mut planes, n, vel);
+            }
+            vel = project_travel_2d(vel, &planes);
         }
         self.pos[0] != start[0] || self.pos[1] != start[1]
     }
 
+    /// The faces the capsule touches at `feet` that are slide planes for a
+    /// travel of `vel`: the reference's contact pass (`one_sided::for_each_contact`)
+    /// with avian's prediction of `2 · skin`. Its gates, in this file's terms:
+    /// no floor or ceiling, the authored normal not pointing along the travel
+    /// (`n·dir > FACING_EPS` is its back), a face the body is already past the
+    /// band of is no plane either - the sweep never reports it, so the slide
+    /// must not invent it.
+    fn slide_planes_at(&self, feet: [f32; 3], vel: [f32; 2]) -> Vec<[f32; 2]> {
+        let mut out = Vec::new();
+        let speed = (vel[0] * vel[0] + vel[1] * vel[1]).sqrt();
+        if speed < 1.0e-6 {
+            return out;
+        }
+        let (dirx, diry) = (vel[0] / speed, vel[1] / speed);
+        let a = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+        let b = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+        self.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+            if t.n[2].abs() >= GROUND_COS {
+                return false; // a floor or a ceiling
+            }
+            let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+            if hl < 1.0e-6 {
+                return false;
+            }
+            let n2 = [t.n[0] / hl, t.n[1] / hl];
+            if n2[0] * dirx + n2[1] * diry > -FACE_FACING_EPS {
+                return false; // the travel runs along its back
+            }
+            let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+            let dx = sp[0] - ap[0];
+            let dy = sp[1] - ap[1];
+            let dz = sp[2] - ap[2];
+            let gap = (dx * dx + dy * dy + dz * dz).sqrt();
+            if !inside && gap >= CAPSULE_RADIUS + SLIDE_CONTACT_PREDICTION {
+                return false; // not a contact within the prediction
+            }
+            // The reference's front-side law, run on every contact of this pass
+            // (`one_sided::for_each_contact:409`: `if c.normal1.dot(n) <= 0.0
+            // { continue }`, "behind a face, its plane does not exist for
+            // movement"). `normal1` is the contact normal pointing from the face
+            // to the mover, so a body seated past the winding sees it oppose `n`
+            // and the slide gains no plane from that face; an axis-through pair
+            // reports the authored normal itself, so it stays.
+            let closing_side = dx * t.n[0] + dy * t.n[1] + dz * t.n[2];
+            if !inside && closing_side >= 0.0 {
+                return false;
+            }
+            if inside || gap < CAPSULE_RADIUS {
+                // Penetrating: `one_sided::behind_the_band`, on the vertices.
+                let lead = ap[0] * dirx + ap[1] * diry + CAPSULE_RADIUS;
+                let ahead =
+                    t.v.iter()
+                        .fold(f32::MIN, |m, v| m.max(v[0] * dirx + v[1] * diry - lead));
+                if ahead < -BACKFACE_BAND {
+                    return false;
+                }
+            }
+            if !out.contains(&n2) {
+                out.push(n2);
+            }
+            false
+        });
+        out
+    }
 
     /// The one-destination point test the mover used before `bn.SweptMover`:
     /// the whole frame's step is tested only at its end, so a step longer than
@@ -2984,7 +3233,11 @@ impl Player {
             pivot[2] - fwd[2] * self.cam_distance,
         ];
         let boom = [seat[0] - head[0], seat[1] - head[1], seat[2] - head[2]];
-        (head, seat, (boom[0] * boom[0] + boom[1] * boom[1] + boom[2] * boom[2]).sqrt())
+        (
+            head,
+            seat,
+            (boom[0] * boom[0] + boom[1] * boom[1] + boom[2] * boom[2]).sqrt(),
+        )
     }
 
     /// `benilla-world`'s `cast_camera`: the solid sphere sweep, then the
@@ -3000,7 +3253,11 @@ impl Player {
             if from[2] > s {
                 let end_z = from[2] + boom[2];
                 if end_z < s {
-                    keep_nearest(&mut best, Some((from[2] - s) / (from[2] - end_z) * len), len);
+                    keep_nearest(
+                        &mut best,
+                        Some((from[2] - s) / (from[2] - end_z) * len),
+                        len,
+                    );
                 }
             }
         }
@@ -3370,288 +3627,296 @@ impl Player {
             // benilla 的 `MoverSession::step`；jump 由它起跳，这里不再自己写 `vel[2]`。
             self.mover_tick(dt, jump, gated || self.snap_pending);
         } else {
-        if jump {
-            if self.swimming {
-                self.swimming = false;
-                self.vel[2] = SWIM_JUMP_SPEED;
-                self.grounded = false;
-                self.swim_hop_s = 0.0;
-                self.pos[2] += 0.05;
-            } else if self.grounded {
-                self.vel[2] = JUMP_SPEED;
-                self.grounded = false;
-                self.pos[2] += 0.05;
-            }
-        }
-
-        // The world query gate, `benilla-app/src/player/edge.rs`'s
-        // `may_resolve`: the reference grows a swept box over the step, gathers
-        // the world inside it, and resolves nothing when the query cannot be
-        // answered (a chunk that is not resident). The body keeps its pose, its
-        // speed and its fall clock; the next frame asks again. Our collision
-        // set is folded asynchronously (the reference's WMO set is complete
-        // before the body can move into it), so the same gate has to cover the
-        // tile's own fold: until the room's floor is in, a query under the
-        // building answers with the terrain below it, which is a worse answer
-        // than none. This replaces the old `stale`/`hang` freezes, which only
-        // reacted after a hole had already been found and never held the
-        // horizontal step. `gated` is computed above the solver fork so both
-        // paths share the same answer this frame.
-
-        // Horizontal step with the client's wall response: a face the travel
-        // enters stops the step and the rest slides along it (`0x632700`'s
-        // one-sided trace + avian's move-and-slide). The old direction-blind
-        // test held a body walking along a kerb, whose bevel is inside the
-        // capsule's radius from either side.
-        let step = [self.vel[0] * dt, self.vel[1] * dt];
-        if !gated && (step[0] != 0.0 || step[1] != 0.0) && !self.horizontal_step(step) {
-            self.vel[0] = 0.0;
-            self.vel[1] = 0.0;
-        }
-
-        if self.swimming {
-            // The floating resolver: no gravity, the vertical only
-            // from the stroke. The feet sink to the rest line
-            // `surface - 0.75·h` when the surface falls, a shallow bottom still
-            // holds them higher, and the bed is solid from either side: a dive
-            // stops on its surface instead of sinking through the terrain.
-            let mut z = self.pos[2] + self.vel[2] * dt;
-            if let Some(s) = surface {
-                let rest = s - enter;
-                // Read the bed from the surface's ceiling, not the feet's: a body
-                // the latch already put at `surface - 0.75·h` over a bed only a
-                // hand's width under the surface sits *below* that bed, and
-                // `feet + STEP_UP_HEIGHT` cannot see it, so it stayed sunk and
-                // kept swimming on dry land. The surface is always above the
-                // feet, so a fast dive cannot carry the candidate past the bed
-                // either. A bed above the surface is not under the water.
-                let bed = self
-                    .ground(self.pos[0], self.pos[1], s + STEP_UP_HEIGHT)
-                    .map(|(b, _)| b)
-                    .filter(|b| *b <= s);
-                z = z.min(rest);
-                if let Some(b) = bed {
-                    z = z.max(b);
+            if jump {
+                if self.swimming {
+                    self.swimming = false;
+                    self.vel[2] = SWIM_JUMP_SPEED;
+                    self.grounded = false;
+                    self.swim_hop_s = 0.0;
+                    self.pos[2] += 0.05;
+                } else if self.grounded {
+                    self.vel[2] = JUMP_SPEED;
+                    self.grounded = false;
+                    self.pos[2] += 0.05;
                 }
             }
-            self.pos[2] = z;
-            self.grounded = false;
-            self.vel[2] = 0.0;
-            // Water ends the arc: the swim picks are their own clips and the
-            // bracket clock (`tick_arc`) does not run here.
-            self.airborne = false;
-        } else if gated || self.snap_pending {
-            // The query is owed (the gate above) - or the spawn snap is still
-            // waiting for the tile's floor set (`snap_pending` is cleared only
-            // once `floors_folding` is false). `gated` is bounded by
-            // `WMO_GATE_MAX_S` so an unlanded fold cannot freeze the mover; the
-            // spawn hold must outlive that bound, or the body falls through a
-            // floor that is not in the set yet (2026-11-09: login at 63.82 fell
-            // into the under-storey crawlspace while `built=0`, then every
-            // heading but one was walled). Horizontal travel still follows
-            // `gated` above, so R6 (walking after the bound) is untouched.
-            // The pose, the speed and the fall clock are kept, so a body caught
-            // mid-air resumes its arc from where it hung once the tile's set
-            // lands, and a standing body keeps its seat.
-            self.void_time = 0.0;
-            self.tick_arc(dt, jump, self.pos[2]);
-        } else if self.standing_still(jump)
+
+            // The world query gate, `benilla-app/src/player/edge.rs`'s
+            // `may_resolve`: the reference grows a swept box over the step, gathers
+            // the world inside it, and resolves nothing when the query cannot be
+            // answered (a chunk that is not resident). The body keeps its pose, its
+            // speed and its fall clock; the next frame asks again. Our collision
+            // set is folded asynchronously (the reference's WMO set is complete
+            // before the body can move into it), so the same gate has to cover the
+            // tile's own fold: until the room's floor is in, a query under the
+            // building answers with the terrain below it, which is a worse answer
+            // than none. This replaces the old `stale`/`hang` freezes, which only
+            // reacted after a hole had already been found and never held the
+            // horizontal step. `gated` is computed above the solver fork so both
+            // paths share the same answer this frame.
+
+            // Horizontal step with the client's wall response: a face the travel
+            // enters stops the step and the rest slides along it (`0x632700`'s
+            // one-sided trace + avian's move-and-slide). The old direction-blind
+            // test held a body walking along a kerb, whose bevel is inside the
+            // capsule's radius from either side.
+            let step = [self.vel[0] * dt, self.vel[1] * dt];
+            if !gated && (step[0] != 0.0 || step[1] != 0.0) && !self.horizontal_step(step) {
+                self.vel[0] = 0.0;
+                self.vel[1] = 0.0;
+            }
+
+            if self.swimming {
+                // The floating resolver: no gravity, the vertical only
+                // from the stroke. The feet sink to the rest line
+                // `surface - 0.75·h` when the surface falls, a shallow bottom still
+                // holds them higher, and the bed is solid from either side: a dive
+                // stops on its surface instead of sinking through the terrain.
+                let mut z = self.pos[2] + self.vel[2] * dt;
+                if let Some(s) = surface {
+                    let rest = s - enter;
+                    // Read the bed from the surface's ceiling, not the feet's: a body
+                    // the latch already put at `surface - 0.75·h` over a bed only a
+                    // hand's width under the surface sits *below* that bed, and
+                    // `feet + STEP_UP_HEIGHT` cannot see it, so it stayed sunk and
+                    // kept swimming on dry land. The surface is always above the
+                    // feet, so a fast dive cannot carry the candidate past the bed
+                    // either. A bed above the surface is not under the water.
+                    let bed = self
+                        .ground(self.pos[0], self.pos[1], s + STEP_UP_HEIGHT)
+                        .map(|(b, _)| b)
+                        .filter(|b| *b <= s);
+                    z = z.min(rest);
+                    if let Some(b) = bed {
+                        z = z.max(b);
+                    }
+                }
+                self.pos[2] = z;
+                self.grounded = false;
+                self.vel[2] = 0.0;
+                // Water ends the arc: the swim picks are their own clips and the
+                // bracket clock (`tick_arc`) does not run here.
+                self.airborne = false;
+            } else if gated || self.snap_pending {
+                HOLD_FRAMES[0].fetch_add(1, Ordering::Relaxed);
+                // The query is owed (the gate above) - or the spawn snap is still
+                // waiting for the tile's floor set (`snap_pending` is cleared only
+                // once `floors_folding` is false). `gated` is bounded by
+                // `WMO_GATE_MAX_S` so an unlanded fold cannot freeze the mover; the
+                // spawn hold must outlive that bound, or the body falls through a
+                // floor that is not in the set yet (2026-11-09: login at 63.82 fell
+                // into the under-storey crawlspace while `built=0`, then every
+                // heading but one was walled). Horizontal travel still follows
+                // `gated` above, so R6 (walking after the bound) is untouched.
+                // The pose, the speed and the fall clock are kept, so a body caught
+                // mid-air resumes its arc from where it hung once the tile's set
+                // lands, and a standing body keeps its seat.
+                self.void_time = 0.0;
+                self.tick_arc(dt, jump, self.pos[2]);
+            } else if self.standing_still(jump)
             // 脚下完全没有碰撞数据（hole）时不能"保持 server's Z"——应让重力接管自然下落，
             // 避免地形空洞里悬空的抖动。WMO upper storey（有天花板/墙壁但无地板）不属于此情况。
             && self.ground(self.pos[0], self.pos[1], f32::MAX).is_some()
-        {
-            // A body on its feet and committed to no motion keeps its seat:
-            // the reference integrates gravity only for a moving or airborne
-            // mover, so standing on a spot the collision set has no floor for
-            // (a hole in the terrain data, a WMO upper storey) holds the
-            // server's Z instead of pumping a fall and a void-guard restore.
-            self.vel[2] = 0.0;
-            self.grounded = true;
-            self.last_ground = self.pos;
-            self.void_time = 0.0;
-            self.tick_arc(dt, jump, self.pos[2]);
-        } else {
-            // Vertical: gravity, then a capsule sweep of the whole travel.
-            // The sweep is the reference's shape cast (`0x632700`); the old code
-            // sampled the height under one point, which misses a floor only the
-            // capsule's rim overhangs and, on a hitched frame, a floor the feet
-            // cross between two ticks - the "jumped the fence and dropped
-            // through the room" report.
-            let prev_z = self.pos[2];
-            let was_grounded = self.grounded;
-            self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
-            let dz = self.vel[2] * dt;
-            // A grounded body also looks `travel · slope + slack` down, the
-            // reference's step-vs-fall election (`0x6367b0`); an airborne one
-            // only as far as it falls, so the arc ends where the slide meets
-            // the floor.
-            let travel = ((self.pos[0] - feet[0]).powi(2) + (self.pos[1] - feet[1]).powi(2)).sqrt();
-            let cone = travel * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
-            let reach = if self.grounded { (-dz).max(cone) } else { -dz };
-            let mut floor_z: Option<f32> = None;
-            if dz > 0.0 {
-                // Rising: the head is solid too. The up-sweep stops where the
-                // capsule's top meets a downward-facing face, and the arc falls
-                // back from there.
-                if let Some(hit) = self.capsule_sweep_z(self.pos, dz) {
-                    self.pos[2] += hit.dist;
-                    if hit.dist <= dz {
-                        self.vel[2] = 0.0;
-                    }
-                } else {
-                    self.pos[2] += dz;
-                }
-                self.grounded = false;
-            } else if let Some(hit) = self.capsule_sweep_z(self.pos, -reach) {
-
-
-
-
-                let contact = self.pos[2] - hit.dist;
-                // The sweep already keeps only faces with a real up component,
-                // so whatever it meets is a surface to stand on. A sweep that
-                // starts already overlapping (`dist` 0) means the body is
-                // inside the face: push it out onto the surface it crosses
-                // instead of leaving it buried, the walk-out the reference's
-                // one-sided law gives.
-                floor_z = Some(if hit.dist <= 1.0e-4 && hit.nz >= GROUND_COS {
-                    self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
-                        .filter(|(z, nz)| *nz >= GROUND_COS && *z > contact)
-                        .map_or(contact, |(z, _)| z)
-                } else {
-                    contact
-                });
-            } else {
-                // The cast can crawl to a stop on a face the capsule only
-                // grazes at the rim (a kerb beside the feet), running out of
-                // its passes before the floor the body is standing on. That is
-                // the reference's step-vs-fall election, not a fall: while the
-                // body was already seated, re-seat it on the height under it
-                // when that is inside the same step cone. A real ledge is
-                // deeper than the cone and still falls.
-                let reseat = if was_grounded {
-                    self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
-                        .filter(|(z, nz)| *nz >= GROUND_COS && *z <= prev_z && prev_z - *z <= cone)
-                        .map(|(z, _)| z)
-                } else {
-                    None
-                };
-                if let Some(z) = reseat {
-                    floor_z = Some(z);
-                } else {
-                    self.pos[2] += dz;
-                    self.grounded = false;
-                }
-            }
-            if let Some(z) = floor_z {
-                self.pos[2] = z;
+            {
+                // A body on its feet and committed to no motion keeps its seat:
+                // the reference integrates gravity only for a moving or airborne
+                // mover, so standing on a spot the collision set has no floor for
+                // (a hole in the terrain data, a WMO upper storey) holds the
+                // server's Z instead of pumping a fall and a void-guard restore.
                 self.vel[2] = 0.0;
                 self.grounded = true;
                 self.last_ground = self.pos;
                 self.void_time = 0.0;
-            }
-            if !self.grounded {
-                // No floor this frame: a hole in the terrain (a tunnel mouth),
-                // a tile that has not streamed in yet, or a body that is
-                // already below the world. Never keep falling forever - report
-                // the spot once and restore the last floor when the fall is
-                // clearly out of the map.
-                self.void_time += dt;
-                if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
-                    let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
-                    let state = match self.tiles.get(&(tx, ty)) {
-                        None => "missing",
-                        Some(t) if t.wmo_ready => "ready",
-                        Some(_) => "loading",
-                    };
-                    eprintln!(
-                        "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
-                     {state} resident={} reach={reach:.2}",
-                        self.pos[0],
-                        self.pos[1],
-                        self.pos[2],
-                        self.tiles.len()
-                    );
-                }
-                // A body with the terrain standing over its head and no floor
-                // under its feet is buried, not falling: a login pose saved
-                // inside a hill, or a hole in the data. Lift it onto the
-                // surface above it. Only a surface *above* the feet qualifies,
-                // so an ordinary fall off a cliff is never touched.
-                let buried = self.void_time > 0.5
-                    && !self.floors_folding(self.pos[0], self.pos[1])
-                    && self.ground(self.pos[0], self.pos[1], self.pos[2]).is_none()
-                    && self
-                        .terrain_z(self.pos[0], self.pos[1])
-                        .is_some_and(|t| t > self.pos[2] + 1.0e-3);
-                if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH || buried {
-                    let seat = if buried {
-                        let z = self
-                            .terrain_z(self.pos[0], self.pos[1])
-                            .unwrap_or(self.pos[2]);
-                        [self.pos[0], self.pos[1], z]
+                self.tick_arc(dt, jump, self.pos[2]);
+            } else {
+                // Vertical: gravity, then a capsule sweep of the whole travel.
+                // The sweep is the reference's shape cast (`0x632700`); the old code
+                // sampled the height under one point, which misses a floor only the
+                // capsule's rim overhangs and, on a hitched frame, a floor the feet
+                // cross between two ticks - the "jumped the fence and dropped
+                // through the room" report.
+                let prev_z = self.pos[2];
+                let was_grounded = self.grounded;
+                self.vel[2] = (self.vel[2] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
+                let dz = self.vel[2] * dt;
+                // A grounded body also looks `travel · slope + slack` down, the
+                // reference's step-vs-fall election (`0x6367b0`); an airborne one
+                // only as far as it falls, so the arc ends where the slide meets
+                // the floor.
+                let travel =
+                    ((self.pos[0] - feet[0]).powi(2) + (self.pos[1] - feet[1]).powi(2)).sqrt();
+                let cone = travel * STEP_SLOPE_RATIO + STEP_SNAP_SLACK;
+                let reach = if self.grounded { (-dz).max(cone) } else { -dz };
+                let mut floor_z: Option<f32> = None;
+                if dz > 0.0 {
+                    // Rising: the head is solid too. The up-sweep stops where the
+                    // capsule's top meets a downward-facing face, and the arc falls
+                    // back from there.
+                    if let Some(hit) = self.capsule_sweep_z(self.pos, dz) {
+                        self.pos[2] += hit.dist;
+                        if hit.dist <= dz {
+                            self.vel[2] = 0.0;
+                        }
                     } else {
-                        // The last seat may itself be in the void - a login
-                        // pose saved under the terrain by a client that had
-                        // already left the map - so restore onto a floor
-                        // that is still real there, not blindly there.
-                        self.ground(
-                            self.last_ground[0],
-                            self.last_ground[1],
-                            self.last_ground[2] + STEP_UP_HEIGHT,
-                        )
-                        .or_else(|| {
-                            self.ground(self.last_ground[0], self.last_ground[1], f32::MAX)
-                        })
-                        .map_or(self.last_ground, |(z, _)| {
-                            [self.last_ground[0], self.last_ground[1], z]
-                        })
+                        self.pos[2] += dz;
+                    }
+                    self.grounded = false;
+                } else if let Some(hit) = self.capsule_sweep_z(self.pos, -reach) {
+                    let contact = self.pos[2] - hit.dist;
+                    // The sweep already keeps only faces with a real up component,
+                    // so whatever it meets is a surface to stand on. A sweep that
+                    // starts already overlapping (`dist` 0) means the body is
+                    // inside the face: push it out onto the surface it crosses
+                    // instead of leaving it buried, the walk-out the reference's
+                    // one-sided law gives.
+                    floor_z = Some(if hit.dist <= 1.0e-4 {
+                        // An overlap on a face steeper than the walk limit
+                        // (`one_sided` keeps `nz >= 0.15`, so a bank's wall is a
+                        // vertical contact) is the horizontal pass's business, not
+                        // support: pinning the feet to it leaves the body buried in
+                        // the slope it is walking up. Measured on the Crystal Lake
+                        // bank at (-9372.2, -202.0), where a 0.65-tall face answered
+                        // the sweep at `dist 0` every frame and the feet stayed
+                        // 0.05 yd under the terrain. The reference seats a mover on
+                        // a walkable floor only (`GROUND_COS`, `0x636a4e`'s
+                        // standability test), so take the floor the walkable probe
+                        // finds at the feet, up to the step-up it certifies.
+                        self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                            .filter(|(z, nz)| *nz >= GROUND_COS && *z > contact)
+                            .map_or(contact, |(z, _)| z)
+                    } else {
+                        contact
+                    });
+                } else {
+                    // The cast can crawl to a stop on a face the capsule only
+                    // grazes at the rim (a kerb beside the feet), running out of
+                    // its passes before the floor the body is standing on. That is
+                    // the reference's step-vs-fall election, not a fall: while the
+                    // body was already seated, re-seat it on the height under it
+                    // when that is inside the same step cone. A real ledge is
+                    // deeper than the cone and still falls.
+                    let reseat = if was_grounded {
+                        self.ground(self.pos[0], self.pos[1], self.pos[2] + STEP_UP_HEIGHT)
+                            .filter(|(z, nz)| {
+                                *nz >= GROUND_COS && *z <= prev_z && prev_z - *z <= cone
+                            })
+                            .map(|(z, _)| z)
+                    } else {
+                        None
                     };
-                    eprintln!(
+                    if let Some(z) = reseat {
+                        floor_z = Some(z);
+                    } else {
+                        self.pos[2] += dz;
+                        self.grounded = false;
+                    }
+                }
+                if let Some(z) = floor_z {
+                    self.pos[2] = z;
+                    self.vel[2] = 0.0;
+                    self.grounded = true;
+                    self.last_ground = self.pos;
+                    self.void_time = 0.0;
+                }
+                if !self.grounded {
+                    // No floor this frame: a hole in the terrain (a tunnel mouth),
+                    // a tile that has not streamed in yet, or a body that is
+                    // already below the world. Never keep falling forever - report
+                    // the spot once and restore the last floor when the fall is
+                    // clearly out of the map.
+                    self.void_time += dt;
+                    if self.void_time > 0.5 && self.void_time - dt <= 0.5 {
+                        let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                        let state = match self.tiles.get(&(tx, ty)) {
+                            None => "missing",
+                            Some(t) if t.wmo_ready => "ready",
+                            Some(_) => "loading",
+                        };
+                        eprintln!(
+                            "bn_player: no ground at ({:.1},{:.1}) z={:.1} tile=({tx},{ty}) \
+                     {state} resident={} reach={reach:.2}",
+                            self.pos[0],
+                            self.pos[1],
+                            self.pos[2],
+                            self.tiles.len()
+                        );
+                    }
+                    // A body with the terrain standing over its head and no floor
+                    // under its feet is buried, not falling: a login pose saved
+                    // inside a hill, or a hole in the data. Lift it onto the
+                    // surface above it. Only a surface *above* the feet qualifies,
+                    // so an ordinary fall off a cliff is never touched.
+                    let buried = self.void_time > 0.5
+                        && !self.floors_folding(self.pos[0], self.pos[1])
+                        && self.ground(self.pos[0], self.pos[1], self.pos[2]).is_none()
+                        && self
+                            .terrain_z(self.pos[0], self.pos[1])
+                            .is_some_and(|t| t > self.pos[2] + 1.0e-3);
+                    if self.pos[2] < self.last_ground[2] - VOID_GUARD_DEPTH || buried {
+                        let seat = if buried {
+                            let z = self
+                                .terrain_z(self.pos[0], self.pos[1])
+                                .unwrap_or(self.pos[2]);
+                            [self.pos[0], self.pos[1], z]
+                        } else {
+                            // The last seat may itself be in the void - a login
+                            // pose saved under the terrain by a client that had
+                            // already left the map - so restore onto a floor
+                            // that is still real there, not blindly there.
+                            self.ground(
+                                self.last_ground[0],
+                                self.last_ground[1],
+                                self.last_ground[2] + STEP_UP_HEIGHT,
+                            )
+                            .or_else(|| {
+                                self.ground(self.last_ground[0], self.last_ground[1], f32::MAX)
+                            })
+                            .map_or(self.last_ground, |(z, _)| {
+                                [self.last_ground[0], self.last_ground[1], z]
+                            })
+                        };
+                        eprintln!(
                         "bn_player: void guard restored ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})",
                         self.pos[0], self.pos[1], self.pos[2],
                         seat[0], seat[1], seat[2]
                     );
-                    self.pos = seat;
-                    self.last_ground = seat;
-                    self.vel = [0.0; 3];
-                    self.grounded = true;
-                    self.void_time = 0.0;
+                        self.pos = seat;
+                        self.last_ground = seat;
+                        self.vel = [0.0; 3];
+                        self.grounded = true;
+                        self.void_time = 0.0;
+                    }
+                }
+                self.tick_arc(dt, jump, prev_z);
+                // Falling-trace: a body that drops through a city floor lands on the
+                // terrain, where `ground` still answers - so the no-ground warning
+                // never fires. Log the trajectory (with the tile's WMO cell count)
+                // every half second instead, so a "fell through here" report has
+                // coordinates and tells us whether the cell held any geometry.
+                self.fall_time = if self.grounded {
+                    0.0
+                } else {
+                    self.fall_time + dt
+                };
+                if !self.grounded && self.vel[2] < -10.0 && self.fall_time >= 0.5 {
+                    self.fall_time = 0.0;
+                    let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+                    let (ready, wmos, cell_tris) = match self.tiles.get(&(tx, ty)) {
+                        Some(t) => (
+                            t.wmo_ready,
+                            t.wmos.len(),
+                            TileCol::wmo_cell(tx, ty, self.pos[0], self.pos[1])
+                                .map_or(0, |i| t.wmo_cells[i as usize].len()),
+                        ),
+                        None => (false, 0, 0),
+                    };
+                    eprintln!(
+                        "bn_player: falling ({:.1},{:.1}) z={:.2} floor={:?} tile=({tx},{ty}) \
+                     wmo_ready={ready} wmos={wmos} celltris={cell_tris}",
+                        self.pos[0], self.pos[1], self.pos[2], floor_z
+                    );
                 }
             }
-            self.tick_arc(dt, jump, prev_z);
-            // Falling-trace: a body that drops through a city floor lands on the
-            // terrain, where `ground` still answers - so the no-ground warning
-            // never fires. Log the trajectory (with the tile's WMO cell count)
-            // every half second instead, so a "fell through here" report has
-            // coordinates and tells us whether the cell held any geometry.
-            self.fall_time = if self.grounded {
-                0.0
-            } else {
-                self.fall_time + dt
-            };
-            if !self.grounded && self.vel[2] < -10.0 && self.fall_time >= 0.5 {
-                self.fall_time = 0.0;
-                let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
-                let (ready, wmos, cell_tris) = match self.tiles.get(&(tx, ty)) {
-                    Some(t) => (
-                        t.wmo_ready,
-                        t.wmos.len(),
-                        TileCol::wmo_cell(tx, ty, self.pos[0], self.pos[1])
-                            .map_or(0, |i| t.wmo_cells[i as usize].len()),
-                    ),
-                    None => (false, 0, 0),
-                };
-                eprintln!(
-                    "bn_player: falling ({:.1},{:.1}) z={:.2} floor={:?} tile=({tx},{ty}) \
-                     wmo_ready={ready} wmos={wmos} celltris={cell_tris}",
-                    self.pos[0],
-                    self.pos[1],
-                    self.pos[2],
-                    floor_z
-                );
-            }
-        }
         }
 
         // The rendered body heading (`player/gait.rs`'s `drive_body_heading`,
@@ -3961,11 +4226,8 @@ impl Player {
         // The probe the reference casts from just above the feet: the body's
         // own XY over the floor it stands on, on the same collision triangles
         // the floor resolve walks.
-        let sampled = self.ground_with_normal(
-            self.pos[0],
-            self.pos[1],
-            self.pos[2] + TILT_PROBE_UP,
-        );
+        let sampled =
+            self.ground_with_normal(self.pos[0], self.pos[1], self.pos[2] + TILT_PROBE_UP);
         // `tilt_target`: a miss or a face too steep to stand on snaps to world
         // up; inside the freeze band the previous pose is kept; past it the
         // face's normal is the target.
@@ -4734,7 +4996,10 @@ pub extern "C" fn bn_player_tick(world: *mut BnWorld, dt: f32, out: *mut BnPlaye
     } else {
         0
     };
-    if w.player.as_ref().is_some_and(|p| p.mount_tilt_display != key) {
+    if w.player
+        .as_ref()
+        .is_some_and(|p| p.mount_tilt_display != key)
+    {
         let mode = if key == 0 {
             0
         } else if key == u32::MAX {
@@ -4901,11 +5166,7 @@ pub extern "C" fn bn_player_collision_probe(
 /// within one radius, [7] feet z, [8] dead flag, [9] stock-binding latch flag.
 /// Writes nothing into the player and no movement decision reads it.
 #[no_mangle]
-pub extern "C" fn bn_player_penetration(
-    world: *const BnWorld,
-    out: *mut f32,
-    cap: u32,
-) -> u32 {
+pub extern "C" fn bn_player_penetration(world: *const BnWorld, out: *mut f32, cap: u32) -> u32 {
     if world.is_null() || out.is_null() || cap < 10 {
         return 0;
     }
@@ -4927,12 +5188,15 @@ pub extern "C" fn bn_player_penetration(
                 return false; // a floor or a ceiling
             }
             let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
-            if top <= feet + STEP_UP_HEIGHT {
-                return false; // a curb the mover steps over
+            // The live sweep has no height gate, so neither may the instrument
+            // that measures it: a railing the body walked through is a leak
+            // whether or not it stands under the step height. Only a face the
+            // feet are already above is geometry the mover legitimately rode.
+            if top <= feet {
+                return false;
             }
             let c = closest_on_tri(q, t);
-            let d = ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2))
-                .sqrt();
+            let d = ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) + (q[2] - c[2]).powi(2)).sqrt();
             if d < nearest {
                 nearest = d;
             }
@@ -5000,8 +5264,12 @@ pub extern "C" fn bn_player_collision_model(
     let w = unsafe { &*world };
     let Some(p) = w.player.as_ref() else { return 0 };
     let (tx, ty) = Player::tile_of(x, y);
-    let Some(t) = p.tiles.get(&(tx, ty)) else { return 0 };
-    let Some(inst) = t.wmos.get(i as usize) else { return 0 };
+    let Some(t) = p.tiles.get(&(tx, ty)) else {
+        return 0;
+    };
+    let Some(inst) = t.wmos.get(i as usize) else {
+        return 0;
+    };
     let mut o = [0.0f32; 8];
     if let Some(mesh) = w.wmo_collision.get(&inst.model) {
         o[0] = (mesh.indices.len() / 3) as f32;
@@ -5210,21 +5478,30 @@ mod tests {
     /// （`void_time`/`last_ground` 恢复），随 `bn.CollisionSolver=1` 整段移除。
     #[test]
     fn a_hole_in_the_collision_data_is_a_fall_not_a_floor() {
-        let mut p = Player::new("Azeroth", -8800.0, -800.0);
-        p.pos[2] = 10.0;
-        p.last_ground = [p.pos[0], p.pos[1], 10.0];
-        p.grounded = true;
-        p.tiles
-            .insert(Player::tile_of(p.pos[0], p.pos[1]), TileCol::new());
-        for _ in 0..400 {
-            p.tick(0.1);
-        }
-        assert!(!p.grounded, "a hole is not a floor");
-        assert!(
-            p.pos[2] < -100.0,
-            "the body falls through it, as benilla: {}",
-            p.pos[2]
-        );
+        // benilla 的步进没有虚空护栏：脚下没有任何面就是自由落体。
+        // 显式切到 solver=1（MoverSession），因为默认 solver=0 的自写求解
+        // 有 `void_time`/`last_ground` 护栏会把身体搬回上一个落脚点。
+        let prev = COLLISION_SOLVER.load(Ordering::Relaxed);
+        COLLISION_SOLVER.store(true, Ordering::Relaxed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut p = Player::new("Azeroth", -8800.0, -800.0);
+            p.pos[2] = 10.0;
+            p.last_ground = [p.pos[0], p.pos[1], 10.0];
+            p.grounded = true;
+            p.tiles
+                .insert(Player::tile_of(p.pos[0], p.pos[1]), TileCol::new());
+            for _ in 0..400 {
+                p.tick(0.1);
+            }
+            assert!(!p.grounded, "a hole is not a floor");
+            assert!(
+                p.pos[2] < -100.0,
+                "the body falls through it, as benilla: {}",
+                p.pos[2]
+            );
+        }));
+        COLLISION_SOLVER.store(prev, Ordering::Relaxed);
+        result.unwrap();
     }
 
     /// benilla 的探针是单向的，也没有"头顶以上的面算墙"这条规则：地表在头顶之上
@@ -5570,7 +5847,10 @@ mod tests {
             "camera head-on: boom={len:.3} want={want:.3} frac={:.3}",
             want / len
         );
-        assert_eq!(want, 0.0, "the arm never leaves the slab, eye stays on the head");
+        assert_eq!(
+            want, 0.0,
+            "the arm never leaves the slab, eye stays on the head"
+        );
     }
 
     /// World x of the profiles' own x = 0; every profile is authored around it.
@@ -7041,7 +7321,12 @@ mod tests {
         let mut samples = 0usize;
         let mut entered = 0usize;
         for d in &modd {
-            let name = d.model.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+            let name = d
+                .model
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if !(name.contains("tree") || name.contains("fence") || name.contains("barrel")) {
                 continue;
             }
@@ -7065,26 +7350,25 @@ mod tests {
             // (the model's first 1.2 yd) and its full height. Inside the knee
             // reach is a penetration; the height says whether the mover's step
             // rule can excuse it.
-            let (knee, top, zlo) = p
-                .hulls
-                .get(&d.model)
-                .and_then(|h| h.as_ref())
-                .map_or((0.0, 0.0, 0.0), |h| {
-                    h.positions.iter().fold(
-                        (0.0f32, 0.0f32, f32::MAX),
-                        |acc, v| {
-                        (
-                            if v[2] > 0.0 && v[2] < 1.2 {
-                                acc.0.max((v[0] * v[0] + v[1] * v[1]).sqrt() * d.scale)
-                            } else {
-                                acc.0
-                            },
-                            acc.1.max(v[2] * d.scale),
-                            acc.2.min(v[2] * d.scale),
-                        )
-                        }
-                    )
-                });
+            let (knee, top, zlo) =
+                p.hulls
+                    .get(&d.model)
+                    .and_then(|h| h.as_ref())
+                    .map_or((0.0, 0.0, 0.0), |h| {
+                        h.positions
+                            .iter()
+                            .fold((0.0f32, 0.0f32, f32::MAX), |acc, v| {
+                                (
+                                    if v[2] > 0.0 && v[2] < 1.2 {
+                                        acc.0.max((v[0] * v[0] + v[1] * v[1]).sqrt() * d.scale)
+                                    } else {
+                                        acc.0
+                                    },
+                                    acc.1.max(v[2] * d.scale),
+                                    acc.2.min(v[2] * d.scale),
+                                )
+                            })
+                    });
             for leg in 0..4 {
                 let a = leg as f32 * std::f32::consts::FRAC_PI_2;
                 let (sx, sy) = (px - a.cos() * 6.0, py - a.sin() * 6.0);
@@ -7151,7 +7435,9 @@ mod tests {
                 );
             }
         }
-        println!("mover: {samples} tree/fence/barrel placements approached, {entered} walked through");
+        println!(
+            "mover: {samples} tree/fence/barrel placements approached, {entered} walked through"
+        );
 
         // The leak, one tenth of a yard at a time: march the capsule's three
         // rings along -X into the prop the body got inside, and print the
@@ -7162,9 +7448,7 @@ mod tests {
             .find(|d| (d.position[0] + 8989.1).abs() < 0.2 && (d.position[1] - 556.3).abs() < 0.2)
             .expect("the prop the body got inside");
         let (px, py) = (diag.position[0], diag.position[1]);
-        let feet = p
-            .ground(px, py, f32::INFINITY)
-            .map_or(0.0, |(z, _)| z);
+        let feet = p.ground(px, py, f32::INFINITY).map_or(0.0, |(z, _)| z);
         println!(
             "scan {} prop z={:.2} floor={feet:.2} rings={:.2},{:.2},{:.2}",
             diag.model.rsplit('\\').next().unwrap_or(""),
@@ -7178,8 +7462,9 @@ mod tests {
             let (x, y) = (px - off, py);
             let mut row = format!("  x-off={off:.1} dist={:.2}", off);
             for k in 0..3 {
-                let rz = feet + CAPSULE_RADIUS + (CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS)
-                    * (k as f32 / 2.0);
+                let rz = feet
+                    + CAPSULE_RADIUS
+                    + (CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS) * (k as f32 / 2.0);
                 let t = [x, y, rz];
                 let mut dmin = f32::MAX;
                 let mut ncnt = 0usize;
@@ -7222,7 +7507,12 @@ mod tests {
             if Player::tile_of(d.position[0], d.position[1]) != k {
                 continue;
             }
-            let name = d.model.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+            let name = d
+                .model
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             let tris = p
                 .hulls
                 .get(&d.model)
@@ -7465,6 +7755,1255 @@ mod tests {
         );
     }
 
+    /// 45° 逼近一面平墙、然后贴着它滑：胶囊中心轴到墙面平面的水平距离全程不得
+    /// 小于半径。进了半径以内，one-sided 扫掠对任何带闭合分量的方向都回 dist 0，
+    /// 身体就再也出不来（上游 `MoverSession` 同样出不来——它没有脱出）。
+    #[test]
+    fn a_diagonal_slide_stays_outside_the_wall() {
+        let mut p = player_on_flat();
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let cx = PROFILE_X0 + 20.0;
+        let cy = -750.0;
+        let west = [
+            Tri::new([cx, cy - 20.0, 0.0], [cx, cy, 0.0], [cx, cy - 20.0, 4.0]),
+            Tri::new([cx, cy, 0.0], [cx, cy, 4.0], [cx, cy - 20.0, 4.0]),
+        ];
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        for t in west.iter() {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, t);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(*t);
+                }
+            }
+        }
+        let d = 1.0f32 / 2.0f32.sqrt();
+        let step = 0.05f32;
+        p.pos = [cx + 2.0, cy - 2.0, 0.0];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        let mut min_gap = f32::MAX;
+        for i in 0..220 {
+            let gap = p.pos[0] - cx;
+            min_gap = min_gap.min(gap);
+            let c = p.sweep_wall_contact(p.pos, -d, -d, step);
+            let moved = p.horizontal_step([-d * step, -d * step]);
+            if i < 6 || i >= 214 || gap < CAPSULE_RADIUS + 0.05 {
+                println!(
+                    "TRACE {i:3} gap={gap:.4} contact={:?} moved={} pos=({:.4} {:.4})",
+                    c.map(|c| (c.dist, c.n)),
+                    moved,
+                    p.pos[0],
+                    p.pos[1]
+                );
+            }
+        }
+        println!(
+            "DIAG min_gap={min_gap:.4} radius={CAPSULE_RADIUS} skin={SKIN_WIDTH} \
+             want at least {CAPSULE_RADIUS}"
+        );
+        assert!(
+            min_gap >= CAPSULE_RADIUS - 1.0e-3,
+            "the slide drove {diff:.3} yd inside the wall",
+            diff = CAPSULE_RADIUS - min_gap
+        );
+    }
+
+    /// 屋内护栏（用户报"屋内护栏硬挤能穿过去"）：x=RX 处一块竖直薄板，顶到
+    /// `STEP_UP_HEIGHT` 之上一点，两面都朝外。参考律里没有高度豁免这回事：sweep
+    /// 报出这块面，能不能过去由台阶认证说了算——护栏背后是地面，不是能达到面顶的
+    /// 落点，所以它不通。（旧律把 `top <= feet + STEP_UP_HEIGHT` 的面直接当不存在，
+    /// 身体就贴着护栏穿过去了，而 BNLEAK 用的是同一条豁免，所以漏检 frames=0。）
+    #[test]
+    fn a_railing_is_a_wall_the_body_does_not_walk_through() {
+        let mut p = player_on_flat();
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let rx = PROFILE_X0 + 10.0;
+        let (ya, yb) = (-770.0f32, -730.0f32);
+        let top = STEP_UP_HEIGHT + 0.1;
+        let faces = [
+            // 朝 -X 的一面：挡住向东。
+            Tri::new([rx, ya, 0.0], [rx, ya, top], [rx, yb, 0.0]),
+            Tri::new([rx, yb, 0.0], [rx, ya, top], [rx, yb, top]),
+            // 朝 +X 的一面：挡住向西。
+            Tri::new([rx, ya, 0.0], [rx, yb, 0.0], [rx, ya, top]),
+            Tri::new([rx, yb, top], [rx, ya, top], [rx, yb, 0.0]),
+        ];
+        for t in faces.iter() {
+            assert!(t.n[2].abs() < GROUND_COS, "the rail is a steep face");
+        }
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        for t in faces.iter() {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, t);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(*t);
+                }
+            }
+        }
+        for (dirx, tag) in [(1.0f32, "east"), (-1.0f32, "west")] {
+            p.pos = [rx - 3.0 * dirx, (ya + yb) * 0.5, 0.0];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            for _ in 0..200 {
+                if !p.horizontal_step([dirx * 0.05, 0.0]) {
+                    break;
+                }
+            }
+            let gap = (p.pos[0] - rx).abs();
+            println!(
+                "RAIL {tag}: x={:.3} gap={:.3} (want stopped at ~{:.3}, never past)",
+                p.pos[0],
+                gap,
+                CAPSULE_RADIUS + SKIN_WIDTH
+            );
+            assert!(
+                (p.pos[0] - rx) * dirx <= 0.0,
+                "walking {tag} crossed the railing plane at x={:.3}",
+                p.pos[0]
+            );
+            assert!(
+                gap <= CAPSULE_RADIUS + SKIN_WIDTH + 0.05,
+                "walking {tag} stopped {gap:.2} yd short of the rail, not at its face"
+            );
+        }
+    }
+
+    /// 屋内西北墙角（用户报"接近墙角就卡，都不用到角"）：西墙平面 x=CX（法线 +X，
+    /// 朝房内）、北墙平面 y=CY（法线 -Y，朝房内），两面在 (CX, CY) 垂直相交，
+    /// 房间是 x > CX 且 y < CY 的那个象限。
+    ///
+    /// 期望（benilla `one_sided::move_and_slide` 的语义）：贴着一面墙走向角点，
+    /// 身体一路滑到距该墙平面一个胶囊半径处、并在距另一面墙同样距离上停下，
+    /// 停点离角点 ≈ r + skin ≈ 0.353 yd，不是提前几码停死。
+    #[test]
+    fn an_indoor_corner_is_slid_into_not_blocked_early() {
+        let mut p = player_on_flat();
+        let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+        let cx = PROFILE_X0 + 20.0;
+        let cy = -750.0;
+        let west = [
+            Tri::new([cx, cy - 20.0, 0.0], [cx, cy, 0.0], [cx, cy - 20.0, 4.0]),
+            Tri::new([cx, cy, 0.0], [cx, cy, 4.0], [cx, cy - 20.0, 4.0]),
+        ];
+        let north = [
+            Tri::new([cx, cy, 0.0], [cx + 20.0, cy, 0.0], [cx, cy, 4.0]),
+            Tri::new([cx + 20.0, cy, 0.0], [cx + 20.0, cy, 4.0], [cx, cy, 4.0]),
+        ];
+        for t in west.iter().chain(north.iter()) {
+            assert!(
+                t.n[2].abs() < GROUND_COS && t.v[0][2].max(t.v[1][2]).max(t.v[2][2]) > 3.0,
+                "wall face n={:?}",
+                t.n
+            );
+        }
+        // 西墙朝 +X、北墙朝 -Y（都是朝房内的一面），否则 one-sided 直接放过。
+        assert_eq!(west[0].n, [1.0, 0.0, 0.0], "west wall faces the room");
+        assert_eq!(north[0].n, [0.0, -1.0, 0.0], "north wall faces the room");
+        let col = p.tiles.get_mut(&(tx, ty)).unwrap();
+        for t in west.iter().chain(north.iter()) {
+            let (x0, y0, x1, y1) = TileCol::wmo_span(tx, ty, t);
+            for ly in y0..=y1 {
+                for lx in x0..=x1 {
+                    col.wmo_cells[(ly * WMO_GRID + lx) as usize].push(*t);
+                }
+            }
+        }
+        assert!(
+            p.ground(cx + 5.0, cy - 5.0, f32::MAX)
+                .is_some_and(|(z, _)| z.abs() < 0.05),
+            "the room has a floor"
+        );
+
+        let r_plus = CAPSULE_RADIUS + SKIN_WIDTH;
+        // 一步的水平推进（mover 每帧的就是这个），将身体从房内推向角点。
+        let mut nudge = |p: &mut Player, from: [f32; 2], dir: [f32; 2]| -> [f32; 2] {
+            p.pos = [from[0], from[1], 0.0];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            for _ in 0..400 {
+                if !p.horizontal_step([dir[0] * 0.05, dir[1] * 0.05]) {
+                    break;
+                }
+            }
+            p.pos = [p.pos[0], p.pos[1], 0.0];
+            [p.pos[0], p.pos[1]]
+        };
+        // 沿北墙向西（-X）走：贴墙、走向角点。
+        let at = nudge(&mut p, [cx + 8.0, cy - CAPSULE_RADIUS], [-1.0, 0.0]);
+        println!(
+            "CORNER along-north: gap_west_wall={:.3} gap_north_wall={:.3} (want ~{:.3})",
+            at[0] - cx,
+            cy - at[1],
+            r_plus
+        );
+        // 沿西墙向南（-Y）走：贴墙、走向角点。
+        let at = nudge(&mut p, [cx + CAPSULE_RADIUS, cy - 8.0], [0.0, -1.0]);
+        println!(
+            "CORNER along-west:  gap_west_wall={:.3} gap_north_wall={:.3} (want ~{:.3})",
+            at[0] - cx,
+            cy - at[1],
+            r_plus
+        );
+        // 斜着走向角点（西北 45°）。
+        let d = 1.0f32 / 2.0f32.sqrt();
+        let at = nudge(&mut p, [cx + 6.0, cy - 6.0], [-d, -d]);
+        println!(
+            "CORNER diagonal:    gap_west_wall={:.3} gap_north_wall={:.3} dist_to_apex={:.3}",
+            at[0] - cx,
+            cy - at[1],
+            ((at[0] - cx).powi(2) + (at[1] - cy).powi(2)).sqrt()
+        );
+
+        // 角点前 1 yd：16 个方向各推一步，报"能动多少"。全 0 就是用户说的卡死。
+        let spots = [
+            [cx + 1.0, cy - 1.0],
+            [cx + 1.6, cy - 1.6],
+            [cx + 2.4, cy - 2.4],
+        ];
+        for sp in spots {
+            let mut line = format!(
+                "CORNER hold @({:.2}, {:.2}) (gap {:.2}/{:.2}):",
+                sp[0] - cx,
+                cy - sp[1],
+                sp[0] - cx,
+                cy - sp[1]
+            );
+            for k in 0..16 {
+                let a = std::f32::consts::TAU * (k as f32 / 16.0);
+                let moved = nudge(&mut p, sp, [a.cos(), a.sin()]);
+                let travel = ((moved[0] - sp[0]).powi(2) + (moved[1] - sp[1]).powi(2)).sqrt();
+                if travel < 0.2 {
+                    line.push_str(&format!(" {:.0}°={:.2}", a.to_degrees(), travel));
+                }
+            }
+            println!("{line}");
+        }
+    }
+
+    /// 同一件事，跑在真实几何上：`specs/collision-sweep/stuck_spots.csv` 记下的
+    /// 狮王之傲旅店室内点 (-9471.08, 28.04, 56.34)，用户报"西北墙之间接近墙角就卡"。
+    /// 这里只做测量：报点周围的墙面孔、以及 16 个朝向各跑 2 s 的行程/净位移。
+    #[test]
+    fn the_reported_indoor_corner_is_measured_not_held() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        assert!(!archives.is_empty(), "the install's MPQs open");
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (x0, y0, z0) = (-9471.08f32, 28.04f32, 56.34f32);
+        let mut p = Player::new("Azeroth", x0, y0);
+        p.pos = [x0, y0, z0];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        let k = Player::tile_of(x0, y0);
+        for _ in 0..4000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&k)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len())
+            {
+                break;
+            }
+        }
+        // 报点所在那一层的地板：从报点上方一个台阶高度向下问，不是从天空向下问
+        // （`f32::MAX` 回答的是屋顶，那一层四面皆空，测不出任何东西）。
+        let Some((floor, ny)) = p.ground(x0, y0, z0 + STEP_UP_HEIGHT) else {
+            println!("INNCORNER: no floor at the reported spot");
+            return;
+        };
+        println!(
+            "INNCORNER: floor {floor:.2} ny {ny:.3} wmo_ready {}",
+            p.tiles.get(&k).is_some_and(|t| t.wmo_ready)
+        );
+
+        // 身体那一截高度上的竖直面：墙面的法线、重心与到报点的水平距离。
+        let mut faces: Vec<Tri> = Vec::new();
+        p.any_tri_near([x0, y0, floor + 1.0], |t| {
+            if t.n[2].abs() < GROUND_COS {
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                if top > floor + STEP_UP_HEIGHT && bot < floor + CAPSULE_HEIGHT {
+                    faces.push(*t);
+                }
+            }
+            false
+        });
+        faces.sort_by(|a, b| {
+            let d = |t: &Tri| {
+                let c = [
+                    (t.v[0][0] + t.v[1][0] + t.v[2][0]) / 3.0,
+                    (t.v[0][1] + t.v[1][1] + t.v[2][1]) / 3.0,
+                ];
+                ((c[0] - x0).powi(2) + (c[1] - y0).powi(2)).sqrt()
+            };
+            d(a).partial_cmp(&d(b)).unwrap()
+        });
+        println!("INNCORNER: {} upright faces around the spot", faces.len());
+        for t in faces.iter().take(10) {
+            let c = [
+                (t.v[0][0] + t.v[1][0] + t.v[2][0]) / 3.0,
+                (t.v[0][1] + t.v[1][1] + t.v[2][1]) / 3.0,
+            ];
+            println!(
+                "INNCORNER:   face n ({:+.2},{:+.2},{:+.2}) at ({:.2},{:.2}) gap {:.2} z {:.2}..{:.2}",
+                t.n[0],
+                t.n[1],
+                t.n[2],
+                c[0],
+                c[1],
+                ((c[0] - x0).powi(2) + (c[1] - y0).powi(2)).sqrt(),
+                t.v[0][2].min(t.v[1][2]).min(t.v[2][2]),
+                t.v[0][2].max(t.v[1][2]).max(t.v[2][2]),
+            );
+        }
+
+        // 整段 mover：跑 2 s，报累计行程与净位移。贴墙走向角点应当一路滑动到底，
+        // 净位移接近 0 而行程也接近 0 就是"接近墙角就卡"。
+        println!("INNCORNER: === run 2 s in each of 16 headings from the spot ===");
+        for q in 0..16 {
+            let a = std::f32::consts::TAU * (q as f32 / 16.0);
+            p.pos = [x0, y0, floor];
+            p.vel = [0.0; 3];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            p.yaw = a;
+            p.model_yaw = a;
+            p.input.forward = 1.0;
+            p.input.strafe = 0.0;
+            let mut travel = 0.0f32;
+            for _ in 0..120 {
+                let before = [p.pos[0], p.pos[1]];
+                p.ensure_wmo(&mut chain, &mut cache);
+                p.tick(1.0 / 60.0);
+                travel += ((p.pos[0] - before[0]).powi(2) + (p.pos[1] - before[1]).powi(2)).sqrt();
+            }
+            println!(
+                "INNCORNER: {:>5.0}deg travel {travel:>6.2} net ({:>6.2},{:>6.2}) z {:.2}",
+                a.to_degrees(),
+                p.pos[0] - x0,
+                p.pos[1] - y0,
+                p.pos[2],
+            );
+        }
+        p.input.forward = 0.0;
+    }
+
+    /// 2026-11-10 用户报"每走一步都感觉搁脚"，重点是室内。先离线归因：把三个真实
+    /// 落脚点（旅店层 -9471.92 24.93、上线站立列 -9467.28 24.35、实机 leak 列
+    /// -9500.00 50.00）都先落稳成 grounded，再各 8 个朝向走 3 s，逐帧问四个判据——
+    /// 求解器有没有把水平速度整条清零（`horizontal_step` 返回 false 的那条路）、是否
+    /// 在空中、墙扫掠答了什么、地板是否否决整步。只读，不改求解行为。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn the_sticky_walk_south_names_the_branch_that_eats_it() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        assert!(!archives.is_empty(), "the install's MPQs open");
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let mut p = Player::new("Azeroth", -9471.92, 24.93);
+        // (label, x, y, drop-from-z) - the three columns the live reports use.
+        let spots: [(&str, f32, f32, f32); 3] = [
+            ("inn", -9471.92, 24.93, 61.41),
+            ("login", -9467.28, 24.35, 60.0),
+            ("leak", -9500.00, 50.00, 82.0),
+        ];
+        let dt = 1.0f32 / 60.0;
+        let want = RUN_SPEED * WALK_RATIO * dt;
+        for (label, x, y, z0) in spots {
+            p.pos = [x, y, z0];
+            for _ in 0..9 {
+                p.ensure_tiles(&archives);
+            }
+            let k = Player::tile_of(x, y);
+            for _ in 0..4000 {
+                p.ensure_wmo(&mut chain, &mut cache);
+                if p.tiles.get(&k).is_some_and(|t| t.wmo_ready) {
+                    break;
+                }
+            }
+            // Settle: no input, fall until the resolver says the feet are on a
+            // floor. Every heading then starts from a grounded pose, which is
+            // the state the player is actually in - not from a teleport in the
+            // air, which is what the first live number was measuring.
+            p.vel = [0.0; 3];
+            p.grounded = false;
+            p.input = Input::default();
+            p.input.walk = true;
+            let mut fell = 0usize;
+            for _ in 0..900 {
+                p.ensure_wmo(&mut chain, &mut cache);
+                p.tick(dt);
+                fell += 1;
+                if p.grounded {
+                    break;
+                }
+            }
+            let settled = p.pos;
+            println!(
+                "STICKCASE {label} settled=({:.3},{:.3},{:.3}) after {fell} ticks",
+                settled[0], settled[1], settled[2]
+            );
+            for q in 0..8 {
+                let a = std::f32::consts::TAU * (q as f32 / 8.0);
+                let (fx, fy) = (a.cos(), a.sin());
+                p.pos = [settled[0], settled[1], settled[2]];
+                p.vel = [0.0; 3];
+                p.grounded = true;
+                p.last_ground = p.pos;
+                p.yaw = a;
+                p.model_yaw = a;
+                p.input = Input::default();
+                p.input.walk = true;
+                p.input.forward = 1.0;
+                let mut travel = 0.0f32;
+                let mut slow = 0usize;
+                let mut zeroed = 0usize;
+                let mut air = 0usize;
+                let mut wall = 0usize;
+                let mut floored = 0usize;
+                let mut none = 0usize;
+                for i in 0..180 {
+                    let before = [p.pos[0], p.pos[1]];
+                    let bpos = p.pos;
+                    let c = p.sweep_wall_contact(bpos, fx, fy, want);
+                    let fb = p.floor_blocks(before[0] + fx * want, before[1] + fy * want, fx, fy);
+                    p.ensure_wmo(&mut chain, &mut cache);
+                    p.tick(dt);
+                    let d =
+                        ((p.pos[0] - before[0]).powi(2) + (p.pos[1] - before[1]).powi(2)).sqrt();
+                    travel += d;
+                    if d >= want * 0.6 {
+                        continue;
+                    }
+                    slow += 1;
+                    // Independent flags, not a chain: the frame that freezes the
+                    // body can answer both, and which one is the cause is the
+                    // question this probe exists to settle.
+                    let still = p.vel[0] == 0.0 && p.vel[1] == 0.0;
+                    if still {
+                        zeroed += 1;
+                    }
+                    if !p.grounded {
+                        air += 1;
+                    }
+                    if c.is_some() {
+                        wall += 1;
+                    }
+                    if fb {
+                        floored += 1;
+                    }
+                    if still && c.is_none() && !fb && p.grounded {
+                        none += 1;
+                    }
+                    if slow <= 10 {
+                        println!(
+                            "STICK {label} {q} i={i:3} d={d:.4} want={want:.4} \
+                             pos=({:.3},{:.3},{:.3}) vel=({:.2},{:.2},{:.2}) g={} \
+                             contact={:?} floor_blocks={} ground=({:?},{:?}) terrain={:?}",
+                            p.pos[0],
+                            p.pos[1],
+                            p.pos[2],
+                            p.vel[0],
+                            p.vel[1],
+                            p.vel[2],
+                            p.grounded,
+                            c.map(|c| (c.dist, c.n, c.top)),
+                            fb,
+                            p.ground(
+                                before[0] + fx * want,
+                                before[1] + fy * want,
+                                bpos[2] + STEP_UP_HEIGHT
+                            ),
+                            p.ground(before[0] + fx * want, before[1] + fy * want, f32::MAX),
+                            p.terrain_z(before[0] + fx * want, before[1] + fy * want),
+                        );
+                    }
+                }
+                println!(
+                    "STICKHDR {label} {:>4.0}deg travel {travel:.2} yd / 3 s \
+                     (free {:.2}) slow {slow}/180 zeroed {zeroed} air {air} wall {wall} \
+                     floor-veto {floored} none {none} end=({:.2},{:.2},{:.2})",
+                    a.to_degrees(),
+                    want * 180.0,
+                    p.pos[0],
+                    p.pos[1],
+                    p.pos[2],
+                );
+            }
+        }
+        p.input = Input::default();
+    }
+
+    /// 真实几何上的"走进去"普查：在狮王之傲旅店那层（logged 卡死点 -9471.92, 24.93,
+    /// 61.41 周围）取 3×3 个落脚点，只保留**起点本身就自由**的格（轴距 ≥ 半径 + 0.05；
+    /// logged 那个点自己已经在墙里，从它起步只能证明出不来，不能证明怎么进去的），每格
+    /// 8 个朝向走 5 s。只报两类：行程不到自由值 25% 的冻结朝向，以及轴距第一次落到半径
+    /// 以内的帧号和那一帧的 dz —— dz 约为 0 是水平扫掠把人送进墙里，dz 明显就是竖直落体
+    /// 或吸附送进去的。这条区分决定修哪一头。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn walking_indoors_never_wedges_the_capsule_inside_a_wall() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (kx, ky, kz) = (-9471.92f32, 24.93f32, 61.41f32);
+        let mut p = Player::new("Azeroth", kx, ky);
+        p.pos = [kx, ky, kz];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        for _ in 0..4000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&Player::tile_of(kx, ky))
+                .is_some_and(|t| t.wmo_ready)
+            {
+                break;
+            }
+        }
+        // 胶囊轴到"它当作墙的面"的真实 3D 间隙，用的就是扫掠自己那套判据（|n.z| 小于
+        // 地面阈值、面顶高于台阶高度、面底低于头顶），距离取 `capsule_tri_closest` 的
+        // 轴-面最短段：小于半径 = 胶囊已经和这面重叠，也就是"身体在墙里"。之前那版量的是
+        // 面重心处的平面距离，会把"轴在面旁边"误报成间隙。
+        let axis_gap = |p: &Player, feet: [f32; 3]| -> Option<f32> {
+            let mut best: Option<f32> = None;
+            let a = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+            let b = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+            p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false;
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                if top <= feet[2] + STEP_UP_HEIGHT || bot >= feet[2] + CAPSULE_HEIGHT {
+                    return false;
+                }
+                let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                let d = if inside {
+                    0.0
+                } else {
+                    let dx = sp[0] - ap[0];
+                    let dy = sp[1] - ap[1];
+                    let dz = sp[2] - ap[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                };
+                if best.is_none_or(|cur| d < cur) {
+                    best = Some(d);
+                }
+                false
+            });
+            best
+        };
+        let dt = 1.0f32 / 60.0;
+        let mut runs = 0usize;
+        let mut skipped = 0usize;
+        let mut frozen = 0usize;
+        let mut entered = 0usize;
+        for ix in 0..3 {
+            for iy in 0..3 {
+                let x = kx - 4.0 + ix as f32 * 4.0;
+                let y = ky - 4.0 + iy as f32 * 4.0;
+                let Some((floor, _)) = p.ground(x, y, kz + STEP_UP_HEIGHT) else {
+                    continue;
+                };
+                if (floor - kz).abs() > 1.0 {
+                    continue; // 另一层，不是一格
+                }
+                // 起点必须是求解器自己认为"自由"的姿态：logged 的那个点本身已经在墙里
+                // （轴距 0.017），从它起步走冻结了只能说明它出不来，不能说明身体是怎么
+                // 进去的。
+                p.pos = [x, y, floor];
+                p.vel = [0.0; 3];
+                p.grounded = true;
+                p.last_ground = p.pos;
+                if axis_gap(&p, p.pos).is_some_and(|g| g < CAPSULE_RADIUS + 0.05) {
+                    skipped += 1;
+                    continue;
+                }
+                for q in 0..8 {
+                    let a = std::f32::consts::TAU * (q as f32 / 8.0);
+                    p.pos = [x, y, floor];
+                    p.vel = [0.0; 3];
+                    p.grounded = true;
+                    p.last_ground = p.pos;
+                    p.yaw = a;
+                    p.model_yaw = a;
+                    p.input = Input::default();
+                    p.input.walk = true;
+                    p.input.forward = 1.0;
+                    let mut travel = 0.0f32;
+                    let mut min_gap = f32::MAX;
+                    let mut enter_at = usize::MAX;
+                    let mut enter_dz = 0.0f32;
+                    let mut prev = p.pos;
+                    runs += 1;
+                    // 5 s 走 12.5 码，够穿过这层的任何家具与隔断。
+                    for i in 0..300 {
+                        p.ensure_wmo(&mut chain, &mut cache);
+                        p.tick(dt);
+                        travel +=
+                            ((p.pos[0] - prev[0]).powi(2) + (p.pos[1] - prev[1]).powi(2)).sqrt();
+                        if let Some(g) = axis_gap(&p, p.pos) {
+                            if g < min_gap {
+                                min_gap = g;
+                            }
+                            if g < CAPSULE_RADIUS && enter_at == usize::MAX {
+                                enter_at = i;
+                                enter_dz = p.pos[2] - prev[2];
+                            }
+                        }
+                        prev = p.pos;
+                    }
+                    p.input = Input::default();
+                    let free = RUN_SPEED * WALK_RATIO * dt * 300.0;
+                    if enter_at != usize::MAX {
+                        entered += 1;
+                        println!(
+                            "WALKIN enter ({:.2},{:.2}) {:>4.0}deg frame {enter_at}/300 \
+                             dz={enter_dz:+.3} gap {min_gap:.3} < r {CAPSULE_RADIUS:.3} \
+                             travel {travel:.2} / free {free:.2} end=({:.2},{:.2},{:.2})",
+                            x,
+                            y,
+                            a.to_degrees(),
+                            p.pos[0],
+                            p.pos[1],
+                            p.pos[2],
+                        );
+                    }
+                    if travel < free * 0.25 {
+                        frozen += 1;
+                        println!(
+                            "WALKIN frozen ({:.2},{:.2}) {:>4.0}deg travel {travel:.2} / free \
+                             {free:.2} gap {min_gap:.3} end=({:.2},{:.2},{:.2})",
+                            x,
+                            y,
+                            a.to_degrees(),
+                            p.pos[0],
+                            p.pos[1],
+                            p.pos[2],
+                        );
+                    } else if a.to_degrees() == 0.0 {
+                        println!(
+                            "WALKIN ok ({:.2},{:.2}) travel {travel:.2} / free {free:.2} \
+                             min gap {min_gap:.3}",
+                            x, y
+                        );
+                    }
+                }
+            }
+        }
+        println!("WALKIN runs={runs} skipped-not-free={skipped} entered={entered} frozen={frozen}");
+        assert_eq!(
+            entered, 0,
+            "a walk that starts free must never end inside a wall"
+        );
+        assert_eq!(frozen, 0, "a walk that starts free must not freeze");
+    }
+
+    /// 实机路径（ffi 自写求解器）在**起点自由**的室内落脚点上跑 45 帧，把每一个
+    /// 冻结朝向的扫掠逐帧摊开：胜出的接触、以及每一张近处面的判据（|n.z|、顶/底、
+    /// 轴距、along、closing、reach）和它被判成的类别。`mover_parity_and_frame_cost`
+    /// 已经证明参考律（avian `one_sided`）在同一批点上有 ffi 走不动的朝向，所以这里
+    /// 要找的是自写扫掠里的**假墙**：把身体按在 0 行程上的那一面，以及它通过的是
+    /// `gap < 半径` 的贴面分支还是 `advance <= 1e-5` 的兜底分支。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn free_starts_name_the_false_wall() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (kx, ky, kz) = (-9471.92f32, 24.93f32, 61.41f32);
+        let mut p = Player::new("Azeroth", kx, ky);
+        p.pos = [kx, ky, kz];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        for _ in 0..4000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&Player::tile_of(kx, ky))
+                .is_some_and(|t| t.wmo_ready)
+            {
+                break;
+            }
+        }
+        let axis_gap = |p: &Player, feet: [f32; 3]| -> Option<f32> {
+            let mut best: Option<f32> = None;
+            let a = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+            let b = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+            p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false;
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                if top <= feet[2] + STEP_UP_HEIGHT || bot >= feet[2] + CAPSULE_HEIGHT {
+                    return false;
+                }
+                let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                let d = if inside {
+                    0.0
+                } else {
+                    let dx = sp[0] - ap[0];
+                    let dy = sp[1] - ap[1];
+                    let dz = sp[2] - ap[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                };
+                if best.is_none_or(|cur| d < cur) {
+                    best = Some(d);
+                }
+                false
+            });
+            best
+        };
+        // 起点：这层里身体自己认为自由的格子（轴距 > 半径 + 贴面余量）。
+        let mut spots: Vec<[f32; 3]> = Vec::new();
+        for ix in 0..13 {
+            for iy in 0..13 {
+                let x = kx - 12.0 + ix as f32 * 2.0;
+                let y = ky - 12.0 + iy as f32 * 2.0;
+                let Some((floor, _)) = p.ground(x, y, kz + STEP_UP_HEIGHT) else {
+                    continue;
+                };
+                p.pos = [x, y, floor];
+                if axis_gap(&p, p.pos).is_some_and(|g| g <= CAPSULE_RADIUS + SKIN_WIDTH) {
+                    continue;
+                }
+                spots.push([x, y, floor]);
+            }
+        }
+        println!("FALSEWALL free={}", spots.len());
+        // 普查跟出厂默认的那条道走：`COLLISION_SOLVER` 不在这里改写。
+        let dt = 1.0f32 / 60.0;
+        let step = RUN_SPEED * dt;
+        let mut rows = 0usize;
+        let mut frozen = 0usize;
+        let mut dumps = 0usize;
+        let mut hist = [0usize; 6];
+        for s in &spots {
+            for q in 0..8 {
+                let a = std::f32::consts::TAU * (q as f32 / 8.0);
+                let (dirx, diry) = (a.cos(), a.sin());
+                let mut buf: Vec<String> = Vec::new();
+                let mut travel = 0.0f32;
+                let seat = |p: &mut Player| {
+                    p.pos = *s;
+                    p.vel = [0.0; 3];
+                    p.grounded = true;
+                    p.last_ground = *s;
+                    p.yaw = a;
+                    p.model_yaw = a;
+                    p.input = Input::default();
+                    p.input.forward = 1.0;
+                };
+                seat(&mut p);
+                for f in 0..45 {
+                    p.ensure_wmo(&mut chain, &mut cache);
+                    let hit = p.sweep_wall_contact(p.pos, dirx, diry, step);
+                    let pre = p.pos;
+                    let fb = p.floor_blocks(pre[0] + dirx * step, pre[1] + diry * step, dirx, diry);
+                    p.tick(dt);
+                    let moved = ((p.pos[0] - pre[0]).powi(2) + (p.pos[1] - pre[1]).powi(2)).sqrt();
+                    travel += moved;
+                    if f < 4 {
+                        buf.push(format!(
+                            "FW f={f} pos=({:.2},{:.2},{:.2}) dir=({:+.3},{:+.3}) step={step:.4} \
+                             hit={} moved={moved:.5} fb={} gap={:?}",
+                            pre[0],
+                            pre[1],
+                            pre[2],
+                            dirx,
+                            diry,
+                            match &hit {
+                                Some(c) => format!(
+                                    "dist={:.4} n=({:+.3},{:+.3}) top={:.2}",
+                                    c.dist, c.n[0], c.n[1], c.top
+                                ),
+                                None => "none".to_string(),
+                            },
+                            fb,
+                            axis_gap(&p, pre).map(|g| (g * 1000.0).round() / 1000.0),
+                        ));
+                        // 参考律在贴面上把速度投影一次后按切向再扫一遍；这里把那条
+                        // 切向逃逸单独扫出来，看它是被同一面还是别的面吃掉的。
+                        if let Some(c) = hit {
+                            let dn = dirx * c.n[0] + diry * c.n[1];
+                            let (t2x, t2y) = (dirx - dn * c.n[0], diry - dn * c.n[1]);
+                            let l2 = (t2x * t2x + t2y * t2y).sqrt();
+                            let esc = if l2 > 1.0e-6 {
+                                p.sweep_wall_contact(pre, t2x / l2, t2y / l2, step * l2)
+                                    .map(|e| {
+                                        format!(
+                                            "dist={:.4} n=({:+.3},{:+.3}) top={:.2}",
+                                            e.dist, e.n[0], e.n[1], e.top
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "none".to_string())
+                            } else {
+                                "tangent~0".to_string()
+                            };
+                            buf.push(format!("FW   slide len={l2:.4} hit={esc}"));
+                        }
+                        // 扫掠对每张近处面的判据，逐条抄自 `sweep_wall_contact` 的闸门。
+                        let feet = pre;
+                        let aa = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+                        let bb = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+                        let mut faces: Vec<(f32, String)> = Vec::new();
+                        p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                            let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                            let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                            if t.n[2].abs() >= GROUND_COS {
+                                return false;
+                            }
+                            if top <= feet[2] + STEP_UP_HEIGHT {
+                                return false;
+                            }
+                            let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                            if hl < 1.0e-6 {
+                                return false;
+                            }
+                            let n2 = [t.n[0] / hl, t.n[1] / hl];
+                            let (ap, sp, inside) = capsule_tri_closest(aa, bb, t);
+                            let dx = sp[0] - ap[0];
+                            let dy = sp[1] - ap[1];
+                            let dz = sp[2] - ap[2];
+                            let gap = (dx * dx + dy * dy + dz * dz).sqrt();
+                            if gap > 1.0 && !inside {
+                                return false;
+                            }
+                            let along = dx * dirx + dy * diry;
+                            let closing = -(n2[0] * dirx + n2[1] * diry);
+                            let h = (dx * dx + dy * dy).sqrt();
+                            let lead = ap[0] * dirx + ap[1] * diry + CAPSULE_RADIUS;
+                            let ahead =
+                                t.v.iter()
+                                    .fold(f32::MIN, |m, v| m.max(v[0] * dirx + v[1] * diry - lead));
+                            let kind = if n2[0] * dirx + n2[1] * diry > -FACE_FACING_EPS {
+                                "BACK"
+                            } else if inside {
+                                "INSIDE"
+                            } else if gap < CAPSULE_RADIUS {
+                                if ahead >= -BACKFACE_BAND {
+                                    "TOUCH0"
+                                } else {
+                                    "NEARNO"
+                                }
+                            } else if along <= 0.0 {
+                                "BEHIND"
+                            } else if closing <= 1.0e-4 {
+                                "PARALLEL"
+                            } else {
+                                "REACH"
+                            };
+                            // 排序键 = 扫掠真正会取到的 reach；被闸门吃掉的排到最后。
+                            let key = match kind {
+                                "TOUCH0" | "INSIDE" => -1.0,
+                                "BACK" | "NEARNO" | "BEHIND" | "PARALLEL" => f32::MAX,
+                                _ => ((gap - CAPSULE_RADIUS) / closing).min(along),
+                            };
+                            faces.push((
+                                key,
+                                format!(
+                                    "    n=({:+.3},{:+.3},{:+.3}) z=[{:.2},{:.2}] head={:.2} \
+                                     gap={:.4} h={:.4} dz={:+.4} along={:+.3} clos={:+.3} \
+                                     ahead={:+.4} reach={key} {kind}",
+                                    t.n[0],
+                                    t.n[1],
+                                    t.n[2],
+                                    bot,
+                                    top,
+                                    feet[2] + CAPSULE_HEIGHT,
+                                    gap,
+                                    h,
+                                    dz,
+                                    along,
+                                    closing,
+                                    ahead,
+                                ),
+                            ));
+                            false
+                        });
+                        faces.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        buf.extend(faces.into_iter().map(|(_, s)| s).take(8));
+                    }
+                }
+                p.input = Input::default();
+                rows += 1;
+                // 速度分布：把"完全冻结"之外的整体降速也量出来，胶感是分布而不是计数。
+                let ratio = travel / (RUN_SPEED * dt * 45.0);
+                hist[if ratio < 0.05 {
+                    0
+                } else if ratio < 0.25 {
+                    1
+                } else if ratio < 0.5 {
+                    2
+                } else if ratio < 0.75 {
+                    3
+                } else if ratio < 0.95 {
+                    4
+                } else {
+                    5
+                }] += 1;
+                if travel < 0.05 {
+                    frozen += 1;
+                    if dumps < 8 {
+                        dumps += 1;
+                        println!(
+                            "FALSEWALL frozen ({:.2},{:.2},{:.2}) {:>4.0}deg travel {travel:.3}",
+                            s[0],
+                            s[1],
+                            s[2],
+                            a.to_degrees()
+                        );
+                        for line in &buf {
+                            println!("{line}");
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "FALSEWALL rows={rows} frozen={frozen} hist <5%={} 5-25%={} 25-50%={} 50-75%={} \
+             75-95%={} >=95%={}",
+            hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]
+        );
+    }
+
+    /// One run, both solvers, two open questions. `bn.CollisionSolver` 1 was
+    /// retired on a 1.5-2.3 s/frame measurement taken before `install` was
+    /// signature-gated, so that number has to be re-taken where the cost is a
+    /// number and not an eyeball. And the reported wall-corner freeze has only
+    /// ever been reproduced from a pose that is already inside geometry, where
+    /// both solvers hold by the reference's own law (its resolver has no
+    /// push-out): a walk that STARTS free is the state the player is actually in.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn mover_parity_and_frame_cost() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (kx, ky, kz) = (-9471.92f32, 24.93f32, 61.41f32);
+        let mut p = Player::new("Azeroth", kx, ky);
+        p.pos = [kx, ky, kz];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        for _ in 0..4000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&Player::tile_of(kx, ky))
+                .is_some_and(|t| t.wmo_ready)
+            {
+                break;
+            }
+        }
+        // True closest distance from the capsule's axis to a face. The plane
+        // distance measured through a triangle's centroid reads small for any
+        // face whose plane merely passes near the body, which is why the first
+        // census found 0 free spots of 81.
+        let tri_dist = |q: [f32; 3], t: &Tri| -> f32 {
+            let [a, b, c] = t.v;
+            let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+            let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+            let ab = sub(b, a);
+            let ac = sub(c, a);
+            let ap = sub(q, a);
+            let d1 = dot(ab, ap);
+            let d2 = dot(ac, ap);
+            if d1 <= 0.0 && d2 <= 0.0 {
+                return dot(ap, ap).sqrt();
+            }
+            let bp = sub(q, b);
+            let d3 = dot(ab, bp);
+            let d4 = dot(ac, bp);
+            if d3 >= 0.0 && d4 <= d3 {
+                return dot(bp, bp).sqrt();
+            }
+            let cp = sub(q, c);
+            let d5 = dot(ab, cp);
+            let d6 = dot(ac, cp);
+            if d6 >= 0.0 && d5 <= d6 {
+                return dot(cp, cp).sqrt();
+            }
+            let vc = d1 * d4 - d3 * d2;
+            if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+                let v = d1 / (d1 - d3);
+                let e = sub(q, [a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]]);
+                return dot(e, e).sqrt();
+            }
+            let vb = d5 * d2 - d1 * d6;
+            if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+                let w = d2 / (d2 - d6);
+                let e = sub(q, [a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]]);
+                return dot(e, e).sqrt();
+            }
+            let va = d3 * d6 - d5 * d4;
+            if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+                let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                let e = sub(
+                    q,
+                    [
+                        b[0] + w * (c[0] - b[0]),
+                        b[1] + w * (c[1] - b[1]),
+                        b[2] + w * (c[2] - b[2]),
+                    ],
+                );
+                return dot(e, e).sqrt();
+            }
+            let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1] + t.n[2] * t.n[2]).max(1.0e-9);
+            (dot(t.n, ap) / hl).abs()
+        };
+        let wall_gap = |p: &Player, feet: [f32; 3]| -> Option<f32> {
+            let mut best: Option<f32> = None;
+            p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                if t.n[2].abs() >= GROUND_COS {
+                    return false;
+                }
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                if top <= feet[2] + STEP_UP_HEIGHT || bot >= feet[2] + CAPSULE_HEIGHT {
+                    return false;
+                }
+                let mut d = f32::MAX;
+                for i in 0..5 {
+                    let z = feet[2]
+                        + CAPSULE_RADIUS
+                        + i as f32 * 0.25 * (CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS);
+                    d = d.min(tri_dist([feet[0], feet[1], z], t));
+                }
+                if best.is_none_or(|b| d < b) {
+                    best = Some(d);
+                }
+                false
+            });
+            best
+        };
+        // A start the capsule is standing in, with no face closer than the
+        // capsule's own radius plus the cast skin: not already inside geometry.
+        let free_spot = |p: &Player, x: f32, y: f32| -> Option<[f32; 3]> {
+            let (floor, _) = p.ground(x, y, kz + STEP_UP_HEIGHT)?;
+            match wall_gap(p, [x, y, floor]) {
+                None => Some([x, y, floor]),
+                Some(g) if g > CAPSULE_RADIUS + SKIN_WIDTH => Some([x, y, floor]),
+                Some(_) => None,
+            }
+        };
+        let prev = COLLISION_SOLVER.load(Ordering::Relaxed);
+
+        const FRAMES: usize = 600;
+        let spot = free_spot(&p, kx, ky).unwrap_or([kx, ky, kz]);
+        let mut install_ms = 0.0f64;
+        let mut mover_worst_ms = 0.0f64;
+        for mover in [false, true] {
+            COLLISION_SOLVER.store(mover, Ordering::Relaxed);
+            p.pos = spot;
+            p.vel = [0.0; 3];
+            p.grounded = true;
+            p.last_ground = spot;
+            p.yaw = 0.0;
+            p.model_yaw = 0.0;
+            p.input.forward = 1.0;
+            p.input.strafe = 0.0;
+            if mover {
+                let t = std::time::Instant::now();
+                p.rebuild_mover_world();
+                install_ms = t.elapsed().as_secs_f64() * 1.0e3;
+            }
+            let mut sum = 0.0f64;
+            let mut worst = 0.0f64;
+            for _ in 0..FRAMES {
+                let t = std::time::Instant::now();
+                p.ensure_wmo(&mut chain, &mut cache);
+                p.tick(1.0 / 60.0);
+                let ms = t.elapsed().as_secs_f64() * 1.0e3;
+                sum += ms;
+                worst = worst.max(ms);
+            }
+            if mover {
+                mover_worst_ms = worst;
+            }
+            println!(
+                "COST solver={:>5} install={install_ms:>7.1}ms avg {:>7.3}ms worst {:>7.3}ms \
+                 net ({:>7.2},{:>7.2}) z {:.2}",
+                if mover { "mover" } else { "ffi" },
+                sum / FRAMES as f64,
+                worst,
+                p.pos[0] - spot[0],
+                p.pos[1] - spot[1],
+                p.pos[2],
+            );
+        }
+
+        let mut spots: Vec<[f32; 3]> = Vec::new();
+        let mut no_floor = 0usize;
+        let mut inside = 0usize;
+        for ix in 0..13 {
+            for iy in 0..13 {
+                let x = kx - 12.0 + ix as f32 * 2.0;
+                let y = ky - 12.0 + iy as f32 * 2.0;
+                match free_spot(&p, x, y) {
+                    Some(s) => spots.push(s),
+                    None => {
+                        if p.ground(x, y, kz + STEP_UP_HEIGHT).is_none() {
+                            no_floor += 1;
+                        } else {
+                            inside += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "PARITY grid=169 free={} no_floor={no_floor} inside={inside}",
+            spots.len()
+        );
+        let mut walk = |p: &mut Player, s: [f32; 3], a: f32, mover: bool| -> (f32, u64) {
+            COLLISION_SOLVER.store(mover, Ordering::Relaxed);
+            let lane = usize::from(mover);
+            let held0 = HOLD_FRAMES[lane].load(Ordering::Relaxed);
+            p.pos = s;
+            p.vel = [0.0; 3];
+            p.grounded = true;
+            p.last_ground = s;
+            p.yaw = a;
+            p.model_yaw = a;
+            p.input.forward = 1.0;
+            p.input.strafe = 0.0;
+            let mut travel = 0.0f32;
+            for _ in 0..45 {
+                let before = [p.pos[0], p.pos[1]];
+                p.ensure_wmo(&mut chain, &mut cache);
+                p.tick(1.0 / 60.0);
+                travel += ((p.pos[0] - before[0]).powi(2) + (p.pos[1] - before[1]).powi(2)).sqrt();
+            }
+            p.input.forward = 0.0;
+            (travel, HOLD_FRAMES[lane].load(Ordering::Relaxed) - held0)
+        };
+        let mut rows = 0usize;
+        let mut ffi_blocked = 0usize;
+        let mut mover_blocked = 0usize;
+        let mut ffi_held = 0usize;
+        let mut mover_held = 0usize;
+        for s in &spots {
+            for q in 0..8 {
+                let a = std::f32::consts::TAU * (q as f32 / 8.0);
+                let (ffi, ffi_h) = walk(&mut p, *s, a, false);
+                let (mover, mover_h) = walk(&mut p, *s, a, true);
+                rows += 1;
+                let f_frozen = ffi < 0.05;
+                let m_frozen = mover < 0.05;
+                if f_frozen {
+                    if ffi_h > 0 {
+                        ffi_held += 1;
+                    } else {
+                        ffi_blocked += 1;
+                    }
+                }
+                if m_frozen {
+                    if mover_h > 0 {
+                        mover_held += 1;
+                    } else {
+                        mover_blocked += 1;
+                    }
+                }
+                if f_frozen != m_frozen || (f_frozen && ffi_h != mover_h) {
+                    println!(
+                        "PARITY diff ({:.2},{:.2},{:.2}) {:>4.0}deg ffi={ffi:.3}/hold{ffi_h} \
+                         mover={mover:.3}/hold{mover_h}",
+                        s[0],
+                        s[1],
+                        s[2],
+                        a.to_degrees()
+                    );
+                }
+            }
+        }
+        COLLISION_SOLVER.store(prev, Ordering::Relaxed);
+        println!(
+            "PARITY free={} rows={rows} ffi: blocked={ffi_blocked} held={ffi_held} | \
+             mover: blocked={mover_blocked} held={mover_held} | mover_worst={mover_worst_ms:.3}ms",
+            spots.len()
+        );
+        assert!(
+            mover_worst_ms < 40.0,
+            "benilla's mover costs {mover_worst_ms:.3} ms on the worst frame of {FRAMES}"
+        );
+        assert_eq!(
+            mover_blocked, 0,
+            "benilla's own mover was stopped by a face in {mover_blocked} of {rows} \
+             walks that start free (hold frames excluded)"
+        );
+    }
+
     /// A beam's underside is a ceiling: the one-sided downward probe (`0x632700`)
     /// never answers a downward-facing face as a floor, and a jump's head stops
     /// on it instead of the body standing on the beam. The reported lock - jumping
@@ -7607,14 +9146,852 @@ mod tests {
         p.input.forward = 0.0;
     }
 
+    /// The faces around the reported inn corner pose (`bn.Leak` start
+    /// (-9473.92, 18.93, 56.96), where the live walk pins at 0.75 yd in seven of
+    /// eight headings on both the old and the new mover): what the sweep answers
+    /// per heading, and every face within the capsule's reach. Reads the geometry
+    /// the body is standing in, so a stick is either a real wall or a false one.
+    #[test]
+    #[ignore = "geometry probe for the reported inn corner"]
+    fn the_inn_corner_pose_lists_its_faces() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let (x0, y0, z0) = (-9473.92f32, 18.93f32, 56.96f32);
+        let mut p = Player::new("Azeroth", x0, y0);
+        p.pos = [x0, y0, z0];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        let k = Player::tile_of(x0, y0);
+        for _ in 0..6000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&k)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len())
+            {
+                break;
+            }
+        }
+        println!(
+            "corner pose: ground={:?} ceiling={:?}",
+            p.ground(x0, y0, z0 + STEP_UP_HEIGHT),
+            p.ceiling(x0, y0, z0 + 0.05)
+        );
+        for yawdeg in [0, 45, 90, 135, 180, 225, 270, 315] {
+            let yaw = yawdeg as f32 * std::f32::consts::PI / 180.0;
+            let (dx, dy) = (yaw.cos(), yaw.sin());
+            let hit = p
+                .sweep_wall_contact(p.pos, dx, dy, 3.0)
+                .map(|c| (c.dist, c.n, c.top));
+            println!("yaw {yawdeg:3}: hit={hit:?}");
+        }
+        let mut seen = Vec::new();
+        let a = [x0, y0, z0 + CAPSULE_RADIUS];
+        let b = [x0, y0, z0 + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+        p.any_tri_near([x0, y0, z0 + CAPSULE_HEIGHT * 0.5], |t| {
+            let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+            let gap = (sp[0] - ap[0]).hypot(sp[1] - ap[1]).hypot(sp[2] - ap[2]);
+            if gap < CAPSULE_RADIUS + 0.5 {
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                let bot = t.v[0][2].min(t.v[1][2]).min(t.v[2][2]);
+                seen.push((t.n, top, bot, gap, inside));
+            }
+            false
+        });
+        println!("{} faces within radius+0.5:", seen.len());
+        for (n, top, bot, gap, inside) in seen {
+            let (n0, n1, n2) = (n[0], n[1], n[2]);
+            println!(
+                "  n=({n0:6.2},{n1:6.2},{n2:6.2}) z=[{bot:6.2},{top:6.2}] gap={gap:5.3} {}",
+                if inside { "INSIDE" } else { "" }
+            );
+        }
+    }
+
+    /// Approach-path probe for the reported inn corner: the body walks the
+    /// same heading from six yards out, so an arm that pins before B is the
+    /// user's C->B, and one that reaches B and stops there is geometry.
+    #[test]
+    #[ignore = "geometry probe for the reported inn corner"]
+    fn the_inn_corner_approach_paths_do_not_pin() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+        let b = [-9473.92f32, 18.93f32, 56.96f32];
+        for swept in [true, false] {
+            bn_player_swept_mover(u32::from(swept));
+            println!("--- lane swept={swept} ---");
+            for deg in [0, 45, 90, 135, 180, 225, 270, 315] {
+                let yaw = deg as f32 * std::f32::consts::PI / 180.0;
+                let (ux, uy) = (yaw.cos(), yaw.sin());
+                let sx = b[0] - ux * 6.0;
+                let sy = b[1] - uy * 6.0;
+                let mut p = Player::new("Azeroth", sx, sy);
+                p.ensure_tiles(&w.archives);
+                let gz = match p.ground(sx, sy, b[2] + STEP_UP_HEIGHT) {
+                    Some((z, nz)) if nz >= GROUND_COS => z,
+                    _ => {
+                        println!("heading {deg:3}: no walkable floor 6 yd back");
+                        continue;
+                    }
+                };
+                p.pos = [sx, sy, gz];
+                p.grounded = true;
+                p.last_ground = p.pos;
+                p.yaw = yaw;
+                p.input.forward = 1.0;
+                let mut path = 0.0f32;
+                let mut prev = p.pos;
+                let mut trail = Vec::new();
+                for i in 0..300 {
+                    p.ensure_tiles(&w.archives);
+                    p.ensure_wmo(&mut w.chain, &mut cache);
+                    p.tick(1.0 / 60.0);
+                    path += ((p.pos[0] - prev[0]).powi(2) + (p.pos[1] - prev[1]).powi(2)).sqrt();
+                    prev = p.pos;
+                    if i % 30 == 29 {
+                        trail.push((
+                            (i + 1) as f32 / 60.0,
+                            p.pos[0],
+                            p.pos[1],
+                            ((p.pos[0] - b[0]).powi(2) + (p.pos[1] - b[1]).powi(2)).sqrt(),
+                        ));
+                    }
+                }
+                p.input.forward = 0.0;
+                let end = p.pos;
+                let db = ((end[0] - b[0]).powi(2) + (end[1] - b[1]).powi(2)).sqrt();
+                let hit = p
+                    .sweep_wall_contact(p.pos, ux, uy, 2.0)
+                    .map(|c| (c.dist, c.n, c.top));
+                println!(
+                    "heading {deg:3}: path={path:5.2} end=({0:.2},{1:.2}) distB={db:5.2} hit={hit:?}",
+                    end[0], end[1]
+                );
+                for (t, x, y, d) in trail {
+                    println!("   {t:4.2}s ({0:.2},{1:.2}) d={d:5.2}", x, y);
+                }
+            }
+        }
+        bn_player_swept_mover(1);
+        crate::bn_shutdown(w);
+    }
+
+    /// Room plan around the reported corner, read through the same sweep the
+    /// mover uses: one glyph per half-yard cell for what blocks the body
+    /// eastward and northward. `#` a face over 1.5 yd above that cell's floor,
+    /// `-` a lower one (a rail), `.` free, ` ` no walkable floor.
+    #[test]
+    #[ignore = "geometry probe for the reported inn corner"]
+    fn the_inn_room_plan_maps_its_blockers() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+        let (cx, cy, cz) = (-9476.0f32, 19.0f32, 56.96f32);
+        let mut p = Player::new("Azeroth", cx, cy);
+        p.pos = [cx, cy, cz];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&w.archives);
+        }
+        let k = Player::tile_of(cx, cy);
+        for _ in 0..3000 {
+            p.ensure_wmo(&mut w.chain, &mut cache);
+        }
+        let ready = p
+            .tiles
+            .get(&k)
+            .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len());
+        println!("corner tile ready: {ready}");
+        for (lx, ly) in [(1.0f32, 0.0f32), (0.0, 1.0)] {
+            println!("--- blocked going ({lx},{ly}) ---");
+            for row in (0..41).rev() {
+                let y = cy - 10.0 + row as f32 * 0.5;
+                let mut line = String::new();
+                for col in 0..41 {
+                    let x = cx - 10.0 + col as f32 * 0.5;
+                    let z = match p.ground(x, y, cz + STEP_UP_HEIGHT) {
+                        Some((z, nz)) if nz >= GROUND_COS => z,
+                        _ => {
+                            line.push(' ');
+                            continue;
+                        }
+                    };
+                    match p.sweep_wall_contact([x, y, z], lx, ly, 0.5) {
+                        None => line.push('.'),
+                        Some(c) => line.push(if c.top - z > 1.5 { '#' } else { '-' }),
+                    }
+                }
+                println!("y={y:8.2} {line}");
+            }
+        }
+        crate::bn_shutdown(w);
+    }
+
+    /// The approach paths again, but handed to benilla's own `MoverSession`.
+    /// It steps over the same triangles this file's sweep reads, so a cell
+    /// where the two disagree is a law difference, not a data difference.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn the_inn_corner_approach_paths_run_upstream_too() {
+        use crate::bn_init;
+        COLLISION_SOLVER.store(true, Ordering::Relaxed);
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir =
+                std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+            let w = bn_init(dir.as_ptr());
+            assert!(!w.is_null());
+            let w = unsafe { &mut *w };
+            let map = std::ffi::CString::new("Azeroth").unwrap();
+            let b = [-9473.92f32, 18.93f32, 56.96f32];
+            assert_eq!(bn_player_reset(w, map.as_ptr(), b[0], b[1]), 1);
+            let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+            for _ in 0..120 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+            for deg in [0, 45, 90, 315] {
+                let yaw = deg as f32 * std::f32::consts::PI / 180.0;
+                let (ux, uy) = (yaw.cos(), yaw.sin());
+                let sx = b[0] - ux * 6.0;
+                let sy = b[1] - uy * 6.0;
+                bn_player_teleport(w, map.as_ptr(), sx, sy, b[2], yaw);
+                bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+                for _ in 0..120 {
+                    bn_player_tick(w, 1.0 / 60.0, &mut st);
+                }
+                let start = st.pos;
+                bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
+                let mut path = 0.0f32;
+                let mut prev = st.pos;
+                for i in 0..300 {
+                    bn_player_tick(w, 1.0 / 60.0, &mut st);
+                    path += ((st.pos[0] - prev[0]).powi(2) + (st.pos[1] - prev[1]).powi(2)).sqrt();
+                    prev = st.pos;
+                    if i % 60 == 59 {
+                        println!(
+                            "   upstream {deg:3} t={:4.1}s ({0:.2},{1:.2}) z={z:.2}",
+                            st.pos[0],
+                            st.pos[1],
+                            z = st.pos[2],
+                        );
+                    }
+                }
+                bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+                println!(
+                    "upstream heading {deg:3}: start=({0:.2},{1:.2}) path={path:5.2} \
+                     end=({2:.2},{3:.2}) distB={db:5.2}",
+                    start[0],
+                    start[1],
+                    st.pos[0],
+                    st.pos[1],
+                    db = ((st.pos[0] - b[0]).powi(2) + (st.pos[1] - b[1]).powi(2)).sqrt()
+                );
+            }
+            crate::bn_shutdown(w);
+        }));
+        COLLISION_SOLVER.store(false, Ordering::Relaxed);
+        ran.unwrap();
+    }
+
+    /// Reachability under the mover's own sweep: flood the room from the
+    /// reported corner one half-yard step at a time, a step allowed when the
+    /// sweep gives the body the whole step. `o` = cells the body can stand in,
+    /// `.` = has a floor but is sealed off, ` ` = no walkable floor. A `.`
+    /// where the player walks in the real client is the phantom wall.
+    #[test]
+    #[ignore = "geometry probe for the reported inn corner"]
+    fn the_inn_room_floods_from_the_corner_under_the_sweep() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+        let (cx, cy, cz) = (-9476.0f32, 19.0f32, 56.96f32);
+        let mut p = Player::new("Azeroth", cx, cy);
+        p.pos = [cx, cy, cz];
+        p.grounded = true;
+        p.last_ground = p.pos;
+        for _ in 0..9 {
+            p.ensure_tiles(&w.archives);
+        }
+        for _ in 0..3000 {
+            p.ensure_wmo(&mut w.chain, &mut cache);
+        }
+        let nx = 41usize;
+        let ny = 41usize;
+        let step = 0.5f32;
+        let cell = |i: usize, j: usize| [cx - 10.0 + i as f32 * step, cy - 10.0 + j as f32 * step];
+        let mut floor = [[f32::NAN; 41]; 41];
+        for j in 0..ny {
+            for i in 0..nx {
+                let [x, y] = cell(i, j);
+                if let Some((z, nz)) = p.ground(x, y, cz + STEP_UP_HEIGHT) {
+                    if nz >= GROUND_COS {
+                        floor[i][j] = z;
+                    }
+                }
+            }
+        }
+        let mut reach = [[false; 41]; 41];
+        let mut queue = Vec::new();
+        // the reported corner itself
+        let b = (
+            ((-9473.92f32 - (cx - 10.0)) / step).round() as usize,
+            ((18.93f32 - (cy - 10.0)) / step).round() as usize,
+        );
+        reach[b.0][b.1] = true;
+        queue.push(b);
+        let dirs = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)];
+        while let Some((i, j)) = queue.pop() {
+            let [x, y] = cell(i, j);
+            let z = floor[i][j];
+            for (dx, dy) in dirs {
+                let ni = i as i32 + dx as i32;
+                let nj = j as i32 + dy as i32;
+                if ni < 0 || nj < 0 || ni as usize >= nx || nj as usize >= ny {
+                    continue;
+                }
+                let (ni, nj) = (ni as usize, nj as usize);
+                if reach[ni][nj] || floor[ni][nj].is_nan() {
+                    continue;
+                }
+                let clear = match p.sweep_wall_contact([x, y, z], dx, dy, step) {
+                    None => true,
+                    Some(c) => c.dist >= step - SKIN_WIDTH,
+                };
+                if clear {
+                    reach[ni][nj] = true;
+                    queue.push((ni, nj));
+                }
+            }
+        }
+        for j in (0..ny).rev() {
+            let y = cy - 10.0 + j as f32 * step;
+            let line: String = (0..nx)
+                .map(|i| {
+                    if floor[i][j].is_nan() {
+                        ' '
+                    } else if reach[i][j] {
+                        'o'
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            println!("y={y:8.2} {line}");
+        }
+        crate::bn_shutdown(w);
+    }
+
+    /// The crawl pose walked through `horizontal_step_swept`'s passes one at a
+    /// time: the same code with the intermediate values printed, so the pass
+    /// that spends no budget and leaves no slide is named instead of guessed.
+    #[test]
+    #[ignore = "geometry probe for the reported inn corner"]
+    fn the_inn_corner_crawl_traces_its_slide_passes() {
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let w = crate::bn_init(dir.as_ptr());
+        assert!(!w.is_null());
+        let w = unsafe { &mut *w };
+        let mut cache = HashMap::new();
+        let poses = [
+            (-9474.70f32, 16.13f32, 0.0f32, 1.0f32),
+            (-9479.55f32, 19.06f32, 1.0f32, 0.0f32),
+        ];
+        for (px, py, ux, uy) in poses {
+            let mut p = Player::new("Azeroth", px, py);
+            p.ensure_tiles(&w.archives);
+            for _ in 0..3000 {
+                p.ensure_wmo(&mut w.chain, &mut cache);
+            }
+            let z = match p.ground(px, py, 56.96 + STEP_UP_HEIGHT) {
+                Some((z, nz)) if nz >= GROUND_COS => z,
+                _ => {
+                    println!("pose ({px},{py}): no floor");
+                    continue;
+                }
+            };
+            p.pos = [px, py, z];
+            p.grounded = true;
+            println!("=== pose ({px},{py},{z:.2}) dir ({ux},{uy}) ===");
+            let mag = 7.0 / 60.0;
+            let mut vel = [ux * mag, uy * mag];
+            let mut pos = [px, py, z];
+            let mut time_left = 1.0f32;
+            for pass in 0..SLIDE_ITERATIONS {
+                let mut planes: Vec<[f32; 2]> = Vec::new();
+                let speed = (vel[0] * vel[0] + vel[1] * vel[1]).sqrt();
+                let dist = time_left * speed;
+                if dist < SLIDE_MIN_TRAVEL {
+                    println!("pass {pass}: budget spent (dist={dist:.6})");
+                    break;
+                }
+                let (dirx, diry) = (vel[0] / speed, vel[1] / speed);
+                let c = p.sweep_wall_contact(pos, dirx, diry, dist);
+                let hit = c
+                    .as_ref()
+                    .map(|c| {
+                        format!(
+                            "dist={:.4} n=({:.4},{:.4}) top={:.2}",
+                            c.dist, c.n[0], c.n[1], c.top
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                println!(
+                    "pass {pass}: pos=({0:.4},{1:.4}) dist={dist:.5} dir=({dirx:.4},{diry:.4}) hit={hit}",
+                    pos[0], pos[1]
+                );
+                let Some(c) = c else {
+                    let blocked = p.floor_blocks(
+                        pos[0] + vel[0] * time_left,
+                        pos[1] + vel[1] * time_left,
+                        dirx,
+                        diry,
+                    );
+                    println!("   no hit, floor_blocks={blocked}");
+                    break;
+                };
+                let closing = (-(c.n[0] * dirx + c.n[1] * diry)).max(SLIDE_DOT_EPSILON);
+                let travel = (c.dist - SKIN_WIDTH / closing).max(0.0);
+                let rides = p.grounded
+                    && p.climb_clears_face(
+                        pos[0] + dirx * dist,
+                        pos[1] + diry * dist,
+                        dirx,
+                        diry,
+                        pos[2],
+                        c.top,
+                    );
+                println!("   n=({0:.4},{1:.4}) cdist={cd:.4} closing={closing:.4} travel={travel:.5} rides={rides}", c.n[0], c.n[1], cd = c.dist);
+                time_left -= time_left * (travel / dist);
+                pos[0] += dirx * travel;
+                pos[1] += diry * travel;
+                shear_steep_contact(&mut vel, c.n);
+                push_slide_plane(&mut planes, c.n, vel);
+                let contacts = p.slide_planes_at(pos, vel);
+                println!(
+                    "   contacts: {}",
+                    contacts
+                        .iter()
+                        .map(|n| format!("({0:.4},{1:.4}) ", n[0], n[1]))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                // The same contacts with their authored 3D normals: two faces
+                // whose horizontal parts are 9 degrees apart but whose z differ
+                // meet in a line in 3D and in a point in this file's 2D.
+                let ca = [pos[0], pos[1], pos[2] + CAPSULE_RADIUS];
+                let cb = [pos[0], pos[1], pos[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+                let mut raw = Vec::new();
+                p.any_tri_near([pos[0], pos[1], pos[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                    if t.n[2].abs() >= GROUND_COS {
+                        return false;
+                    }
+                    let (ap, sp, inside) = capsule_tri_closest(ca, cb, t);
+                    let gap = (sp[0] - ap[0]).hypot(sp[1] - ap[1]).hypot(sp[2] - ap[2]);
+                    if !inside && gap > CAPSULE_RADIUS + SLIDE_CONTACT_PREDICTION {
+                        return false;
+                    }
+                    raw.push((t.n, t.v[0][2].max(t.v[1][2]).max(t.v[2][2]), gap, inside));
+                    false
+                });
+                for (n, top, gap, inside) in &raw {
+                    let (n0, n1, n2) = (n[0], n[1], n[2]);
+                    println!(
+                        "   face n=({n0:7.4},{n1:7.4},{n2:7.4}) top={top:6.2} gap={gap:5.3} {}",
+                        if *inside { "INSIDE" } else { "" }
+                    );
+                }
+                for n in contacts {
+                    if planes.len() >= SLIDE_MAX_PLANES {
+                        break;
+                    }
+                    shear_steep_contact(&mut vel, n);
+                    push_slide_plane(&mut planes, n, vel);
+                }
+                vel = project_travel_2d(vel, &planes);
+                println!(
+                    "   after: pos=({0:.4},{1:.4}) vel=({2:.5},{3:.5}) |v|={s:.5} time_left={time_left:.4}",
+                    pos[0], pos[1], vel[0], vel[1], s = (vel[0]*vel[0]+vel[1]*vel[1]).sqrt()
+                );
+            }
+            println!(
+                "   frame travel = {:.5}",
+                ((pos[0] - px).powi(2) + (pos[1] - py).powi(2)).sqrt()
+            );
+        }
+        crate::bn_shutdown(w);
+    }
+
+    /// One pose, three lanes: the reported crawl position run through
+    /// `MoverSession`, through this file's swept step, and through the old
+    /// point step, with the same command. Only a per-frame difference at the
+    /// same position says which law is wrong; a path difference can always be
+    /// the route that got there.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn the_inn_corner_crawl_pose_runs_in_all_three_lanes() {
+        use crate::bn_init;
+        // The three live corner headings first (the `bn.Leak` cells, so a row
+        // here is the same walk), then the two pinned poses and the seven
+        // headings the 1128-walk census still reports at travel 0.000: every
+        // one of them answers frame 0 with `hit=dist=0.0000`, so the question is
+        // whether benilla's own mover is pinned in the same place or walks.
+        let poses_deg: [(f32, f32, f32, f32); 12] = [
+            (-9471.08, 28.04, 56.34, 45.0),
+            (-9471.08, 28.04, 56.34, 135.0),
+            (-9471.08, 28.04, 56.34, 225.0),
+            (-9474.70, 16.13, 56.42, 90.0),
+            (-9479.55, 19.06, 56.45, 0.0),
+            (-9477.92, 24.93, 57.11, 90.0),
+            (-9473.92, 22.93, 56.34, 0.0),
+            (-9471.92, 20.93, 57.26, 135.0),
+            (-9471.92, 36.93, 57.46, 270.0),
+            (-9471.92, 36.93, 57.46, 315.0),
+            (-9465.92, 12.93, 56.96, 315.0),
+            (-9461.92, 18.93, 57.31, 270.0),
+        ];
+        for (px, py, pz, deg) in poses_deg {
+            let yaw = deg.to_radians();
+            println!("=== pose ({px},{py},{pz}) yaw={deg:.0} ===");
+            for (name, solver, swept) in [
+                ("mover_session", true, 1u32),
+                ("ffi_swept", false, 1),
+                ("ffi_point", false, 0),
+            ] {
+                let prev_solver = COLLISION_SOLVER.load(Ordering::Relaxed);
+                COLLISION_SOLVER.store(solver, Ordering::Relaxed);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let dir =
+                        std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data")
+                            .unwrap();
+                    let w = bn_init(dir.as_ptr());
+                    assert!(!w.is_null());
+                    let w = unsafe { &mut *w };
+                    let map = std::ffi::CString::new("Azeroth").unwrap();
+                    assert_eq!(bn_player_reset(w, map.as_ptr(), px, py), 1);
+                    let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+                    for _ in 0..120 {
+                        bn_player_tick(w, 1.0 / 60.0, &mut st);
+                    }
+                    bn_player_swept_mover(swept);
+                    bn_player_teleport(w, map.as_ptr(), px, py, pz, yaw);
+                    bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+                    for _ in 0..180 {
+                        bn_player_tick(w, 1.0 / 60.0, &mut st);
+                    }
+                    let start = st.pos;
+                    bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
+                    let mut path = 0.0f32;
+                    let mut prev = st.pos;
+                    let mut frames = Vec::new();
+                    for i in 0..120 {
+                        bn_player_tick(w, 1.0 / 60.0, &mut st);
+                        let d =
+                            ((st.pos[0] - prev[0]).powi(2) + (st.pos[1] - prev[1]).powi(2)).sqrt();
+                        path += d;
+                        if i % 30 == 29 {
+                            frames.push(format!(
+                                "t{:3}: ({0:.3},{1:.3}) z={2:.2} spd={3:.2}",
+                                st.pos[0], st.pos[1], st.pos[2], st.speed
+                            ));
+                        }
+                        prev = st.pos;
+                    }
+                    bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+                    println!(
+                        "{name:13}: start=({0:.3},{1:.3}) path={path:5.2}",
+                        start[0], start[1]
+                    );
+                    for f in frames {
+                        println!("   {f}");
+                    }
+                    crate::bn_shutdown(w);
+                }));
+                COLLISION_SOLVER.store(prev_solver, Ordering::Relaxed);
+                ran.unwrap();
+            }
+        }
+    }
+
+    /// The two pinned poses, asked face by face: what this file's horizontal
+    /// sweep does to every triangle near the body versus what the reference's
+    /// `cast_move` does (the same facing gate, and `behind_the_band` for a
+    /// penetrating overlap). A row where the two columns disagree is the rule
+    /// that pins the body.
+    #[test]
+    #[ignore = "per-face decision dump for the inn corner pin"]
+    fn the_inn_corner_wall_sweep_shows_which_rule_keeps_it() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                if let Ok(a) = benilla_mpq::Archive::open(&path) {
+                    archives.push(a);
+                }
+            }
+        }
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        for (tag, feet, dx, dy) in [
+            (
+                "east out of the west wall",
+                [-9479.55f32, 19.06, 56.45],
+                1.0f32,
+                0.0f32,
+            ),
+            (
+                "north at the deep pinch",
+                [-9474.70, 16.13, 56.42],
+                0.0,
+                1.0,
+            ),
+        ] {
+            let mut p = Player::new("Azeroth", feet[0], feet[1]);
+            p.pos = feet;
+            p.grounded = true;
+            p.last_ground = feet;
+            for _ in 0..9 {
+                p.ensure_tiles(&archives);
+            }
+            let k = Player::tile_of(feet[0], feet[1]);
+            for _ in 0..6000 {
+                p.ensure_wmo(&mut chain, &mut cache);
+                if p.tiles
+                    .get(&k)
+                    .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len())
+                {
+                    break;
+                }
+            }
+            let a = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+            let b = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+            // The capsule's support point along a horizontal dir: the axis is
+            // vertical, so its dot is the axis's dot plus the radius.
+            let lead = feet[0] * dx + feet[1] * dy + CAPSULE_RADIUS;
+            let mut rows = Vec::new();
+            p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
+                let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                let (ex, ey, ez) = (sp[0] - ap[0], sp[1] - ap[1], sp[2] - ap[2]);
+                let gap = (ex * ex + ey * ey + ez * ez).sqrt();
+                if gap > CAPSULE_RADIUS + 0.6 {
+                    return false;
+                }
+                let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                let n2 = if hl > 1.0e-6 {
+                    [t.n[0] / hl, t.n[1] / hl]
+                } else {
+                    [0.0, 0.0]
+                };
+                let facing = n2[0] * dx + n2[1] * dy <= -FACE_FACING_EPS;
+                let ahead =
+                    t.v.iter()
+                        .fold(f32::MIN, |m, v| m.max(v[0] * dx + v[1] * dy - lead));
+                let top = t.v[0][2].max(t.v[1][2]).max(t.v[2][2]);
+                // The two reference gates this dump is deciding between: the
+                // travel's projection on the face-to-body vector (parry's
+                // `normal_vel`, the cast's separating test) and the authored
+                // normal's projection on it (`for_each_contact:409`).
+                let along = ex * dx + ey * dy;
+                let dn = ex * t.n[0] + ey * t.n[1] + ez * t.n[2];
+                rows.push((t.n, gap, inside, facing, ahead, top, sp, along, dn));
+                false
+            });
+            println!(
+                "=== {tag}: pose=({0},{1},{2}) dir=({dx},{dy}) ===",
+                feet[0], feet[1], feet[2]
+            );
+            for (n, gap, inside, facing, ahead, top, sp, along, dn) in rows {
+                let (n0, n1, n2) = (n[0], n[1], n[2]);
+                let (sx, sy, sz) = (sp[0], sp[1], sp[2]);
+                let floor = n2.abs() >= GROUND_COS;
+                let mine = if floor {
+                    "floor/ceil"
+                } else if !facing {
+                    "back"
+                } else if inside {
+                    "KEPT axis-through"
+                } else if gap < CAPSULE_RADIUS {
+                    if along <= 0.0 {
+                        "drop separating"
+                    } else if ahead >= -BACKFACE_BAND {
+                        "KEPT in band"
+                    } else {
+                        "drop band"
+                    }
+                } else {
+                    "march"
+                };
+                let reference = if floor || !facing {
+                    "skipped"
+                } else if gap < CAPSULE_RADIUS {
+                    if along <= 0.0 {
+                        "DROPPED separating"
+                    } else if ahead < -BACKFACE_BAND {
+                        "DROPPED band"
+                    } else {
+                        "hit at t=0"
+                    }
+                } else {
+                    "cast"
+                };
+                println!(
+                    "  n=({n0:7.3},{n1:7.3},{n2:7.3}) gap={gap:5.3} along={along:7.3} dn={dn:7.3} ahead={ahead:7.3} top={top:6.2} near=({sx:8.2},{sy:6.2},{sz:6.2}) | mine={mine:17} ref={reference}"
+                );
+            }
+            let hit = p.sweep_wall_contact(feet, dx, dy, 3.0);
+            match hit {
+                Some(c) => println!(
+                    "  sweep: dist={:5.3} n=({:7.3},{:7.3}) top={:6.2}",
+                    c.dist, c.n[0], c.n[1], c.top
+                ),
+                None => println!("  sweep: none within 3.0"),
+            }
+        }
+    }
+
+    /// The faces that block the pinned pose, with their vertices and the bucket
+    /// they came from (terrain / WMO group / doodad), and what benilla's own
+    /// mover costs per frame on this room: `install` (the fold of every loaded
+    /// triangle into the avian world) versus `step`. The pinned pose is where the
+    /// swept lane stops walking east and benilla's mover walks past it, so the
+    /// face list is the divergence and the timing decides whether the adapter can
+    /// hand the whole mover to benilla.
+    #[test]
+    #[ignore = "vertex dump of the pinning face and the reference mover's cost"]
+    fn the_inn_corner_blocking_face_is_named_and_the_mover_is_timed() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut archives = Vec::new();
+        for e in std::fs::read_dir(&data).expect("data dir").flatten() {
+            let path = e.path();
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mpq"))
+            {
+                archives.push(path);
+            }
+        }
+        let archives: Vec<benilla_mpq::Archive> = archives
+            .iter()
+            .filter_map(|p| benilla_mpq::Archive::open(p).ok())
+            .collect();
+        let mut chain = benilla_formats::Chain::open(&data).ok();
+        let mut cache = HashMap::new();
+        let feet = [-9479.55f32, 19.06, 56.45];
+        let (dx, dy) = (1.0f32, 0.0f32);
+        let mut p = Player::new("Azeroth", feet[0], feet[1]);
+        p.pos = feet;
+        p.grounded = true;
+        p.last_ground = feet;
+        for _ in 0..9 {
+            p.ensure_tiles(&archives);
+        }
+        let k = Player::tile_of(feet[0], feet[1]);
+        for _ in 0..6000 {
+            p.ensure_wmo(&mut chain, &mut cache);
+            if p.tiles
+                .get(&k)
+                .is_some_and(|t| t.wmo_ready && t.doodad_next >= t.doodads.len())
+            {
+                break;
+            }
+        }
+        let a = [feet[0], feet[1], feet[2] + CAPSULE_RADIUS];
+        let b = [feet[0], feet[1], feet[2] + CAPSULE_HEIGHT - CAPSULE_RADIUS];
+        let lead = feet[0] * dx + feet[1] * dy + CAPSULE_RADIUS;
+        let (mut n_tri, mut n_body) = (0usize, 0usize);
+        for t in p.tiles.values() {
+            n_tri += t.buckets.iter().map(|c| c.len()).sum::<usize>()
+                + t.wmo_cells.iter().map(|c| c.len()).sum::<usize>()
+                + t.doodad_cells.iter().map(|c| c.len()).sum::<usize>();
+        }
+        for (tag, cells) in [
+            ("T", &p.tiles[&k].buckets),
+            ("W", &p.tiles[&k].wmo_cells),
+            ("D", &p.tiles[&k].doodad_cells),
+        ] {
+            for cell in cells.iter() {
+                for t in cell {
+                    let (ap, sp, inside) = capsule_tri_closest(a, b, t);
+                    let (ex, ey, ez) = (sp[0] - ap[0], sp[1] - ap[1], sp[2] - ap[2]);
+                    let gap = (ex * ex + ey * ey + ez * ez).sqrt();
+                    if gap >= CAPSULE_RADIUS || t.n[2].abs() >= GROUND_COS {
+                        continue;
+                    }
+                    let hl = (t.n[0] * t.n[0] + t.n[1] * t.n[1]).sqrt();
+                    if hl < 1.0e-6 || t.n[0] / hl * dx + t.n[1] / hl * dy > -FACE_FACING_EPS {
+                        continue;
+                    }
+                    let ahead =
+                        t.v.iter()
+                            .fold(f32::MIN, |m, v| m.max(v[0] * dx + v[1] * dy - lead));
+                    let (n0, n1, n2) = (t.n[0], t.n[1], t.n[2]);
+                    let (sx, sy, sz) = (sp[0], sp[1], sp[2]);
+                    let (v0, v1, v2) = (t.v[0], t.v[1], t.v[2]);
+                    n_body += 1;
+                    println!(
+                        "  {tag} n=({n0:7.3},{n1:7.3},{n2:7.3}) gap={gap:5.3} ahead={ahead:7.3} {} near=({sx:9.2},{sy:6.2},{sz:6.2})",
+                        if inside { "AXIS" } else { "    " },
+                    );
+                    for (i, v) in [v0, v1, v2].iter().enumerate() {
+                        let (vx, vy, vz) = (v[0], v[1], v[2]);
+                        println!("     v{i}: ({vx:9.2},{vy:8.2},{vz:6.2})");
+                    }
+                }
+            }
+        }
+        println!(
+            "{} blocking faces of {n_tri} in {} tiles",
+            n_body,
+            p.tiles.len()
+        );
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            p.rebuild_mover_world();
+            let install = t0.elapsed();
+            p.mover.set_pose(feet);
+            let mut step = std::time::Duration::ZERO;
+            for _ in 0..30 {
+                let t1 = std::time::Instant::now();
+                p.mover.step(1.0 / 60.0, [7.0, 0.0], 7.0, false, None);
+                step += t1.elapsed();
+            }
+            println!("install={:?} step/30={:?}", install, step / 30);
+        }
+    }
+
     #[test]
     fn tilt_target_follows_the_conform_three_bands() {
-        // A miss and a face steeper than 89° both snap to world up.
         assert_eq!(tilt_target(None), Some([0.0, 0.0, 1.0]));
-        assert_eq!(
-            tilt_target(Some([0.17, 0.0, 0.01])),
-            Some([0.0, 0.0, 1.0])
-        );
+        assert_eq!(tilt_target(Some([0.17, 0.0, 0.01])), Some([0.0, 0.0, 1.0]));
         // Inside the freeze band the previous pose holds.
         assert_eq!(tilt_target(Some([0.9, 0.0, 0.2])), None);
         // Past it the face's own normal is the target.
@@ -7888,10 +10265,16 @@ mod tests {
             let (eye, _) = p.camera();
             let Some(t) = p.tiles.get(&key) else { continue };
             let mut near = f32::MAX;
-            for t2 in t.cam_cells.iter().flatten().chain(t.wmo_cells.iter().flatten()) {
+            for t2 in t
+                .cam_cells
+                .iter()
+                .flatten()
+                .chain(t.wmo_cells.iter().flatten())
+            {
                 let q = closest_on_tri(eye, t2);
-                let d = ((eye[0] - q[0]).powi(2) + (eye[1] - q[1]).powi(2) + (eye[2] - q[2]).powi(2))
-                    .sqrt();
+                let d =
+                    ((eye[0] - q[0]).powi(2) + (eye[1] - q[1]).powi(2) + (eye[2] - q[2]).powi(2))
+                        .sqrt();
                 near = near.min(d);
             }
             if near < worst {
@@ -7955,8 +10338,9 @@ mod tests {
         let mut near: Vec<(f32, Tri)> = Vec::new();
         p.any_tri_near([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], |t| {
             let q = closest_on_tri([feet[0], feet[1], feet[2] + CAPSULE_HEIGHT * 0.5], t);
-            let d = ((q[0] - feet[0]).powi(2) + (q[1] - feet[1]).powi(2) + (q[2] - feet[2]).powi(2))
-                .sqrt();
+            let d =
+                ((q[0] - feet[0]).powi(2) + (q[1] - feet[1]).powi(2) + (q[2] - feet[2]).powi(2))
+                    .sqrt();
             if d < 3.0 {
                 near.push((d, *t));
             }
@@ -7970,11 +10354,21 @@ mod tests {
             println!(
                 "d={d:.3} n=({:.4} {:.4} {:.4}) top={:.3} v0=({:.3} {:.3} {:.3}) \
                  v1=({:.3} {:.3} {:.3}) v2=({:.3} {:.3} {:.3}) dx={:.3} dy={:.3}",
-                t.n[0], t.n[1], t.n[2], top,
-                t.v[0][0], t.v[0][1], t.v[0][2],
-                t.v[1][0], t.v[1][1], t.v[1][2],
-                t.v[2][0], t.v[2][1], t.v[2][2],
-                dn[0], dn[1]
+                t.n[0],
+                t.n[1],
+                t.n[2],
+                top,
+                t.v[0][0],
+                t.v[0][1],
+                t.v[0][2],
+                t.v[1][0],
+                t.v[1][1],
+                t.v[1][2],
+                t.v[2][0],
+                t.v[2][1],
+                t.v[2][2],
+                dn[0],
+                dn[1]
             );
         }
         // ---- login-spawn probe: the saved server pose in `bnfall.log` ----
@@ -8021,7 +10415,11 @@ mod tests {
             let c = p.sweep_wall_contact(fp, dx, dy, 1.0);
             println!(
                 "dir {k} yaw={:.3} pos=({:.3} {:.3} {:.3}) grounded={} contact={:?}",
-                p.yaw, fp[0], fp[1], fp[2], p.grounded,
+                p.yaw,
+                fp[0],
+                fp[1],
+                fp[2],
+                p.grounded,
                 c.map(|c| (c.dist, c.n, c.top))
             );
             bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
@@ -8031,13 +10429,71 @@ mod tests {
                     println!(
                         "dir {k} t={:.2}s pos=({:.3} {:.3} {:.3}) grounded={} speed={:.2}",
                         (n + 1) as f32 / 60.0,
-                        st.pos[0], st.pos[1], st.pos[2], st.grounded, st.speed
+                        st.pos[0],
+                        st.pos[1],
+                        st.pos[2],
+                        st.grounded,
+                        st.speed
                     );
                 }
             }
         }
         bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
         crate::bn_shutdown(w);
+    }
+
+    /// The same logged pose through the other solver: `bn.CollisionSolver` 1 hands
+    /// the whole step to benilla's `MoverSession`, so this settles whether the
+    /// freeze is the ffi's swept solver or a sweep the upstream also runs. The walk
+    /// is 60 frames per heading because the upstream rebuilds its physics world
+    /// every step.
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stuck_pose_upstream_solver_20261109() {
+        use crate::bn_init;
+        let prev = COLLISION_SOLVER.load(Ordering::Relaxed);
+        COLLISION_SOLVER.store(true, Ordering::Relaxed);
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir =
+                std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+            let w = bn_init(dir.as_ptr());
+            assert!(!w.is_null());
+            let w = unsafe { &mut *w };
+            let map = std::ffi::CString::new("Azeroth").unwrap();
+            let (sx, sy, server_z) = (-9471.92f32, 24.93f32, 61.41f32);
+            assert_eq!(bn_player_reset(w, map.as_ptr(), sx, sy), 1);
+            let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+            for _ in 0..60 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+            println!(
+                "upstream reset pos=({:.3} {:.3} {:.3}) grounded={}",
+                st.pos[0], st.pos[1], st.pos[2], st.grounded
+            );
+            for k in 0..8 {
+                let ang = k as f32 * std::f32::consts::FRAC_PI_4;
+                bn_player_teleport(w, map.as_ptr(), sx, sy, server_z, ang);
+                bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+                for _ in 0..30 {
+                    bn_player_tick(w, 1.0 / 60.0, &mut st);
+                }
+                let start = st.pos;
+                bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
+                for _ in 0..60 {
+                    bn_player_tick(w, 1.0 / 60.0, &mut st);
+                }
+                let d = ((st.pos[0] - start[0]).powi(2) + (st.pos[1] - start[1]).powi(2)).sqrt();
+                println!(
+                    "upstream dir {k} yaw={ang:.3} travel={d:.3} \
+                     pos=({:.3} {:.3} {:.3}) grounded={} speed={:.2}",
+                    st.pos[0], st.pos[1], st.pos[2], st.grounded, st.speed
+                );
+            }
+            bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+            crate::bn_shutdown(w);
+        }));
+        COLLISION_SOLVER.store(prev, Ordering::Relaxed);
+        ran.unwrap();
     }
 }
 
