@@ -3963,11 +3963,7 @@ fn wmo_doodad_at(w: &BnWorld, i: u32) -> Option<&WmoDoodadInst> {
 /// host draws those props unlit with `tex × colour`, the reference's base
 /// light, so a roof hole or the sun cannot relight them.
 #[no_mangle]
-pub extern "C" fn bn_doodad_interior_light(
-    world: *const BnWorld,
-    i: u32,
-    out: *mut u32,
-) -> u32 {
+pub extern "C" fn bn_doodad_interior_light(world: *const BnWorld, i: u32, out: *mut u32) -> u32 {
     if world.is_null() || out.is_null() {
         return 0;
     }
@@ -4081,11 +4077,11 @@ pub extern "C" fn bn_wmo_interior_light(
     let (cx, cy) = tile.center;
     // The flat's axes: (world - centre) through the WoW->UE mirror.
     let (px, py, pz) = wow_vec_to_ue(x - cx, y - cy, z);
-    const PAD_XY: f32 = 0.6;   // yards: wall thickness / door frame
+    const PAD_XY: f32 = 0.6; // yards: wall thickness / door frame
     const PAD_DOWN: f32 = 1.0;
-    const PAD_UP: f32 = 3.0;   // a body's height above the floor
-    // The thinnest containing batch is the one an entity stands on (the floor),
-    // which is exactly what the reference's downward ray samples.
+    const PAD_UP: f32 = 3.0; // a body's height above the floor
+                             // The thinnest containing batch is the one an entity stands on (the floor),
+                             // which is exactly what the reference's downward ray samples.
     let mut best: Option<([u8; 4], f32)> = None;
     for (inst, flat) in &w.wmo_flats {
         let boxes = wmo_interior_boxes(&w.tile_path, *inst, flat);
@@ -4108,12 +4104,21 @@ pub extern "C" fn bn_wmo_interior_light(
     let Some((light, _)) = best else {
         return 0;
     };
-    // Fold the reference's `1 + 4·a` light datum into the colour: the host's
-    // M2 materials take a plain RGB ambient term and must not read alpha
-    // (opacity) from it. Clamped, since a bright MOCV and a high alpha can
-    // exceed the byte range.
-    let scale = 1.0 + 4.0 * (f32::from(light[3]) / 255.0);
-    let fold = |c: u8| ((f32::from(c) * scale).round() as u32).min(255) as u8;
+    // The reference's indoor ambient word for an entity in a baked group is
+    // `cap96(MOCV)` (`benilla-world`'s `interior.rs:746`, the ramp's target), and
+    // `cap96` scales the colour so its brightest channel lands at 96/255
+    // (`benilla-assets`' `wmo.rs:169`). It is not the room geometry's
+    // `tex · MOCV · (1 + 4a)`: folding that law (up to 5x) into a single RGB
+    // term and clamping the bytes to 255 turned a lit room's MOCV into white and
+    // painted every indoor unit and prop with it - the daytime "室内太亮". The
+    // arithmetic below is the reference's, to the bit.
+    let max = light[0].max(light[1]).max(light[2]);
+    let scale = if max <= 96 {
+        255u32
+    } else {
+        ((96.0 * 255.0 / f32::from(max)) - 0.5).round_ties_even() as u32
+    };
+    let fold = |c: u8| ((u32::from(c) * scale + 255) >> 8).min(255) as u8;
     unsafe {
         *out = fold(light[0]);
         *out.add(1) = fold(light[1]);
