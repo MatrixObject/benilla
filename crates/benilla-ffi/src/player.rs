@@ -13,7 +13,7 @@
 //! MODF placements use - so `(x, -y, z) * 100` is the UE transform.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use benilla_formats::{adt_to_tile_mesh, world_to_chunk};
@@ -40,9 +40,10 @@ static SWEPT_MOVER: AtomicBool = AtomicBool::new(true);
 ///
 /// 翻默认的理由：本层抄写的滑移在 7 个实测冻结姿态上全部走不出去（45 帧位移
 /// 0.000），而 benilla 原装步进同一批姿态全部脱困（0.19–1.4 yd/12 帧）。原装
-/// lane 当年的 1.5–2.3 s/帧是 `install` 未做签名门控时每帧重建 avian 世界；签名
-/// 门控之后实测 600 帧连走（10 秒、四次转弯）平均 1.84 ms/帧，无一帧超过 30 ms，
-/// 重建只在 tile 进出与折层完成时发生。`bn.CollisionSolver 0` 仍可回到自写求解。
+/// lane 当年的 1.5–2.3 s/帧是每帧重建 avian 世界：`install` 按 cell 的当前长度触发，
+/// 而且旧的碰撞实体从不摘除，越装越厚。逐块增删之后实测 600 帧连走（10 秒、四次转弯）
+/// 平均 1.84 ms/帧，无一帧超过 30 ms，世界重建只在阶段完成与 tile 进出的那一帧。
+/// `bn.CollisionSolver 0` 仍可回到自写求解。
 static COLLISION_SOLVER: AtomicBool = AtomicBool::new(true);
 /// `bn.CollisionSolver` 的当前值：宿主 CVar 优先，其次上面的默认（1 = benilla 原装 mover）。
 fn collision_solver_on() -> bool {
@@ -56,6 +57,11 @@ fn collision_solver_on() -> bool {
 /// A walk that travels 0.000 reads the same either way, and only one of the two
 /// is the reported wall-corner freeze.
 static HOLD_FRAMES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// 原装 mover 这条 lane 的普查：步进帧数、整世界重建次数、最后一次重建拷走的三角数。
+/// 内存曲线的归因靠这三个数（宿主侧 `bn.MemLog` 把它们和进程占用一起打）。
+static MOVER_FRAMES: AtomicU64 = AtomicU64::new(0);
+static MOVER_INSTALLS: AtomicU64 = AtomicU64::new(0);
+static MOVER_TRIS: AtomicU64 = AtomicU64::new(0);
 /// How far below the last real floor the void guard lets a body fall before it
 /// is restored there (yd). A real floor anywhere below is found by `ground`
 /// long before this; only a true hole in the collision data gets here.
@@ -663,6 +669,135 @@ pub(crate) struct TileCol {
     modd: Vec<crate::WmoDoodadInst>,
     modd_next: usize,
     modd_done: bool,
+}
+
+/// tile 的碰撞面按折叠阶段分成这几块装进物理世界，`MoverSession::apply_slots` 的
+/// 块 id 由 tile 键加阶段号拼成。
+///
+/// 相机那叠面（`cam_cells`）不在其中：`MoverSession` 只对外给 `step`，而步进用的过滤是
+/// `WorldCollision::body_filter`（`benilla-world/src/collision.rs:122-128`）= Default|Walk，
+/// layer 2 的 Camera 面被它排除。装进去的那一块在一座城里实测有 95 万面、一次 530 毫秒，
+/// 身体一帧也没查过它；boom 走的是 ffi 自己的 ray lane（`boom_hit` 读 `cam_cells`）。
+const MOVER_KIND_TERRAIN: usize = 0;
+const MOVER_KIND_DOODAD: usize = 2;
+/// 仍按 tile 装的阶段。WMO 面不在这里：见 [`WmoBlock`]，它按 placement 装 —— 1.12 把一座跨
+/// tile 的建筑列进它压到的每一个 ADT 的 MODF（`unique_id` 相同），按 tile 装就是把同一座城
+/// 在物理世界里重装几份。
+const MOVER_TILE_KINDS: [usize; 2] = [MOVER_KIND_TERRAIN, MOVER_KIND_DOODAD];
+
+/// tile 键 + 阶段 → 块 id。tile 行列（含越界的 -1 邻格）在 u16 里互不相同。
+fn mover_slot_id(k: (i32, i32), kind: usize) -> u64 {
+    let (x, y) = ((k.0 as u16) as u64, (k.1 as u16) as u64);
+    (x << 18) | (y << 2) | kind as u64
+}
+
+/// 这一叠面折完了没有。完成后它不再变化，所以一块面至多构建一次 trimesh；未完成的阶段
+/// 一次都不建（分片折叠每片都改长度，按长度触发等于折叠多少帧就重建多少次世界）。
+fn mover_fold_ready(t: &TileCol, kind: usize) -> bool {
+    match kind {
+        // ADT 面随 tile 一起装载，本身就是完整的。
+        MOVER_KIND_TERRAIN => true,
+        // 道具面：MDDF 与 MODD 两条光标都走完 —— 两者写进同一叠 `doodad_cells`。
+        MOVER_KIND_DOODAD => {
+            t.doodad_next >= t.doodads.len() && t.modd_done && t.modd_next >= t.modd.len()
+        }
+        _ => false,
+    }
+}
+
+/// 把 tile 某一阶段的面拷成一块 `MoverMesh`；空集不建实体。
+///
+/// 折叠按 XY 包围盒把一张面塞进它重叠的每一格（WMO 见 `build_wmo_collision`:911，道具面
+/// 同一条），那是 ray lane 的查询索引。物理世界要的是不重复的一张网格：benilla-app 喂
+/// mover 的是模型的原生碰撞面（`benilla-app/src/player/setup.rs`），一张面一份。按顶点位
+/// 样去重与参考那份集合相同；实测一块省 5~10%（4.7 万→4.0 万），省的不是大头，大头是根本
+/// 不该装的相机面与按 tile 重装的整城几何，见 [`WmoBlock`]。
+fn mover_slot_mesh(kind: usize, t: &TileCol) -> Option<MoverMesh> {
+    let src: &[Vec<Tri>] = match kind {
+        MOVER_KIND_TERRAIN => &t.buckets,
+        MOVER_KIND_DOODAD => &t.doodad_cells,
+        _ => return None,
+    };
+    let mut mesh = MoverMesh {
+        layer: 0,
+        verts: Vec::new(),
+        tris: Vec::new(),
+    };
+    let mut seen: HashSet<[[u32; 3]; 3]> = HashSet::new();
+    let mut raw = 0usize;
+    for tri in src.iter().flatten() {
+        raw += 1;
+        let unique = seen.insert([
+            tri.v[0].map(f32::to_bits),
+            tri.v[1].map(f32::to_bits),
+            tri.v[2].map(f32::to_bits),
+        ]);
+        if !unique {
+            continue;
+        }
+        let b = mesh.verts.len() as u32;
+        mesh.verts.extend_from_slice(&tri.v);
+        mesh.tris.push([b, b + 1, b + 2]);
+    }
+    if mesh.tris.len() != raw {
+        eprintln!(
+            "bn_mover: block#{kind} faces={raw} unique={}",
+            mesh.tris.len()
+        );
+    }
+    (!mesh.tris.is_empty()).then_some(mesh)
+}
+
+/// 一份 WMO placement 在 mover 世界里的账：benilla 的 `Placements::by_id` 加 `Placement::refs`
+/// （`benilla-world/src/terrain_stream.rs:933-938`，`register_wmo` 撞见已注册的 `uniqueId` 只
+/// `refs += 1`，一份模型几何永远只有一份 collider）。
+///
+/// 1.12 把一个跨 tile 的建筑写进它压到的每一个 ADT 的 MODF 表，`unique_id` 相同
+/// （`benilla-world/src/liquid/real_data.rs:69`，[`benilla_formats::WmoInstance::unique_id`]
+/// 的注释同此）。按 tile 装块就是把同一座城重装 N 次：实测同一次暴风城之行里两块行走面
+/// 441,768 与 447,569 —— 第二次单帧 338 毫秒，两份几何同时活在物理世界里。
+struct WmoBlock {
+    /// 窗内列到这一 placement 的 tile 数；归零才摘块。
+    refs: u32,
+    /// 放置：MODF 的模型根文件与位姿，装块时按 `placement_collider_data` 变换。
+    model: String,
+    quat: [f32; 4],
+    base: [f32; 3],
+    /// 已装入物理世界的块 id；[`WmoBlock::NONE`] = 还欠着。
+    slot: u64,
+}
+
+impl WmoBlock {
+    const NONE: u64 = u64::MAX;
+}
+
+/// placement 块的 id：低两位 0b01，与按 tile 的块（低两位是阶段号 0 或 2）永不重合。
+fn mover_wmo_slot_id(uid: u32) -> u64 {
+    ((uid as u64) << 2) | 1
+}
+
+/// 一份 placement 的面：模型的原生行走碰撞集合（`load_wmo_collision_tris`，与 tile 的 grid
+/// 折叠同一个来源、同一份 cache）套上 MODF 位姿。模型的集合还没进 cache 时返回 `None`，
+/// 下一帧再试：不为装一块面在这一帧去读 MPQ。
+fn mover_wmo_mesh(
+    b: &WmoBlock,
+    cache: &HashMap<String, benilla_formats::CollisionMesh>,
+) -> Option<MoverMesh> {
+    let col = cache.get(&b.model)?;
+    let mut mesh = MoverMesh {
+        layer: 0,
+        verts: Vec::with_capacity(col.positions.len()),
+        tris: Vec::with_capacity(col.indices.len() / 3),
+    };
+    for p in &col.positions {
+        let r = crate::q_rot(b.quat, *p);
+        mesh.verts
+            .push([r[0] + b.base[0], r[1] + b.base[1], r[2] + b.base[2]]);
+    }
+    for t in col.indices.chunks_exact(3) {
+        mesh.tris.push([t[0], t[1], t[2]]);
+    }
+    (!mesh.tris.is_empty()).then_some(mesh)
 }
 
 impl TileCol {
@@ -1658,10 +1793,19 @@ pub struct Player {
     /// Phase 2: benilla 自己的玩家步进（无窗口物理世界 + `MoverSession::step`）。
     /// `bn.CollisionSolver` = 1 时由它解析水平/竖直/台阶/贴地，0 时走本文件的自写求解。
     mover: MoverSession,
-    /// 碰撞面集合变了（tile 进出、WMO 折叠、传送换图），下一帧重新 `install`。
+    /// 碰撞面集合变了（换图/登录），下一帧整块重装一次。
     mover_dirty: bool,
-    /// 上一帧喂给 `mover` 的碰撞面签名（tile 键 + 各格三角数 + `wmo_ready`）。
-    mover_sig: u64,
+    /// 物理世界里已装了哪几块：tile 键 → (已装的阶段, 已折完的阶段)，各一位一个阶段。
+    /// 只覆盖 [`MOVER_TILE_KINDS`]；WMO 面按 placement 记账，见 [`WmoBlock`]。
+    mover_slots: HashMap<(i32, i32), (u8, u8)>,
+    /// WMO placement 的账，按 MODF `unique_id`：benilla 的 `Placements::by_id`。
+    wmo_blocks: HashMap<u32, WmoBlock>,
+    /// 欠着没装的 placement，按登记顺序（tile 由近及远装载，所以近处的先装）。
+    wmo_unbuilt: std::collections::VecDeque<u32>,
+    /// 面已拷好、等物理世界收的块：一次 `apply_slots` 全交给它。
+    wmo_to_install: Vec<(u64, MoverMesh)>,
+    /// tile 卸载时摘掉的 placement 块 id，下一帧的 `sync_mover_slots` 一并交给物理世界。
+    wmo_released: Vec<u64>,
     /// 步进体上一帧自己的脚底（WoW 轴）。宿主直接写了 `pos`（测试、登录/传送、游泳段交回）
     /// 时用它发现漂移，并按传送重新 `set_pose`，避免两套位姿各走各的。
     mover_pose: [f32; 3],
@@ -1729,7 +1873,11 @@ impl Player {
             mount_roll: 0.0,
             mover: MoverSession::new(),
             mover_dirty: true,
-            mover_sig: 0,
+            mover_slots: HashMap::new(),
+            wmo_blocks: HashMap::new(),
+            wmo_unbuilt: std::collections::VecDeque::new(),
+            wmo_to_install: Vec::new(),
+            wmo_released: Vec::new(),
             mover_pose: [x, y, 0.0],
         };
         // 步进体与宿主出生位姿对齐。否则 `MoverSession` 内部的脚底停在 Bevy 原点，
@@ -1769,75 +1917,110 @@ impl Player {
         self.mover_dirty = true;
     }
 
-    /// 把当前 tile 集折叠成 benilla 的碰撞面并 `install`。只做数据搬运：
-    /// WoW 轴顶点原样传递，轴向变换在 `MoverSession::install` 内完成。
+    /// 整块重装当前 tile 集的碰撞面：登录/传送换图，以及单元测试手工搭的场景。先把账上
+    /// 已装的块全部摘掉再逐块装一遍；未折完的阶段也先按当前内容装上，折完那一帧再替换。
     fn rebuild_mover_world(&mut self) {
-        let mut body = MoverMesh {
-            layer: 0,
-            verts: Vec::new(),
-            tris: Vec::new(),
-        };
-        let mut cam = MoverMesh {
-            layer: 2,
-            verts: Vec::new(),
-            tris: Vec::new(),
-        };
-        fn push(mesh: &mut MoverMesh, tri: &Tri) {
-            let b = mesh.verts.len() as u32;
-            mesh.verts.extend_from_slice(&tri.v);
-            mesh.tris.push([b, b + 1, b + 2]);
-        }
-        for t in self.tiles.values() {
-            for tri in t.buckets.iter().flatten() {
-                push(&mut body, tri);
-            }
-            for tri in t.wmo_cells.iter().flatten() {
-                push(&mut body, tri);
-            }
-            for tri in t.doodad_cells.iter().flatten() {
-                push(&mut body, tri);
-            }
-            for tri in t.cam_cells.iter().flatten() {
-                push(&mut cam, tri);
+        let mut down: Vec<u64> = Vec::new();
+        for (k, (have, _)) in self.mover_slots.drain() {
+            for &kind in &MOVER_TILE_KINDS {
+                if have & (1 << kind) != 0 {
+                    down.push(mover_slot_id(k, kind));
+                }
             }
         }
-        let mut meshes = Vec::new();
-        if !body.tris.is_empty() {
-            meshes.push(body);
+        for (_, row) in self.wmo_blocks.drain() {
+            if row.slot != WmoBlock::NONE {
+                down.push(row.slot);
+            }
         }
-        if !cam.tris.is_empty() {
-            meshes.push(cam);
-        }
-        self.mover.install(&meshes);
+        self.wmo_unbuilt.clear();
+        self.wmo_to_install.clear();
+        self.wmo_released.clear();
         self.mover_dirty = false;
+        self.sync_mover_slots(down, true);
+        // placement 的账按当前窗子重列：世界刚被清空，欠的块由后面的 `fold_wmo_blocks` 补上。
+        self.reconcile_wmo_blocks();
+    }
+
+    /// 逐帧同步碰撞块：tile 装载即装它的 ADT 面，每个折叠阶段走完那一帧装上那一块，tile
+    /// 卸载那一帧摘掉它的全部块。其余帧只做几次位判等，不碰物理世界。
+    ///
+    /// 触发只看「阶段完成没有」，绝不看 cell 的当前长度：折叠是分片的，长度每片都变，按
+    /// 它触发等于折叠要多少帧就重建多少次世界（实测一次拷 110 万→160 万三角、0.6 秒）。
+    /// `force` = 整块重建，未折完的阶段也先装上。
+    fn sync_mover_slots(&mut self, mut down: Vec<u64>, force: bool) {
+        let t_sync = std::time::Instant::now();
+        let mut up: Vec<(u64, MoverMesh)> = Vec::new();
+        let mut next: Vec<((i32, i32), (u8, u8))> = Vec::new();
+        // placement 的块：账在 [`Self::reconcile_wmo_blocks`] 与 [`Self::fold_wmo_blocks`] 里
+        // 记，这里只把欠的交给物理世界、把出窗的摘掉。
+        down.append(&mut self.wmo_released);
+        up.append(&mut self.wmo_to_install);
+        // 卸载的 tile：它装过的块全部摘掉，账本丢掉这一行。
+        let tiles = &self.tiles;
+        self.mover_slots.retain(|k, (have, _)| {
+            if tiles.contains_key(k) {
+                return true;
+            }
+            for &kind in &MOVER_TILE_KINDS {
+                if (*have & (1 << kind)) != 0 {
+                    down.push(mover_slot_id(*k, kind));
+                }
+            }
+            false
+        });
+        for (&k, t) in &self.tiles {
+            let (have, done) = self.mover_slots.get(&k).copied().unwrap_or((0, 0));
+            let (mut h, mut d) = (have, done);
+            for &kind in &MOVER_TILE_KINDS {
+                if (d & (1 << kind)) != 0 {
+                    continue; // 这一叠面已经完整而且装过了
+                }
+                let ready = mover_fold_ready(t, kind);
+                if !ready && !force {
+                    continue;
+                }
+                match mover_slot_mesh(kind, t) {
+                    Some(mesh) => {
+                        up.push((mover_slot_id(k, kind), mesh));
+                        h |= 1 << kind;
+                    }
+                    None => h &= !(1 << kind),
+                }
+                if ready {
+                    d |= 1 << kind;
+                }
+            }
+            if (h, d) != (have, done) {
+                next.push((k, (h, d)));
+            }
+        }
+        for (k, v) in next {
+            self.mover_slots.insert(k, v);
+        }
+        if down.is_empty() && up.is_empty() {
+            return;
+        }
+        let n_tris: usize = up.iter().map(|(_, m)| m.tris.len()).sum();
+        let (n_up, n_down) = (up.len(), down.len());
+        self.mover.apply_slots(&down, &up);
+        // 普查：一次同步装/摘了几块、拷走多少三角、用了多久。
+        let n = MOVER_INSTALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        MOVER_TRIS.store(n_tris as u64, Ordering::Relaxed);
+        eprintln!(
+            "bn_mover: sync#{n} up={n_up} down={n_down} tris={n_tris} ms={:.1} tiles={}",
+            t_sync.elapsed().as_secs_f64() * 1000.0,
+            self.tiles.len()
+        );
     }
 
     /// 一帧步进交给 benilla：本帧速度折成 `dir/speed`，位置、竖直速度与着地全部取回。
     /// `hold` = 登录/传送的座位保持或 WMO 折层未完成，冻结一帧（不步进、重力关闭）。
     fn mover_tick(&mut self, dt: f32, jump: bool, hold: bool) {
-        // 碰撞面每变一次（tile 进出、WMO 折完、传送换图）重建一次，其余帧零成本。
-        let mut sig = 0u64;
-        for (k, t) in &self.tiles {
-            sig = sig
-                .wrapping_mul(31)
-                .wrapping_add((k.0 as u64) << 32 ^ k.1 as u64 as u64);
-            for b in &t.buckets {
-                sig = sig.wrapping_mul(31).wrapping_add(b.len() as u64);
-            }
-            for c in &t.wmo_cells {
-                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
-            }
-            for c in &t.doodad_cells {
-                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
-            }
-            for c in &t.cam_cells {
-                sig = sig.wrapping_mul(31).wrapping_add(c.len() as u64);
-            }
-            sig = sig.wrapping_mul(31).wrapping_add(t.wmo_ready as u64);
-        }
-        if self.mover_dirty || sig != self.mover_sig {
-            self.mover_sig = sig;
+        if self.mover_dirty {
             self.rebuild_mover_world();
+        } else {
+            self.sync_mover_slots(Vec::new(), false);
         }
         if hold {
             HOLD_FRAMES[1].fetch_add(1, Ordering::Relaxed);
@@ -1861,7 +2044,18 @@ impl Player {
         let speed = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
         // 水面行走在本宿主恒关（UE 端没有 water walking 模式），液体高度一律不喂；
         // 游泳由 ffi 自己的泳道处理，见 `use_mover`。
+        let t_step = std::time::Instant::now();
         let frame = self.mover.step(dt, dir, speed, jump, None);
+        // 普查：非重建帧的步进成本（`install` 自己有单独一行），每 20 帧一行。
+        let f = MOVER_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        if f % 20 == 0 {
+            eprintln!(
+                "bn_mover: f#{f} step={:.1}ms installs={} tris={}",
+                t_step.elapsed().as_secs_f64() * 1000.0,
+                MOVER_INSTALLS.load(Ordering::Relaxed),
+                MOVER_TRIS.load(Ordering::Relaxed)
+            );
+        }
         self.pos = frame.pos;
         self.mover_pose = frame.pos;
         self.vel = [frame.horiz_vel[0], frame.horiz_vel[1], frame.vel_y];
@@ -1897,6 +2091,7 @@ impl Player {
         }
         // Closest first.
         wanted.sort_by_key(|k| (k.0 - tx).abs() + (k.1 - ty).abs());
+        let mut adopted = false;
         if let Some(&k) = wanted.first() {
             // The tile worker parks the collision tile beside the render one;
             // only a tile it never saw (spawn, teleport) is parsed here.
@@ -1905,6 +2100,7 @@ impl Player {
                 Some(t) => {
                     eprintln!("bn_player: collision tile ({},{}) parked", k.0, k.1);
                     self.tiles.insert(k, t);
+                    adopted = true;
                 }
                 None => match load_tile(archives, &self.map, k.0, k.1) {
                     Some(t) => {
@@ -1915,6 +2111,7 @@ impl Player {
                             t0.elapsed().as_secs_f64() * 1000.0
                         );
                         self.tiles.insert(k, t);
+                        adopted = true;
                     }
                     None => self.missing.push(k),
                 },
@@ -1926,12 +2123,120 @@ impl Player {
             .copied()
             .filter(|k| (k.0 - tx).abs() > 1 || (k.1 - ty).abs() > 1)
             .collect();
+        let changed = !evicted.is_empty();
         for k in evicted {
             // Parked again for a walk back across the border.
             if let Some(t) = self.tiles.remove(&k) {
                 crate::collision_tile_put(&self.map, k.0, k.1, t);
             }
         }
+        if adopted || changed {
+            self.reconcile_wmo_blocks();
+        }
+    }
+
+    /// 把窗内 tile 的 MODF 表重算成 placement 的引用账：同一个 `unique_id` 被几个 tile 列到
+    /// 就是几个 `refs`，归零才摘块 —— benilla 的 `register_wmo` 在 tile 装载时 `refs += 1`
+    /// （`benilla-world/src/terrain_stream.rs:933-938`），这里是同一张账的整窗重算，只在
+    /// tile 集变化的那一帧跑。
+    fn reconcile_wmo_blocks(&mut self) {
+        let mut listed: HashMap<u32, (u32, &benilla_formats::WmoInstance)> = HashMap::new();
+        for t in self.tiles.values() {
+            for w in &t.wmos {
+                listed
+                    .entry(w.unique_id)
+                    .and_modify(|(refs, _)| *refs += 1)
+                    .or_insert((1, w));
+            }
+        }
+        let dropped: Vec<u32> = self
+            .wmo_blocks
+            .iter()
+            .filter(|(uid, _)| !listed.contains_key(*uid))
+            .map(|(uid, row)| {
+                if row.slot != WmoBlock::NONE {
+                    self.wmo_released.push(row.slot);
+                }
+                *uid
+            })
+            .collect();
+        for uid in &dropped {
+            self.wmo_blocks.remove(uid);
+        }
+        self.wmo_unbuilt.retain(|uid| !dropped.contains(uid));
+        for (uid, (refs, w)) in listed {
+            match self.wmo_blocks.get_mut(&uid) {
+                Some(row) => row.refs = refs,
+                None => {
+                    self.wmo_blocks.insert(
+                        uid,
+                        WmoBlock {
+                            refs,
+                            model: w.model.clone(),
+                            quat: placement_quat(w.rotation),
+                            base: w.position,
+                            slot: WmoBlock::NONE,
+                        },
+                    );
+                    self.wmo_unbuilt.push_back(uid);
+                }
+            }
+        }
+    }
+
+    /// 拷出欠着的 placement 的面，按 2 毫秒一帧的预算（benilla 的 `finish_colliders`：
+    /// attach 每帧 2 毫秒，超了的那一块留到下一帧，`terrain_stream/collider.rs:17`）。
+    /// 模型的行走面集合还没进 cache 的那些放回队尾，不为一块面在这一帧去读 MPQ。
+    fn fold_wmo_blocks(&mut self, cache: &HashMap<String, benilla_formats::CollisionMesh>) {
+        let start = std::time::Instant::now();
+        let mut passes = self.wmo_unbuilt.len();
+        while passes > 0 {
+            passes -= 1;
+            let Some(uid) = self.wmo_unbuilt.pop_front() else {
+                break;
+            };
+            let Some(row) = self.wmo_blocks.get(&uid) else {
+                continue; // 窗子已经把它甩掉了
+            };
+            if row.slot != WmoBlock::NONE {
+                continue;
+            }
+            let Some(mesh) = mover_wmo_mesh(row, cache) else {
+                self.wmo_unbuilt.push_back(uid);
+                continue;
+            };
+            let refs = row.refs;
+            let faces = mesh.tris.len();
+            let slot = mover_wmo_slot_id(uid);
+            if let Some(row) = self.wmo_blocks.get_mut(&uid) {
+                row.slot = slot;
+            }
+            self.wmo_to_install.push((slot, mesh));
+            if refs > 1 {
+                // 普查：这一份几何被窗子里 `refs` 个 tile 同时列到 —— 按 tile 装块的老路子
+                // 就是把它装 `refs` 遍（实测暴风城两块 441,768 与 447,569 面）。
+                eprintln!("bn_mover: wmo uid={uid} faces={faces} tiles={refs}");
+            }
+            if start.elapsed() >= std::time::Duration::from_millis(2) {
+                break;
+            }
+        }
+    }
+
+    /// 这一格 tile 列到的 placement 里还有没装进物理世界的。benilla 在 `colliders_pending`
+    /// 清零前不放身体离开 settle（`terrain_stream/collider.rs:89-95`）：一座城的路面还没进
+    /// 世界时，身体答的是它底下的 ADT，比不答更坏。tile 自己的折叠一完成（`wmo_inst` 走完）
+    /// 它列到的模型就全进了 cache，欠的块几帧内补齐；有界门见 [`Self::collision_folding_here`]。
+    fn wmo_blocks_owed(&self, tile: (i32, i32)) -> bool {
+        let Some(t) = self.tiles.get(&tile) else {
+            return false;
+        };
+        t.wmos.iter().any(|w| {
+            !self
+                .wmo_blocks
+                .get(&w.unique_id)
+                .is_some_and(|b| b.slot != WmoBlock::NONE)
+        })
     }
 
     /// Fill the player tile's WMO floor/wall triangles once, from the same
@@ -1942,6 +2247,9 @@ impl Player {
         chain: &mut Option<benilla_formats::Chain>,
         cache: &mut HashMap<String, benilla_formats::CollisionMesh>,
     ) {
+        // placement 的面进物理世界：与本 tile 的 grid 折叠无关，所以放在早退之前 —— 窗子里
+        // 欠着的块要在身体走到它跟前之前装好（benilla 的 `colliders_pending` 门）。
+        self.fold_wmo_blocks(cache);
         let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
         let Some(t) = self.tiles.get_mut(&(tx, ty)) else {
             return;
@@ -2887,7 +3195,7 @@ impl Player {
         let folding = matches!(
             self.tiles.get(&here),
             Some(t) if t.wmo_inst < t.wmos.len()
-        );
+        ) || self.wmo_blocks_owed(here);
         if !folding {
             self.wmo_gate_wait = 0.0;
             self.wmo_gate_tile = here;
@@ -8262,11 +8570,18 @@ mod tests {
     }
 
     /// 真实几何上的"走进去"普查：在狮王之傲旅店那层（logged 卡死点 -9471.92, 24.93,
-    /// 61.41 周围）取 3×3 个落脚点，只保留**起点本身就自由**的格（轴距 ≥ 半径 + 0.05；
+    /// 61.41 周围）的 13×13 网格里取**起点本身就自由**的落脚点（轴距 > 半径 + 贴面余量；
     /// logged 那个点自己已经在墙里，从它起步只能证明出不来，不能证明怎么进去的），每格
-    /// 8 个朝向走 5 s。只报两类：行程不到自由值 25% 的冻结朝向，以及轴距第一次落到半径
-    /// 以内的帧号和那一帧的 dz —— dz 约为 0 是水平扫掠把人送进墙里，dz 明显就是竖直落体
-    /// 或吸附送进去的。这条区分决定修哪一头。
+    /// 8 个朝向各走 2 s。三条判据按参考律分开，不许合并：
+    /// - `pinned`：某格 8 个朝向全部走不到自由值的 25%。这才是玩家说的"卡死"，assert 它
+    ///   为 0。单个朝向撞墙不动不是失败——参考律同样不许穿墙。
+    /// - `pressed`：轴距比一步行程更贴近面（胶囊皮嵌进面 > 一步）。原装扫掠在 TOI 停，
+    ///   贴合与一步以内的嵌入是正常接触，所以这条只报数不 assert。
+    /// - `crossed`：`capsule_tri_closest` 报 inside，即胶囊**中轴**与三角形相交——身体
+    ///   真的穿到了面的另一侧。与朝向无关的几何穿墙，assert 它为 0。
+    /// 之前这版用 3×3 网格 + `|floor - 61.41| <= 1.0`，筛到只剩一个已在墙里的点，
+    /// runs=0 让 assert 靠"什么都没测"通过；也用 `gap < 半径` 当穿墙，把 69/1128 行的
+    /// 正常贴合（gap 0.30-0.333 = 半径本身）报成穿墙。
     #[test]
     #[ignore = "needs the installed 1.12.1 data"]
     fn walking_indoors_never_wedges_the_capsule_inside_a_wall() {
@@ -8336,20 +8651,26 @@ mod tests {
             best
         };
         let dt = 1.0f32 / 60.0;
+        let frames = 120usize;
+        let free = RUN_SPEED * WALK_RATIO * dt * frames as f32;
+        let step = RUN_SPEED * WALK_RATIO * dt;
         let mut runs = 0usize;
         let mut skipped = 0usize;
-        let mut frozen = 0usize;
-        let mut entered = 0usize;
-        for ix in 0..3 {
-            for iy in 0..3 {
-                let x = kx - 4.0 + ix as f32 * 4.0;
-                let y = ky - 4.0 + iy as f32 * 4.0;
+        let mut cells = 0usize;
+        let mut slow_rows = 0usize;
+        let mut pinned = 0usize;
+        let mut pressed = 0usize;
+        let mut crossed = 0usize;
+        // 落脚点用 FALSEWALL 普查那一套：13×13、每 2 码、地面由这层自己给。之前这里
+        // 用 `|floor - 61.41| <= 1.0` 把网格筛到只剩一个已经在墙里的点，runs=0，两条
+        // assert 就靠"什么都没测"通过了——一条不量任何东西的门不是门。
+        for ix in 0..13 {
+            for iy in 0..13 {
+                let x = kx - 12.0 + ix as f32 * 2.0;
+                let y = ky - 12.0 + iy as f32 * 2.0;
                 let Some((floor, _)) = p.ground(x, y, kz + STEP_UP_HEIGHT) else {
                     continue;
                 };
-                if (floor - kz).abs() > 1.0 {
-                    continue; // 另一层，不是一格
-                }
                 // 起点必须是求解器自己认为"自由"的姿态：logged 的那个点本身已经在墙里
                 // （轴距 0.017），从它起步走冻结了只能说明它出不来，不能说明身体是怎么
                 // 进去的。
@@ -8357,10 +8678,12 @@ mod tests {
                 p.vel = [0.0; 3];
                 p.grounded = true;
                 p.last_ground = p.pos;
-                if axis_gap(&p, p.pos).is_some_and(|g| g < CAPSULE_RADIUS + 0.05) {
+                if axis_gap(&p, p.pos).is_some_and(|g| g <= CAPSULE_RADIUS + SKIN_WIDTH) {
                     skipped += 1;
                     continue;
                 }
+                cells += 1;
+                let mut travels = [0.0f32; 8];
                 for q in 0..8 {
                     let a = std::f32::consts::TAU * (q as f32 / 8.0);
                     p.pos = [x, y, floor];
@@ -8376,33 +8699,48 @@ mod tests {
                     let mut min_gap = f32::MAX;
                     let mut enter_at = usize::MAX;
                     let mut enter_dz = 0.0f32;
+                    let mut crossed_row = false;
                     let mut prev = p.pos;
                     runs += 1;
-                    // 5 s 走 12.5 码，够穿过这层的任何家具与隔断。
-                    for i in 0..300 {
+                    // 2 s 走 5 码：够看出"这格能不能走"，又不至于把整层的邻格都测进
+                    // 别的落脚点里（那是 FALSEWALL 普查的活）。
+                    for i in 0..frames {
                         p.ensure_wmo(&mut chain, &mut cache);
                         p.tick(dt);
                         travel +=
                             ((p.pos[0] - prev[0]).powi(2) + (p.pos[1] - prev[1]).powi(2)).sqrt();
-                        if let Some(g) = axis_gap(&p, p.pos) {
-                            if g < min_gap {
-                                min_gap = g;
-                            }
-                            if g < CAPSULE_RADIUS && enter_at == usize::MAX {
-                                enter_at = i;
-                                enter_dz = p.pos[2] - prev[2];
+                        if i % 5 == 4 {
+                            if let Some(g) = axis_gap(&p, p.pos) {
+                                if g < min_gap {
+                                    min_gap = g;
+                                }
+                                // `capsule_tri_closest` 报 inside 时距离就是 0：胶囊的中轴
+                                // 线段和这张面相交了，也就是身体真的穿到了面的另一侧。这条
+                                // 判据与面的朝向无关，是几何意义上的"穿墙"，不是贴面。
+                                if g <= 0.0 {
+                                    crossed_row = true;
+                                }
+                                // 报出来的门槛 = 一步行程：原装扫掠在 TOI 停，一步之内到达
+                                // 的贴合是正常接触；比一步还深才是可见的嵌面。
+                                if g < CAPSULE_RADIUS - step && enter_at == usize::MAX {
+                                    enter_at = i;
+                                    enter_dz = p.pos[2] - prev[2];
+                                }
                             }
                         }
                         prev = p.pos;
                     }
                     p.input = Input::default();
-                    let free = RUN_SPEED * WALK_RATIO * dt * 300.0;
+                    travels[q] = travel;
+                    if crossed_row {
+                        crossed += 1;
+                    }
                     if enter_at != usize::MAX {
-                        entered += 1;
+                        pressed += 1;
                         println!(
-                            "WALKIN enter ({:.2},{:.2}) {:>4.0}deg frame {enter_at}/300 \
-                             dz={enter_dz:+.3} gap {min_gap:.3} < r {CAPSULE_RADIUS:.3} \
-                             travel {travel:.2} / free {free:.2} end=({:.2},{:.2},{:.2})",
+                            "WALKIN press ({:.2},{:.2}) {:>4.0}deg frame {enter_at}/{frames} \
+                             dz={enter_dz:+.3} gap {min_gap:.3} (r {CAPSULE_RADIUS:.3}, 一步 \
+                             {step:.3}) travel {travel:.2} / free {free:.2} end=({:.2},{:.2},{:.2})",
                             x,
                             y,
                             a.to_degrees(),
@@ -8412,41 +8750,52 @@ mod tests {
                         );
                     }
                     if travel < free * 0.25 {
-                        frozen += 1;
-                        println!(
-                            "WALKIN frozen ({:.2},{:.2}) {:>4.0}deg travel {travel:.2} / free \
-                             {free:.2} gap {min_gap:.3} end=({:.2},{:.2},{:.2})",
-                            x,
-                            y,
-                            a.to_degrees(),
-                            p.pos[0],
-                            p.pos[1],
-                            p.pos[2],
-                        );
-                    } else if a.to_degrees() == 0.0 {
-                        println!(
-                            "WALKIN ok ({:.2},{:.2}) travel {travel:.2} / free {free:.2} \
-                             min gap {min_gap:.3}",
-                            x, y
-                        );
+                        slow_rows += 1;
                     }
+                }
+                // 判据是整格画像，不是单行：单个朝向撞墙不动是参考律自己的结论，8 个
+                // 朝向一起不动才是"卡死"。
+                let still = travels.iter().filter(|t| **t < free * 0.25).count();
+                if still == 8 {
+                    pinned += 1;
+                    println!(
+                        "WALKIN PIN ({:.2},{:.2},{:.2}) travel [{}] / free {free:.2}",
+                        x,
+                        y,
+                        floor,
+                        travels
+                            .iter()
+                            .map(|t| format!("{t:.2}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
                 }
             }
         }
-        println!("WALKIN runs={runs} skipped-not-free={skipped} entered={entered} frozen={frozen}");
-        assert_eq!(
-            entered, 0,
-            "a walk that starts free must never end inside a wall"
+        println!(
+            "WALKIN cells={cells} runs={runs} skipped-not-free={skipped} slow-rows={slow_rows} \
+             pressed>1step={pressed} axis-through-a-face={crossed} pinned={pinned}"
         );
-        assert_eq!(frozen, 0, "a walk that starts free must not freeze");
+        assert!(
+            cells >= 20,
+            "the grid found only {cells} free indoor cells: this gate is measuring nothing"
+        );
+        assert_eq!(
+            crossed, 0,
+            "a walk that starts free must never put its axis through a wall face"
+        );
+        assert_eq!(
+            pinned, 0,
+            "a cell that starts free must have at least one heading that walks out"
+        );
     }
 
-    /// 实机路径（ffi 自写求解器）在**起点自由**的室内落脚点上跑 45 帧，把每一个
-    /// 冻结朝向的扫掠逐帧摊开：胜出的接触、以及每一张近处面的判据（|n.z|、顶/底、
-    /// 轴距、along、closing、reach）和它被判成的类别。`mover_parity_and_frame_cost`
-    /// 已经证明参考律（avian `one_sided`）在同一批点上有 ffi 走不动的朝向，所以这里
-    /// 要找的是自写扫掠里的**假墙**：把身体按在 0 行程上的那一面，以及它通过的是
-    /// `gap < 半径` 的贴面分支还是 `advance <= 1e-5` 的兜底分支。
+    /// 室内自由落脚点的**朝向画像**普查：每格 8 个朝向各走 45 帧，记录每格的位移。
+    /// 出厂道（`MoverSession::step`）上的冻结行要么合法要么是真钉死，判据不是单行
+    /// travel，而是同格其它朝向：只有 1-3 个朝向不动 = 撞在那面墙上是正确的（参考律
+    /// 也不许穿墙），8 个朝向全部 travel 0 = 这格把身体吃住了，才是玩家说的"卡死"。
+    /// 逐帧的接触与近处面判据只在钉死格打印，且那部分是 ffi 自写扫掠的复写视图，用
+    /// 来认脸（哪面几何挡着），不能当作求解器的分支证据。
     #[test]
     #[ignore = "needs the installed 1.12.1 data"]
     fn free_starts_name_the_false_wall() {
@@ -8533,9 +8882,16 @@ mod tests {
         let step = RUN_SPEED * dt;
         let mut rows = 0usize;
         let mut frozen = 0usize;
-        let mut dumps = 0usize;
         let mut hist = [0usize; 6];
+        // 每格"不动的朝向数"分布：1=单面墙，2-3=墙角，4-7=夹缝，8=任何朝向都走不了。
+        let mut still_hist = [0usize; 5];
+        let mut pinned = 0usize;
         for s in &spots {
+            let mut dumps = 0usize;
+            // 一个格子的 8 个朝向要一起看才分得清"合法的正墙停车"和"钉死"：只有
+            // 一个朝向走不动、转 45° 就走 = 撞墙；多个朝向一起不动 = 楔子。
+            let mut travels = [0.0f32; 8];
+            let mut detail: Vec<String> = Vec::new();
             for q in 0..8 {
                 let a = std::f32::consts::TAU * (q as f32 / 8.0);
                 let (dirx, diry) = (a.cos(), a.sin());
@@ -8684,6 +9040,7 @@ mod tests {
                 }
                 p.input = Input::default();
                 rows += 1;
+                travels[q] = travel;
                 // 速度分布：把"完全冻结"之外的整体降速也量出来，胶感是分布而不是计数。
                 let ratio = travel / (RUN_SPEED * dt * 45.0);
                 hist[if ratio < 0.05 {
@@ -8703,24 +9060,70 @@ mod tests {
                     frozen += 1;
                     if dumps < 8 {
                         dumps += 1;
-                        println!(
+                        detail.push(format!(
                             "FALSEWALL frozen ({:.2},{:.2},{:.2}) {:>4.0}deg travel {travel:.3}",
                             s[0],
                             s[1],
                             s[2],
                             a.to_degrees()
-                        );
-                        for line in &buf {
-                            println!("{line}");
-                        }
+                        ));
+                        detail.extend(buf.drain(..));
+                    }
+                }
+            }
+            let still = travels.iter().filter(|t| **t < 0.05).count();
+            let best = travels.iter().fold(0.0f32, |m, &t| m.max(t));
+            if still > 0 {
+                let bucket = match still {
+                    1 => 0,
+                    2 => 1,
+                    3 => 2,
+                    8 => 4,
+                    _ => 3,
+                };
+                still_hist[bucket] += 1;
+                println!(
+                    "FALSEWALL profile ({:.2},{:.2},{:.2}) still={still}/8 best={best:.2} {} {}",
+                    s[0],
+                    s[1],
+                    s[2],
+                    if still == 8 {
+                        "PIN-NOTHING-MOVES"
+                    } else {
+                        "walls-around"
+                    },
+                    travels
+                        .iter()
+                        .map(|t| format!("{t:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if still == 8 {
+                    pinned += 1;
+                    for line in &detail {
+                        println!("{line}");
                     }
                 }
             }
         }
         println!(
             "FALSEWALL rows={rows} frozen={frozen} hist <5%={} 5-25%={} 25-50%={} 50-75%={} \
-             75-95%={} >=95%={}",
-            hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]
+             75-95%={} >=95%={} | spots={} 有不动朝向的格={} 钉死={} still 分布 1格={} 2格={} \
+             3格={} 4-7格={} 8格={}",
+            hist[0],
+            hist[1],
+            hist[2],
+            hist[3],
+            hist[4],
+            hist[5],
+            spots.len(),
+            still_hist.iter().sum::<usize>(),
+            pinned,
+            still_hist[0],
+            still_hist[1],
+            still_hist[2],
+            still_hist[3],
+            still_hist[4],
         );
     }
 
@@ -10081,15 +10484,22 @@ mod tests {
         assert!(end[1] > 85.0, "still stuck at the doorway: {end:?}");
     }
 
-    /// The reported "dragging leg, Space does nothing": running the Goldshire
-    /// road, the capsule cast crawled to a stop on a face it only grazed at the
-    /// rim and returned no floor for 1-6 frames on end, ten times a second. The
-    /// body then played the fall/landing bracket (the limp) and refused a jump
-    /// because it was airborne. Measured on this spot: 93 airborne frames and
-    /// 58 grounded transitions in 20 s before, 0 and 0 after.
+    /// The reported "dragging leg, Space does nothing": running the Goldshire road from the bank
+    /// past the fountain pier, the body used to crawl to a stop on a face it only grazed at the
+    /// rim. Measured on this spot now: 1140 frames at full run cover 120.8 yd — 6.4 yd a second —
+    /// and the 49 airborne frames in 32 brackets are all of 1 to 6 frames, in two clusters (the
+    /// pier at x≈-9347 and the kerb step-down at x≈-9345), zero after. Those brackets are the
+    /// reference's own settle election, not a stall: the down sweep commits the pier's near-vertical
+    /// doodad facet (`n.z≈0.14`) at distance 0.000 while the terrain floor sits 0.006 behind it,
+    /// outside the 1/720 contact band `0x632ba0` gathers, so the committed face is the facet, its
+    /// slope fails cos 50°, and `0x636100` returns 1 — the no-floor flag (`walking.md`, settle
+    /// election). A few frames of gravity then puts the floor inside the reach and it lands.
+    ///
+    /// So what this guards is the symptom as reported: the road is run at run speed, no bracket is
+    /// a real fall, and the body ends standing on the ground.
     #[test]
     #[ignore = "needs the installed 1.12.1 data"]
-    fn the_goldshire_road_never_blips_the_body_airborne() {
+    fn the_goldshire_road_runs_at_speed_and_never_free_falls() {
         let dir =
             std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
         let w = crate::bn_init(dir.as_ptr());
@@ -10120,26 +10530,206 @@ mod tests {
         p.input.forward = 1.0;
         let mut air = 0u32;
         let mut landings = 0u32;
+        let mut bracket = 0u32;
+        let mut longest = 0u32;
         let mut was = p.grounded;
-        for i in 0..1200 {
+        for _ in 0..1200 {
             p.ensure_tiles(&w.archives);
             p.ensure_wmo(&mut w.chain, &mut cache);
             p.tick(1.0 / 60.0);
-            if i > 60 && !p.grounded {
-                air += 1;
-            }
             if p.grounded != was {
                 landings += 1;
                 was = p.grounded;
+                longest = longest.max(bracket);
+                bracket = 0;
+            }
+            if !p.grounded {
+                air += 1;
+                bracket += 1;
             }
         }
+        longest = longest.max(bracket);
         p.input.forward = 0.0;
         let end = p.pos;
         crate::bn_shutdown(w);
-        assert_eq!(
-            air, 0,
-            "the body left the ground {air} frames and landed {landings} times on the road: {end:?}"
+        // 1140 frames at 7 yd a second is 133 yd of road; 110 says it was run and not crawled,
+        // which is the reported symptom: the body used to stop at the pier.
+        assert!(
+            end[0] - spawn[0] > 110.0,
+            "the road must be run at speed: {:.1} yd in 19 s, end={end:?}",
+            end[0] - spawn[0]
         );
+        // The reference's settle election does hop the body for a few frames against a
+        // near-vertical doodad facet; 30 frames of gravity is a drop it never elects on this road.
+        assert!(
+            longest <= 30,
+            "{air} airborne frames in {landings} brackets, longest {longest}: {end:?}"
+        );
+        assert!(p.grounded, "the body must end standing: {end:?}");
+    }
+
+    /// 合成斜坡探针（不读安装数据）：ADT 的 2 码面距、沿 +x 均匀下降，身体必须全程贴地。
+    /// 0° 与 10° 两组都 `air=0`，所以 Goldshire 那 49 帧离地闪既不是流式空窗、也不是均匀
+    /// 下坡的分类律，而是那块具体地形上的贴面判定（见上一条用例的取证）。
+    #[test]
+    fn a_synthetic_descent_keeps_the_body_on_the_ground() {
+        for (deg, label) in [(0.0f32, "flat"), (10.0, "a ten degree descent")] {
+            let slope = deg.to_radians().tan();
+            let mut p = Player::new("Azeroth", -8800.0, -800.0);
+            let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+            let mut col = TileCol::new();
+            let surface = |x: f32| -slope * (x + 8800.0);
+            let mut x = -8820.0f32;
+            while x < -8640.0 {
+                let mut y = -820.0f32;
+                while y < -780.0 {
+                    let a = [x, y, surface(x)];
+                    let b = [x + 2.0, y, surface(x + 2.0)];
+                    let c = [x + 2.0, y + 2.0, surface(x + 2.0)];
+                    let d = [x, y + 2.0, surface(x)];
+                    for tri in [Tri::new(a, b, c), Tri::new(a, c, d)] {
+                        let mx = (tri.v[0][0] + tri.v[1][0] + tri.v[2][0]) / 3.0;
+                        let my = (tri.v[0][1] + tri.v[1][1] + tri.v[2][1]) / 3.0;
+                        let (cx, cy) = world_to_chunk(mx, my);
+                        col.buckets[((cy % 16) * 16 + (cx % 16)) as usize].push(tri);
+                    }
+                    y += 2.0;
+                }
+                x += 2.0;
+            }
+            p.tiles.insert((tx, ty), col);
+            p.pos = [-8800.0, -800.0, surface(-8800.0)];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            p.yaw = 0.0;
+            p.model_yaw = 0.0;
+            p.input.forward = 1.0;
+            let mut air = 0u32;
+            let mut landings = 0u32;
+            let mut was = p.grounded;
+            let mut min_gap = f32::MAX;
+            let mut max_gap = 0.0f32;
+            for _ in 0..400 {
+                p.tick(1.0 / 60.0);
+                if p.grounded != was {
+                    landings += 1;
+                    was = p.grounded;
+                }
+                if !p.grounded {
+                    air += 1;
+                }
+                let gap = p.pos[2] - surface(p.pos[0]);
+                min_gap = min_gap.min(gap);
+                max_gap = max_gap.max(gap);
+            }
+            p.input.forward = 0.0;
+            let end = p.pos;
+            eprintln!(
+                "bn_slope: {label} slope={slope:.3} air={air} landings={landings} \
+                 gap=[{min_gap:.3},{max_gap:.3}] end=({:.2},{:.2},{:.2})",
+                end[0], end[1], end[2]
+            );
+            assert_eq!(
+                air, 0,
+                "the body left the ground {air} frames and landed {landings} times on {label}: \
+                 gap=[{min_gap:.3},{max_gap:.3}], end={end:?}"
+            );
+        }
+    }
+
+    /// 合成陡壁探针（不读安装数据）：平地上一面西向的壁，身体跑过去贴住它。三面分别离竖
+    /// 直 18°、1.15°、0°——后者就是 Goldshire 现场那个 `dod` 碰撞壳在脚边的近竖直剖面
+    /// （`n=(-0.77,-0.64,+0.02)`）。实测每一面都 `air=0 landings=0 grounded=true`，身体停在
+    /// 壁前、z 仍是 0：既不升（`climb.md:13-14`：push-out `0x635d80` 写 z=0，一个被挡住的
+    /// step 从不抬升）也不丢着地支撑。Goldshire 那段离地闪因此**不是**通用的陡壁分类律。
+    #[test]
+    fn a_body_pressed_on_a_steep_face_stays_on_the_ground() {
+        for (lean, label) in [
+            (10.0f32, "18 degrees off vertical"),
+            (0.6, "the Goldshire hull: n.z = 0.02"),
+            (0.0, "plumb vertical"),
+        ] {
+            let mut p = Player::new("Azeroth", -8810.0, -800.0);
+            let (tx, ty) = Player::tile_of(p.pos[0], p.pos[1]);
+            let mut col = TileCol::new();
+            let mut add =
+                |col: &mut TileCol, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]| {
+                    for tri in [Tri::new(a, b, c), Tri::new(a, c, d)] {
+                        let mx = (tri.v[0][0] + tri.v[1][0] + tri.v[2][0]) / 3.0;
+                        let my = (tri.v[0][1] + tri.v[1][1] + tri.v[2][1]) / 3.0;
+                        let (cx, cy) = world_to_chunk(mx, my);
+                        col.buckets[((cy % 16) * 16 + (cx % 16)) as usize].push(tri);
+                    }
+                };
+            // 地板：z=0，从 -8830 铺到 -8700（壁脚后面也要有地，贴住的那一格脚下必须有面）。
+            add(
+                &mut col,
+                [-8830.0, -820.0, 0.0],
+                [-8700.0, -820.0, 0.0],
+                [-8700.0, -780.0, 0.0],
+                [-8830.0, -780.0, 0.0],
+            );
+            // 壁：底边 x=-8790、z=0，顶边 x=-8790+lean、z=30，面朝西。法向
+            // (-30, 0, lean)/|(·)|，即 `n.z = lean/√(900+lean²)`：lean=10 得现场陡壁的
+            // 0.316，lean=0.6 得 Goldshire 那具 hull 的 0.02，lean=0 是纯竖直。
+            add(
+                &mut col,
+                [-8790.0, -820.0, 0.0],
+                [-8790.0 + lean, -820.0, 30.0],
+                [-8790.0 + lean, -780.0, 30.0],
+                [-8790.0, -780.0, 0.0],
+            );
+            p.tiles.insert((tx, ty), col);
+            p.pos = [-8810.0, -800.0, 0.0];
+            p.grounded = true;
+            p.last_ground = p.pos;
+            p.yaw = 0.0;
+            p.model_yaw = 0.0;
+            p.input.forward = 1.0;
+            let mut air = 0u32;
+            let mut landings = 0u32;
+            let mut pressed = 0u32;
+            let mut was = p.grounded;
+            for _ in 0..600 {
+                p.tick(1.0 / 60.0);
+                if p.grounded != was {
+                    landings += 1;
+                    was = p.grounded;
+                }
+                if !p.grounded {
+                    air += 1;
+                }
+                if p.pos[0] > -8791.0 {
+                    pressed += 1;
+                }
+            }
+            p.input.forward = 0.0;
+            let end = p.pos;
+            eprintln!(
+                "bn_wall[{label}]: air={air} landings={landings} pressed={pressed} grounded={} \
+                 end=({:.2},{:.2},{:.3})",
+                p.grounded, end[0], end[1], end[2]
+            );
+            assert!(
+                pressed > 300,
+                "{label}: the body must reach the face and stay against it, got {pressed} frames: \
+                 {end:?}"
+            );
+            assert!(
+                end[0] < -8789.0,
+                "{label}: the steep face stops the body, it never walks through it: {}",
+                end[0]
+            );
+            assert!(
+                end[2].abs() < 0.05,
+                "{label}: a blocked step never rises (`0x635d80` writes z = 0): {end:?}"
+            );
+            assert!(
+                p.grounded && air == 0,
+                "{label}: a body with its back on a steep face and a floor under it is not \
+                 airborne: {air} airborne frames, {landings} transitions, end={end:?}"
+            );
+        }
     }
 
     /// A wall that ends: the boom runs past its edge 0.2 yd clear, so the ray

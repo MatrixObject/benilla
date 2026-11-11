@@ -5,6 +5,7 @@
 use avian3d::character_controller::move_and_slide::MoveHitData;
 use avian3d::prelude::*;
 use bevy::prelude::*;
+use std::collections::HashMap;
 
 use super::{
     move_trace, Player, CAPSULE_HEIGHT, CAPSULE_RADIUS, FEATHER_TERMINAL_VELOCITY,
@@ -2434,7 +2435,7 @@ pub struct MoverSession {
     app: App,
     player: Player,
     capsule: Collider,
-    meshes: Vec<Entity>,
+    meshes: HashMap<u64, Entity>,
 }
 
 impl Default for MoverSession {
@@ -2469,33 +2470,48 @@ impl MoverSession {
             player: Player::default(),
             // 与 setup.rs 的玩家胶囊同一构造。
             capsule: Collider::capsule(CAPSULE_RADIUS, CAPSULE_HEIGHT - 2.0 * CAPSULE_RADIUS),
-            meshes: Vec::new(),
+            meshes: HashMap::new(),
         }
     }
 
-    /// 用宿主这一批碰撞面整体替换场景（流式换 tile / WMO / doodad）。
-    pub fn install(&mut self, meshes: &[MoverMesh]) {
-        for e in self.meshes.drain(..) {
-            self.app.world_mut().despawn(e);
+    /// 流式增删碰撞块：`down` 里的 id 摘掉，`up` 里的装入（同 id 先摘后装），只做一次
+    /// 世界重建。宿主按 tile 与折叠阶段逐块维护，所以一块面的成本只与它自己有关。
+    pub fn apply_slots(&mut self, down: &[u64], up: &[(u64, MoverMesh)]) {
+        if down.is_empty() && up.is_empty() {
+            return;
         }
-        for m in meshes {
-            // WoW 轴 → Bevy（`benilla-assets/src/coords.rs:10` 的同一映射）。
-            let verts: Vec<Vec3> = m
-                .verts
-                .iter()
-                .map(|v| Vec3::new(-v[1], v[2], -v[0]))
-                .collect();
-            let mut e = self.app.world_mut().spawn((
-                RigidBody::Static,
-                Collider::trimesh(verts, m.tris.clone()),
-                Transform::default(),
-            ));
-            if m.layer != 0 {
-                e.insert(CollisionLayers::new(LayerMask(1 << m.layer), LayerMask::ALL));
+        for id in down {
+            if let Some(e) = self.meshes.remove(id) {
+                self.app.world_mut().despawn(e);
             }
+        }
+        for (id, m) in up {
+            if let Some(e) = self.meshes.remove(id) {
+                self.app.world_mut().despawn(e);
+            }
+            let e = self.spawn_mesh(m);
+            self.meshes.insert(*id, e);
         }
         // 一帧重建 Position/Rotation 与空间查询树。
         self.app.update();
+    }
+
+    /// WoW 轴 → Bevy（`benilla-assets/src/coords.rs:10` 的同一映射）。
+    fn spawn_mesh(&mut self, m: &MoverMesh) -> Entity {
+        let verts: Vec<Vec3> = m
+            .verts
+            .iter()
+            .map(|v| Vec3::new(-v[1], v[2], -v[0]))
+            .collect();
+        let mut e = self.app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::trimesh(verts, m.tris.clone()),
+            Transform::default(),
+        ));
+        if m.layer != 0 {
+            e.insert(CollisionLayers::new(LayerMask(1 << m.layer), LayerMask::ALL));
+        }
+        e.id()
     }
 
     /// 采纳一个外部位姿（登录/传送/服务端强制校正）：清速度与贴地状态，下一帧由 `step` 重新分类。
