@@ -12,6 +12,7 @@
 //! Player position is raw WoW world yards - the same space the ADT chunks and
 //! MODF placements use - so `(x, -y, z) * 100` is the UE transform.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -114,12 +115,14 @@ const SLIDE_CONTACT_PREDICTION: f32 = SKIN_WIDTH * 2.0;
 const SLIDE_DOT_EPSILON: f32 = 0.005;
 /// avian's `MIN_DISTANCE` in the slide loop: a budget below this is spent.
 const SLIDE_MIN_TRAVEL: f32 = 1.0e-4;
-/// How long the mover waits for a tile's WMO collision set to finish folding
-/// before it stops gating on it. The reference's set is complete before the
-/// body can move in; ours folds over ticks, and a gate that never lifts (an
-/// instance whose cells never stream) freezes the body on ground that looks
-/// empty - the "nothing here and I cannot walk" report.
-const WMO_GATE_MAX_S: f32 = 2.0;
+/// How long the mover waits on a WMO collision set that is not advancing. The reference's settle
+/// hold releases on the destination's residency with every collider attached, and its
+/// `SETTLE_TIMEOUT` is a *stall* budget: while the stream moves the deadline is pushed, and only
+/// a stream that changes nothing for the whole budget lets the body go
+/// (`benilla-app/src/player/world_focus.rs:127-146`). A gate that instead counts wall clock cuts
+/// a cold city load mid-fold and answers with the ADT under the pavement — the body drops through
+/// its own street and is unrecoverable.
+const WMO_GATE_MAX_S: f32 = 6.0;
 /// The water kinds' accept margin for a submerged point (yd): the reference's camera probe
 /// compares `z < surface + 0.01` at `0x69ba23` (the f32 `0x3c23d70a`), so the view turns
 /// submerged as the near rectangle's lowest corner reaches the surface. Magma and slime
@@ -763,12 +766,18 @@ struct WmoBlock {
     model: String,
     quat: [f32; 4],
     base: [f32; 3],
-    /// 已装入物理世界的块 id；[`WmoBlock::NONE`] = 还欠着。
+    /// 已装入物理世界的块 id；[`WmoBlock::NONE`] = 还欠着，[`WmoBlock::EMPTY`] = 这模型没有
+    /// 可行走的面（账关掉，门不为它一直按着）。
     slot: u64,
+    /// 面已拷好、在这一帧的 `apply_slots` 里交给物理世界：排队不等于装好，[`Self::slot`]
+    /// 只在真的交出去那一帧才写，门的判据始终是「在物理世界里」。
+    queued: bool,
 }
 
 impl WmoBlock {
     const NONE: u64 = u64::MAX;
+    /// 没有面可装：与 [`Self::NONE`] 的区别是这一份永远不会再来。
+    const EMPTY: u64 = u64::MAX - 1;
 }
 
 /// placement 块的 id：低两位 0b01，与按 tile 的块（低两位是阶段号 0 或 2）永不重合。
@@ -924,12 +933,10 @@ fn build_wmo_collision_step(
                     }
                     match benilla_formats::load_wmo_collision_tris(chain, &model) {
                         Ok(m) => m,
-                        Err(_) => {
-                            t.wmo_inst += 1;
-                            t.wmo_tri = 0;
-                            t.wmo_vtx = 0;
-                            continue;
-                        }
+                        // 载入失败与模型本就无面记同一张账：一份空集合（相机那一叠
+                        // 已经这么办，`unwrap_or_default`）。跳过而不入账，下面按
+                        // placement 的账就永远等一份不会来的面。
+                        Err(_) => Default::default(),
                     }
                 }
             };
@@ -1760,10 +1767,13 @@ pub struct Player {
     /// Seconds since the last falling-trace line (diagnostics).
     fall_time: f32,
     /// Seconds the current tile has waited for its WMO collision fold to land
-    /// (`collision_folding_here`). Bounded by [`WMO_GATE_MAX_S`].
+    /// (`collision_folding_here`). The reference's stall budget: it restarts every frame the
+    /// fold's ledger moves, so [`WMO_GATE_MAX_S`] only bites on a fold that is not advancing.
     wmo_gate_wait: f32,
     /// The tile `wmo_gate_wait` is charged to.
     wmo_gate_tile: (i32, i32),
+    /// 上一帧折叠的账（[`Self::wmo_gate_counters`]）：与这一帧不同就是流还在动。
+    wmo_gate_seen: [u64; 5],
     /// Roam mode (F8): no gravity, no collision, no water - free flight for
     /// inspecting the world. The ICC/M2 body still follows the pose.
     fly: bool,
@@ -1862,6 +1872,7 @@ impl Player {
             fall_time: 0.0,
             wmo_gate_wait: 0.0,
             wmo_gate_tile: (i32::MIN, i32::MIN),
+            wmo_gate_seen: [0; 5],
             fly: false,
             look_active: false,
             look_steer: false,
@@ -1929,7 +1940,7 @@ impl Player {
             }
         }
         for (_, row) in self.wmo_blocks.drain() {
-            if row.slot != WmoBlock::NONE {
+            if row.slot != WmoBlock::NONE && row.slot != WmoBlock::EMPTY {
                 down.push(row.slot);
             }
         }
@@ -2004,6 +2015,18 @@ impl Player {
         let n_tris: usize = up.iter().map(|(_, m)| m.tris.len()).sum();
         let (n_up, n_down) = (up.len(), down.len());
         self.mover.apply_slots(&down, &up);
+        // 交出去的那一帧才算装上：placement 块的低两位是 0b01，按 tile 的块是 0b00/0b10，
+        // 所以这一趟只认领 placement 的账。门的判据（[`Self::wmo_blocks_owed`]）读的是
+        // `slot`，它必须回答「物理世界里有这一份几何」，不是「排了队」。
+        for &(slot, _) in &up {
+            if slot & 3 != 1 {
+                continue;
+            }
+            if let Some(row) = self.wmo_blocks.get_mut(&((slot >> 2) as u32)) {
+                row.slot = slot;
+                row.queued = false;
+            }
+        }
         // 普查：一次同步装/摘了几块、拷走多少三角、用了多久。
         let n = MOVER_INSTALLS.fetch_add(1, Ordering::Relaxed) + 1;
         MOVER_TRIS.store(n_tris as u64, Ordering::Relaxed);
@@ -2017,11 +2040,6 @@ impl Player {
     /// 一帧步进交给 benilla：本帧速度折成 `dir/speed`，位置、竖直速度与着地全部取回。
     /// `hold` = 登录/传送的座位保持或 WMO 折层未完成，冻结一帧（不步进、重力关闭）。
     fn mover_tick(&mut self, dt: f32, jump: bool, hold: bool) {
-        if self.mover_dirty {
-            self.rebuild_mover_world();
-        } else {
-            self.sync_mover_slots(Vec::new(), false);
-        }
         if hold {
             HOLD_FRAMES[1].fetch_add(1, Ordering::Relaxed);
             // benilla 的 settle 保持（`benilla-app/src/player/mover.rs:109-112`）：世界还没
@@ -2154,7 +2172,7 @@ impl Player {
             .iter()
             .filter(|(uid, _)| !listed.contains_key(*uid))
             .map(|(uid, row)| {
-                if row.slot != WmoBlock::NONE {
+                if row.slot != WmoBlock::NONE && row.slot != WmoBlock::EMPTY {
                     self.wmo_released.push(row.slot);
                 }
                 *uid
@@ -2164,6 +2182,10 @@ impl Player {
             self.wmo_blocks.remove(uid);
         }
         self.wmo_unbuilt.retain(|uid| !dropped.contains(uid));
+        // 出窗的块若还排在待交的那一叠里，面要一起甩掉：物理世界不收一份没有主人
+        // 记账的几何，否则它成为一份谁也摘不掉的块。
+        self.wmo_to_install
+            .retain(|(slot, _)| !dropped.contains(&((slot >> 2) as u32)));
         for (uid, (refs, w)) in listed {
             match self.wmo_blocks.get_mut(&uid) {
                 Some(row) => row.refs = refs,
@@ -2176,6 +2198,7 @@ impl Player {
                             quat: placement_quat(w.rotation),
                             base: w.position,
                             slot: WmoBlock::NONE,
+                            queued: false,
                         },
                     );
                     self.wmo_unbuilt.push_back(uid);
@@ -2187,6 +2210,8 @@ impl Player {
     /// 拷出欠着的 placement 的面，按 2 毫秒一帧的预算（benilla 的 `finish_colliders`：
     /// attach 每帧 2 毫秒，超了的那一块留到下一帧，`terrain_stream/collider.rs:17`）。
     /// 模型的行走面集合还没进 cache 的那些放回队尾，不为一块面在这一帧去读 MPQ。
+    /// 面在这里只是「拷好、排队」；[`Self::slot`] 由 [`Self::sync_mover_slots`] 在交给物理
+    /// 世界那一帧才写 —— 门问的是在不在物理世界里，不是排没排队。
     fn fold_wmo_blocks(&mut self, cache: &HashMap<String, benilla_formats::CollisionMesh>) {
         let start = std::time::Instant::now();
         let mut passes = self.wmo_unbuilt.len();
@@ -2198,18 +2223,28 @@ impl Player {
             let Some(row) = self.wmo_blocks.get(&uid) else {
                 continue; // 窗子已经把它甩掉了
             };
-            if row.slot != WmoBlock::NONE {
+            if row.slot != WmoBlock::NONE || row.queued {
                 continue;
             }
+            let known = cache.contains_key(&row.model);
             let Some(mesh) = mover_wmo_mesh(row, cache) else {
-                self.wmo_unbuilt.push_back(uid);
+                if known {
+                    // 集合进过 cache 却是空的：这模型没有可行走的面（载入失败或本就无面）。
+                    // 参考那份的 collider 任务也是这样「完成」的，不是永远吊着 —— 记 EMPTY，
+                    // 门不再为一份不会来的几何按着身体。
+                    if let Some(row) = self.wmo_blocks.get_mut(&uid) {
+                        row.slot = WmoBlock::EMPTY;
+                    }
+                } else {
+                    self.wmo_unbuilt.push_back(uid);
+                }
                 continue;
             };
             let refs = row.refs;
             let faces = mesh.tris.len();
             let slot = mover_wmo_slot_id(uid);
             if let Some(row) = self.wmo_blocks.get_mut(&uid) {
-                row.slot = slot;
+                row.queued = true;
             }
             self.wmo_to_install.push((slot, mesh));
             if refs > 1 {
@@ -2239,6 +2274,68 @@ impl Player {
         })
     }
 
+    /// 窗子里所有 placement 的行走面集合，按离身体由近到远补进 `cache`，每帧 2 毫秒。
+    ///
+    /// 参考那份把碰撞体交给异步池建、按帧预算装上，靠的是「流式窗口装得足够远，身体走
+    /// 不到还没装好的那一格」（`terrain_stream/collider.rs:15-17`）。这里 `cache` 原先只
+    /// 由脚下那一格的折叠填 —— 身体一跨进新格，那份模型才第一次被解析，`fold_wmo_blocks`
+    /// 排不上队，装块门就把身体按住（实测暴风城门口与雕像处各冻住约 1 秒）。这一趟只补
+    /// `cache`，不折任何网格：面进了 `cache`，`fold_wmo_blocks` 就能提前把整窗的块排好、
+    /// `sync_mover_slots` 提前交给物理世界，门到身体跟前时已经没有欠账。
+    fn prefetch_wmo_models(
+        &mut self,
+        chain: &mut Option<benilla_formats::Chain>,
+        cache: &mut HashMap<String, benilla_formats::CollisionMesh>,
+    ) {
+        let Some(chain) = chain.as_mut() else {
+            return;
+        };
+        let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
+        // 由近到远：身体脚下那一格的模型先有一份，门才可能在身体走到邻居之前就先松开。
+        let mut models: Vec<String> = Vec::new();
+        {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut keys: Vec<(i32, i32)> = self.tiles.keys().copied().collect();
+            keys.sort_by_key(|k| (k.0 - tx).abs() + (k.1 - ty).abs());
+            for k in keys {
+                let Some(t) = self.tiles.get(&k) else {
+                    continue;
+                };
+                for w in &t.wmos {
+                    if cache.contains_key(&w.model) || !seen.insert(w.model.clone()) {
+                        // 一座城的一个 WMO 被几个 tile 列到，解析一次就够。
+                        continue;
+                    }
+                    models.push(w.model.clone());
+                }
+            }
+        }
+        let start = std::time::Instant::now();
+        for model in models {
+            if cache.contains_key(&model) {
+                continue;
+            }
+            // 与折叠同一份账：tile worker 停放在旁边的直接用，没有的才在本帧解析；
+            // 载入失败与本就无面记同一张账（空集合），否则门永远在等一份不会来的面。
+            let mesh = match wmo_collision_take(&model) {
+                Some(m) => m,
+                None => {
+                    if start.elapsed() >= std::time::Duration::from_millis(2) {
+                        break;
+                    }
+                    match benilla_formats::load_wmo_collision_tris(chain, &model) {
+                        Ok(m) => m,
+                        Err(_) => Default::default(),
+                    }
+                }
+            };
+            cache.insert(model, mesh);
+            if start.elapsed() >= std::time::Duration::from_millis(2) {
+                break;
+            }
+        }
+    }
+
     /// Fill the player tile's WMO floor/wall triangles once, from the same
     /// walking-collision gather benilla traces (every face but MOPY `DETAIL`),
     /// cached per model path.
@@ -2249,6 +2346,7 @@ impl Player {
     ) {
         // placement 的面进物理世界：与本 tile 的 grid 折叠无关，所以放在早退之前 —— 窗子里
         // 欠着的块要在身体走到它跟前之前装好（benilla 的 `colliders_pending` 门）。
+        self.prefetch_wmo_models(chain, cache);
         self.fold_wmo_blocks(cache);
         let (tx, ty) = Self::tile_of(self.pos[0], self.pos[1]);
         let Some(t) = self.tiles.get_mut(&(tx, ty)) else {
@@ -3185,17 +3283,26 @@ impl Player {
     /// ours is folded over several ticks, and until it lands a query under the
     /// building answers with the terrain below it - a worse answer than none.
     ///
-    /// The wait is bounded by [`WMO_GATE_MAX_S`]: a fold that never lands (a
-    /// leftover instance whose cells never stream) must not hold the body on
-    /// ground that looks empty forever. After the bound the already-folded
-    /// part answers; the worst case is a couple of frames on the terrain under
-    /// a building, which beats never walking again.
-    fn collision_folding_here(&mut self, dt: f32) -> bool {
+    /// The bound is the reference's *stall* budget, not wall clock
+    /// (`benilla-app/src/player/world_focus.rs:127-146`): the deadline is pushed every frame the
+    /// fold's ledger changes, so a cold city load keeps the body held while its geometry is
+    /// arriving, and only a fold that changes nothing for the whole budget releases. Cutting a
+    /// progressing fold at a fixed time is what drops a body through the street it is standing on.
+    fn collision_folding_here(&mut self, dt: f32, mover_lane: bool) -> bool {
         let here = Self::tile_of(self.pos[0], self.pos[1]);
-        let folding = matches!(
-            self.tiles.get(&here),
-            Some(t) if t.wmo_inst < t.wmos.len()
-        ) || self.wmo_blocks_owed(here);
+        // 门问的是「这一条道要读的那叠几何到齐没有」，两本账各归各的道：
+        // * mover 道只查物理世界，一帧也没读过 tile 的 grid（见 [`MOVER_TILE_KINDS`] 上方那段），
+        //   要等的是 placement 块进没进世界。
+        // * 旧道（水面、游泳起跳的弹道窗口，以及 `bn.CollisionSolver` = 0）查的是 ffi 自己的
+        //   ray 面集合，要等的是脚下这格的折叠光标。
+        let folding = if mover_lane {
+            self.wmo_blocks_owed(here)
+        } else {
+            matches!(self.tiles.get(&here), Some(t) if t.wmo_inst < t.wmos.len())
+        };
+        let counters = self.wmo_gate_counters(here);
+        let progressed = counters != self.wmo_gate_seen;
+        self.wmo_gate_seen = counters;
         if !folding {
             self.wmo_gate_wait = 0.0;
             self.wmo_gate_tile = here;
@@ -3204,9 +3311,31 @@ impl Player {
         if self.wmo_gate_tile != here {
             self.wmo_gate_tile = here;
             self.wmo_gate_wait = 0.0;
+            return true;
         }
-        self.wmo_gate_wait += dt;
+        if progressed {
+            self.wmo_gate_wait = 0.0;
+        } else {
+            self.wmo_gate_wait += dt;
+        }
         self.wmo_gate_wait < WMO_GATE_MAX_S
+    }
+
+    /// 折叠这一帧的账，用来回答「流还在不在动」：参考那份看六个流计数器
+    /// （`world_focus.rs:127`），这里能看见的是窗子大小、脚下 tile 的折叠光标、列到的
+    /// placement 数、真进了物理世界的块数、排在待交那一叠里的块数。
+    fn wmo_gate_counters(&self, here: (i32, i32)) -> [u64; 5] {
+        let t = self.tiles.get(&here);
+        [
+            self.tiles.len() as u64,
+            t.map_or(u64::MAX, |t| t.wmo_inst as u64),
+            self.wmo_blocks.len() as u64,
+            self.wmo_blocks
+                .values()
+                .filter(|b| b.slot != WmoBlock::NONE)
+                .count() as u64,
+            self.wmo_to_install.len() as u64,
+        ]
     }
 
     /// One frame's horizontal travel through the collision set: the reference's
@@ -3924,12 +4053,23 @@ impl Player {
         self.jump_was_down = self.input.jump;
         // The world query gate, `benilla-app/src/player/edge.rs`'s
         // `may_resolve`: ... (see the old-path comment below)
-        let gated = self.collision_folding_here(dt);
+        // 送碰撞块是独立的流式阶段，与本帧走哪条泳道无关（benilla 把 collider 的装上放在
+        // `finish_colliders` 这一独立阶段，`terrain_stream/collider.rs:64`）。原先它只长在
+        // `mover_tick` 里：身体一进水道（旧路径）队列就停摆，门等的那笔账永远不会偿还 ——
+        // 实测暴风城 y=-875 一带水陆交界处因此冻满 6.0 秒的门封顶。
+        if self.mover_dirty {
+            self.rebuild_mover_world();
+        } else {
+            self.sync_mover_slots(Vec::new(), false);
+        }
         // 游泳起跳的弹道窗口（`0x7c5de0`：整条弧 `2·speed/g`）仍由 ffi 的旧路径解析：
         // 它要的是 `SWIM_JUMP_SPEED` 的竖直初速，而 `MoverSession::step` 从零竖直速度起步。
         // 窗口覆盖到回落/重新入水为止，窗口内 `swimming` 一旦重新拉闩也会走旧路径。
         let swim_breach = self.swim_hop_s < 2.0 * SWIM_JUMP_SPEED / GRAVITY;
         let use_mover = collision_solver_on() && !self.swimming && !swim_breach;
+        // 门问的是「本帧这一条道真要读的那叠几何到齐没有」：mover 道读物理世界的
+        // placement 块，旧道读 ffi 自己的 ray 面集合（脚下这格的折叠光标）。
+        let gated = self.collision_folding_here(dt, use_mover);
         if use_mover {
             // `bn.CollisionSolver` = 1：水平、台阶、贴地吸附、重力与竖直扫描整段交给
             // benilla 的 `MoverSession::step`；jump 由它起跳，这里不再自己写 `vel[2]`。
@@ -4822,14 +4962,39 @@ pub extern "C" fn bn_player_reset(
     // after this call. The drop below is a one-shot, so taken early it seats the
     // body on the ADT under the pavement (Stormwind: 75.1 against a street at
     // 93.8), and the mover's snap cannot lift a body a whole storey down - its
-    // seat filter only trusts a floor within a step. Fold this tile first.
-    let fold = std::time::Instant::now();
-    while p.floors_folding(x, y) && fold.elapsed() < std::time::Duration::from_secs(2) {
+    // seat filter only trusts a floor within a step. Fold this tile first, and
+    // bound the wait the way the reference bounds its settle hold: the clock only
+    // runs while the fold stops advancing (`WMO_GATE_MAX_S`), never against a
+    // fold that is still bringing geometry in.
+    let tile = Player::tile_of(x, y);
+    let mut cursor = p
+        .tiles
+        .get(&tile)
+        .map(|t| (t.wmo_inst, t.wmos.len(), p.tiles.len()));
+    let mut stalled = std::time::Instant::now();
+    while p.floors_folding(x, y) {
         p.ensure_tiles(&w.archives);
         p.ensure_wmo(&mut w.chain, &mut w.wmo_collision);
+        let now = p
+            .tiles
+            .get(&tile)
+            .map(|t| (t.wmo_inst, t.wmos.len(), p.tiles.len()));
+        if now != cursor {
+            cursor = now;
+            stalled = std::time::Instant::now();
+        }
+        if stalled.elapsed() >= std::time::Duration::from_secs_f64(WMO_GATE_MAX_S as f64) {
+            break;
+        }
     }
-    // Drop to the floor under the spawn (city pavement over the ADT).
-    if let Some((z, _)) = p.ground(x, y, f32::MAX) {
+    // 落座用参考那份 spawn snap 的律：地形面之上第一张可行走面（街面），不是整根射线上
+    // 最高的那张 —— 城里最高面是屋顶，把它当座位就是把身体写进屋顶（实测 116.06）。
+    // 没有地形参照（室内/缺 ADT）时退回最高可行走面，与那份的 `seat.is_none()` 一支同义。
+    let seat = p
+        .terrain_z(x, y)
+        .and_then(|tz| p.lowest_floor_above(x, y, tz, 60.0))
+        .or_else(|| p.ground(x, y, f32::MAX).map(|(z, _)| z));
+    if let Some(z) = seat {
         p.pos[2] = z;
         p.grounded = true;
         p.last_ground = p.pos;
@@ -5067,6 +5232,10 @@ thread_local! {
         clicks: [None; 2],
     }) };
     static BN_LOOK_AT: std::time::Instant = std::time::Instant::now();
+    /// `CameraControl::cursor_released`, for the host's window: the look session outlives a
+    /// deactivate (`0x514490` keeps the mouse bits), and while the window is not the foreground
+    /// one the pointer belongs to the other applications.
+    static BN_LOOK_RELEASED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Seconds since this thread's first look event, the clock the press predicate
@@ -5173,6 +5342,41 @@ pub extern "C" fn bn_player_mouse(world: *mut BnWorld, dx: f32, dy: f32) -> u32 
 #[no_mangle]
 pub extern "C" fn bn_player_look_session() -> u32 {
     look_session() as u32
+}
+
+/// The window's focus edge, read once per frame, mirroring `sync_look_focus`
+/// (`crates/benilla-app/src/player/camera.rs`): a session outlives a deactivate, so the pointer
+/// is handed back to the other applications while the window is not the foreground one and taken
+/// again when it comes back. Returns whether the session holds the pointer through this whole
+/// frame: the host pins and hides it only then, and drops the frame's travel otherwise, so the
+/// view does not jolt on the frame the window returns.
+#[no_mangle]
+pub extern "C" fn bn_player_look_focus(focused: u32) -> u32 {
+    let focused = focused != 0;
+    if !look_session() {
+        return focused as u32;
+    }
+    BN_LOOK_RELEASED.with(|r| match (focused, r.get()) {
+        (false, false) => {
+            r.set(true);
+            0
+        }
+        (true, true) => {
+            // `take_cursor` again: the anchor moves to where the player brought the
+            // pointer back, so the next frame's travel is measured from there.
+            r.set(false);
+            0
+        }
+        _ => focused as u32,
+    })
+}
+
+/// Whether the pointer was handed back during the session that just ended: `disengage_look`
+/// restores the stash only when it was still ours, otherwise the pointer stays wherever the
+/// player left it. Reads and clears, like the reference's `mem::take`.
+#[no_mangle]
+pub extern "C" fn bn_player_look_released() -> u32 {
+    BN_LOOK_RELEASED.with(|r| r.replace(false) as u32)
 }
 
 /// Wheel zoom: `notches` positive = closer (CameraZoomIn 1.0 per notch).
@@ -5391,11 +5595,12 @@ pub extern "C" fn bn_player_state(world: *const BnWorld, out: *mut BnPlayerState
 
 /// Collision evidence probe for the indoor-leak report: at a WoW-space point,
 /// write the tile's WMO bookkeeping, the cell triangle counts, the nearest
-/// steep face and a four-direction blocked mask. `out` layout (16 f32):
+/// steep face and a four-direction blocked mask. `out` layout (18 f32):
 ///   [0] wmos, [1] wmo_inst built, [2] wmo_ready, [3] wmo_mliq built,
 ///   [4] cell WMO tris, [5] cell doodad tris, [6] nearest steep distance (yd, -1 none),
 ///   [7..10] nearest steep normal, [10] nearest steep top z,
-///   [11..15] blocked toward +X, +Y, -X, -Y
+///   [11..15] blocked toward +X, +Y, -X, -Y,
+///   [15] placement 块的账（窗内列到多少个）, [16] 其中真进了物理世界的, [17] 装块门已等秒数
 #[no_mangle]
 pub extern "C" fn bn_player_collision_probe(
     world: *const BnWorld,
@@ -5405,14 +5610,22 @@ pub extern "C" fn bn_player_collision_probe(
     out: *mut f32,
     cap: u32,
 ) -> u32 {
-    if world.is_null() || out.is_null() || cap < 16 {
+    if world.is_null() || out.is_null() || cap < 18 {
         return 0;
     }
     let w = unsafe { &*world };
     let Some(p) = w.player.as_ref() else { return 0 };
     let (tx, ty) = Player::tile_of(x, y);
-    let mut o = [0.0f32; 16];
+    let mut o = [0.0f32; 18];
     o[6] = -1.0;
+    // 装块门的三列：窗内列到多少个 placement、其中真进了物理世界的（`slot` 只在
+    // `sync_mover_slots` 交出去那一帧写，排队不算）、门已经等了多久。
+    o[15] = p.wmo_blocks.len() as f32;
+    o[16] = p.wmo_blocks
+        .values()
+        .filter(|b| b.slot != WmoBlock::NONE && b.slot != WmoBlock::EMPTY)
+        .count() as f32;
+    o[17] = p.wmo_gate_wait;
     if let Some(t) = p.tiles.get(&(tx, ty)) {
         o[0] = t.wmos.len() as f32;
         o[1] = t.wmo_inst as f32;
@@ -5949,11 +6162,10 @@ mod tests {
             name_set: 0,
         });
         p.tiles.insert(Player::tile_of(p.pos[0], p.pos[1]), col);
-        // 折叠门是有界的（`WMO_GATE_MAX_S = 2.0`，`player.rs:92`、`collision_folding_here`
-        // 的 `wmo_gate_wait < WMO_GATE_MAX_S`）：一个永不落地的折叠不许永久冻住身体
-        // （`player.rs:2721-2725` 的文档）。benilla 侧的对应语义只是世界驻留期的 settle
-        // hold（`benilla-app/src/player/mover.rs:109-112`），不是无界冻结。原用例的 100 帧
-        // (10 s) 是旧求解的无界保持；15 帧 (1.5 s) 留在门内。
+        // 折叠门有界（`WMO_GATE_MAX_S = 6.0`），但那是参考那份的**停顿**预算：账在动的每一帧
+        // 都重新计时（`collision_folding_here` 的 `progressed`），只有整段预算里什么都没动才
+        // 放行。一个永不落地的折叠不许永久冻住身体（`player.rs:2721-2725` 的文档），但一次
+        // 还在装载的暴风城不许在半途把身体交给路面底下的 ADT。这 15 帧 (1.5 s) 里账没动。
         for _ in 0..15 {
             p.tick(0.1);
             assert!(
@@ -11032,6 +11244,160 @@ mod tests {
         crate::bn_shutdown(w);
     }
 
+    /// 暴风城广场的掉层普查：`bn_player_reset` 把人坐在街面（实测 93.8），静置 90 帧
+    /// 后脚底若在 75.08 就是穿过了城地面落到底下的 ADT 地形。两条道各跑一遍：
+    /// `MoverSession` 查物理世界，自写求解查 `wmo_cells`。只有前者掉、后者坐得住，
+    /// 就说明物理世界那一叠面缺了这块街面，而不是数据里没有面。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stormwind_square_seat_survives_the_city_floor() {
+        use crate::bn_init;
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        let prev = COLLISION_SOLVER.load(Ordering::Relaxed);
+        for mover in [true, false] {
+            COLLISION_SOLVER.store(mover, Ordering::Relaxed);
+            let w = bn_init(dir.as_ptr());
+            assert!(!w.is_null());
+            let w = unsafe { &mut *w };
+            println!("--- lane mover_session={mover} ---");
+            for iy in 0..7 {
+                for ix in 0..7 {
+                    let x = -8916.5 + ix as f32 * 0.5;
+                    let y = 552.5 + iy as f32 * 0.5;
+                    assert_eq!(bn_player_reset(w, map.as_ptr(), x, y), 1);
+                    let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+                    bn_player_tick(w, 1.0 / 60.0, &mut st);
+                    let seat = st.pos[2];
+                    for _ in 0..89 {
+                        bn_player_tick(w, 1.0 / 60.0, &mut st);
+                    }
+                    println!(
+                        "({x:8.1},{y:6.1}) seat={seat:6.2} end=({e0:.2} {e1:.2} {e2:.2}) \
+                         grounded={} speed={:.2}",
+                        st.grounded,
+                        st.speed,
+                        e0 = st.pos[0],
+                        e1 = st.pos[1],
+                        e2 = st.pos[2]
+                    );
+                }
+            }
+            crate::bn_shutdown(w);
+        }
+        COLLISION_SOLVER.store(prev, Ordering::Relaxed);
+    }
+
+    /// 冷启动掉层的计时取证：`bn_player_reset` 的入座等在一个 2 秒墙钟的折层界后面，座位
+    /// 之后交给物理装块门（`collision_folding_here`）。暴风城那块 42.5 万面的 WMO 要多久
+    /// 才进得了物理世界，决定身体是坐在街面还是掉到底下的 ADT 75.08 —— 界一到就不可逆
+    /// （入座只救一步高，静置又保持座位）。判据：身体不许停在地形面底下。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stormwind_cold_pavement_fold_outlives_the_gate() {
+        use crate::bn_init;
+        let dir = std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+        for (x, y) in [(-8915.0f32, 554.0f32), (-8916.5, 552.5)] {
+            let w = unsafe { &mut *bn_init(dir.as_ptr()) };
+            let t0 = std::time::Instant::now();
+            assert_eq!(bn_player_reset(w, map.as_ptr(), x, y), 1);
+            let reset_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let tile = Player::tile_of(x, y);
+            let seat = w.player.as_ref().unwrap().pos[2];
+            // 路面底下的 ADT：暴风城这一块是一张平的 75.08，身体一旦坐到它就是埋了。
+            let adt = w.player.as_ref().unwrap().terrain_z(x, y).unwrap_or(0.0);
+            println!("=== ({x},{y}) reset={reset_ms:.0}ms seat={seat:.2} adt={adt:.2} ===");
+            for f in 0..300 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+                let p = w.player.as_ref().unwrap();
+                let built = p
+                    .wmo_blocks
+                    .values()
+                    .filter(|b| b.slot != WmoBlock::NONE && b.slot != WmoBlock::EMPTY)
+                    .count();
+                assert!(
+                    p.pos[2] > adt + 1.0,
+                    "f{f} 身体掉到路面底下的 ADT：seat={seat:.2} adt={adt:.2} z={:.2} \
+                     blocks={built}/{} gate={:.2}",
+                    p.pos[2],
+                    p.wmo_blocks.len(),
+                    p.wmo_gate_wait
+                );
+                if f < 20 || f % 20 == 0 {
+                    println!(
+                        "f{f:3} t={:6.0}ms z={:7.2} ray={:7.2} blocks={built}/{} owed={} \
+                         gate={:5.2} snap={} grounded={}",
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                        p.pos[2],
+                        p.ground(x, y, f32::MAX).map(|(z, _)| z).unwrap_or(0.0),
+                        p.wmo_blocks.len(),
+                        p.wmo_blocks_owed(tile),
+                        p.wmo_gate_wait,
+                        p.snap_pending,
+                        st.grounded,
+                    );
+                }
+            }
+            crate::bn_shutdown(w);
+        }
+    }
+
+    /// 另一条道：每帧都来一次 server 位姿（`set_server_pose` 置 `mover_dirty`，下一帧
+    /// `rebuild_mover_world` 会把 `wmo_to_install` 整个丢掉）。若城块因此永远进不了物理
+    /// 世界，街面就答不出来 —— 实机那 1.5 秒 18.8 码的自由落体正是这个形状。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn a_rebuild_every_frame_empties_the_pavement() {
+        use crate::bn_init;
+        let dir = std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        let (x, y) = (-8915.0f32, 554.0f32);
+        let w = unsafe { &mut *bn_init(dir.as_ptr()) };
+        assert_eq!(bn_player_reset(w, map.as_ptr(), x, y), 1);
+        let tile = Player::tile_of(x, y);
+        let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+        let adt = w.player.as_ref().unwrap().terrain_z(x, y).unwrap_or(0.0);
+        for f in 0..200 {
+            if f >= 30 {
+                let z = w.player.as_ref().unwrap().pos[2];
+                bn_player_teleport(w, map.as_ptr(), x, y, z, 0.0);
+            }
+            bn_player_tick(w, 1.0 / 60.0, &mut st);
+            let p = w.player.as_ref().unwrap();
+            let built = p
+                .wmo_blocks
+                .values()
+                .filter(|b| b.slot != WmoBlock::NONE && b.slot != WmoBlock::EMPTY)
+                .count();
+            assert!(
+                p.pos[2] > adt + 1.0,
+                "t{f} 每帧重装把身体送到了路面底下的 ADT：adt={adt:.2} z={:.2} blocks={built}/{} \
+                 gate={:.2} snap={}",
+                p.pos[2],
+                p.wmo_blocks.len(),
+                p.wmo_gate_wait,
+                p.snap_pending
+            );
+            if f < 40 || f % 10 == 0 {
+                println!(
+                    "t{f:3} z={:7.2} ray={:7.2} blocks={built}/{} owed={} dirty={} gate={:5.2} \
+                     grounded={}",
+                    p.pos[2],
+                    p.ground(x, y, f32::MAX).map(|(z, _)| z).unwrap_or(0.0),
+                    p.wmo_blocks.len(),
+                    p.wmo_blocks_owed(tile),
+                    p.mover_dirty,
+                    p.wmo_gate_wait,
+                    st.grounded,
+                );
+            }
+        }
+        crate::bn_shutdown(w);
+    }
+
     /// The same logged pose through the other solver: `bn.CollisionSolver` 1 hands
     /// the whole step to benilla's `MoverSession`, so this settles whether the
     /// freeze is the ffi's swept solver or a sweep the upstream also runs. The walk
@@ -11084,6 +11450,134 @@ mod tests {
         }));
         COLLISION_SOLVER.store(prev, Ordering::Relaxed);
         ran.unwrap();
+    }
+
+    /// 卡点普查（跨格版）：一格 ADT 是 533 码，身体 8 秒只走 46 码，连格子边界都碰不到
+    /// —— 用户报的两个卡点都在边界上（进城门、雕像处左转）。每条路线从边界前 30 码起步、
+    /// 一路走过去，把每一段「被按住」单独报出来：什么时候开始、多长、当时在第几格、走到
+    /// 哪儿才松开。起步那 4 秒的按住是登录/传送的落座保持，另记，不算边界卡点。
+    #[test]
+    #[ignore = "needs the installed 1.12.1 data"]
+    fn stall_census_crossing_the_adt_borders() {
+        use crate::bn_init;
+        let prev_solver = COLLISION_SOLVER.load(Ordering::Relaxed);
+        COLLISION_SOLVER.store(true, Ordering::Relaxed);
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let map = std::ffi::CString::new("Azeroth").unwrap();
+        // (名字, 起点 x, 起点 y, 朝向弧度)：朝向即前进方向，起点都摆在格子边界前约 30 码。
+        let routes: [(&str, f32, f32, f32); 3] = [
+            ("+X @y=-875", -9100.0, -875.0, 0.0),
+            ("+X @y=-300", -9100.0, -300.0, 0.0),
+            ("-Y @x=-9180", -9180.0, -1030.0, -std::f32::consts::FRAC_PI_2),
+        ];
+        let w = unsafe { &mut *bn_init(dir.as_ptr()) };
+        let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
+        for (name, x, y, yaw) in routes {
+            assert_eq!(bn_player_reset(w, map.as_ptr(), x, y), 1);
+            for _ in 0..180 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+            bn_player_teleport(w, map.as_ptr(), x, y, st.pos[2], yaw);
+            for _ in 0..60 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+            let p0 = w.player.as_ref().unwrap();
+            let (snap0, gate0) = (p0.snap_pending, p0.wmo_gate_wait);
+            bn_player_input(w, 1.0, 0.0, 0.0, 0, 0, 0.0);
+            let mut was = st.pos;
+            let mut held = 0usize;
+            let mut travel = 0.0f32;
+            let mut run = 0usize;
+            let mut run_tile = (0i32, 0i32);
+            let mut runs: Vec<(usize, usize, (i32, i32), [f32; 2])> = Vec::new();
+            for n in 0..2400 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+                let p = w.player.as_ref().unwrap();
+                let here = Player::tile_of(p.pos[0], p.pos[1]);
+                let grid = p.tiles.get(&here).map_or(0, |t| t.wmos.len() - t.wmo_inst);
+                let owed = p.wmo_blocks_owed(here);
+                let step =
+                    ((p.pos[0] - was[0]).powi(2) + (p.pos[1] - was[1]).powi(2)).sqrt();
+                was = p.pos;
+                travel += step;
+                let frozen = step < 0.001
+                    && (grid > 0
+                        || owed
+                        || p.snap_pending
+                        || p.wmo_gate_wait > 0.0
+                        || p.floors_folding(p.pos[0], p.pos[1]));
+                if frozen {
+                    held += 1;
+                    if run == 0 {
+                        run_tile = here;
+                    }
+                    run += 1;
+                    // 按住的那一段里每秒报一次欠账：谁没装、cache 里有没有、队列多长。
+                    if run % 60 == 1 {
+                        let t = p.tiles.get(&here);
+                        println!(
+                            "  HOLD f{n} pos=({:9.1} {:8.1} {:6.1}) tile={here:?} grid={grid} \
+                             owed={owed} gate={:.2} snap={} swim={} floors={} unbuilt={} \
+                             to_install={} wmos={} cache={}",
+                            p.pos[0],
+                            p.pos[1],
+                            p.pos[2],
+                            p.wmo_gate_wait,
+                            p.snap_pending,
+                            p.swimming,
+                            p.floors_folding(p.pos[0], p.pos[1]),
+                            p.wmo_unbuilt.len(),
+                            p.wmo_to_install.len(),
+                            t.map_or(0, |t| t.wmos.len()),
+                            w.wmo_collision.len(),
+                        );
+                        for tile in [here, (here.0 + 1, here.1), (here.0 - 1, here.1)] {
+                            let Some(t) = p.tiles.get(&tile) else {
+                                continue;
+                            };
+                            for wm in &t.wmos {
+                                let b = p.wmo_blocks.get(&wm.unique_id);
+                                println!(
+                                    "    {tile:?} uid={:6} cached={} slot={:?} queued={} \
+                                     {}",
+                                    wm.unique_id,
+                                    w.wmo_collision.contains_key(&wm.model),
+                                    b.map(|b| b.slot),
+                                    b.map_or(false, |b| b.queued),
+                                    wm.model,
+                                );
+                            }
+                        }
+                    }
+                } else if run > 0 {
+                    runs.push((n - run, run, run_tile, [p.pos[0], p.pos[1]]));
+                    run = 0;
+                }
+            }
+            if run > 0 {
+                runs.push((2400 - run, run, run_tile, [st.pos[0], st.pos[1]]));
+            }
+            bn_player_input(w, 0.0, 0.0, 0.0, 0, 0, 0.0);
+            println!(
+                "ROUTE {name}: HELD={held} ({:.2}s of 40.0s) travel={travel:.1}yd \
+                 start_snap={snap0} start_gate={gate0:.2}",
+                held as f32 / 60.0
+            );
+            for (start, len, tile, end) in &runs {
+                println!(
+                    "  RUN t={start:.2}s len={:.2}s tile={tile:?} released_at=({ex:.1} {ey:.1})",
+                    *len as f32 / 60.0,
+                    ex = end[0],
+                    ey = end[1]
+                );
+            }
+            for _ in 0..60 {
+                bn_player_tick(w, 1.0 / 60.0, &mut st);
+            }
+        }
+        COLLISION_SOLVER.store(prev_solver, Ordering::Relaxed);
+        crate::bn_shutdown(w);
     }
 }
 
