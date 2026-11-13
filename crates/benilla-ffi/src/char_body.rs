@@ -109,8 +109,10 @@ pub extern "C" fn bn_char_skin_extra_texture(
 /// Per-triangle character texture slot + geoset visibility, in the exact
 /// triangle order `bn_model_fill` emits (index lookup applied, triples).
 ///
-/// `out[i]` low three bits = slot (0 body, 1 hair, 2 object, 3 skin extra);
-/// bit `0x80` set when the batch's geoset is hidden for this appearance (the
+/// `out[i]` low three bits = slot (0 body, 1 hair, 2 object, 3 skin extra); bit
+/// `0x40` set instead means the batch is no compositor slot and its low 6 bits
+/// carry the M2 texture index of its own BLP (the night elf eye glow); bit `0x80`
+/// is the geoset-hidden flag, set when this appearance hides the batch (the
 /// naked default look: no equipment). Returns the number of triangles written.
 ///
 /// The visibility set is the client's selector driven by the
@@ -266,7 +268,15 @@ fn char_model_slots(
             .copied();
         let tex = tex_index.and_then(|ti| model.textures.get(ti as usize));
         let slot = if is_char {
-            char_slot_of(tex)
+            match char_slot_of(tex) {
+                // A character slot the compositor fills: 0 body, 1 hair, 2 object, 3 extra.
+                s @ 0..=3 => s,
+                // Not a character slot (`Hardcoded`): the night elf and scourge eye
+                // glow and the gnome male's skin name a real BLP. That file belongs to
+                // its own batch only, so report the TEXTURE INDEX behind a flag rather
+                // than let it stand in for the body.
+                _ => 0x40 | tex_index.unwrap_or(0).min(0x3f) as u8,
+            }
         } else {
             // Low 7 bits = texture index; bit 7 stays clear (a non-character model
             // is never geoset-hidden).
