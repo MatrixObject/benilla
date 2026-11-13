@@ -4935,7 +4935,13 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         } => {
             let mut giver = BnNetGiver {
                 npc: *npc,
-                mode: 1,
+                // The gossip latch records only which NPC has a window and what its rows are: a
+                // `mode` of 1 is the greeting panel, and that one belongs to
+                // `SMSG_QUESTGIVER_QUEST_LIST` alone (the reference's `QuestView::Greeting`, which
+                // `ui_gossip` never writes from a gossip packet). Latching it here left an empty
+                // `body` in the cell, so the stock `QuestFrame` greeting opened on it the moment
+                // the conversation ended and `gossip_vm` stopped owning the npc.
+                mode: 0,
                 ..Default::default()
             };
             for (i, q) in quests.iter().take(giver.quests.len()).enumerate() {

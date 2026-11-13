@@ -3005,12 +3005,12 @@ fn quest_row_cmd(npc: u64, quest: u32, icon: u32) -> Cmd {
 /// latch, so this pass owns only mode 1. Returns whether this tick changed the panel.
 fn feed_quest_greeting(script: &mut UiScript) -> bool {
     let giver = net::ui_giver();
-    // `SMSG_GOSSIP_MESSAGE` latches a mode-1 giver too, but its menu - options and quest
-    // rows - belongs to the stock `GossipFrame`, which `gossip_vm` owns and shows. A
-    // `QuestFrame` greeting only comes from a giver with no gossip menu, i.e. the
-    // `SMSG_QUESTGIVER_QUEST_LIST` leg (`gossip_vm` has no menu latched for this NPC).
+    // `SMSG_GOSSIP_MESSAGE` latches this npc and its rows too, with `mode` 0: its menu -
+    // options and quest rows - belongs to the stock `GossipFrame`, which `gossip_vm` owns
+    // and shows, and the greeting panel is not the quest-list packet's to hand out. So a
+    // `QuestFrame` greeting needs a mode-1 latch and no gossip menu open for the same NPC.
     let gossip_owns = crate::gossip_vm::npc() == giver.npc;
-    if giver.npc == 0 || giver.mode >= 2 || gossip_owns {
+    if giver.npc == 0 || giver.mode != 1 || gossip_owns {
         // Nothing to show, or the host's panel is live: drop the memo so a return
         // to the list fires `QUEST_GREETING` again instead of reading as unchanged.
         FEED.with(|f| {
