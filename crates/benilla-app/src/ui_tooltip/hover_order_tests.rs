@@ -146,6 +146,7 @@ fn a_retired_hovered_plate_is_not_published_again() {
         alpha: 1.0,
         lit: false,
         hovered: false,
+        name_only: false,
     };
     {
         let mut s = script(&mut app);

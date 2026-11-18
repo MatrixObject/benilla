@@ -603,6 +603,9 @@ fn drive_vplates(
             alpha,
             lit,
             hovered: hover,
+            // The app answers `0x6070a0`'s name legs with its own world-text lane
+            // ([`crate::nameplates`]), so a plate here is always a full plate.
+            name_only: false,
         });
     }
 

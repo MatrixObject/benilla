@@ -8,6 +8,10 @@
 //!   written only by the four plate verbs, folded in [`fold_bits`].
 //! - Gate: never our own unit, never a `NOT_SELECTABLE` one, never a ghost; health above 0; 20 yd;
 //!   the `0x200` created-by rule; enemy or friendly by the category test below.
+//! - Name leg: `0x6070a0`'s target test — the current target shows its name whatever the two
+//!   switches say, on a name-only frame when its side carries no plates. The mask's other legs
+//!   (`UnitNameOwn`, `UnitNamePlayer`, `UnitNameNPC`) are not ported, so an untargeted unit names
+//!   nothing.
 //! - Anchor: the overhead head point (`0x608640`) plus 2/3 yd (`[0x80abfc]`), projected through the
 //!   same cone the host renders, the plate's top centre on it (`0x509ec0`), sized in gx units of the
 //!   screen diagonal (`0x41ad10`), outside `UIParent`'s scale.
@@ -24,6 +28,10 @@
 //!   animation lifts or drops its head hangs its plate at the bind height.
 //! - [`held_bucket`] seats on the UI root's rect, which the host letterboxes inside the window; the
 //!   reference's `WorldFrame` is the whole window.
+//!
+//! Two deviations of the name leg, both from riding the plate pool: the name-only frame is one of
+//! the `WorldFrame` children an addon walks, and it seats through the plate bucket, where the
+//! reference's name descriptor hangs fixed on the anchor.
 
 use std::cell::{Cell, RefCell};
 
@@ -349,6 +357,22 @@ fn plate_rank(factions: Option<&FactionCatalog>, target: &ObjectFields, own: &Ob
         .map_or(Reaction::Neutral, |(t, p)| t.reaction_toward(&p)) as u8
 }
 
+/// One unit that cleared its lane's gate, in the order the seat needs it.
+struct Cand {
+    /// Squared distance from the seat sort point (`0x608870`), which orders the seating.
+    sort: f32,
+    /// The anchor, projected into the root's device pixels, y down from its top-left.
+    screen: Vec2,
+    /// `0x606530`'s standing, for the bar tint, the con colour and the name colour.
+    rank: u8,
+    is_player: bool,
+    key: u64,
+    fields: ObjectFields,
+    /// The target's overhead name, not a plate: `0x6070a0`'s target leg, whose gate is the
+    /// selectable slot alone.
+    name_only: bool,
+}
+
 /// Every UI tick: gate the units, seat each plate, and hand the result to the widget layer.
 pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
     // SAFETY: the caller hands over the handle it holds on this thread, and the game thread owns
@@ -357,12 +381,9 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
         script.retire_nameplates();
         return;
     };
+    // Both switches off admits nobody to `0x60f600`'s category test, so no plate is built; the pass
+    // still runs, because the target's name (`0x6070a0`) does not depend on them.
     let mode = fold_bits(script);
-    if !mode.enemies && !mode.friends {
-        script.retire_nameplates();
-        BUCKET.with(|b| b.borrow_mut().clear());
-        return;
-    }
     let (Some(cam), Some(self_guid), Some(own)) = (
         world.player.as_ref().map(|p| p.camera()),
         (net::ui_self_guid() != 0).then_some(net::ui_self_guid()),
@@ -418,7 +439,7 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
         0.4 * view.root.length(),
         view.root.y - 0.3 * view.root.length(),
     );
-    let mut cands: Vec<(f32, Vec2, u8, bool, u64, ObjectFields)> = Vec::new();
+    let mut cands: Vec<Cand> = Vec::new();
     for guid in net::ui_unit_guids() {
         if guid == self_guid {
             continue;
@@ -431,53 +452,58 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
             continue;
         }
         let f = &unit.fields;
-        // `NOT_SELECTABLE` (flags bit 25) never gets a plate, re-tested every tick (`0x60f622`).
+        // `NOT_SELECTABLE` (flags bit 25) gets neither, and it is the first test of both lanes
+        // (`0x60f622`, `0x6070a0`).
         if f.unit_flags() & (1 << 25) != 0 {
             continue;
         }
-        // `0x60f600`'s first test: health 0 or less (absent reads 0) has no plate.
-        if f.unit_health().unwrap_or(0) == 0 {
-            continue;
-        }
-        // `0x60f62e`: `bytes_1` byte 3 `& 3` (ghost or creep) has no plate.
-        if f.unit_is_ghost_visual() {
+        let friendly = plate_is_friendly(cats.as_deref(), f, &own);
+        let category_admits = friendly && mode.friends || !friendly && mode.enemies;
+        // `0x6070a0`'s target leg, which comes after its plate test: a target whose side carries
+        // plates already has its name on one, and the other side's target gets the name alone.
+        let name_only = selection != 0 && guid == selection && !category_admits;
+        if !category_admits && !name_only {
             continue;
         }
         let feet = net::ui_unit_pose(guid).unwrap_or(unit.pos);
-        let d = [
-            feet[0] - self_pos[0],
-            feet[1] - self_pos[1],
-            feet[2] - self_pos[2],
-        ];
-        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > MAX_DIST_SQ {
-            continue;
-        }
-        // A CREATEDBY owner, no SUMMONEDBY owner and flags bit 9 (`0x200`): no plate in either
-        // category (`0x60f70b`-`0x60f72d`); the bit's 1.12 name is unknown.
-        if f.unit_created_by().is_some_and(|g| g != 0)
-            && f.unit_summoned_by().is_none_or(|g| g == 0)
-            && f.unit_flags() & 0x200 != 0
-        {
-            continue;
-        }
-        let friendly = plate_is_friendly(cats.as_deref(), f, &own);
-        if friendly && !mode.friends || !friendly && !mode.enemies {
-            continue;
-        }
-        // Only on the hostile side, a dead-looking unit has no plate (`0x60f733`).
-        if !friendly && f.unit_reads_dead() {
-            continue;
+        if !name_only {
+            // `0x60f600`'s legs the name does not share (`0x6070a0` tests none of them): health,
+            // ghost, the 20 yd range, the created-by rule and the enemy-dead test.
+            if f.unit_health().unwrap_or(0) == 0 || f.unit_is_ghost_visual() {
+                continue;
+            }
+            let d = [
+                feet[0] - self_pos[0],
+                feet[1] - self_pos[1],
+                feet[2] - self_pos[2],
+            ];
+            if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > MAX_DIST_SQ {
+                continue;
+            }
+            // A CREATEDBY owner, no SUMMONEDBY owner and flags bit 9 (`0x200`): no plate in either
+            // category (`0x60f70b`-`0x60f72d`); the bit's 1.12 name is unknown.
+            if f.unit_created_by().is_some_and(|g| g != 0)
+                && f.unit_summoned_by().is_none_or(|g| g == 0)
+                && f.unit_flags() & 0x200 != 0
+            {
+                continue;
+            }
+            // Only on the hostile side, a dead-looking unit has no plate (`0x60f733`).
+            if !friendly && f.unit_reads_dead() {
+                continue;
+            }
         }
         // Behind the camera or outside the root there is no plate: `0x60f600` destroys it before
         // the seat, never clamping it in from off-screen.
         // The anchor is the RIDER's own model, never the mount's: `0x6074c0` re-picks the
-        // attachment to `PlayerNameMounted` on the body while a mount display is set.
+        // attachment to `PlayerNameMounted` on the body while a mount display is set. The plate
+        // projects the name position plus 2/3 (`0x60f7f0`); the name itself is `0x608640` alone.
         let lift = overhead_height(
             world,
             f.unit_displayid().unwrap_or(0).max(0) as u32,
             f.unit_mount_display_id() != 0,
         ) * f.object_scale_x().unwrap_or(1.0).max(0.01)
-            + PLATE_LIFT;
+            + if name_only { 0.0 } else { PLATE_LIFT };
         let Some(on_screen) = project(
             player.0,
             player.1,
@@ -491,34 +517,38 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
         if !(0.0..=view.root.x).contains(&screen.x) || !(0.0..=view.root.y).contains(&screen.y) {
             continue;
         }
-        cands.push((
-            screen.distance_squared(sort_pt),
+        cands.push(Cand {
+            sort: screen.distance_squared(sort_pt),
             screen,
-            plate_rank(cats.as_deref(), f, &own),
-            unit.kind == 4,
-            guid,
-            f.clone(),
-        ));
+            rank: plate_rank(cats.as_deref(), f, &own),
+            is_player: unit.kind == 4,
+            key: guid,
+            fields: f.clone(),
+            name_only,
+        });
     }
-    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cands.sort_by(|a, b| a.sort.total_cmp(&b.sort));
 
     BUCKET.with(|b| b.borrow_mut().clear());
     let mut states: Vec<PlateState> = Vec::with_capacity(cands.len());
-    for (_, screen, rank, is_player, guid, f) in cands {
-        let alpha = if selection == 0 || selection == guid {
+    for c in cands {
+        let f = &c.fields;
+        let alpha = if selection == 0 || selection == c.key {
             1.0
         } else {
             DIM_ALPHA
         };
-        let tint = plate_tint(rank, is_player);
+        let tint = plate_tint(c.rank, c.is_player);
         // The seat (`0x509ec0`): the plate hangs from its top centre on the projected point, is
-        // solved off the plates already claimed, then clamped half a plate inside the screen.
-        let desired = Seat::new(
-            screen.x - pw * 0.5,
-            screen.y,
-            screen.x + pw * 0.5,
-            screen.y + ph,
-        );
+        // solved off the plates already claimed, then clamped half a plate inside the screen. The
+        // name-only frame centres its own line on the anchor instead, since the reference's name
+        // descriptor hangs there and is not one of the plates.
+        let (min_y, max_y) = if c.name_only {
+            (c.screen.y - ph * 0.5, c.screen.y + ph * 0.5)
+        } else {
+            (c.screen.y, c.screen.y + ph)
+        };
+        let desired = Seat::new(c.screen.x - pw * 0.5, min_y, c.screen.x + pw * 0.5, max_y);
         let solved = BUCKET.with(|b| b.borrow().resolve(desired, view.root));
         // Snap the left edge, not the centre, which an odd width would put between texels; the
         // claim takes the snapped rect, so later plates dodge what is drawn. The host's canvas
@@ -527,11 +557,11 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
         let top = solved.min.y.round();
         let plate = Seat::new(left, top, left + pw, top + ph);
         BUCKET.with(|b| b.borrow_mut().claim(plate));
-        let hover = hovered_key == Some(guid);
+        let hover = hovered_key == Some(c.key);
         let level = f.unit_level();
         // The plates hang off `WorldFrame`, outside `UIParent`'s scale, so root units are their own.
         states.push(PlateState {
-            key: guid,
+            key: c.key,
             top_centre: (
                 (plate.min.x + plate.max.x) * 0.5 / view.seam,
                 (view.root.y - plate.min.y) / view.seam,
@@ -541,23 +571,24 @@ pub(crate) fn drive(world: *mut BnWorld, script: &mut UiScript) {
             max_health: f.unit_max_health().unwrap_or(1).max(1) as f32,
             bar_colour: tint,
             name: names
-                .get(&guid)
+                .get(&c.key)
                 .cloned()
-                .or_else(|| net::ui_creature_name(guid))
+                .or_else(|| net::ui_creature_name(c.key))
                 .unwrap_or_default(),
             level,
             // The skull (`0x7cbb40`): a boss's rank rung needs `CreatureTemplate::rank`, which this
             // crate's creature cache does not carry; the hostile-ten-or-more rung is here.
             skull: level.is_some_and(|level| {
-                rank <= 1 && level >= my_level + 10 && !unit_is_grey(my_level, level)
+                c.rank <= 1 && level >= my_level + 10 && !unit_is_grey(my_level, level)
             }),
             level_colour: level.map_or([1.0, 1.0, 1.0], |level| con_color(my_level, level)),
             // The mark rides the raid roster's target list, which the feed does not carry; no raid,
             // no mark, which is what `GetRaidTargetIndex` answers on its own.
             raid_icon: None,
             alpha,
-            lit: hover || selection == guid,
+            lit: hover || selection == c.key,
             hovered: hover,
+            name_only: c.name_only,
         });
     }
 

@@ -51,6 +51,7 @@ fn plate(name: &str, health: f32, max: f32) -> PlateState {
         alpha: 1.0,
         lit: false,
         hovered: false,
+        name_only: false,
     }
 }
 
@@ -522,6 +523,30 @@ fn a_unit_with_no_level_yet_wears_no_skull() {
             r#"
             local _, _, _, level, levelicon = WorldFrame:GetChildren():GetRegions()
             return level:IsShown() == nil and levelicon:IsShown() == nil
+        "#
+        )
+        .unwrap());
+}
+
+/// Deviation: a name-only frame is the target's overhead name (`0x6070a0`) riding on a pooled
+/// plate, which is the seam's only world-anchored text: it keeps the name and nothing else, and it
+/// stops taking the pointer, since a name has nothing to click.
+#[test]
+fn a_name_only_plate_keeps_the_name_and_loses_the_plate() {
+    let mut s = vm();
+    let mut named = plate("Marshal Winslow", 30.0, 40.0);
+    named.name_only = true;
+    drive(&mut s, &[named]);
+    assert!(s
+        .eval::<bool>(
+            r#"
+            local plate = WorldFrame:GetChildren()
+            local border, glow, name, level, levelicon, raid = plate:GetRegions()
+            local bar = plate:GetChildren()
+            return border:IsShown() == nil and glow:IsShown() == nil and level:IsShown() == nil
+                   and levelicon:IsShown() == nil and raid:IsShown() == nil
+                   and bar:IsShown() == nil and name:IsShown() ~= nil and name:GetText() ~= nil
+                   and plate:IsMouseEnabled() == nil
         "#
         )
         .unwrap());

@@ -90,6 +90,11 @@ pub struct PlateState {
     pub lit: bool,
     /// The pointer is on the plate: the name goes yellow (`0x7cb850`) and the glow region shows.
     pub hovered: bool,
+    /// Deviation: the target's overhead name (`0x6070a0`'s target leg) riding on a pooled plate
+    /// frame, which is the only world-anchored text the seam paints. Every plate part but the name
+    /// hides and the frame takes no pointer, so it behaves as the reference's name descriptor and
+    /// not as a `CGNamePlateFrame`.
+    pub name_only: bool,
 }
 
 /// One pooled plate's widgets, in the reference's creation order.
@@ -671,10 +676,12 @@ impl Plate {
     ) {
         let p = &model.nameplates.plates[i];
         let (frame, bar) = (p.frame, p.bar);
-        let (glow, name, level, skull, raid, fill) =
-            (p.glow, p.name, p.level, p.skull, p.raid, p.fill);
+        let (border, glow, name, level, skull, raid, fill) =
+            (p.border, p.glow, p.name, p.level, p.skull, p.raid, p.fill);
         let last = p.last.clone();
         let world_id = model.frame_id(world);
+        // Riding a plate frame means the whole switch, not just the parts that move.
+        let restyles = last.as_ref().is_none_or(|l| l.name_only != state.name_only);
 
         // Re-seated whenever it moves, as the reference does (`0x509ec0`).
         if last
@@ -702,6 +709,16 @@ impl Plate {
         }
         if last.as_ref().is_none_or(|l| l.alpha != state.alpha) {
             model.arena.set_alpha(frame, state.alpha);
+        }
+
+        // A name-only frame is the reference's overhead name: the plate's own parts hide and it
+        // stops taking the pointer, since a name has nothing to click.
+        if restyles {
+            for rh in [border, glow, level, skull, raid] {
+                model.set_region_hidden(rh, state.name_only);
+            }
+            model.set_shown_silent(bar, !state.name_only);
+            model.arena.set_mouse_enabled(frame, !state.name_only);
         }
 
         // Raw health on the bar; the fill's reaction colour brightens while lit (`LIT_BOOST`).
@@ -737,9 +754,21 @@ impl Plate {
             // A new string clears the valid bit and invalidates (`0x771ea4`).
             model.clear_region_valid(name);
         }
-        if last.as_ref().is_none_or(|l| l.hovered != state.hovered) {
+        if last
+            .as_ref()
+            .is_none_or(|l| l.hovered != state.hovered || l.name_only != state.name_only)
+        {
+            // A name-only frame draws the overhead name, whose colour is the unit's reaction
+            // (`0x605960`); the bar's tint answers the same test.
             let c = if state.hovered {
                 [1.0, 1.0, 0.0, 1.0]
+            } else if state.name_only {
+                [
+                    state.bar_colour[0],
+                    state.bar_colour[1],
+                    state.bar_colour[2],
+                    1.0,
+                ]
             } else {
                 [1.0, 1.0, 1.0, 1.0]
             };
@@ -749,12 +778,17 @@ impl Plate {
                 .or_default()
                 .set_vertex_color(Some(c));
             // The glow really shows, as addons read mouseover from it; it only paints nothing.
-            model.set_region_hidden(glow, !state.hovered);
+            model.set_region_hidden(glow, !state.hovered || state.name_only);
         }
 
-        if last.as_ref().is_none_or(|l| {
-            l.level != state.level || l.skull != state.skull || l.level_colour != state.level_colour
-        }) {
+        if !state.name_only
+            && last.as_ref().is_none_or(|l| {
+                l.level != state.level
+                    || l.skull != state.skull
+                    || l.level_colour != state.level_colour
+                    || l.name_only != state.name_only
+            })
+        {
             match (state.level, state.skull) {
                 // The skull flag wins the seat, whatever the level.
                 (_, true) => {
@@ -781,7 +815,10 @@ impl Plate {
             }
         }
 
-        if last.as_ref().is_none_or(|l| l.raid_icon != state.raid_icon) {
+        if last
+            .as_ref()
+            .is_none_or(|l| l.raid_icon != state.raid_icon || l.name_only != state.name_only)
+        {
             match state.raid_icon {
                 Some(idx) => {
                     let (u0, v0) = (f32::from(idx & 3) * 0.25, f32::from(idx >> 2) * 0.25);
