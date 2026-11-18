@@ -132,6 +132,10 @@ mod world_map;
 
 mod zone_text;
 
+// ---- The tutorial banks behind the stock `TutorialFrame.xml` ----
+
+mod tutorial;
+
 // ---- The item tooltip's templates, sets and requirement state, as the network answered ----
 
 mod item_vm;
@@ -9089,6 +9093,9 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
     // The zone caches are the VM's too: every load is a first world enter, whose zone id change
     // splashes the zone name.
     zone_text::clear();
+    // The tutorial banks are the account's, not the VM's: only the bank this VM was told is
+    // forgotten, so the next feed pushes it in again (the app's per-VM memo).
+    tutorial::vm_rebuilt();
     // SAFETY: caller guarantees a valid handle for the call's span.
     let w = unsafe { &mut *world };
     // Mutable: the world map's catalog loaders read DBC files through `&mut Chain` before the
@@ -9255,6 +9262,9 @@ pub extern "C" fn bn_ui_world_enter() -> u32 {
             // `PLAYER_XP_UPDATE`, which is the only thing that paints `MainMenuExpBar`.
             crate::ui_feed::sync(script, 0.0);
             script.fire_world_enter();
+            // The tutorial bring-up (`0x4b5330`) and the enter cascade's arming, after the world's
+            // first snapshot so the cascade's own gate — the local player — reads true.
+            crate::tutorial::world_enter();
             1
         })
     }));

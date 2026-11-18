@@ -2374,6 +2374,9 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) -> bool {
     // The zone texts and the `ZONE_CHANGED` family, the same `AreaTable` read on the same chunk
     // edge: the stock `ZoneText.xml` splash puts the new zone's name on the screen (`area.rs`).
     crate::zone_text::sync(script);
+    // The tutorial banks and the `TUTORIAL_TRIGGER` events they owe, on the same tick: the stock
+    // `TutorialFrame`'s pulsing `?` and its popup card (`crates/benilla-app/src/tutorial.rs`).
+    crate::tutorial::sync(script);
     // The plates seat on this frame's world and the stock `NAMEPLATES_ON` verbs, so they ride the
     // same tick the feed does (`crates/benilla-app/src/vplates.rs`, across the boundary).
     crate::nameplates::drive(WORLD.with(|w| w.get()), script);
@@ -2996,6 +2999,8 @@ pub(crate) fn intents(script: &mut UiScript) {
     for key in script.take_ui_errors() {
         fire_error(script, key);
     }
+    // The tutorial verbs the popup's OK button just called, and the `CMSG_TUTORIAL_*` they owe.
+    crate::tutorial::drain(script);
 }
 
 /// One quest row's packet: an active row (`SelectActiveQuest`, `0x501320`) is

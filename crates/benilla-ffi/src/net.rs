@@ -1322,6 +1322,14 @@ pub(crate) enum Cmd {
     /// End the worker and drop the link: the host's world teardown and a
     /// re-authentication need the session gone, which is what a park `Logout` does.
     CloseLink,
+    /// `CMSG_TUTORIAL_FLAG` (`0xFE`): the id the stock tutorial popup's OK button acknowledged.
+    TutorialFlag {
+        id: u32,
+    },
+    /// `CMSG_TUTORIAL_CLEAR` (`0xFF`): `ClearTutorials()`, the box left unchecked.
+    TutorialClear,
+    /// `CMSG_TUTORIAL_RESET` (`0x100`): `ResetTutorials()`.
+    TutorialReset,
 }
 
 /// What a world loop ended with, so the park knows whether to keep the link.
@@ -1877,6 +1885,15 @@ pub(crate) fn push_event(line: String) {
 
 pub(crate) fn ui_selection() -> u64 {
     shared().selection.load(Ordering::SeqCst)
+}
+
+/// The axes the stock bindings last held, `(forward, strafe, turn)`: the same input the session
+/// thread turns into `MSG_MOVE_START_*` edges, which is what the tutorial's movement site reads.
+pub(crate) fn ui_input() -> (f32, f32, f32) {
+    *shared()
+        .last_input
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn ui_player() -> Option<BnNetPlayer> {
@@ -3024,6 +3041,22 @@ fn run_world(
                         benilla_protocol::messages::opcode::CMSG_TAXINODE_STATUS_QUERY,
                         &benilla_protocol::messages::taxi_node_status_query(npc),
                     );
+                }
+                // The tutorial acknowledges (`0xFE`/`0xFF`/`0x100`): the popup's OK button, the
+                // unchecked box, and the reset. The payloads carry no answer.
+                Ok(Cmd::TutorialFlag { id }) => {
+                    let _ = session.send_body(
+                        benilla_protocol::messages::opcode::CMSG_TUTORIAL_FLAG,
+                        &benilla_protocol::messages::tutorial_flag(id),
+                    );
+                }
+                Ok(Cmd::TutorialClear) => {
+                    let _ = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_TUTORIAL_CLEAR, &[]);
+                }
+                Ok(Cmd::TutorialReset) => {
+                    let _ = session
+                        .send_body(benilla_protocol::messages::opcode::CMSG_TUTORIAL_RESET, &[]);
                 }
                 Ok(Cmd::Target(guid)) => {
                     // The wire has no selection echo; record it here so the target
@@ -4492,6 +4525,11 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             // indicator. The host must not draw this trace line a second time.
             crate::chat_vm::enqueue(msg);
         }
+        // `SMSG_TUTORIAL_FLAGS` (`0xFD`, handler `0x4b5700`): the account's two tutorial banks,
+        // which the stock `TutorialFrame` reads through `TutorialsEnabled`.
+        ServerPacket::TutorialFlags(flags) => {
+            crate::tutorial::flags_arrived(flags.bytes.clone());
+        }
         // The world stream is very chatty; object updates are the bulk, so they
         // are folded into the tracked table rather than echoed as events.
         ServerPacket::UpdateObject { objects } => {
@@ -4633,6 +4671,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             let me = sh.self_guid.load(Ordering::SeqCst);
             if me != 0 && p.player_guid == me {
                 let entry = p.item_entry;
+                // `0x491a60`'s tutorial sites, resolved on the next feed with the template.
+                crate::tutorial::item_received(entry, p.bag_slot, p.item_slot);
                 let fresh = sh
                     .item_asked
                     .lock()
@@ -4772,6 +4812,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             sh.event(format!("xp|{}|{}|{}", x.total, x.base, u8::from(x.kill)));
         }
         ServerPacket::LevelUp(info) => {
+            // `0x5e38c0`'s level-gated tutorial arm, queued for the next feed.
+            crate::tutorial::level_up(info.level);
             sh.event(format!(
                 "levelup|{}|{}|{}",
                 info.level, info.health, info.powers[0]

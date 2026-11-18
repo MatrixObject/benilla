@@ -231,6 +231,20 @@ pub(crate) fn note_tile(map: &str, x: i32, z: i32, mcnk: &[McnkChunk]) {
     sh.wake.notify_all();
 }
 
+/// A Rust-side `PlaySound("name")` for the lanes with no Lua verb of their own: the tutorial
+/// popup's cue (`0x846b68`), which the engine plays as it raises the event, not the frame.
+pub(crate) fn play_kit(name: &str) {
+    let sh = shared();
+    {
+        let mut inner = lock(&sh);
+        if inner.requests.len() >= REQUEST_CAP {
+            inner.requests.pop_front();
+        }
+        inner.requests.push_back(Request::SoundKit(name.to_owned()));
+    }
+    sh.wake.notify_all();
+}
+
 /// A select that cleared the greeting's gates (`0x60c270`): re-track the NPC and say its line.
 /// The cycle's counter, the take and the channel's busy time all live with the kits, on the audio
 /// thread, because `0x623910` reads the pissed kit's variation count.
