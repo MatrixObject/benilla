@@ -2371,6 +2371,9 @@ pub(crate) fn sync(script: &mut UiScript, dt: f32) -> bool {
     // stock `WorldMapFrame` projects (`crates/benilla-app/src/ui_world_map.rs`, across the
     // boundary).
     crate::world_map::sync(script);
+    // The zone texts and the `ZONE_CHANGED` family, the same `AreaTable` read on the same chunk
+    // edge: the stock `ZoneText.xml` splash puts the new zone's name on the screen (`area.rs`).
+    crate::zone_text::sync(script);
     // The plates seat on this frame's world and the stock `NAMEPLATES_ON` verbs, so they ride the
     // same tick the feed does (`crates/benilla-app/src/vplates.rs`, across the boundary).
     crate::nameplates::drive(WORLD.with(|w| w.get()), script);

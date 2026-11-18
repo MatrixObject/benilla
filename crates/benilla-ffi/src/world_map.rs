@@ -592,6 +592,12 @@ pub(crate) fn seed(chain: &mut Chain, script: &mut UiScript) {
     });
 }
 
+/// The `AreaTable` catalog this lane loaded, for the readers beside the map window (`zone_text`).
+/// `None` before [`seed`] or when the chain has no rows.
+pub(crate) fn with_areas<R>(f: impl FnOnce(&AreaTableCatalog) -> R) -> Option<R> {
+    MAP.with(|slot| slot.borrow().as_ref().map(|m| f(&m.areas)))
+}
+
 /// The per-frame feed (`feed_world_map` in the app): the discovery bits, the player's selection
 /// and projected positions, and the landmark sources when one of their inputs moves.
 pub(crate) fn sync(script: &mut UiScript) {

@@ -130,6 +130,8 @@ mod ui_feed;
 
 mod world_map;
 
+mod zone_text;
+
 // ---- The item tooltip's templates, sets and requirement state, as the network answered ----
 
 mod item_vm;
@@ -9084,6 +9086,9 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
     BN_LATCH.with(|l| l.borrow_mut().clear());
     // The engine clears the nameplate toggles with the VM it loads.
     nameplates::clear_bits();
+    // The zone caches are the VM's too: every load is a first world enter, whose zone id change
+    // splashes the zone name.
+    zone_text::clear();
     // SAFETY: caller guarantees a valid handle for the call's span.
     let w = unsafe { &mut *world };
     // Mutable: the world map's catalog loaders read DBC files through `&mut Chain` before the
