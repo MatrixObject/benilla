@@ -162,6 +162,10 @@ mod cursor;
 
 mod audio;
 
+// ---- The NPC's select greeting (`0x60c270`): the gates here, the kits on the audio thread ----
+
+mod greeting;
+
 // ---- kira's mix into the machine's output (cpal 0.17, the workspace's lock) ----
 
 mod audio_out;

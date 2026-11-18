@@ -88,6 +88,8 @@ pub(crate) struct Catalogs {
     pub(crate) talents: Option<benilla_formats::TalentCatalog>,
     /// `DurabilityCosts.dbc` + `DurabilityQuality.dbc`: the vendor's repair price.
     durability: Option<DurabilityTables>,
+    /// `NPCSounds.dbc` + `CreatureDisplayInfo.dbc`: the greeting kits a select plays (`0x60c270`).
+    pub(crate) greetings: Option<benilla_formats::NpcGreetingCatalog>,
     race_teams: HashMap<u8, i8>,
 }
 
@@ -112,6 +114,7 @@ impl Catalogs {
                 quest_tags: None,
                 talents: None,
                 durability: None,
+                greetings: None,
                 race_teams: HashMap::new(),
             };
         };
@@ -133,6 +136,7 @@ impl Catalogs {
             quest_tags: load_quest_tag_names(chain).ok(),
             talents: benilla_formats::load_talent_catalog(chain).ok(),
             durability: load_durability_tables(chain).ok(),
+            greetings: benilla_formats::load_npc_greeting_catalog(chain).ok(),
             race_teams: load_race_pvp_teams(chain).unwrap_or_default(),
         }
     }
@@ -1239,6 +1243,11 @@ impl Feed {
         // (`TargetFrame.lua:37-56` shows the frame, and only this event ever does).
         if selection != prev_selection {
             fire(script, "PLAYER_TARGET_CHANGED", Vec::new());
+            // `0x60c270`: the reference greets on the select. Its click router is the host's, and
+            // the mirrored descriptor is the news that reaches this side, so the edge is here.
+            if selection != 0 {
+                crate::greeting::select(cats, selection);
+            }
         }
 
         // Units the tokens' `target` hops reach: their own snapshots let `targettargettarget`

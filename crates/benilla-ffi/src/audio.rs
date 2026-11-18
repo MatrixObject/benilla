@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use benilla_adt::McnkChunk;
 use benilla_formats::sound_kit_flags::LOOPING;
 use benilla_formats::{
-    load_area_sound_catalog, load_sound_kit_catalog, AreaSoundCatalog, Chain, SoundKitCatalog,
-    ZoneIntroEntry, ZoneMusicEntry, CHUNK_SIZE, TILE_SIZE,
+    load_area_sound_catalog, load_sound_kit_catalog, AreaSoundCatalog, Chain, NpcGreeting,
+    SoundKitCatalog, ZoneIntroEntry, ZoneMusicEntry, CHUNK_SIZE, TILE_SIZE,
 };
 use benilla_ui::script::UiScript;
 use kira::sound::static_sound::StaticSoundData;
@@ -28,6 +28,7 @@ use kira::sound::{FromFileError, PlaybackState};
 use kira::{AudioManager, AudioManagerSettings, Decibels, Tween};
 
 use crate::audio_out::CpalBackend;
+use crate::greeting::{self, GreetLine};
 use crate::net;
 
 /// The music a slot gives up over: the reference's `0x7a5a10(4.0f)` on a zone change (`0x4604d4`).
@@ -52,6 +53,8 @@ const REQUEST_CAP: usize = 256;
 const TILE_CAP: usize = 96;
 /// The decoded one-shots kept by path.
 const SFX_CACHE_CAP: usize = 128;
+/// The vocal channels published for the greeting's latch.
+const VOCAL_CAP: usize = 64;
 
 // ---------------------------------------------------------------------------------------------
 // The game thread's side
@@ -132,6 +135,13 @@ enum Request {
     PlayMusic(String),
     /// `StopMusic()`.
     StopMusic,
+    /// A select that cleared `0x60c270`'s gates: re-track the NPC, and where its display has a
+    /// greeting row, say the line `d_sq` yards from the listener.
+    Greeting {
+        npc: u64,
+        row: Option<NpcGreeting>,
+        d_sq: f32,
+    },
 }
 
 struct Inner {
@@ -143,6 +153,9 @@ struct Inner {
     tiles: HashMap<(i32, i32), Arc<Vec<ChunkArea>>>,
     tick: Option<Tick>,
     requests: VecDeque<Request>,
+    /// `[unit+0xb1c]`'s vocal channel, published for the game thread's gate: each NPC whose last
+    /// greeting is still sounding, with the instant it ends.
+    vocals: HashMap<u64, Instant>,
 }
 
 struct Shared {
@@ -159,6 +172,7 @@ static SHARED: LazyLock<Arc<Shared>> = LazyLock::new(|| {
             tiles: HashMap::new(),
             tick: None,
             requests: VecDeque::new(),
+            vocals: HashMap::new(),
         }),
         wake: Condvar::new(),
     })
@@ -215,6 +229,34 @@ pub(crate) fn note_tile(map: &str, x: i32, z: i32, mcnk: &[McnkChunk]) {
         }
     }
     sh.wake.notify_all();
+}
+
+/// A select that cleared the greeting's gates (`0x60c270`): re-track the NPC and say its line.
+/// The cycle's counter, the take and the channel's busy time all live with the kits, on the audio
+/// thread, because `0x623910` reads the pissed kit's variation count.
+pub(crate) fn greet_npc(npc: u64, row: Option<NpcGreeting>, d_sq: f32) {
+    let sh = shared();
+    {
+        let mut inner = lock(&sh);
+        if inner.requests.len() >= REQUEST_CAP {
+            inner.requests.pop_front();
+        }
+        inner
+            .requests
+            .push_back(Request::Greeting { npc, row, d_sq });
+    }
+    sh.wake.notify_all();
+}
+
+/// `[unit+0xb1c]` (`0x60c28c`): whether this NPC's last greeting is still sounding, which is the
+/// gate the select runs before anything else.
+pub(crate) fn vocal_busy(npc: u64) -> bool {
+    let sh = shared();
+    let inner = lock(&sh);
+    inner
+        .vocals
+        .get(&npc)
+        .is_some_and(|end| Instant::now() < *end)
 }
 
 /// The game thread's beat, from [`crate::bn_ui_tick`]: publish what changed and wake the audio
@@ -356,7 +398,7 @@ fn probe(area: Option<u32>, in_world: bool) {
 /// (no output device, no patch chain) leaves the client silent and the thread exits, so nothing
 /// retries against a dead device every beat.
 fn run(sh: Arc<Shared>, data_dir: String) {
-    match Engine::new(&data_dir) {
+    match Engine::new(&data_dir, Arc::clone(&sh)) {
         Ok(mut engine) => {
             say("audio: output open");
             let start = Instant::now();
@@ -431,11 +473,17 @@ struct Engine {
     pick_rng: u32,
     silence_rng: u32,
     sfx_cache: HashMap<String, StaticSoundData>,
+    /// `[0xc4d908]` and `[0xc4d970]`: the NPC the select greeting tracks and its cycle counter.
+    greet_tracked: u64,
+    greet_seq: usize,
+    /// Publishing the vocal channel's busy time for the game thread's latch gate.
+    shared: Arc<Shared>,
 }
 
 impl Engine {
-    fn new(data_dir: &str) -> Result<Self, String> {
-        let mut chain = Chain::open(std::path::Path::new(data_dir)).map_err(|e| format!("{e:#}"))?;
+    fn new(data_dir: &str, shared: Arc<Shared>) -> Result<Self, String> {
+        let mut chain =
+            Chain::open(std::path::Path::new(data_dir)).map_err(|e| format!("{e:#}"))?;
         let areas = load_area_sound_catalog(&mut chain)
             .map_err(|e| format!("the zone audio tables — {e:#}"))?;
         let kits =
@@ -471,6 +519,9 @@ impl Engine {
             pick_rng: 0x9e37_79b9,
             silence_rng: 0x1234_5677,
             sfx_cache: HashMap::new(),
+            greet_tracked: 0,
+            greet_seq: 0,
+            shared,
         })
     }
 
@@ -583,7 +634,76 @@ impl Engine {
             Request::SoundFile(path) => self.play_file(&path),
             Request::PlayMusic(path) => self.set_lua_music(Some(&path), now),
             Request::StopMusic => self.set_lua_music(None, now),
+            Request::Greeting { npc, row, d_sq } => self.greet(npc, row, d_sq),
         }
+    }
+
+    /// The select greeting's tail (`0x60c326` and `0x623910`): a different NPC restarts the cycle,
+    /// a unit whose display has no `NPCSounds` row is tracked and says nothing, and only a line
+    /// that opened a channel moves the counter.
+    fn greet(&mut self, npc: u64, row: Option<NpcGreeting>, d_sq: f32) {
+        if self.greet_tracked != npc {
+            self.greet_tracked = npc;
+            self.greet_seq = 0;
+        }
+        let Some(row) = row else { return };
+        let takes = self.kits.get(row.pissed).map_or(0, |k| k.files.len());
+        let (line, next) = greeting::greet_line(self.greet_seq, takes);
+        let (kit, take) = match line {
+            GreetLine::Hello => (row.hello, None),
+            GreetLine::Pissed(i) => (row.pissed, Some(i)),
+        };
+        if self.play_vocal(npc, kit, take, d_sq) {
+            self.greet_seq = next;
+        }
+    }
+
+    /// One line on the NPC's vocal channel: the kit's take, at the SFX gain times the reference's
+    /// audible gain for the listener's distance. True when a channel opened, and the channel's
+    /// length is what the game thread's latch gate reads.
+    fn play_vocal(&mut self, npc: u64, kit_id: u32, take: Option<usize>, d_sq: f32) -> bool {
+        let Some(kit) = self.kits.get(kit_id) else {
+            return false;
+        };
+        if kit_id == 0 || kit.files.is_empty() || !greeting::audible(d_sq, kit.distance_cutoff) {
+            return false;
+        }
+        let (min_dist, cutoff, base) = (kit.min_distance, kit.distance_cutoff, kit.volume);
+        let weights: Vec<u32> = kit.files.iter().map(|(_, w)| *w).collect();
+        let pick = take.unwrap_or_else(|| self.pick_variation(kit_id, &weights));
+        let Some(path) = self
+            .kits
+            .get(kit_id)
+            .and_then(|k| k.files.get(pick))
+            .map(|f| f.0.clone())
+        else {
+            return false;
+        };
+        let amp =
+            self.vol.amp(Channel::Sfx) * base * greeting::audible_gain(d_sq, min_dist, cutoff);
+        let data = match self.sfx_data(&path, amp, false) {
+            Ok(d) => d,
+            Err(e) => {
+                self.unplayable(&path, e);
+                return false;
+            }
+        };
+        let end = Instant::now() + data.duration();
+        if self.manager.play(data).is_err() {
+            return false;
+        }
+        let mut inner = lock(&self.shared);
+        if inner.vocals.len() >= VOCAL_CAP {
+            inner.vocals.clear();
+        }
+        inner.vocals.insert(npc, end);
+        // The instrument a live run reads the greeting with, as a structured event line: the
+        // host's in-world drain logs `audio|` and drops the lane's prose.
+        say(format!(
+            "audio|greet|{npc:x}|{kit_id}|{pick}|{:.1}",
+            d_sq.sqrt()
+        ));
+        true
     }
 
     fn zone_row(&self, id: u32) -> Option<&ZoneMusicEntry> {
