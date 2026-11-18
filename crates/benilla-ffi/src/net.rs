@@ -4525,6 +4525,17 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
             // indicator. The host must not draw this trace line a second time.
             crate::chat_vm::enqueue(msg);
         }
+        // `SMSG_NOTIFICATION` (`0x1cb`, handler `0x401800`): the red error-frame line — `0x4945b0`'s
+        // kind 1 with the server's own text, never a chat line. vmangos sends `.gm on` as both a
+        // system line and a notification (`Objects/Player.cpp:2676-2677`).
+        ServerPacket::Notification { text } => {
+            push_chat_event("UI_ERROR_MESSAGE", vec![ScriptValue::Str(text.clone())]);
+        }
+        // `SMSG_AREA_TRIGGER_MESSAGE` (`0x2b8`, arm `0x48f8ff` of `0x48f690`): the yellow line,
+        // `0x4945b0`'s kind 0 — why a trigger refused us.
+        ServerPacket::AreaTriggerMessage { text } => {
+            push_chat_event("UI_INFO_MESSAGE", vec![ScriptValue::Str(text.clone())]);
+        }
         // `SMSG_TUTORIAL_FLAGS` (`0xFD`, handler `0x4b5700`): the account's two tutorial banks,
         // which the stock `TutorialFrame` reads through `TutorialsEnabled`.
         ServerPacket::TutorialFlags(flags) => {
@@ -7189,5 +7200,50 @@ mod tests {
         assert!(!wound_full_body(8, 0, false, true)); // mounted
         assert!(!wound_full_body(9, 0, false, false)); // CombatWound stays upper-body
         assert!(wound_full_body(9, 27, false, false)); // a ready stance takes it all
+    }
+}
+
+/// The two server-pushed error-frame messages: `SMSG_NOTIFICATION` (`0x1cb`, handler `0x401800`)
+/// and `SMSG_AREA_TRIGGER_MESSAGE` (`0x2b8`, arm `0x48f8ff` of `0x48f690`) both go through
+/// `DisplayError` (`0x4945b0`) — kind 1 red and kind 0 yellow — and never into a chat frame.
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    /// Both tests drain the process-wide event queue.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_notification_is_a_red_line_and_a_trigger_refusal_a_yellow_one() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sh = shared();
+        take_chat_events();
+        handle_packet(
+            &ServerPacket::Notification {
+                text: "You are now in Ghost mode.".to_string(),
+            },
+            sh,
+        );
+        handle_packet(
+            &ServerPacket::AreaTriggerMessage {
+                text: "You can't enter there while dead.".to_string(),
+            },
+            sh,
+        );
+        assert_eq!(
+            take_chat_events(),
+            vec![
+                (
+                    "UI_ERROR_MESSAGE".to_string(),
+                    vec![ScriptValue::Str("You are now in Ghost mode.".to_string())]
+                ),
+                (
+                    "UI_INFO_MESSAGE".to_string(),
+                    vec![ScriptValue::Str(
+                        "You can't enter there while dead.".to_string()
+                    )]
+                ),
+            ]
+        );
     }
 }
