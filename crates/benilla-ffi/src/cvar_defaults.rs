@@ -397,3 +397,116 @@ pub(crate) const DEFAULTS: &[(&str, &str)] = &[
     ("waterLOD", "0"),
     ("widescreen", "1"),
 ];
+
+/// The rows the VM starts from, ahead of [`DEFAULTS`]: `config.toml`'s own, and — where it names no
+/// realm — the install's `realmlist.wtf`, which the reference reads into the same CVar
+/// (`0x5ab680` → `0x63d820`). With neither on the drive, the registered default stands.
+pub(crate) fn saved_base(data_dir: &str) -> Vec<(String, String)> {
+    with_realmlist_wtf(benilla_app::stored_cvars(), std::path::Path::new(data_dir))
+}
+
+/// `rows`, plus the `realmlist.wtf` address when no row names `realmList`: a row the player keeps in
+/// `config.toml` outlives the install's file, the file outlives the built-in default.
+fn with_realmlist_wtf(
+    mut rows: Vec<(String, String)>,
+    data_dir: &std::path::Path,
+) -> Vec<(String, String)> {
+    if rows
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(benilla_app::CVAR_REALMLIST))
+    {
+        return rows;
+    }
+    if let Some(address) = benilla_app::realmlist_wtf(data_dir) {
+        rows.push((benilla_app::CVAR_REALMLIST.to_string(), address));
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use benilla_ui::script::UiScript;
+
+    /// A temp install: the `Data` folder the host names, with the file beside it.
+    fn install(address: Option<&str>) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("benilla-ffi-realmlist-{}", std::process::id()));
+        let data = root.join("Data");
+        std::fs::create_dir_all(&data).unwrap();
+        match address {
+            Some(address) => std::fs::write(
+                root.join("realmlist.wtf"),
+                format!("set realmlist {address}\r\n"),
+            )
+            .unwrap(),
+            None => {
+                let _ = std::fs::remove_file(root.join("realmlist.wtf"));
+            }
+        }
+        data
+    }
+
+    /// The install's file is what a bare launch dials: it reaches the registered rows and the
+    /// stock `GetCVar` answers from it, so no `127.0.0.1` stands between the drive and the socket.
+    #[test]
+    fn the_install_s_file_seeds_the_realm_the_vm_dials() {
+        let data = install(Some("203.0.113.7:3725"));
+        let rows = with_realmlist_wtf(Vec::new(), &data);
+        let mut script = UiScript::new().unwrap();
+        script.set_cvar_saved_base(rows);
+        script.register_cvars(super::DEFAULTS.iter().copied());
+        assert_eq!(
+            script.cvar("realmList").as_deref(),
+            Some("203.0.113.7:3725"),
+            "realmlist.wtf never reached the CVar"
+        );
+        let _ = std::fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    /// A row the player keeps in `config.toml` outranks the install's own file.
+    #[test]
+    fn a_saved_row_outranks_the_install_s_file() {
+        let data = install(Some("203.0.113.7:3725"));
+        let rows = with_realmlist_wtf(
+            [("realmList".to_string(), "198.51.100.9:3725".to_string())].to_vec(),
+            &data,
+        );
+        assert_eq!(
+            rows.as_slice(),
+            [("realmList".to_string(), "198.51.100.9:3725".to_string())].as_slice(),
+            "the file overwrote the player's own address"
+        );
+        let _ = std::fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    /// No file, no row: nothing is invented beyond the registered default.
+    #[test]
+    fn no_file_adds_no_row() {
+        let data = install(None);
+        assert!(with_realmlist_wtf(Vec::new(), &data).is_empty());
+        let _ = std::fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    /// A disk row is what the registered default gives way to: seeded before the rows, the
+    /// `config.toml` value is what the stock `GetCVar` answers, so `realmList` off the drive is the
+    /// address a logon dials when neither the command line nor `$WOW_HOST` names one.
+    #[test]
+    fn a_saved_row_beats_the_registered_default() {
+        let mut script = UiScript::new().unwrap();
+        script.set_cvar_saved_base([("realmList".to_string(), "203.0.113.7:3725".to_string())]);
+        script.register_cvars(super::DEFAULTS.iter().copied());
+        assert_eq!(
+            script.cvar("realmList").as_deref(),
+            Some("203.0.113.7:3725"),
+            "the registered row ignored the saved base"
+        );
+    }
+
+    /// With no saved base the row is the reference's own default, unchanged.
+    #[test]
+    fn with_no_saved_base_the_registered_default_stands() {
+        let script = UiScript::new().unwrap();
+        script.register_cvars(super::DEFAULTS.iter().copied());
+        assert_eq!(script.cvar("realmList").as_deref(), Some("127.0.0.1:3725"));
+    }
+}

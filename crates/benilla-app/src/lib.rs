@@ -211,9 +211,12 @@ pub use ui_script::glue_mgr::{
     STATUS_FAILED_TO_CONNECT, STATUS_REALM_LIST_FAILED, STATUS_REALM_LIST_REALM_NOT_FOUND,
 };
 // The realmlist law and the realm-list query's wait, for the same host: it dials what the client
-// would dial and waits as long as the client waits.
+// would dial and waits as long as the client waits — including the client's own `realmlist.wtf`.
 pub use net::io::REALM_REFRESH_TIMEOUT;
-pub use realmlist::{realmlist_address, CVAR_REALMLIST};
+pub use realmlist::{realmlist_address, realmlist_wtf, CVAR_REALMLIST};
+// The same door for the console vars: a host with no `App` seeds its VM from `config.toml` before
+// it registers the rows, so a disk value is what the stock `GetCVar` answers.
+pub use cvars::stored_cvars;
 // The queue ring (`0x46ae50`), for a host whose connect reports its place in line.
 pub use glue_session::queue::QueueEstimate;
 

@@ -807,6 +807,21 @@ pub(crate) fn boot_cvar(name: &str) -> Option<String> {
     }
 }
 
+/// Every `[cvars]` row `config.toml` holds, for a host that drives the VM itself and has no `App`:
+/// the FFI seeds these as its VM's saved base before it registers the rows, so the disk value is
+/// what the stock `GetCVar` answers. A malformed file answers none and keeps itself, the same law
+/// as [`boot_cvar`] and [`load_config`].
+pub fn stored_cvars() -> Vec<(String, String)> {
+    match stored_config() {
+        StoredConfig::Table(t) => t.into_iter().collect(),
+        StoredConfig::Absent => Vec::new(),
+        StoredConfig::Bad(msg) => {
+            warn!("{msg}");
+            Vec::new()
+        }
+    }
+}
+
 /// Per frame: seed a new VM's mirror, drain its registrations and writes into the registry, push
 /// the registry's writes into the mirror, and trigger every accepted move.
 pub(crate) fn sync_cvars(
@@ -2094,6 +2109,41 @@ mod tests {
         assert!(text.contains("MusicVolume = \"0.75\""), "{text}");
         assert!(!app.world().resource::<Cvars>().dirty);
         assert!(app.should_exit().is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The door a host with no `App` and no world takes: the file's rows, for its VM's saved base.
+    #[test]
+    fn stored_cvars_answers_with_the_file_s_rows() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("benilla-stored-cvars-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _c = EnvGuard::unset("WOW_CAPTURE");
+        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+
+        // No file yet: every value stays at its registered default.
+        assert!(stored_cvars().is_empty(), "a missing file answered rows");
+
+        crate::local_state::write_atomic(
+            &tmp.join("config.toml"),
+            "[cvars]\nrealmList = \"203.0.113.7:3725\"\ngameTip = \"1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stored_cvars(),
+            vec![
+                ("gameTip".to_string(), "1".to_string()),
+                ("realmList".to_string(), "203.0.113.7:3725".to_string()),
+            ]
+        );
+
+        // A malformed file answers none and keeps itself, so nothing overwrites it.
+        crate::local_state::write_atomic(&tmp.join("config.toml"), "not toml at all [").unwrap();
+        assert!(stored_cvars().is_empty(), "a malformed file answered rows");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

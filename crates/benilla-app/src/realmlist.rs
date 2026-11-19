@@ -4,7 +4,8 @@
 //! `0x5ab6a6`) and loads it from `realmlist.wtf` beside the executable, with no UI. benilla keeps
 //! the name, the shape and the help string. Deviation: the value lives in `config.toml` with every
 //! other CVar and is edited from a login-screen control, because local state is one folder and one
-//! config file.
+//! config file. A host that keeps its CVars in a UI VM rather than an `App` falls back to the
+//! reference's own file when its config names no realm ([`realmlist_wtf`]).
 //!
 //! `$WOW_HOST` wins for the session, is never written to the file, and is taken verbatim, not
 //! through [`normalize`].
@@ -124,6 +125,25 @@ pub fn realmlist_address(cvar: Option<&str>) -> String {
     list.address().to_string()
 }
 
+/// The address a launch with no `App` dials when no `config.toml` row names one: the reference's
+/// own `realmlist.wtf`, which `0x5ab680` reads into the CVar through `0x63d820`, the routine that
+/// loads a `.wtf`'s rows. `data_dir` is the install's `Data` folder, so the file is its sibling;
+/// the last usable line wins, as a row-by-row load overwrites. `None` when the file is absent or
+/// holds no address.
+pub fn realmlist_wtf(data_dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(data_dir.parent()?.join("realmlist.wtf")).ok()?;
+    // A file re-saved by an editor can carry a byte-order mark, which is neither whitespace nor a
+    // control character and so would hide the `set` from `normalize`.
+    let text = String::from_utf8_lossy(&bytes);
+    let mut address = None;
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        if let Some(found) = normalize(line) {
+            address = Some(found);
+        }
+    }
+    address
+}
+
 /// Normalizes typed or pasted text into a `host[:port]`, checking syntax only; reachability
 /// surfaces in the `LOGIN_FAILED` dialog. A pasted `realmlist.wtf` line
 /// (`SET realmlist "logon.example.org"`) is unwrapped to its value.
@@ -200,6 +220,49 @@ mod tests {
                 "unwrapping {line:?}",
             );
         }
+    }
+
+    /// The install's own file, in the shape a shipped one has: read through the `Data` folder the
+    /// host names, its last usable line wins and no file is no address.
+    #[test]
+    fn the_wtf_beside_the_install_is_the_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("benilla-realmlist-wtf-{}", std::process::id()));
+        let data = root.join("Data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            root.join("realmlist.wtf"),
+            "set realmlist 203.0.113.7:3725\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            realmlist_wtf(&data).as_deref(),
+            Some("203.0.113.7:3725"),
+            "the install's own line, read from its sibling"
+        );
+        std::fs::write(
+            root.join("realmlist.wtf"),
+            "set realmlist 203.0.113.7\r\nSET realmlist \"logon.example.org:3725\"\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            realmlist_wtf(&data).as_deref(),
+            Some("logon.example.org:3725"),
+            "a row-by-row load keeps the last line"
+        );
+        std::fs::write(
+            root.join("realmlist.wtf"),
+            "﻿set realmlist 198.51.100.9:3725\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            realmlist_wtf(&data).as_deref(),
+            Some("198.51.100.9:3725"),
+            "an editor's byte-order mark hides the line"
+        );
+        std::fs::remove_file(root.join("realmlist.wtf")).unwrap();
+        assert_eq!(realmlist_wtf(&data), None, "no file is no address");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

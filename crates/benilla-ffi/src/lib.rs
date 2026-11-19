@@ -9154,6 +9154,9 @@ pub extern "C" fn bn_ui_load(world: *mut BnWorld) -> u32 {
         // lacks (`0x842310`): `TextStatusBar.lua:47` reads `statusBarText` on
         // every health-bar update, so one unseeded name aborts that tick's whole
         // dispatch. Same rows the app's registry seeds into its own VM.
+        // The drive first: a `config.toml` row, else the install's own `realmlist.wtf`, is what the
+        // registered default gives way to, so the address a bare launch dials is one on disk.
+        script.set_cvar_saved_base(cvar_defaults::saved_base(&w.data_dir));
         script.register_cvars(cvar_defaults::DEFAULTS.iter().copied());
         // `WTF\DefaultBindings.wtf`, set 0 (`0x4b62b0`), then set 1 live as a
         // first login's account set is.
@@ -10729,7 +10732,9 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         script.set_client_region(benilla_formats::client_region(chain) as i32);
         script.set_text_measurer(Box::new(ui_font::VmMeasure));
         // The engine registers every console var before either interface loads;
-        // the glue screens read `gxResolution`, `readEULA` and `movieSubtitle`.
+        // the glue screens read `gxResolution`, `readEULA` and `movieSubtitle`. The login dials the
+        // `realmList` this VM answers, so the drive seeds it here too.
+        script.set_cvar_saved_base(cvar_defaults::saved_base(&w.data_dir));
         script.register_cvars(cvar_defaults::DEFAULTS.iter().copied());
         // The agreements the login's first tests read; a returning player's
         // flags, so the menu is not parked on the ToU screen.
