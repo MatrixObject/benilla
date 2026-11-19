@@ -18,7 +18,7 @@ const MINUTE_MS: i64 = 60_000;
 /// Sampled once per queue packet, on no timer, so its only clock is the server's send cadence.
 /// A new value is a fresh connect (`0x5aab20` zeroes the ring and the estimate together).
 #[derive(Debug, Default, Clone)]
-pub(crate) struct QueueEstimate {
+pub struct QueueEstimate {
     tick_ms: [u32; SAMPLES],
     position: [u32; SAMPLES],
     /// `[0xb41df0]`: the wait in ms the last packet that moved the queue forward computed; 0 until
@@ -32,7 +32,7 @@ impl QueueEstimate {
     /// With the oldest sample set and the newest position below it, the estimate is recomputed
     /// against this packet's time and stored (`0x46aeda`); otherwise it keeps its value
     /// (`0x46aec0`, `0x46aece`).
-    pub(crate) fn sample(&mut self, position: u32, now_ms: u32) {
+    pub fn sample(&mut self, position: u32, now_ms: u32) {
         let repeat = position == self.position[0] && self.tick_ms[SAMPLES - 1] != 0;
         if !repeat {
             self.tick_ms.rotate_right(1);
@@ -45,7 +45,7 @@ impl QueueEstimate {
         }
     }
 
-    pub(crate) fn position(&self) -> Option<u32> {
+    pub fn position(&self) -> Option<u32> {
         (self.tick_ms[0] != 0).then_some(self.position[0])
     }
 
@@ -70,7 +70,7 @@ impl QueueEstimate {
     }
 
     /// The stored estimate, if there is one: `[0xb41df0]` above 0 (`0x46bcb8`).
-    pub(crate) fn estimate_ms(&self) -> Option<i64> {
+    pub fn estimate_ms(&self) -> Option<i64> {
         (self.estimate_ms > 0).then_some(self.estimate_ms)
     }
 
@@ -85,7 +85,7 @@ impl QueueEstimate {
     ///
     /// The reference composes `"%s\n%s"` with an always-empty first half, a leading blank line in
     /// two of three states; that blank line is not reproduced.
-    pub(crate) fn text_by(
+    pub fn text_by(
         &self,
         now_ms: u32,
         realm: Option<&str>,

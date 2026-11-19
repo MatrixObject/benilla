@@ -27,10 +27,22 @@ fn main() {
         let text = String::from_utf8_lossy(&bytes);
         if let Some(pos) = text.find(&needle) {
             let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
+            let end = text[pos..]
+                .find('\n')
+                .map(|i| pos + i)
+                .unwrap_or(text.len());
             println!("{} :: {}", name, &text[start..end]);
-            let ctx_start = text[..pos].match_indices('\n').rev().nth(20).map(|(i, _)| i + 1).unwrap_or(0);
-            let ctx_end = text[pos..].match_indices('\n').nth(20).map(|(i, _)| pos + i).unwrap_or(text.len());
+            let ctx_start = text[..pos]
+                .match_indices('\n')
+                .rev()
+                .nth(20)
+                .map(|(i, _)| i + 1)
+                .unwrap_or(0);
+            let ctx_end = text[pos..]
+                .match_indices('\n')
+                .nth(20)
+                .map(|(i, _)| pos + i)
+                .unwrap_or(text.len());
             println!("--- context ---\n{}\n---", &text[ctx_start..ctx_end]);
         }
     }

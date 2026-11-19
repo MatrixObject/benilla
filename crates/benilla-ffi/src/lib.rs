@@ -636,9 +636,14 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
         }
         let vtx0 = out.verts.len() as u32;
         // MCSH bytes are the occlusion itself: `benilla-formats terrain.rs:409` turns a set bit
-        // into 255, and the reference reads that array as "255 shadowed, 0 lit" (`terrain.wgsl:213`).
-        // Inverting it here mirrors the countryside's shadows; a dark town is authored data.
-        let shadow_bytes: Option<&Vec<u8>> = c.shadow.as_ref();
+        // into 255 (shadowed), and the reference shader inverts it at `terrain.wgsl:218`
+        // (`shadow_lit = 1.0 - mcsh`) before compositing. We do that inversion here, once,
+        // because the UE host reads A-channel / Vertex R directly as lit (255 = lit, 0 = shadowed).
+        // Evidence: Azeroth_31_49 has 72.25% raw 255 — that is open ground, not shadow.
+        let shadow_lit: Option<Vec<u8>> = c
+            .shadow
+            .as_ref()
+            .map(|v| v.iter().map(|&b| 255 - b).collect());
         // MCSH reads the same grid `ChunkMesh::mcsh_shadowed_at` walks: row from
         // the north-west corner toward +x (south), column toward +y (east).
         let nw = c.positions.first().copied().unwrap_or([0.0, 0.0, 0.0]);
@@ -670,7 +675,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             // MCSH is 64×64 per 33.3 yd chunk (~0.52 yd a texel); a point
             // sample quantises the boundary to half-yard blocks, so bilinear
             // over the four surrounding texels keeps the edge continuous.
-            let (shade, valid) = match shadow_bytes {
+            let (shade, valid) = match shadow_lit.as_ref() {
                 Some(sh) => {
                     // *16 scales the chunk-local offset (0..CHUNK_SIZE) to the
                     // 0..1 tile fraction the MCSH grid is indexed by.
@@ -719,7 +724,7 @@ fn build_tile_flat_mesh(tile: &benilla_formats::TileMesh) -> Option<TileFlat> {
             tex: c.base_texture.clone().unwrap_or_default(),
             layers: c.layer_textures.clone(),
             alpha: c.alpha_map.clone(),
-            shadow: shadow_bytes.cloned(),
+            shadow: shadow_lit,
         });
     }
     // ADT liquid (MCLQ): own buffer, same tile-local + WoW->UE mirror as the
@@ -8957,6 +8962,23 @@ const UI_DUMP_DEFS_LUA: &str = r#"
         end
         return string.format("1\t%.2f\t%.2f", s, l)
     end
+    -- The rect a host draws is the resolved rect (`ApplyRect 0x76b580` stores the
+    -- edges), not the authored size: an object anchored on both edges of an axis
+    -- stretches and `GetWidth` still answers the number the XML wrote. The middle
+    -- slice of every three-slice bar (`<Middle>` of
+    -- `CharacterCustomizationFrameTemplate`, the create screen's option rows) is
+    -- that case, and reporting its authored 5 leaves the label bare. A FontString
+    -- is not: its `GetLeft`/`GetRight` answer its centre and centre-plus-half, so
+    -- its text extent comes from `GetWidth`.
+    local function drawn_rect(o)
+        local l, t, w, h = o:GetLeft(), o:GetTop(), o:GetWidth(), o:GetHeight()
+        local ok, r, b = pcall(function() return o:GetRight(), o:GetBottom() end)
+        if ok and type(r) == "number" and type(b) == "number"
+            and type(l) == "number" and type(t) == "number" then
+            w, h = r - l, t - b
+        end
+        return l, t, w, h
+    end
     local function dump_one(f)
         local mine = {}
         -- IsVisible, not IsShown: the shown bit ignores hidden ancestors, so
@@ -9031,9 +9053,15 @@ const UI_DUMP_DEFS_LUA: &str = r#"
                 local okv, vv = pcall(function() return r:GetJustifyV() end)
                 if okv then jv = clean(vv) end
             end
+            local rl, rt, rw, rh
+            if ty == "Texture" then
+                rl, rt, rw, rh = drawn_rect(r)
+            else
+                rl, rt, rw, rh = r:GetLeft(), r:GetTop(), r:GetWidth(), r:GetHeight()
+            end
             table.insert(mine, table.concat({ "R", clean(f:GetName()),
-                clean(r:GetName()), ty, num(r:GetLeft()), num(r:GetTop()),
-                num(r:GetWidth()), num(r:GetHeight()), extra,
+                clean(r:GetName()), ty, num(rl), num(rt),
+                num(rw), num(rh), extra,
                 colr, region_alpha_str(r), font, size, flags, jh, jv,
                 texcoord_str(r), layer_str(r), blend_str(r, ty),
                 (bar_tex ~= nil and r == bar_tex) and "1" or "0",
@@ -10230,6 +10258,22 @@ use benilla_ui::script::{
     GlueText, NoticeState, ScriptValue, UiScript,
 };
 
+// The client's own glue laws, read rather than re-typed: the address a logon dials, the record
+// shapes the roster and the realm holder take, the queue ring, the `realmList` CVar's reference
+// spelling, and the flag `EnterWorld` gates on.
+use benilla_app::{
+    glue_realm, realmlist_address, roster_record, QueueEstimate, CVAR_REALMLIST,
+    FLAG_LOCKED_FOR_TRANSFER, STATUS_CHAR_LOGIN_LOCKED_FOR_TRANSFER, STATUS_FAILED_TO_CONNECT,
+    STATUS_REALM_LIST_FAILED, STATUS_REALM_LIST_REALM_NOT_FOUND,
+};
+
+// The result bytes the create, delete and rename replies are judged against, and the roster flags
+// the world entry gates on, by the names the protocol gives them, so no bare byte or bit is read
+// as a success here.
+use benilla_protocol::messages::{
+    CHARACTER_FLAG_RENAME, CHAR_CREATE_NAME_IN_USE, CHAR_CREATE_SUCCESS, CHAR_DELETE_SUCCESS,
+};
+
 /// The DBC catalogs the glue screens read: the create screen's races/classes/
 /// customization counts and the roster's race/class/zone/model strings. Loaded
 /// once with the glue VM.
@@ -10242,6 +10286,11 @@ struct GlueCatalogs {
     creatures: Option<benilla_formats::CreatureCatalog>,
 }
 
+/// The reference's `realmName` (`0x83f2d0`, registered `""` at `0x882748`, "Last realm connected
+/// to"): the connect resolves the realm its value names (`0x5ab6f0`) and `ConnectToRealm` stamps
+/// it (`0x5ab7b0`).
+const CVAR_REALM_NAME: &str = "realmName";
+
 /// The menu's bridge between the network worker and the glue VM: the worker
 /// state already applied, the pending roster fetch, the realm the screen picked
 /// and the status dialog the host raised.
@@ -10253,9 +10302,16 @@ struct MenuSync {
     roster_epoch_at_request: u64,
     realm_index: Option<u32>,
     dialog: Option<&'static str>,
-    realms_refresh: bool,
     events: Vec<String>,
+    /// The address the next logon dials, re-read from the `realmList` CVar every tick
+    /// (`realmlist_address`), never frozen: the reference reads the cell per attempt.
     realm_address: String,
+    /// Whether the list the worker next publishes answers a `RequestRealmList` query
+    /// (`COP_GET_REALMS`, `0x5ab840`) rather than the logon's connect (`0x5aab20`).
+    awaiting_query: bool,
+    /// The world dial's queue ring (`0x46ae50`), reset when `connect_gen` says the dial is new.
+    queue: QueueEstimate,
+    queue_gen: u64,
     catalogs: GlueCatalogs,
 }
 
@@ -10269,9 +10325,11 @@ impl Default for MenuSync {
             roster_epoch_at_request: 0,
             realm_index: None,
             dialog: None,
-            realms_refresh: false,
             events: Vec::new(),
             realm_address: String::new(),
+            awaiting_query: false,
+            queue: QueueEstimate::default(),
+            queue_gen: 0,
             catalogs: GlueCatalogs::default(),
         }
     }
@@ -10297,6 +10355,17 @@ fn open_raw(which: &'static str, text: String) -> GlueSignal {
     }
 }
 
+/// What the worker's failure answers with, after closing whatever stood: the dialog by its stock
+/// key or its raw words, or `DISCONNECTED_FROM_SERVER` for a link that died with no server answer,
+/// which stock `GlueParent.lua` takes back to the login screen with its `DISCONNECTED` dialog.
+fn failure_signals(failure: net::MenuFailure) -> Vec<GlueSignal> {
+    match failure {
+        net::MenuFailure::Key(which, key) => vec![GlueSignal::Close, open_key(which, key)],
+        net::MenuFailure::Raw(which, text) => vec![GlueSignal::Close, open_raw(which, text)],
+        net::MenuFailure::Disconnected => vec![GlueSignal::Close, GlueSignal::Disconnected],
+    }
+}
+
 fn set_dialog(which: Option<&'static str>) {
     BN_MENU.with(|m| m.borrow_mut().dialog = which);
 }
@@ -10312,16 +10381,12 @@ fn faction_groups<'a>(
         .filter(|g| g.mask_id != 0 && template.group_mask & 1u32.wrapping_shl(g.mask_id) != 0)
 }
 
-/// The race's body display for a sex, then that display's model row.
+/// The race's body display for a sex, then that display's model row: `0x5ec480` asks the creature
+/// catalog whether the display id has a model behind it, which is [`benilla_formats::CreatureCatalog::model`].
 fn display_resolves(cats: &GlueCatalogs, display: u32) -> bool {
-    let Some(creatures) = cats.creatures.as_ref() else {
-        return false;
-    };
-    let models: std::collections::HashSet<u32> =
-        creatures.sized_models().map(|(id, _, _)| id).collect();
-    creatures
-        .display_models()
-        .any(|(d, m)| d == display && models.contains(&m))
+    cats.creatures
+        .as_ref()
+        .is_some_and(|c| c.model(display).is_some())
 }
 
 /// The create screen's catalog, assembled the way the glue build walks it
@@ -10420,56 +10485,23 @@ fn build_create_catalog(cats: &GlueCatalogs) -> GlueCreateCatalog {
 struct MenuHost;
 
 impl MenuHost {
-    /// The roster rows as the character screen's records take them.
-    fn map_chars(sync: &MenuSync) -> Vec<GlueCharacter> {
-        let text = |s: Option<&str>| s.unwrap_or_default().to_string();
-        let mut out = Vec::new();
-        for row in net::menu_chars() {
-            let bytes: Vec<u8> = row
-                .name
-                .iter()
-                .take_while(|c| **c != 0)
-                .map(|c| *c as u8)
-                .collect();
-            out.push(GlueCharacter {
-                guid: row.guid,
-                name: String::from_utf8_lossy(&bytes).into_owned(),
-                race: text(
-                    sync.catalogs
-                        .create
-                        .as_ref()
-                        .and_then(|r| r.race_name(row.race)),
-                ),
-                class: text(
-                    sync.catalogs
-                        .classes
-                        .as_ref()
-                        .and_then(|c| c.name(u32::from(row.class))),
-                ),
-                level: row.level,
-                zone: sync
-                    .catalogs
-                    .areas
-                    .as_ref()
-                    .and_then(|a| a.name(row.zone))
-                    .map(str::to_string),
-                file_string: text(
-                    sync.catalogs
-                        .create
-                        .as_ref()
-                        .and_then(|r| r.race_file(row.race)),
-                ),
-                gender: row.gender,
-                flags: 0,
-                model: sync
-                    .catalogs
-                    .create
-                    .as_ref()
-                    .and_then(|r| r.body_display(row.race, row.gender))
-                    .is_some_and(|d| display_resolves(&sync.catalogs, d)),
-            });
-        }
-        out
+    /// The roster as the character screen's records, built by the client's own enum law
+    /// (`benilla_app::roster_record`, `0x4732a0`) over the protocol's rows: the race, class and zone
+    /// names off the DBCs, the record's own `flags`, and the model bit from the display the race and
+    /// sex give.
+    fn roster_records(sync: &MenuSync) -> Vec<GlueCharacter> {
+        net::menu_roster()
+            .iter()
+            .map(|c| {
+                roster_record(
+                    c,
+                    sync.catalogs.areas.as_ref(),
+                    sync.catalogs.create.as_ref(),
+                    sync.catalogs.classes.as_ref(),
+                    |display| display_resolves(&sync.catalogs, display),
+                )
+            })
+            .collect()
     }
 }
 
@@ -10496,6 +10528,7 @@ impl GlueHost for MenuHost {
                     s.last_chars_epoch = 0;
                     s.pending_roster = false;
                     s.realm_index = None;
+                    s.awaiting_query = false;
                     s.dialog = Some("CANCEL");
                 });
                 let _ = net::menu_login(&addr, &c.account, &c.password);
@@ -10506,8 +10539,13 @@ impl GlueHost for MenuHost {
                 }]
             }
             // The dialog button at the logon cancels the link, then closes.
+            // `CLoginMgr::Cancel` (`0x5b3320`) stops the operation in flight, and a world dial
+            // waiting in a queue is an operation in flight.
             GlueCall::StatusDialogClick => {
-                if net::menu_snapshot().status == net::ST_CONNECTING {
+                if matches!(
+                    net::menu_snapshot().status,
+                    net::ST_CONNECTING | net::ST_WORLD_CONNECTING
+                ) {
                     let _ = net::menu_logout();
                 }
                 set_dialog(None);
@@ -10520,15 +10558,23 @@ impl GlueHost for MenuHost {
                 vec![GlueSignal::Close, GlueSignal::Disconnected]
             }
             GlueCall::QuitGame => vec![],
-            // State 4: the `REALM_LIST_IN_PROGRESS` dialog when asked, and the
-            // rebuild of the list the worker already holds.
+            // State 4 (`0x46b8d0`): the operation, its dialog, and `COP_GET_REALMS` asked for real
+            // (`0x5ab840`) — not a re-publish of the rows already held. The list the reply brings is
+            // published by the tick when the worker's epoch moves, and its failure is reported there
+            // as `STATUS_REALM_LIST_FAILED`.
             GlueCall::RequestRealmList { dialog } => {
-                BN_MENU.with(|m| m.borrow_mut().realms_refresh = true);
-                if dialog {
+                let open = if dialog {
                     set_dialog(Some("CANCEL"));
                     vec![open_key("CANCEL", "REALM_LIST_IN_PROGRESS")]
                 } else {
                     vec![]
+                };
+                if net::menu_realm_refresh() {
+                    BN_MENU.with(|m| m.borrow_mut().awaiting_query = true);
+                    open
+                } else {
+                    set_dialog(Some("OKAY"));
+                    failure_signals(net::status_failure(STATUS_REALM_LIST_FAILED))
                 }
             }
             GlueCall::CancelRealmListQuery => {
@@ -10553,42 +10599,49 @@ impl GlueHost for MenuHost {
                 }
                 None => {
                     set_dialog(Some("OKAY"));
-                    vec![open_key("OKAY", "REALM_LIST_REALM_NOT_FOUND")]
+                    failure_signals(net::status_failure(STATUS_REALM_LIST_REALM_NOT_FOUND))
                 }
             },
             // State 3: the dialog and the `CMSG_CHAR_ENUM`; the roster reply is
             // loaded by the tick, with the script free.
             GlueCall::GetCharacterList => {
-                let now = net::menu_snapshot().chars_epoch;
-                if !net::menu_refresh_roster() {
+                if !self.connected() {
                     set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "CHAR_LIST_FAILED")];
+                    return failure_signals(net::status_failure(STATUS_FAILED_TO_CONNECT));
                 }
+                let now = net::menu_snapshot().chars_epoch;
                 BN_MENU.with(|m| {
                     let mut s = m.borrow_mut();
                     s.pending_roster = true;
                     s.roster_epoch_at_request = now;
                     s.dialog = Some("CANCEL");
                 });
+                let _ = net::menu_refresh_roster();
                 vec![open_key("CANCEL", "CHAR_LIST_RETRIEVING")]
             }
             GlueCall::DeleteCharacter(guid) => {
-                if !net::menu_delete_character(guid) {
+                if !self.connected() {
                     set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                    return failure_signals(net::status_failure(STATUS_FAILED_TO_CONNECT));
                 }
                 set_dialog(Some("CANCEL"));
+                let _ = net::menu_delete_character(guid);
                 vec![open_key("CANCEL", "CHAR_DELETE_IN_PROGRESS")]
             }
+            // `0x5ab630`: the rename's step sends nothing without the world link and never
+            // completes, so the in-progress dialog stands.
             GlueCall::RenameCharacter { guid, name } => {
-                if !net::menu_rename_character(guid, name) {
-                    set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
+                if self.connected() {
+                    let _ = net::menu_rename_character(guid, name);
                 }
                 set_dialog(Some("CANCEL"));
                 vec![open_key("CANCEL", "CHAR_RENAME_IN_PROGRESS")]
             }
             GlueCall::CreateCharacter(request) => {
+                if !self.connected() {
+                    set_dialog(Some("OKAY"));
+                    return failure_signals(net::status_failure(STATUS_FAILED_TO_CONNECT));
+                }
                 let req = benilla_protocol::CharCreateReq {
                     name: request.name.clone(),
                     race: request.race,
@@ -10600,27 +10653,26 @@ impl GlueHost for MenuHost {
                     hair_color: request.hair_color,
                     facial_hair: request.facial_hair,
                 };
-                if !net::menu_create_character(req) {
-                    set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
-                }
                 set_dialog(Some("CANCEL"));
+                let _ = net::menu_create_character(req);
                 vec![open_key("CANCEL", "CHAR_CREATE_IN_PROGRESS")]
             }
-            // The world entry's guards and the pick. The render host sees the
-            // world through `bn_net_status == ST_IN_WORLD`.
+            // The world entry's guards and the pick (`0x46b539`, `0x46b57e`, `0x46b5b1`). The
+            // render host sees the world through `bn_net_status == ST_IN_WORLD`.
             GlueCall::EnterWorld { guid, flags, .. } => {
-                if flags & 0x4 != 0 {
-                    set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "CHAR_LOGIN_LOCKED_FOR_TRANSFER")];
+                if !self.connected() {
+                    return vec![];
                 }
-                if flags & 0x4000 != 0 {
+                if flags & FLAG_LOCKED_FOR_TRANSFER != 0 {
+                    set_dialog(Some("OKAY"));
+                    return failure_signals(net::status_failure(
+                        STATUS_CHAR_LOGIN_LOCKED_FOR_TRANSFER,
+                    ));
+                }
+                if flags & CHARACTER_FLAG_RENAME != 0 {
                     return vec![GlueSignal::ForceRename("CHAR_RENAME_DESCRIPTION")];
                 }
-                if !net::menu_enter(guid) {
-                    set_dialog(Some("OKAY"));
-                    return vec![open_key("OKAY", "RESPONSE_FAILED_TO_CONNECT")];
-                }
+                let _ = net::menu_enter(guid);
                 vec![]
             }
         }
@@ -10760,11 +10812,7 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
             })
             .unwrap_or_default();
         script.set_glue_realm_setup(categories, types);
-        let realm_address = std::env::var("BN_REALMD")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| script.cvar("realmlist").filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "127.0.0.1:3725".to_string());
+        let realm_address = realmlist_address(script.cvar(CVAR_REALMLIST).as_deref());
         BN_MENU.with(|m| {
             *m.borrow_mut() = MenuSync {
                 realm_address,
@@ -10778,6 +10826,21 @@ pub extern "C" fn bn_ui_load_glue(world: *const BnWorld) -> u32 {
         // benilla leaves it unset, so a real binding is never shadowed.
         let _ = script
             .run("if not GetBillingPlan then GetBillingPlan = function() return 0, 0, 0 end end");
+        // This install's patch overlay rewrites three status dialogs to press their own button as
+        // they show (`GlueDialog.lua`'s `OnShow = ... StatusDialogClick()` in `patch.MPQ`, absent
+        // from the same file in `interface.MPQ`), so a login refusal opened by `0x46b140` closes
+        // itself on the frame it appears. Run the base file's handlers, which leave the dialog up
+        // until its button is pressed.
+        let _ = script.run(
+            "for _, which in ipairs({'OKAY', 'CONNECTION_HELP'}) do
+               local t = GlueDialogTypes[which]
+               if t and t.OnShow then t.OnShow = nil end
+             end
+             GlueDialogTypes['DISCONNECTED'].OnShow = function()
+               RealmList:Hide()
+               if VirtualKeypadFrame then VirtualKeypadFrame:Hide() end
+             end",
+        );
         script.fire_event("FRAMES_LOADED", Vec::new());
         // Seat the host after the load (as the client does) and run the
         // calls the load made while it waited.
@@ -11010,22 +11073,12 @@ fn fire(script: &mut UiScript, signals: Vec<GlueSignal>) {
     }
 }
 
-/// Publish the worker's realm list and run the glue rebuild (whose tail fires
-/// `OPEN_REALM_LIST` or `GET_PREFERRED_REALM_INFO`). The account's character
-/// count comes from the realm records so a roster-bearing account gets the
-/// list rather than the new-account wizard.
+/// Publish the worker's realm list into the glue holder (`0x5b2230`). The account's character count
+/// comes from the realm records so a roster-bearing account gets the list rather than the new-account
+/// wizard. What follows the fill is the reply's own arm, not this: see [`raise_realm_list`] and
+/// [`connect_from_list`].
 fn publish_realms(script: &mut UiScript) {
-    let realms: Vec<GlueRealm> = net::menu_realms()
-        .iter()
-        .map(|r| GlueRealm {
-            name: r.name.clone(),
-            realm_type: r.realm_type,
-            flags: r.flags,
-            population: r.population,
-            characters: r.characters,
-            category: r.category,
-        })
-        .collect();
+    let realms: Vec<GlueRealm> = net::menu_realms().iter().map(glue_realm).collect();
     let count: u16 = realms.iter().map(|r| u16::from(r.characters)).sum::<u16>();
     eprintln!(
         "bn_menu: publish realms={} chars={count} {:?}",
@@ -11035,11 +11088,15 @@ fn publish_realms(script: &mut UiScript) {
             .map(|r| (&r.name, r.category, r.flags, r.characters))
             .collect::<Vec<_>>()
     );
-    // The client's realm-list reply frame: the
-    // status dialog closed first, then the holder and the rebuild.
-    fire(script, vec![GlueSignal::Close]);
     script.set_glue_realms(realms);
     script.set_glue_realm_characters(count);
+}
+
+/// The list raised over the screen: the status dialog closed, then the rebuild (`0x46e510`), whose
+/// tail fires `OPEN_REALM_LIST` for an account with characters or a choice made
+/// (`0x46bf1f`-`0x46bf96`, and state 4's success at `0x46c0d2`-`0x46c0e2`).
+fn raise_realm_list(script: &mut UiScript) {
+    fire(script, vec![GlueSignal::Close]);
     script.rebuild_glue_realms();
     let n = script.eval::<f64>("return GetNumRealms(1)").unwrap_or(-1.0);
     let cats = script
@@ -11051,6 +11108,38 @@ fn publish_realms(script: &mut UiScript) {
     );
 }
 
+/// `0x5ab800`'s connect arm over the list a logon brought: the realm already selected this process,
+/// else the one `realmName` names (`0x5ab6f0`, first match case folded), dialled as `ConnectToRealm`
+/// dials. `false` is `REALM_LIST_REALM_NOT_FOUND` (`0x5ab7d0`): the list is raised in its place, so
+/// a login with a remembered realm never shows the server selection.
+fn connect_from_list(script: &mut UiScript) -> bool {
+    let realms = net::menu_realms();
+    let chosen = BN_MENU.with(|m| m.borrow().realm_index);
+    let named = match chosen {
+        Some(index) => realms.get(index as usize).map(|r| r.name.clone()),
+        None => {
+            let name = script.cvar(CVAR_REALM_NAME).unwrap_or_default();
+            if name.is_empty() {
+                None
+            } else {
+                net::menu_realm_index(&name)
+                    .and_then(|i| realms.get(i as usize).map(|r| r.name.clone()))
+            }
+        }
+    };
+    match named {
+        Some(name) => {
+            // `0x5ab7b0`: `ConnectToRealm`'s first act stamps the realm it dials.
+            script.set_cvar_host(CVAR_REALM_NAME, &name);
+            for signal in MenuHost.call(GlueCall::ChangeRealm(name)) {
+                script.fire_glue_signal(signal);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// The `GetCharacterListUpdate` tail, called from the tick for the screen's
 /// `OnShow` and after a delete or rename.
 fn begin_char_list(script: &mut UiScript) {
@@ -11059,20 +11148,64 @@ fn begin_char_list(script: &mut UiScript) {
     }
 }
 
+/// The world connect's queue arm (`0x46bc49`'s `STATUS_WAIT_QUEUE` branch, `0x5ab280`): every
+/// packet that moved the queue is folded into the reference's ring (`0x46ae50`) once, and while the
+/// dial sits in line the dialog is re-texted each frame from that ring, the way
+/// `ClientServices::FlushPendingOperations`' queue step does.
+fn sync_queue(script: &mut UiScript) {
+    let (queued, gen, realm, packets) = net::menu_queue();
+    BN_MENU.with(|m| {
+        let mut s = m.borrow_mut();
+        if s.queue_gen != gen {
+            // `0x5aab20` zeroes the ring and the estimate together on a new connect.
+            s.queue = QueueEstimate::default();
+            s.queue_gen = gen;
+        }
+        for (position, at) in packets {
+            s.queue.sample(position.unwrap_or(0), at);
+        }
+    });
+    if !queued {
+        return;
+    }
+    let realm = (!realm.is_empty()).then_some(realm.as_str());
+    let now = benilla_protocol::client_uptime_ms();
+    let body = BN_MENU.with(|m| {
+        m.borrow()
+            .queue
+            .text_by(now, realm, |key| script.global_text(key))
+    });
+    let button = script.global_text("CHANGE_REALM");
+    script.fire_event(
+        "UPDATE_STATUS_DIALOG",
+        vec![ScriptValue::Str(body), ScriptValue::Str(button)],
+    );
+}
+
 /// Apply the worker's replies to the glue VM: the realm list, screen
 /// transitions, the roster and the status dialogs. Runs outside a verb's call
 /// fan-out, which is why the replies wait for a tick.
 fn sync_menu(script: &mut UiScript) {
+    // The address a logon dials is the `realmList` cell read per attempt, so it is refreshed here,
+    // where the VM is free to read; a verb's call runs while it is already borrowed.
+    let address = realmlist_address(script.cvar(CVAR_REALMLIST).as_deref());
+    BN_MENU.with(|m| m.borrow_mut().realm_address = address);
+    sync_queue(script);
+
     let snap = net::menu_snapshot();
     let last_status = BN_MENU.with(|m| m.borrow().last_status);
     let last_realms = BN_MENU.with(|m| m.borrow().last_realms_epoch);
-    let refresh_realms = BN_MENU.with(|m| std::mem::take(&mut m.borrow_mut().realms_refresh));
 
     if snap.realms_epoch != last_realms {
         BN_MENU.with(|m| m.borrow_mut().last_realms_epoch = snap.realms_epoch);
         publish_realms(script);
-    } else if refresh_realms {
-        publish_realms(script);
+        // Whose reply this is decides what follows it: a `RequestRealmList` query redraws the list
+        // the screen already asked for, and the logon's connect dials the realm its reply names,
+        // raising the list only when none is named (`0x5ab800`, `0x46bf1f`-`0x46bf96`).
+        let query = BN_MENU.with(|m| std::mem::take(&mut m.borrow_mut().awaiting_query));
+        if query || !connect_from_list(script) {
+            raise_realm_list(script);
+        }
     }
 
     if snap.status != last_status {
@@ -11097,8 +11230,12 @@ fn sync_menu(script: &mut UiScript) {
             }
             net::ST_FAILED => {
                 set_dialog(None);
-                let msg = net::menu_take_error().unwrap_or_else(|| "login failed".to_string());
-                fire(script, vec![GlueSignal::Close, open_raw("OKAY", msg)]);
+                // A failure the worker named is the dialog it named; one it named nothing (because
+                // the tick-end drain already showed it, or because the reference reports nothing,
+                // as for the proof's 0x0A at `0x5bada2`) leaves the screen as it stands.
+                if let Some(failure) = net::menu_take_error() {
+                    fire(script, failure_signals(failure));
+                }
             }
             // The world is up; the render host polls this through
             // `bn_ui_poll_event` (it also reads `bn_net_status`).
@@ -11122,13 +11259,20 @@ fn sync_menu(script: &mut UiScript) {
             s.dialog = None;
         });
         fire(script, vec![GlueSignal::Close]);
-        let chars = BN_MENU.with(|m| MenuHost::map_chars(&m.borrow()));
-        script.load_glue_roster(chars);
+        let records = BN_MENU.with(|m| MenuHost::roster_records(&m.borrow()));
+        // `0x47254b`, inside the load: a roster loaded with no realm chosen this process asks for
+        // the realm list, and that ask is `RequestRealmList(1)` — its dialog and its query.
+        let ask = script.load_glue_roster(records);
+        if ask {
+            for signal in MenuHost.call(GlueCall::RequestRealmList { dialog: true }) {
+                script.fire_glue_signal(signal);
+            }
+        }
     }
 
     if let Some((_name, code)) = net::menu_take_create_reply() {
         set_dialog(None);
-        if code == 0x2E {
+        if code == CHAR_CREATE_SUCCESS {
             fire(
                 script,
                 vec![
@@ -11149,7 +11293,7 @@ fn sync_menu(script: &mut UiScript) {
     }
 
     if let Some((_guid, code)) = net::menu_take_delete_reply() {
-        if code == 0x39 {
+        if code == CHAR_DELETE_SUCCESS {
             fire(script, vec![GlueSignal::Close, GlueSignal::SelectFirst]);
             begin_char_list(script);
         } else {
@@ -11164,33 +11308,27 @@ fn sync_menu(script: &mut UiScript) {
         }
     }
 
-    if let Some((_guid, _name, code)) = net::menu_take_rename_reply() {
+    if let Some((guid, name, code)) = net::menu_take_rename_reply() {
+        // `0x46b440`: the reply closes the dialog and leaves the screen state as it found it, so no
+        // roster is re-asked. A result of 0 renames the record in place; `0x31` is the name-in-use
+        // line and any other result the failed one, both through `FORCE_RENAME_CHARACTER`.
         set_dialog(None);
-        if code == 0x2E {
-            fire(script, vec![GlueSignal::Close]);
-            begin_char_list(script);
-        } else if code == 0x31 {
-            fire(
+        fire(script, vec![GlueSignal::Close]);
+        match code {
+            0 => script.apply_glue_rename(guid, &name),
+            CHAR_CREATE_NAME_IN_USE => fire(
                 script,
-                vec![
-                    GlueSignal::Close,
-                    GlueSignal::ForceRename("CHAR_CREATE_NAME_IN_USE"),
-                ],
-            );
-        } else {
-            fire(
-                script,
-                vec![
-                    GlueSignal::Close,
-                    open_key("OKAY", benilla_ui::script::glue_status_key(i32::from(code))),
-                ],
-            );
+                vec![GlueSignal::ForceRename(
+                    benilla_ui::script::glue_status_key(i32::from(CHAR_CREATE_NAME_IN_USE)),
+                )],
+            ),
+            _ => fire(script, vec![GlueSignal::ForceRename("CHAR_RENAME_FAILED")]),
         }
     }
 
-    if let Some(msg) = net::menu_take_error() {
+    if let Some(failure) = net::menu_take_error() {
         set_dialog(None);
-        fire(script, vec![GlueSignal::Close, open_raw("OKAY", msg)]);
+        fire(script, failure_signals(failure));
     }
 }
 

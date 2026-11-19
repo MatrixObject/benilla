@@ -1,7 +1,7 @@
 fn main() {
-    let mut chain = benilla_formats::Chain::open(
-        std::path::Path::new("I:/WOW/World of Warcraft 1.12.1.5875 zhCN/Data"),
-    )
+    let mut chain = benilla_formats::Chain::open(std::path::Path::new(
+        "I:/WOW/World of Warcraft 1.12.1.5875 zhCN/Data",
+    ))
     .unwrap();
     let l = chain.list().unwrap();
     let mut n = 0;

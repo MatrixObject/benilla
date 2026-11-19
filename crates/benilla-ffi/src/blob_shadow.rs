@@ -12,7 +12,9 @@
 //! host honours the registered `mapShadows` video CVar (default 1) so the Options-side toggle can
 //! turn the decals off without stopping the rest of the scene.
 
+use std::collections::HashSet;
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::net;
@@ -34,6 +36,47 @@ pub struct BnShadowVertex {
 fn held_verts() -> &'static Mutex<Vec<BnShadowVertex>> {
     static CACHE: OnceLock<Mutex<Vec<BnShadowVertex>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The units the host says already cast a real sun silhouette. One unit carries one
+/// shadow: the decal is a unit's shadow only where the sun cannot reach it, and a
+/// unit drawn with both reads as a double shadow. The host owns that test (it is the
+/// same predicate it puts on the body's `CastShadow`), so it lists the sun-lit guids
+/// and those units get no decal. An empty list - the reference's own state, where no
+/// unit casts - keeps the blob on every unit.
+fn sunlit_guids() -> &'static Mutex<HashSet<u64>> {
+    static CACHE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Replace the sun-lit guid list. `bn_unit_shadows` applies it to the next batch it
+/// builds, so the host pushes it once per pass, right before asking for the count.
+///
+/// # Safety
+///
+/// `guids` must point to `count` readable `u64`s, or be null when `count` is 0.
+#[no_mangle]
+pub unsafe extern "C" fn bn_unit_shadows_sunlit(guids: *const u64, count: u32) {
+    let mut set = sunlit_guids().lock().unwrap_or_else(|e| e.into_inner());
+    set.clear();
+    if !guids.is_null() {
+        set.extend(std::slice::from_raw_parts(guids, count as usize));
+    }
+}
+
+/// The host's own body, said the same way: 1 when it already carries a real sun
+/// silhouette. A guid the host never sees (`self` is the interface's own resolver
+/// entry, not a tracked unit) cannot be in the list above, so the local player needs
+/// this flag rather than an entry in it.
+fn self_sunlit() -> &'static AtomicU8 {
+    static FLAG: OnceLock<AtomicU8> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicU8::new(0))
+}
+
+/// `bn_unit_shadows` applies it to the next batch it builds.
+#[no_mangle]
+pub extern "C" fn bn_unit_shadows_self(b: u32) {
+    self_sunlit().store(u8::from(b != 0), Ordering::Relaxed);
 }
 
 /// `mapShadows`, the reference's registered "Toggle map shadows" video option. Absent before
@@ -96,13 +139,12 @@ fn shadow_box(
 /// BLP path. `0` means draw nothing (no session, no shadows CVar, no units, or the player's
 /// collision scene is not up yet).
 #[no_mangle]
-pub extern "C" fn bn_unit_shadows(
-    world: *mut BnWorld,
-    out_tex: *mut c_char,
-    tex_cap: u32,
-) -> u32 {
+pub extern "C" fn bn_unit_shadows(world: *mut BnWorld, out_tex: *mut c_char, tex_cap: u32) -> u32 {
     let clear = || {
-        held_verts().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        held_verts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         0
     };
     if world.is_null() {
@@ -129,12 +171,18 @@ pub extern "C" fn bn_unit_shadows(
         is_self: bool,
     }
     let mut pending: Vec<Pending> = Vec::new();
+    let sunlit = sunlit_guids().lock().unwrap_or_else(|e| e.into_inner());
     for guid in net::ui_unit_guids() {
         let Some(unit) = net::ui_unit(guid) else {
             continue;
         };
         // The reference registers the blob on units, players and corpses only.
         if !matches!(unit.kind, 3 | 4 | 7) {
+            continue;
+        }
+        // Already shadowed by the sun: its decal would sit inside its own
+        // silhouette, which is the double shadow the host is avoiding.
+        if sunlit.contains(&guid) {
             continue;
         }
         let mount = unit.fields.unit_mount_display_id();
@@ -163,6 +211,11 @@ pub extern "C" fn bn_unit_shadows(
             continue;
         }
         let is_self = guid == self_guid;
+        // The local body's decal follows the host's own sun test: it is the one unit
+        // the guid list above cannot name.
+        if is_self && self_sunlit().load(Ordering::Relaxed) != 0 {
+            continue;
+        }
         // The local body is drawn from the mover's own feet, and `ui_unit_pose` is the wire
         // snapshot: it lags by the whole distance walked, so a blob anchored on it stays where
         // the character used to be. Every other unit keeps the snapshot (that is what is drawn).
@@ -192,6 +245,7 @@ pub extern "C" fn bn_unit_shadows(
         });
     }
 
+    drop(sunlit);
     let p = w.player.as_ref().unwrap();
     let mut verts: Vec<BnShadowVertex> = Vec::new();
     for item in pending {

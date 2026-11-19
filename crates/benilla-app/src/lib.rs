@@ -203,6 +203,19 @@ pub use target::Interact;
 // collider meshes and one frame of usercmd, and reads back the resolved pose. The wrapper's body
 // only converts coordinates and calls `player::mover::step`; no movement logic lives outside.
 pub use player::mover::{MoverFrame, MoverMesh, MoverSession};
+// `0x46b140`'s dialog for one realmd refusal byte, so a host that drives the login itself (the UE
+// client's `benilla-ffi`) shows the stock words rather than its own.
+pub use ui_script::glue_mgr::{
+    glue_realm, logon_disconnect_dialog, logon_refusal_dialog, roster_record,
+    FLAG_LOCKED_FOR_TRANSFER, STATUS_CHAR_LIST_FAILED, STATUS_CHAR_LOGIN_LOCKED_FOR_TRANSFER,
+    STATUS_FAILED_TO_CONNECT, STATUS_REALM_LIST_FAILED, STATUS_REALM_LIST_REALM_NOT_FOUND,
+};
+// The realmlist law and the realm-list query's wait, for the same host: it dials what the client
+// would dial and waits as long as the client waits.
+pub use net::io::REALM_REFRESH_TIMEOUT;
+pub use realmlist::{realmlist_address, CVAR_REALMLIST};
+// The queue ring (`0x46ae50`), for a host whose connect reports its place in line.
+pub use glue_session::queue::QueueEstimate;
 
 /// Builds and runs the client app. `build` is the launcher's compile-time git stamp, passed in as
 /// data so the sha lives in the shim's fingerprint and a commit does not recompile this crate.

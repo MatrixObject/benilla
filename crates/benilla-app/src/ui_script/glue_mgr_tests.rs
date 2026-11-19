@@ -189,6 +189,47 @@ fn a_logon_refusal_opens_its_result_and_ends_the_logon() {
     }
 }
 
+/// The door the ffi login takes: for every byte that reaches the failed state, the pair it names
+/// is the dialog the manager opens, and the proof's 0x0A names nothing because the manager opens
+/// nothing. The two success bytes (`0x00`, `0x0E`) are excluded: they never reach that door, and
+/// the manager shows the authenticated progress for them.
+#[test]
+fn the_logon_law_door_names_the_dialog_the_manager_opens() {
+    use benilla_protocol::LogonReply::{Challenge, Proof};
+    for byte in 0x01u8..=0x10 {
+        if byte == 0x0e {
+            continue;
+        }
+        for reply in [Challenge, Proof] {
+            let mut m = fresh();
+            m.login("a".into(), "b".into());
+            settle(&mut m);
+            m.outbox.clear();
+            let refusal = match reply {
+                Challenge => LoginRefusal::Logon(byte),
+                Proof => LoginRefusal::LogonProof(byte),
+            };
+            m.on_failed(&failed(Some(refusal), false));
+            m.tick();
+            settle(&mut m);
+            let shown = match m.outbox.as_slice() {
+                [] => None,
+                [Outgoing::Open {
+                    which,
+                    text: Some(Text::Key(key)),
+                    ..
+                }] => Some((*which, *key)),
+                other => panic!("{byte:#04x} {reply:?}: {other:?}"),
+            };
+            assert_eq!(
+                shown,
+                logon_refusal_dialog(byte, reply),
+                "{byte:#04x} {reply:?}"
+            );
+        }
+    }
+}
+
 /// One realm, `name`, as realmd lists it.
 fn realm(name: &str) -> RealmInfo {
     RealmInfo {

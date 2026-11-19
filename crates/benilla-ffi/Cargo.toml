@@ -29,6 +29,8 @@ benilla-ui = { path = "../benilla-ui" }
 # middle layer. Protocol only: no Bevy, no app runtime.
 benilla-protocol = { path = "../benilla-protocol" }
 benilla-app = { path = "../benilla-app" }
+# The protocol layer's error type, read for the login dialog's reference law (`downcast_ref`).
+anyhow.workspace = true
 # Glyph outlines for `bn_ui_text_bitmap` (FontString -> RGBA for the UE HUD).
 ab_glyph = "0.2"
 # The client's audio: kira's mix with a cpal output written here (kira's own cpal

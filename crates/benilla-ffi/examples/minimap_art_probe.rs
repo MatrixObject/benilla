@@ -1,7 +1,7 @@
 fn main() {
-    let mut chain = benilla_formats::Chain::open(
-        std::path::Path::new("I:/WOW/World of Warcraft 1.12.1.5875 zhCN/Data"),
-    )
+    let mut chain = benilla_formats::Chain::open(std::path::Path::new(
+        "I:/WOW/World of Warcraft 1.12.1.5875 zhCN/Data",
+    ))
     .unwrap();
     for name in [
         "Interface\\Minimap\\MinimapArrow.blp",
@@ -25,8 +25,7 @@ fn main() {
                 let y = (r * h as usize) / rows;
                 let i = (y * w as usize + x) * 4;
                 let a = rgba[i + 3] as usize;
-                let lum =
-                    (rgba[i] as usize + rgba[i + 1] as usize + rgba[i + 2] as usize) / 3;
+                let lum = (rgba[i] as usize + rgba[i + 1] as usize + rgba[i + 2] as usize) / 3;
                 line.push(if a < 40 {
                     '.'
                 } else if lum > 200 {

@@ -116,8 +116,15 @@ pub fn load_wmo_collision_tris(chain: &mut Chain, raw_path: &str) -> Result<Coll
         // back face the one-sided mover ignores. Two-sided materials (MOMT 0x04)
         // get the same treatment wherever they are drawn.
         let interior = group.flags & 0x48 == 0;
-        append_group_faces(&group, MOPY_DETAIL, 0, interior, Some(&two_sided), &mut positions,
-                           &mut indices);
+        append_group_faces(
+            &group,
+            MOPY_DETAIL,
+            0,
+            interior,
+            Some(&two_sided),
+            &mut positions,
+            &mut indices,
+        );
     }
     Ok(CollisionMesh { positions, indices })
 }
@@ -201,7 +208,15 @@ fn accumulate_wmo_group_faces(
     let Ok(ParsedWmo::Group(group)) = parse_wmo(&mut Cursor::new(group_bytes)) else {
         return;
     };
-    append_group_faces(&group, skip_mask, require_mask, false, None, positions, indices);
+    append_group_faces(
+        &group,
+        skip_mask,
+        require_mask,
+        false,
+        None,
+        positions,
+        indices,
+    );
 }
 
 /// Append one parsed group's kept faces. `group_two_sided` / `two_sided_mats`
@@ -253,9 +268,21 @@ fn append_group_faces(
                 .copied()
                 .unwrap_or(false);
         if two_sided {
-            let a = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2]];
-            let b = [pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2]];
-            let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let a = [
+                pts[1][0] - pts[0][0],
+                pts[1][1] - pts[0][1],
+                pts[1][2] - pts[0][2],
+            ];
+            let b = [
+                pts[2][0] - pts[0][0],
+                pts[2][1] - pts[0][1],
+                pts[2][2] - pts[0][2],
+            ];
+            let n = [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ];
             let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             if len > 0.0 && (n[2] / len).abs() < WMO_WALL_GROUND_COS {
                 indices.extend_from_slice(&[tri[2], tri[1], tri[0]]);

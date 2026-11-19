@@ -90,8 +90,9 @@ pub(super) struct Parks {
 /// number, so a reply is told from an older link's.
 static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// How long a realm-list query waits for realmd; the park serving it is deaf that long.
-const REALM_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a realm-list query waits for realmd; the park serving it is deaf that long. Public so a
+/// UI host's own query waits the same.
+pub const REALM_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The reference's 30 s ping timer (`0x537ff0`). vmangos kicks a socket whose pings come faster
 /// than 27 s apart more than twice (`WorldSocket::_HandlePing`), so this must not shrink.

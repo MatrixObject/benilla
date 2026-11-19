@@ -267,10 +267,11 @@ const LOGIN_PIN_WAIT: i32 = 8;
 const RESULT_LOGIN_FAILED: i32 = 0x0b;
 const RESULT_DISCONNECTED: i32 = 0x14;
 
-/// World statuses.
+/// World statuses. The four a UI host names a failure with are public so it reports the same
+/// `ClientServices` code as [`GlueMgr`] instead of re-typing the byte.
 const STATUS_RESPONSE_FAILURE: u8 = 0x01;
 const STATUS_CANCELLED: u8 = 0x02;
-const STATUS_FAILED_TO_CONNECT: u8 = 0x04;
+pub const STATUS_FAILED_TO_CONNECT: u8 = 0x04;
 const STATUS_RESPONSE_CONNECTED: u8 = 0x05;
 const STATUS_CONNECTING: u8 = 0x07;
 const STATUS_AUTHENTICATING: u8 = 0x0b;
@@ -279,22 +280,22 @@ const STATUS_AUTH_FAILED: u8 = 0x0d;
 const STATUS_WAIT_QUEUE: u8 = 0x1b;
 const STATUS_REALM_LIST_IN_PROGRESS: u8 = 0x22;
 const STATUS_REALM_LIST_SUCCESS: u8 = 0x23;
-const STATUS_REALM_LIST_FAILED: u8 = 0x24;
-const STATUS_REALM_LIST_REALM_NOT_FOUND: u8 = 0x26;
+pub const STATUS_REALM_LIST_FAILED: u8 = 0x24;
+pub const STATUS_REALM_LIST_REALM_NOT_FOUND: u8 = 0x26;
 const STATUS_CHAR_LIST_RETRIEVING: u8 = 0x2a;
 const STATUS_CHAR_LIST_RETRIEVED: u8 = 0x2b;
-const STATUS_CHAR_LIST_FAILED: u8 = 0x2c;
+pub const STATUS_CHAR_LIST_FAILED: u8 = 0x2c;
 const STATUS_CHAR_CREATE_IN_PROGRESS: u8 = 0x2d;
 const STATUS_CHAR_CREATE_SUCCESS: u8 = 0x2e;
 const STATUS_CHAR_DELETE_IN_PROGRESS: u8 = 0x38;
 const STATUS_CHAR_DELETE_SUCCESS: u8 = 0x39;
 const STATUS_CHAR_LOGIN_IN_PROGRESS: u8 = 0x3c;
 const STATUS_CHAR_LOGIN_FAILED: u8 = 0x41;
-const STATUS_CHAR_LOGIN_LOCKED_FOR_TRANSFER: u8 = 0x44;
+pub const STATUS_CHAR_LOGIN_LOCKED_FOR_TRANSFER: u8 = 0x44;
 
 /// The record flags `EnterWorld` tests (`+0xfc`): locked for a paid transfer (`0x46b57e`) and
-/// flagged for a rename (`0x46b5b1`).
-const FLAG_LOCKED_FOR_TRANSFER: u32 = 0x4;
+/// flagged for a rename (`0x46b5b1`). Both are public so a UI host gates on the same bit.
+pub const FLAG_LOCKED_FOR_TRANSFER: u32 = 0x4;
 const FLAG_RENAME: u32 = benilla_protocol::CHARACTER_FLAG_RENAME;
 
 /// `SMSG_CHARACTER_LOGIN_FAILED`'s byte as a status (`0x5aad70`, jump table `0x5aae08`): a 1-based
@@ -339,6 +340,50 @@ pub(crate) fn realmd_result(byte: u8, reply: benilla_protocol::LogonReply) -> Op
         _ => RESULT_LOGIN_FAILED,
     };
     Some((LOGIN_FAILED_STATE, result))
+}
+
+/// `0x46b140`'s failed-state arm read through the table walk: the dialog's button set and its stock
+/// `LOGIN_RESULT_KEYS` entry, `None` for a result past the table (`0x46b1ae`'s no-dialog arm).
+fn login_result_dialog(result: i32) -> Option<(&'static str, &'static str)> {
+    let key = *usize::try_from(result)
+        .ok()
+        .and_then(|r| LOGIN_RESULT_KEYS.get(r))?;
+    let which = if result == RESULT_LOGIN_FAILED {
+        "CONNECTION_HELP"
+    } else {
+        "OKAY"
+    };
+    Some((which, key))
+}
+
+/// The dialog a logon with no result byte answers with: [`GlueMgr::on_failed`]'s arm for the link
+/// dying rather than being refused (`0x5b1bb7` to `0x5b1c30`), whose result is the clamp's `0xff`
+/// and so [`RESULT_DISCONNECTED`]. A host whose worker has no realmd answer to read names the
+/// failure with this instead of its own words.
+pub fn logon_disconnect_dialog() -> Option<(&'static str, &'static str)> {
+    login_result_dialog(RESULT_DISCONNECTED)
+}
+
+/// `0x46b140` for one realmd result byte: the `{which, key}` the status dialog opens with, the
+/// [`realmd_result`] cells read through both arms of [`GlueMgr::show_login_dialog`] — the failed
+/// state's table walk and the non-failed states' `CANCEL` with its `LOGIN_STATE_KEYS` line. `None`
+/// is a byte that opens no dialog: the proof's 0x0A (`0x5bada2`), whose report never happens, a
+/// success byte, a state past the table, or the two states that show nothing (`0x0b`, `0x0c`).
+pub fn logon_refusal_dialog(
+    byte: u8,
+    reply: benilla_protocol::LogonReply,
+) -> Option<(&'static str, &'static str)> {
+    let (state, result) = realmd_result(byte, reply)?;
+    if state == LOGIN_FAILED_STATE {
+        return login_result_dialog(result);
+    }
+    if state == 0x0b || state == 0x0c {
+        return None;
+    }
+    let key = *usize::try_from(state)
+        .ok()
+        .and_then(|s| LOGIN_STATE_KEYS.get(s))?;
+    Some(("CANCEL", key))
 }
 
 /// A `ClientServices` operation (`[svc+0x1b10]`).
@@ -1644,16 +1689,8 @@ impl GlueMgr {
         self.cells.shown_state = c.state;
         self.cells.shown_result = c.result;
         if c.state == LOGIN_FAILED_STATE {
-            let Some(key) = usize::try_from(c.result)
-                .ok()
-                .and_then(|r| LOGIN_RESULT_KEYS.get(r))
-            else {
+            let Some((which, key)) = login_result_dialog(c.result) else {
                 return;
-            };
-            let which = if c.result == RESULT_LOGIN_FAILED {
-                "CONNECTION_HELP"
-            } else {
-                "OKAY"
             };
             self.open(which, Some(Text::Key(key)));
             return;
@@ -1738,8 +1775,9 @@ fn select_by_name(holder: &[RealmInfo], name: &str) -> Option<RealmInfo> {
         .cloned()
 }
 
-/// A realm record as the glue VM's holder takes it.
-fn glue_realm(r: &RealmInfo) -> GlueRealm {
+/// A realm record as the glue VM's holder takes it. Public for a UI host with the same holder, so
+/// the wire fields reach the VM in this order and nowhere re-picks them.
+pub fn glue_realm(r: &RealmInfo) -> GlueRealm {
     GlueRealm {
         name: r.name.clone(),
         realm_type: r.realm_type,
@@ -2210,22 +2248,36 @@ struct RosterNames<'a> {
 /// whether the race row's body for the gender resolves to a model. A race, class or zone with no row reads
 /// empty, empty, nil as the reference's does, and so does one whose catalog did not load.
 fn glue_character(c: &Character, names: &RosterNames) -> GlueCharacter {
+    roster_record(c, names.areas, names.create, names.classes, |display| {
+        names.creatures.is_some_and(|k| k.resolves_model(display))
+    })
+}
+
+/// [`glue_character`] over the catalogs a caller holds, for a UI host that loads the same DBCs into
+/// its own tables and must not re-derive the record. `resolves_model` is the `0x5ec480` walk from
+/// the display id to a model row, over the caller's creature catalog.
+pub fn roster_record(
+    c: &Character,
+    areas: Option<&benilla_formats::AreaTableCatalog>,
+    create: Option<&benilla_formats::CharCreateCatalog>,
+    classes: Option<&benilla_formats::ChrClasses>,
+    mut resolves_model: impl FnMut(u32) -> bool,
+) -> GlueCharacter {
     let text = |s: Option<&str>| s.unwrap_or_default().to_string();
     GlueCharacter {
         guid: c.guid,
         name: c.name.clone(),
-        race: text(names.create.and_then(|r| r.race_name(c.race))),
-        class: text(names.classes.and_then(|k| k.name(u32::from(c.class)))),
+        race: text(create.and_then(|r| r.race_name(c.race))),
+        class: text(classes.and_then(|k| k.name(u32::from(c.class)))),
         level: c.level,
-        zone: names.areas.and_then(|a| a.name(c.zone)).map(str::to_string),
-        file_string: text(names.create.and_then(|r| r.race_file(c.race))),
+        zone: areas.and_then(|a| a.name(c.zone)).map(str::to_string),
+        file_string: text(create.and_then(|r| r.race_file(c.race))),
         gender: c.gender,
         flags: c.flags,
         // `0x5ec480`: the race row's display for the gender, then its model rows.
-        model: names
-            .create
+        model: create
             .and_then(|r| r.body_display(c.race, c.gender))
-            .is_some_and(|display| names.creatures.is_some_and(|k| k.resolves_model(display))),
+            .is_some_and(&mut resolves_model),
     }
 }
 

@@ -21,8 +21,18 @@ extern "C" {
 }
 
 const KEYWORDS: [&str; 12] = [
-    "tree", "canop", "leaf", "branch", "bush", "grass", "fern", "flower", "flora", "wisp",
-    "particleemit", "trunk",
+    "tree",
+    "canop",
+    "leaf",
+    "branch",
+    "bush",
+    "grass",
+    "fern",
+    "flower",
+    "flora",
+    "wisp",
+    "particleemit",
+    "trunk",
 ];
 
 struct Entry {
@@ -121,7 +131,10 @@ unsafe fn run() {
             }
         }
 
-        println!("tile {tx}_{tz}: {chunks} chunks, {n} doodads, {} unique models", entries.len());
+        println!(
+            "tile {tx}_{tz}: {chunks} chunks, {n} doodads, {} unique models",
+            entries.len()
+        );
         for (path, e) in entries.iter() {
             let cp = std::ffi::CString::new(path.clone()).unwrap();
             let emitters = bn_model_particle_group_count(w, cp.as_ptr());
@@ -153,7 +166,11 @@ unsafe fn run() {
                     continue;
                 }
                 let tn = benilla::bn_doodad_texture(w, e.first, g, tex_buf.as_mut_ptr(), 256);
-                let tex = if tn == 0 { String::new() } else { cstr(&tex_buf) };
+                let tex = if tn == 0 {
+                    String::new()
+                } else {
+                    cstr(&tex_buf)
+                };
                 if b != 0 || tex.contains("leaf") || tex.contains("tree") {
                     blends.push(format!("{g}:b{b}:{tex}"));
                 }

@@ -36,7 +36,7 @@ impl Plugin for RealmlistPlugin {
 }
 
 /// The CVar name, the reference's spelling.
-pub(crate) const CVAR_REALMLIST: &str = "realmList";
+pub const CVAR_REALMLIST: &str = "realmList";
 
 /// Deviation: the local machine's server, not the reference's
 /// `us.logon.worldofwarcraft.com:3724`, because that host no longer resolves.
@@ -110,6 +110,18 @@ impl Realmlist {
         }
         self.address = address.to_string();
     }
+}
+
+/// The address the next logon dials, [`Realmlist`]'s own law for a host that keeps its CVars in a
+/// UI VM rather than in `config.toml`: `$WOW_HOST` verbatim and pinned, else the `realmList` value
+/// through [`normalize`], else [`DEFAULT_REALMLIST`]. Read it per attempt, as [`Realmlist`] is read
+/// per attempt, so an edit reaches the next one and never repoints one in flight.
+pub fn realmlist_address(cvar: Option<&str>) -> String {
+    let mut list = Realmlist::default();
+    if let Some(address) = cvar.and_then(normalize) {
+        list.set(&address);
+    }
+    list.address().to_string()
 }
 
 /// Normalizes typed or pasted text into a `host[:port]`, checking syntax only; reachability

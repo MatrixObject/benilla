@@ -186,7 +186,8 @@ fn held_fade(fresh: Option<f32>) -> f32 {
 /// needs an M2 read. A display with no row takes the degenerate-box footprint at scale 1 and no
 /// height, so a unit always gets a ring.
 pub(crate) fn display_bounds(world: &mut BnWorld, display_id: u32) -> (f32, f32, f32) {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, (f32, f32, f32)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u32, (f32, f32, f32)>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(r) = cache
         .lock()

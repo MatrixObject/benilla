@@ -27,12 +27,19 @@ use std::time::{Duration, Instant};
 use benilla_protocol::messages::opcode as MOVE_OP;
 use benilla_protocol::messages::{
     AttackSwingError, AttackerState, CastOutcome, CharCreateReq, ItemInfo, MonsterMoveFacing,
-    Object, ObjectFields, ObjectType, ServerPacket, BAG_PLAYER_INVENTORY, SLOT_PACK_FIRST,
+    Object, ObjectFields, ObjectType, ServerPacket, BAG_PLAYER_INVENTORY, CHAR_CREATE_SUCCESS,
+    CHAR_DELETE_SUCCESS, SLOT_PACK_FIRST,
+};
+// The client's own glue laws, read rather than re-typed: which dialog a realmd answer opens, which
+// address a logon dials, how long a realm-list query waits, and the status codes a failure names.
+use benilla_app::{
+    logon_disconnect_dialog, logon_refusal_dialog, realmlist_address, REALM_REFRESH_TIMEOUT,
+    STATUS_CHAR_LIST_FAILED, STATUS_FAILED_TO_CONNECT, STATUS_REALM_LIST_FAILED,
+    STATUS_REALM_LIST_REALM_NOT_FOUND,
 };
 // The server-authored path walk: benilla's own sampler, shared with the Bevy client.
 use benilla_protocol::motion::{monster_move_spline, Spline};
-use benilla_protocol::RealmInfo;
-use benilla_protocol::WorldSession;
+use benilla_protocol::{Character, RealmInfo, WorldConnectEvent, WorldSession};
 use benilla_ui::script::ScriptValue;
 
 /// Stage codes returned by `bn_net_status`.
@@ -46,6 +53,80 @@ pub const ST_ENTERING: u32 = 5;
 pub const ST_IN_WORLD: u32 = 6;
 /// Terminal failure; the last event line says why.
 pub const ST_FAILED: u32 = 100;
+
+/// A menu failure, in the reference's own terms: the status dialog's button set (`which`) with
+/// either its stock `L*` key — `CGlueMgr`'s `LOGIN_*` table (`0x836b78`) or its `ClientServices`
+/// status table (`0x85cae8`) — or the words a server itself wrote, which the reference quotes raw.
+#[derive(Clone)]
+pub(crate) enum MenuFailure {
+    Key(&'static str, &'static str),
+    Raw(&'static str, String),
+    /// The link died rather than being refused: `DISCONNECTED_FROM_SERVER`, which the stock
+    /// `GlueParent.lua` answers by returning to the login screen and showing its `DISCONNECTED`
+    /// dialog.
+    Disconnected,
+}
+
+/// `CGlueMgr`'s failure arm (`0x46bea7`): the `OKAY` dialog with the status's stock key.
+pub(crate) fn status_failure(status: u8) -> MenuFailure {
+    MenuFailure::Key(
+        "OKAY",
+        benilla_ui::script::glue_status_key(i32::from(status)),
+    )
+}
+
+/// The protocol error of type `E` anywhere in an `anyhow` chain: `benilla-protocol` wraps each
+/// reply in `.context(...)`, so a plain downcast of the outermost error never sees the refusal.
+fn cause<'a, E>(err: &'a anyhow::Error) -> Option<&'a E>
+where
+    E: std::error::Error + 'static,
+{
+    err.chain().find_map(|c| c.downcast_ref::<E>())
+}
+
+/// `0x46b140` over a realmd refusal, through benilla-app's `logon_refusal_dialog`: the stock
+/// `LOGIN_*` key, or `None` for the proof's 0x0A, which the reference reports nowhere (`0x5bada2`)
+/// and whose dialog therefore stands.
+fn logon_failure(err: &anyhow::Error) -> Option<MenuFailure> {
+    match cause::<benilla_protocol::AuthReject>(err) {
+        Some(r) => {
+            logon_refusal_dialog(r.code, r.reply).map(|(which, key)| MenuFailure::Key(which, key))
+        }
+        // No realmd byte at all: the link died, which is `on_failed`'s other arm. Read the dialog
+        // from that law rather than naming a key here.
+        None => logon_disconnect_dialog().map(|(which, key)| MenuFailure::Key(which, key)),
+    }
+}
+
+/// The world server's answer: its `SMSG_AUTH_RESPONSE` byte as a status key, its own Warden words
+/// (`fail_terminal`, no reference status), else a dial that got no reply.
+fn world_failure(err: &anyhow::Error) -> MenuFailure {
+    if let Some(r) = cause::<benilla_protocol::WorldAuthReject>(err) {
+        return status_failure(r.code);
+    }
+    if let Some(w) = cause::<benilla_protocol::WardenRequired>(err) {
+        return MenuFailure::Raw("OKAY", w.to_string());
+    }
+    status_failure(STATUS_FAILED_TO_CONNECT)
+}
+
+/// The roster's failure: the server's Warden words, else the query failing (`0x5ab300`).
+fn roster_failure(err: &anyhow::Error) -> MenuFailure {
+    if let Some(w) = cause::<benilla_protocol::WardenRequired>(err) {
+        return MenuFailure::Raw("OKAY", w.to_string());
+    }
+    status_failure(STATUS_CHAR_LIST_FAILED)
+}
+
+/// The failure the glue screen turns into its next status dialog.
+fn report(sh: &Shared, f: MenuFailure) {
+    *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// The stream died with no server answer behind it: `DISCONNECTED_FROM_SERVER`.
+fn disconnected(sh: &Shared) {
+    report(sh, MenuFailure::Disconnected);
+}
 
 /// One `SMSG_CHAR_ENUM` entry as the host renders it.
 #[repr(C)]
@@ -1300,6 +1381,10 @@ pub(crate) enum Cmd {
     },
     /// Re-ask the roster (after a create/delete/rename, or on re-entry).
     RefreshRoster,
+    /// `CMD_REALM_LIST` over the realmd link: `RequestRealmList`'s (`0x5ab840`) own query, which
+    /// `RealmList.lua` re-asks every 5 s while its screen stands. Answered by a fresh list and a
+    /// bumped `realms_epoch`, or by the realm-list-failed status.
+    RealmRefresh,
     /// Pick realm `index` and world-connect on its address, replacing the
     /// default auto-pick; answers with a fresh roster at `ST_CHARS`.
     RealmPick(u32),
@@ -1418,6 +1503,9 @@ struct Shared {
     mover_ready: AtomicU32,
     events: Mutex<VecDeque<String>>,
     chars: Mutex<Vec<BnNetChar>>,
+    /// The same roster as the protocol's records. The C ABI reads `chars`; the stock VM's rows are
+    /// built from these by benilla-app's `roster_record`, the law the client's own enum applies.
+    char_records: Mutex<Vec<Character>>,
     /// Every tracked object in the stream window (the client's own object
     /// manager, reduced to what the FFI exposes).
     units: Mutex<HashMap<u64, UnitRec>>,
@@ -1478,7 +1566,7 @@ struct Shared {
     /// Bumped whenever the roster in `chars` is replaced.
     chars_epoch: AtomicU64,
     /// The last menu-mode failure the glue host turns into a status dialog.
-    menu_error: Mutex<Option<String>>,
+    menu_error: Mutex<Option<MenuFailure>>,
     /// The last `CMSG_CHAR_CREATE` reply `(name, code)` for the glue host.
     create_reply: Mutex<Option<(String, u8)>>,
     /// The last `CMSG_CHAR_DELETE` reply `(guid, code)` for the glue host.
@@ -1491,6 +1579,22 @@ struct Shared {
     /// The last logon's SRP6 session key, so `RealmPick`'s world connect
     /// re-authenticates on the same key. All-zero when no logon completed.
     session_key: Mutex<[u8; 40]>,
+    /// Every `SMSG_AUTH_RESPONSE(AUTH_WAIT_QUEUE)` the world dial reported, as position and the
+    /// client tick it landed on — the two `QueueEstimate::sample` takes. The UI tick drains these
+    /// into the ring, because the dialog's text is read from the VM's own `GlueStrings`.
+    queue_packets: Mutex<VecDeque<(Option<u32>, u32)>>,
+    /// The realm being queued for, for the queue text's `%s`; the reference reads it from the
+    /// `realmName` CVar it wrote on the way in.
+    queue_realm: Mutex<Option<String>>,
+    /// Whether the world dial is sitting in a queue right now: the frame that shows it re-texts the
+    /// dialog every tick (`0x46bc49`'s queue arm), so the estimate counts down between packets.
+    queued: AtomicBool,
+    /// Bumped as a dial starts, so the UI tick starts a fresh ring for it (`0x5aab20` zeroes the
+    /// ring and the estimate together before the connect).
+    connect_gen: AtomicU64,
+    /// The queue's abandon latch: the dialog's button sets it and the dial stops waiting, because
+    /// a queue can last minutes and would otherwise take its place after the player left.
+    connect_cancel: AtomicBool,
     /// The unit the local player picked (`CMSG_SET_SELECTION`). The server never
     /// echoes a selection back, so without this the UI cannot show a target.
     selection: AtomicU64,
@@ -1498,7 +1602,8 @@ struct Shared {
     names: Mutex<HashMap<u64, String>>,
     /// Player guids a `CMSG_NAME_QUERY` was already sent for.
     names_asked: Mutex<HashSet<u64>>,
-    /// A wire chat line waiting to be fired as its `CHAT_MSG_*` event on the UI tick.
+    /// A wire event waiting to be fired on the UI tick: a `CHAT_MSG_*` line, or one of the
+    /// error-frame messages, which are the same shape — an event name and its arguments.
     chat_events: Mutex<VecDeque<(String, Vec<ScriptValue>)>>,
     /// `SMSG_INVENTORY_CHANGE_FAILURE` reasons waiting for the UI tick, which turns each into the
     /// stock `UI_ERROR_MESSAGE` line (`DisplayError` `0x496720`). Queued because the Lua VM lives
@@ -1678,6 +1783,7 @@ fn shared() -> &'static Shared {
         mover_ready: AtomicU32::new(0),
         events: Mutex::new(VecDeque::new()),
         chars: Mutex::new(Vec::new()),
+        char_records: Mutex::new(Vec::new()),
         units: Mutex::new(HashMap::new()),
         engaged: Mutex::new(HashSet::new()),
         player: Mutex::new(None),
@@ -1708,6 +1814,11 @@ fn shared() -> &'static Shared {
         rename_reply: Mutex::new(None),
         creds: Mutex::new(None),
         session_key: Mutex::new([0u8; 40]),
+        queue_packets: Mutex::new(VecDeque::new()),
+        queue_realm: Mutex::new(None),
+        queued: AtomicBool::new(false),
+        connect_gen: AtomicU64::new(0),
+        connect_cancel: AtomicBool::new(false),
         selection: AtomicU64::new(0),
         names: Mutex::new(HashMap::new()),
         names_asked: Mutex::new(HashSet::new()),
@@ -1914,8 +2025,9 @@ pub(crate) fn note(line: impl Into<String>) {
     shared().event(line);
 }
 
-/// Queue a `CHAT_MSG_*` event the network thread read off the wire, for [`take_chat_events`] to
-/// fire on the UI tick. Bounded: a UI that is not draining cannot grow the queue without limit.
+/// Queue an event the network thread read off the wire — a `CHAT_MSG_*` line or an error-frame
+/// message — for [`take_chat_events`] to fire on the UI tick. Bounded: a UI that is not draining
+/// cannot grow the queue without limit.
 pub(crate) fn push_chat_event(name: &'static str, args: Vec<ScriptValue>) {
     let sh = shared();
     let mut q = sh.chat_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -2577,6 +2689,77 @@ pub(crate) fn set_login_locale(tag: u32) {
     LOGIN_LOCALE.store(tag, Ordering::Relaxed);
 }
 
+/// The world dial with its queue reported: the connect goes through
+/// [`WorldSession::connect_queued`], every `SMSG_AUTH_RESPONSE(AUTH_WAIT_QUEUE)` lands in
+/// [`Shared`]'s queue cells, and the UI thread turns those into the stock dialog's text with
+/// benilla-app's own `QueueEstimate`. The latch is tested per packet, not after the dial, because a
+/// queue can last minutes and a player who left must not keep the place and enter anyway — the
+/// reference's `0x5ab280` re-arms the connect as the queue's and `CLoginMgr::Cancel` (`0x5b3320`)
+/// drops it.
+fn world_connect(
+    sh: &Shared,
+    addr: &str,
+    user: &str,
+    session_key: [u8; 40],
+    realm_name: &str,
+) -> anyhow::Result<WorldSession> {
+    sh.connect_gen.fetch_add(1, Ordering::SeqCst);
+    *sh.queue_packets.lock().unwrap_or_else(|e| e.into_inner()) = VecDeque::new();
+    *sh.queue_realm.lock().unwrap_or_else(|e| e.into_inner()) = realm_name.to_string().into();
+    sh.queued.store(false, Ordering::SeqCst);
+    sh.connect_cancel.store(false, Ordering::SeqCst);
+    let mut on_event = |event| {
+        match event {
+            WorldConnectEvent::Connected => sh.queued.store(false, Ordering::SeqCst),
+            WorldConnectEvent::Queued(position) => {
+                sh.queued.store(true, Ordering::SeqCst);
+                sh.queue_packets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back((position, benilla_protocol::client_uptime_ms()));
+            }
+        }
+        !sh.connect_cancel.load(Ordering::SeqCst)
+    };
+    let dialed = WorldSession::connect_queued(addr, user, session_key, &mut on_event);
+    sh.queued.store(false, Ordering::SeqCst);
+    dialed
+}
+
+/// Whether the last world dial ended because the player left, in which case the reference names no
+/// status: `CLoginMgr::Cancel` drops the link and the screen keeps its realm list.
+fn connect_canceled(sh: &Shared) -> bool {
+    sh.connect_cancel.load(Ordering::SeqCst)
+}
+
+/// `RequestRealmList`'s query (`0x5ab840`), the app's `net::io::query` law read rather than
+/// re-typed: ask the held realmd link and, when that fails for any reason — realmd closed the idle
+/// socket after `MaxSessionDuration`, the 5 s timeout passed, the reply did not parse — dial realmd
+/// again from this session's credentials and take its list. The re-dial's session key is stored, so
+/// the next world connect authenticates on it as the reference's reconnect challenge would. The
+/// list is published either way; `false` means neither answer arrived and the held rows stand.
+fn refresh_realms(sh: &Shared, logon: &mut benilla_protocol::Logon) -> bool {
+    let mut ok = logon.refresh_realms(REALM_REFRESH_TIMEOUT);
+    if !ok {
+        let creds = sh.creds.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((host, user, pass)) = creds {
+            let locale = LOGIN_LOCALE.load(Ordering::Relaxed);
+            match benilla_protocol::logon(&host, &user, &pass, locale) {
+                Ok(fresh) => {
+                    sh.event(format!("realms|re-dial|{} realms", fresh.realms.len()));
+                    *sh.session_key.lock().unwrap_or_else(|e| e.into_inner()) = fresh.session_key;
+                    *logon = fresh;
+                    ok = true;
+                }
+                Err(e) => sh.event(format!("error|realms|re-dial|{e:#}")),
+            }
+        }
+    }
+    *sh.realms.lock().unwrap_or_else(|e| e.into_inner()) = logon.realms.clone();
+    sh.realms_epoch.fetch_add(1, Ordering::SeqCst);
+    ok
+}
+
 fn worker(
     host: String,
     user: String,
@@ -2595,8 +2778,12 @@ fn worker(
         Ok(l) => l,
         Err(e) => {
             sh.event(format!("error|logon|{e}"));
-            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("logon: {e}"));
-            sh.set(ST_FAILED);
+            // `0x46b140`: the refusal's own `LOGIN_*` words. The proof's 0x0A reports nothing, so
+            // the logon's dialog stands and the screen waits on its Cancel button (`0x5bada2`).
+            if let Some(f) = logon_failure(&e) {
+                report(sh, f);
+                sh.set(ST_FAILED);
+            }
             return;
         }
     };
@@ -2618,8 +2805,9 @@ fn worker(
             .cloned()
         else {
             sh.event("error|realms|no realms on this account");
-            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some("no realms on this account".to_string());
+            // Nothing to connect to is the reference's realm-not-found answer: a run with no realm
+            // named fails `REALM_LIST_REALM_NOT_FOUND` into the list, as `connect_realm` does.
+            report(sh, status_failure(STATUS_REALM_LIST_REALM_NOT_FOUND));
             sh.set(ST_FAILED);
             return;
         };
@@ -2629,7 +2817,7 @@ fn worker(
         ));
 
         sh.set(ST_WORLD_CONNECTING);
-        match WorldSession::connect(&realm.address, &user, logon.session_key) {
+        match world_connect(sh, &realm.address, &user, logon.session_key, &realm.name) {
             Ok(s) => {
                 session = Some(s);
                 // The held realmd socket is only needed for realm-list refreshes; free it.
@@ -2637,8 +2825,7 @@ fn worker(
             }
             Err(e) => {
                 sh.event(format!("error|world|{e}"));
-                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("world: {e}"));
+                report(sh, world_failure(&e));
                 sh.set(ST_FAILED);
                 return;
             }
@@ -2647,8 +2834,7 @@ fn worker(
             Ok(n) => sh.event(format!("chars|{n}")),
             Err(e) => {
                 sh.event(format!("error|char_enum|{e}"));
-                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("char_enum: {e}"));
+                report(sh, roster_failure(&e));
                 sh.set(ST_FAILED);
                 return;
             }
@@ -2666,6 +2852,9 @@ fn worker(
                     };
                     let Some(realm) = realm else {
                         sh.event(format!("error|realm|{index} out of range"));
+                        // A pick off a list that has no such row is the reference's realm-not-
+                        // found answer, not a silent drop of the ask.
+                        report(sh, status_failure(STATUS_REALM_LIST_REALM_NOT_FOUND));
                         continue;
                     };
                     sh.event(format!(
@@ -2674,7 +2863,7 @@ fn worker(
                     ));
                     sh.set(ST_WORLD_CONNECTING);
                     let key = *sh.session_key.lock().unwrap_or_else(|e| e.into_inner());
-                    match WorldSession::connect(&realm.address, &user, key) {
+                    match world_connect(sh, &realm.address, &user, key, &realm.name) {
                         Ok(mut s) => match roster(&mut s, sh) {
                             Ok(n) => {
                                 sh.event(format!("chars|{n}"));
@@ -2684,17 +2873,26 @@ fn worker(
                             }
                             Err(e) => {
                                 sh.event(format!("error|char_enum|{e}"));
-                                *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(format!("char_enum: {e}"));
+                                report(sh, roster_failure(&e));
                                 sh.set(ST_LOGON_OK);
                             }
                         },
                         Err(e) => {
+                            // A queue the player left is not a failure: the `CloseLink` its button
+                            // already sent ends the worker on the next receive.
+                            if connect_canceled(sh) {
+                                sh.event("closed|queue");
+                                continue;
+                            }
                             sh.event(format!("error|world|{e}"));
-                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("world: {e}"));
+                            report(sh, world_failure(&e));
                             sh.set(ST_LOGON_OK);
                         }
+                    }
+                }
+                Ok(Cmd::RealmRefresh) => {
+                    if !refresh_realms(sh, &mut logon) {
+                        report(sh, status_failure(STATUS_REALM_LIST_FAILED));
                     }
                 }
                 // The park has no world session to leave, so both the reference's
@@ -2769,7 +2967,10 @@ fn worker(
                                 sh.set(ST_CHARS);
                                 match roster(&mut session, sh) {
                                     Ok(n) => sh.event(format!("chars|{n}")),
-                                    Err(e) => sh.event(format!("error|char_enum|{e}")),
+                                    Err(e) => {
+                                        sh.event(format!("error|char_enum|{e}"));
+                                        report(sh, roster_failure(&e));
+                                    }
                                 }
                                 sh.event("logout|roster");
                                 continue;
@@ -2779,8 +2980,7 @@ fn worker(
                     Err(e) => {
                         sh.event(format!("error|player_login|{e}"));
                         if mode == RunMode::Glue {
-                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("player_login: {e}"));
+                            report(sh, world_failure(&e));
                             sh.set(ST_CHARS);
                             continue;
                         }
@@ -2794,8 +2994,7 @@ fn worker(
                 Err(e) => {
                     sh.event(format!("error|char_enum|{e}"));
                     if mode == RunMode::Glue {
-                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("char_enum: {e}"));
+                        report(sh, roster_failure(&e));
                         sh.set(ST_CHARS);
                         continue;
                     }
@@ -2811,16 +3010,16 @@ fn worker(
                         sh.event(format!("char_create|{}|{code}", req.name));
                         *sh.create_reply.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some((req.name.clone(), code));
-                        if code == 0x2E {
+                        if code == CHAR_CREATE_SUCCESS {
                             if let Err(e) = roster(&mut session, sh) {
                                 sh.event(format!("error|char_enum|{e}"));
+                                report(sh, roster_failure(&e));
                             }
                         }
                     }
                     Err(e) => {
                         sh.event(format!("error|char_create|{e}"));
-                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("char_create: {e}"));
+                        report(sh, world_failure(&e));
                     }
                 }
             }
@@ -2831,38 +3030,32 @@ fn worker(
                         *sh.delete_reply.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some((guid, code));
                         // A success takes the row out of the roster the screen shows.
-                        if code == 0x39 {
+                        if code == CHAR_DELETE_SUCCESS {
                             if let Err(e) = roster(&mut session, sh) {
                                 sh.event(format!("error|char_enum|{e}"));
+                                report(sh, roster_failure(&e));
                             }
                         }
                     }
                     Err(e) => {
                         sh.event(format!("error|char_delete|{e}"));
-                        *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("char_delete: {e}"));
+                        report(sh, world_failure(&e));
                     }
                 }
             }
             Ok(Cmd::CharRename { guid, name }) => match session.rename_character(guid, &name) {
                 Ok((code, renamed)) => {
-                    if let Some((g, n)) = renamed {
-                        sh.event(format!("char_rename|{g}|{n}|{code}"));
-                    } else {
-                        sh.event(format!("char_rename|{guid}|{code}"));
-                    }
+                    sh.event(format!("char_rename|{guid}|{name}|{code}"));
+                    // `0x46b440`: a success is a result of 0 and carries its own guid and name; the
+                    // screen renames that record in place and re-asks nothing, because the reply
+                    // leaves the state as it found it.
+                    let (guid, name) = renamed.unwrap_or_default();
                     *sh.rename_reply.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some((guid, name.clone(), code));
-                    if code == 0x2E {
-                        if let Err(e) = roster(&mut session, sh) {
-                            sh.event(format!("error|char_enum|{e}"));
-                        }
-                    }
+                        Some((guid, name, code));
                 }
                 Err(e) => {
                     sh.event(format!("error|char_rename|{e}"));
-                    *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("char_rename: {e}"));
+                    report(sh, world_failure(&e));
                 }
             },
             Ok(Cmd::RealmPick(index)) => {
@@ -2872,6 +3065,7 @@ fn worker(
                 };
                 let Some(realm) = realm else {
                     sh.event(format!("error|realm|{index} out of range"));
+                    report(sh, status_failure(STATUS_REALM_LIST_REALM_NOT_FOUND));
                     continue;
                 };
                 sh.event(format!(
@@ -2882,11 +3076,12 @@ fn worker(
                 // closes when `session` is replaced below.
                 sh.set(ST_WORLD_CONNECTING);
                 let key = *sh.session_key.lock().unwrap_or_else(|e| e.into_inner());
-                match WorldSession::connect(&realm.address, &user, key) {
+                match world_connect(sh, &realm.address, &user, key, &realm.name) {
                     Ok(s) => {
                         session = s;
                         if let Err(e) = roster(&mut session, sh) {
                             sh.event(format!("error|char_enum|{e}"));
+                            report(sh, roster_failure(&e));
                             if mode == RunMode::Glue {
                                 sh.set(ST_LOGON_OK);
                                 continue;
@@ -2896,16 +3091,24 @@ fn worker(
                         }
                     }
                     Err(e) => {
+                        if connect_canceled(sh) {
+                            sh.event("closed|queue");
+                            continue;
+                        }
                         sh.event(format!("error|world|{e}"));
+                        report(sh, world_failure(&e));
                         if mode == RunMode::Glue {
-                            *sh.menu_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("world: {e}"));
                             sh.set(ST_LOGON_OK);
                             continue;
                         }
                         sh.set(ST_FAILED);
                         return;
                     }
+                }
+            }
+            Ok(Cmd::RealmRefresh) => {
+                if !refresh_realms(sh, &mut logon) {
+                    report(sh, status_failure(STATUS_REALM_LIST_FAILED));
                 }
             }
             // The park has no world session to leave. `LogoutToRoster` (the host's back button)
@@ -2922,11 +3125,9 @@ fn worker(
 }
 
 /// Ask `CMSG_CHAR_ENUM` and fill the shared roster; returns its row count.
-fn roster(
-    session: &mut WorldSession,
-    sh: &Shared,
-) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+fn roster(session: &mut WorldSession, sh: &Shared) -> anyhow::Result<usize> {
     let chars = session.char_enum()?;
+    *sh.char_records.lock().unwrap_or_else(|e| e.into_inner()) = chars.clone();
     {
         let mut out = sh.chars.lock().unwrap_or_else(|e| e.into_inner());
         out.clear();
@@ -2981,14 +3182,6 @@ fn run_world(
         .clear();
     sh.quest_epoch.fetch_add(1, Ordering::SeqCst);
 
-    // Client tick for MovementInfo timestamps: matches benilla-protocol's
-    // `world::movement::client_uptime_ms` (pub(super), so we mirror it here).
-    fn uptime_ms() -> u32 {
-        use std::sync::OnceLock;
-        static START: OnceLock<Instant> = OnceLock::new();
-        (START.get_or_init(|| Instant::now()).elapsed().as_millis() as u32).max(1)
-    }
-
     // Movement state machine: mirror the host's directional input to emit the
     // right MSG_MOVE_* opcode edges vmangos expects. Without StartForward the
     // server would just drop every heartbeat and rubber-band us back on the
@@ -3005,6 +3198,9 @@ fn run_world(
         // Commands first: sending is cheap and must not wait a server packet.
         loop {
             match rx.try_recv() {
+                // `COP_GET_REALMS` is a login-screen operation and the world link answers no realm
+                // list query; in the world there is nothing to refresh.
+                Ok(Cmd::RealmRefresh) => {}
                 Ok(Cmd::Chat(msg)) => {
                     if let Err(e) = session.send_chat(&msg) {
                         sh.event(format!("error|chat|{e}"));
@@ -3812,6 +4008,7 @@ fn run_world(
                     continue;
                 }
                 sh.event(format!("error|recv|{e}"));
+                disconnected(sh);
                 sh.set(ST_FAILED);
                 return WorldExit::Closed;
             }
@@ -4425,9 +4622,8 @@ fn handle_packet(packet: &ServerPacket, sh: &Shared) {
         } => {
             if *guid == sh.self_guid.load(Ordering::SeqCst) {
                 let pos = [position.x, position.y, position.z];
-                *sh.self_teleport
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some((pos, *orientation));
+                *sh.self_teleport.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((pos, *orientation));
                 *sh.last_pose.lock().unwrap_or_else(|e| e.into_inner()) = Some((pos, *orientation));
                 if let Some(rec) = sh
                     .units
@@ -5513,14 +5709,17 @@ pub extern "C" fn bn_net_connect(
 ) -> u32 {
     let host = cstr(host)
         .filter(|s| !s.is_empty())
-        .or_else(|| env_var("WOW_HOST"));
+        .or_else(|| env_var("WOW_HOST"))
+        // Neither names one: the client's own realmlist law, read through the door it gives a
+        // host with no VM of its own, whose answer is the `realmList` CVar's stock default.
+        .unwrap_or_else(|| realmlist_address(None));
     let user = cstr(user)
         .filter(|s| !s.is_empty())
         .or_else(|| env_var("WOW_USER"));
     let pass = cstr(pass)
         .filter(|s| !s.is_empty())
         .or_else(|| env_var("WOW_PASS"));
-    let (Some(host), Some(user), Some(pass)) = (host, user, pass) else {
+    let (Some(user), Some(pass)) = (user, pass) else {
         return 0;
     };
     {
@@ -5575,9 +5774,11 @@ pub(crate) fn menu_realms() -> Vec<RealmInfo> {
         .clone()
 }
 
-pub(crate) fn menu_chars() -> Vec<BnNetChar> {
+/// The roster as the protocol read it, so the glue VM's records are built by the client's own
+/// enum law (`benilla_app::roster_record`) rather than re-derived from the C ABI rows.
+pub(crate) fn menu_roster() -> Vec<Character> {
     shared()
-        .chars
+        .char_records
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -5627,8 +5828,37 @@ pub(crate) fn menu_pick_realm(index: u32) -> bool {
     send_cmd(Cmd::RealmPick(index))
 }
 
-/// Drop the menu's link at the worker (the logon or the held realmd socket).
+/// `RequestRealmList`'s query, asked for real rather than served from the rows already held.
+pub(crate) fn menu_realm_refresh() -> bool {
+    send_cmd(Cmd::RealmRefresh)
+}
+
+/// The queue cells the world dial filled: whether it is queued now, the generation its ring
+/// belongs to, the realm to name in the text, and the packets not yet folded into that ring.
+pub(crate) fn menu_queue() -> (bool, u64, String, Vec<(Option<u32>, u32)>) {
+    let sh = shared();
+    let packets = sh
+        .queue_packets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    (
+        sh.queued.load(Ordering::SeqCst),
+        sh.connect_gen.load(Ordering::SeqCst),
+        sh.queue_realm
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+        packets,
+    )
+}
+
+/// Drop the menu's link at the worker (the logon or the held realmd socket). The latch goes up
+/// first, so a dial still waiting in a queue abandons instead of taking its place.
 pub(crate) fn menu_logout() -> bool {
+    shared().connect_cancel.store(true, Ordering::SeqCst);
     send_cmd(Cmd::CloseLink)
 }
 
@@ -5652,7 +5882,7 @@ pub(crate) fn menu_rename_character(guid: u64, name: String) -> bool {
     send_cmd(Cmd::CharRename { guid, name })
 }
 
-pub(crate) fn menu_take_error() -> Option<String> {
+pub(crate) fn menu_take_error() -> Option<MenuFailure> {
     shared()
         .menu_error
         .lock()
@@ -5848,7 +6078,7 @@ pub extern "C" fn bn_net_reconnect() -> u32 {
         return 0;
     };
     // Close whatever link is running first, so only one worker owns the state.
-    let _ = send_cmd(Cmd::CloseLink);
+    let _ = menu_logout();
     // Give the running worker a beat to notice its close before we restart.
     std::thread::sleep(Duration::from_millis(50));
     {
@@ -6188,7 +6418,7 @@ pub extern "C" fn bn_net_event(buf: *mut c_char, cap: u32) -> u32 {
 /// link, no logout ask on the wire.
 #[no_mangle]
 pub extern "C" fn bn_net_disconnect() -> u32 {
-    send_cmd(Cmd::CloseLink) as u32
+    menu_logout() as u32
 }
 
 /// Feed the host's latest player pose so the world worker can echo it back to

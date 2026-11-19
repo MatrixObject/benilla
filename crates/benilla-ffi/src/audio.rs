@@ -299,12 +299,7 @@ pub(crate) fn ui_tick(script: &mut UiScript) {
     probe(area, in_world);
     let ghost = net::ui_player().is_some_and(|p| p.ghost != 0);
     let value = |name: &str| script.cvar(name).unwrap_or_default();
-    let number = |name: &str, default: f32| {
-        value(name)
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(default)
-    };
+    let number = |name: &str, default: f32| value(name).trim().parse::<f32>().unwrap_or(default);
     let toggle = |name: &str| number(name, 0.0) != 0.0;
     let tick = Tick {
         in_world,
@@ -574,9 +569,12 @@ impl Engine {
             let intro = resolved.as_ref().and_then(|r| r.intro).map(|i| i.id);
             say(format!(
                 "audio: area {:?} row {music_row} intro {:?} amb {:?}",
-                self.area.map(|a| (a, resolved.as_ref().map(|r| r.area_name).unwrap_or("?"))),
+                self.area
+                    .map(|a| (a, resolved.as_ref().map(|r| r.area_name).unwrap_or("?"))),
                 intro,
-                resolved.as_ref().and_then(|r| r.ambience.map(|a| a.kits[PHASE]))
+                resolved
+                    .as_ref()
+                    .and_then(|r| r.ambience.map(|a| a.kits[PHASE]))
             ));
             if music_row != self.zone_music {
                 self.zone_music = music_row;
@@ -738,7 +736,10 @@ impl Engine {
         if no_delay {
             return Some(now);
         }
-        match self.zone_row(row).map(|m| (m.silence_min[PHASE], m.silence_max[PHASE])) {
+        match self
+            .zone_row(row)
+            .map(|m| (m.silence_min[PHASE], m.silence_max[PHASE]))
+        {
             Some((min, max)) => Some(now + self.silence_ms(min, max) as f64 / 1000.0),
             None => Some(now + 6.0),
         }
@@ -1020,8 +1021,8 @@ impl Engine {
             Some(d) => d.clone(),
             None => {
                 let bytes = self.read(path)?;
-                let mut d = StaticSoundData::from_cursor(Cursor::new(bytes))
-                    .map_err(|e| format!("{e}"))?;
+                let mut d =
+                    StaticSoundData::from_cursor(Cursor::new(bytes)).map_err(|e| format!("{e}"))?;
                 if looping {
                     d = d.loop_region(..);
                 }

@@ -375,11 +375,7 @@ struct PlayerSelection {
 /// `0x4947ac` also calls: the continent carrying the player's map, then its zone, where a zone
 /// miss leaves the continent map; only on a continent miss, the first instance map on the
 /// player's map (`SetMap(-2, id)`, `0x4a6717`); else the world view.
-fn resolve_player_selection(
-    data: &Data,
-    map_id: u32,
-    top_zone: Option<u32>,
-) -> PlayerSelection {
+fn resolve_player_selection(data: &Data, map_id: u32, top_zone: Option<u32>) -> PlayerSelection {
     if let Some(ci) = data.continents.iter().position(|c| c.map_id == map_id) {
         let zone = top_zone
             .and_then(|top| {
@@ -532,13 +528,16 @@ fn landmark_sources(
                     landmark_gates_pass(poi, level, areas, explored, world_states)
                         .then(|| landmark_texture_index(poi, level))
                 });
-                icons.iter().any(Option::is_some).then(|| WorldMapLandmarkSource {
-                    name: poi.name.clone(),
-                    description: poi.description.clone(),
-                    map: poi.continent_id,
-                    pos: (poi.pos[0], poi.pos[1]),
-                    icons,
-                })
+                icons
+                    .iter()
+                    .any(Option::is_some)
+                    .then(|| WorldMapLandmarkSource {
+                        name: poi.name.clone(),
+                        description: poi.description.clone(),
+                        map: poi.continent_id,
+                        pos: (poi.pos[0], poi.pos[1]),
+                        icons,
+                    })
             })
             .collect()
     })
@@ -570,12 +569,7 @@ pub(crate) fn seed(chain: &mut Chain, script: &mut UiScript) {
     );
     script.set_world_map_catalog(views);
     // The instance maps, at the same edge: the reference fills both containers in one walk.
-    script.set_world_map_direct_areas(
-        data.direct
-            .iter()
-            .map(|d| (d.id, d.view.clone()))
-            .collect(),
-    );
+    script.set_world_map_direct_areas(data.direct.iter().map(|d| (d.id, d.view.clone())).collect());
     let pois = load_area_poi_catalog(chain).ok();
     MAP.with(|slot| {
         *slot.borrow_mut() = Some(Map {
@@ -686,9 +680,7 @@ pub(crate) fn sync(script: &mut UiScript) {
                 .data
                 .continents
                 .iter()
-                .find(|cont| {
-                    m.zone != 0 && cont.zones.iter().any(|z| z.area_id == m.zone)
-                })
+                .find(|cont| m.zone != 0 && cont.zones.iter().any(|z| z.area_id == m.zone))
                 .map(|cont| cont.map_id)
                 .unwrap_or(player.map);
             project(member_map, pose[0], pose[1]).filter(|uv| *uv != (0.0, 0.0))
@@ -850,9 +842,8 @@ mod tests {
             description: String::new(),
             world_state_id: 0,
         };
-        let pass = |flags, level| {
-            landmark_gates_pass(&poi(flags), level, &areas, &explored, &states)
-        };
+        let pass =
+            |flags, level| landmark_gates_pass(&poi(flags), level, &areas, &explored, &states);
 
         assert!(pass(0x0d, WorldMapLevel::Zone));
         assert!(pass(0x0d, WorldMapLevel::Continent));
@@ -888,7 +879,10 @@ mod tests {
         assert!(pass(&poi(2372), &states));
         assert!(!pass(&poi(2373), &states));
         states.insert(2372, 0);
-        assert!(!pass(&poi(2372), &states), "a zero value hides the row again");
+        assert!(
+            !pass(&poi(2372), &states),
+            "a zero value hides the row again"
+        );
     }
 
     #[test]

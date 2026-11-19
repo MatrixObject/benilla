@@ -5621,7 +5621,8 @@ pub extern "C" fn bn_player_collision_probe(
     // 装块门的三列：窗内列到多少个 placement、其中真进了物理世界的（`slot` 只在
     // `sync_mover_slots` 交出去那一帧写，排队不算）、门已经等了多久。
     o[15] = p.wmo_blocks.len() as f32;
-    o[16] = p.wmo_blocks
+    o[16] = p
+        .wmo_blocks
         .values()
         .filter(|b| b.slot != WmoBlock::NONE && b.slot != WmoBlock::EMPTY)
         .count() as f32;
@@ -11297,7 +11298,8 @@ mod tests {
     #[ignore = "needs the installed 1.12.1 data"]
     fn stormwind_cold_pavement_fold_outlives_the_gate() {
         use crate::bn_init;
-        let dir = std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
         let map = std::ffi::CString::new("Azeroth").unwrap();
         let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
         for (x, y) in [(-8915.0f32, 554.0f32), (-8916.5, 552.5)] {
@@ -11352,7 +11354,8 @@ mod tests {
     #[ignore = "needs the installed 1.12.1 data"]
     fn a_rebuild_every_frame_empties_the_pavement() {
         use crate::bn_init;
-        let dir = std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
+        let dir =
+            std::ffi::CString::new(r"I:\WOW\World of Warcraft 1.12.1.5875 zhCN\Data").unwrap();
         let map = std::ffi::CString::new("Azeroth").unwrap();
         let (x, y) = (-8915.0f32, 554.0f32);
         let w = unsafe { &mut *bn_init(dir.as_ptr()) };
@@ -11469,7 +11472,12 @@ mod tests {
         let routes: [(&str, f32, f32, f32); 3] = [
             ("+X @y=-875", -9100.0, -875.0, 0.0),
             ("+X @y=-300", -9100.0, -300.0, 0.0),
-            ("-Y @x=-9180", -9180.0, -1030.0, -std::f32::consts::FRAC_PI_2),
+            (
+                "-Y @x=-9180",
+                -9180.0,
+                -1030.0,
+                -std::f32::consts::FRAC_PI_2,
+            ),
         ];
         let w = unsafe { &mut *bn_init(dir.as_ptr()) };
         let mut st: BnPlayerState = unsafe { std::mem::zeroed() };
@@ -11497,8 +11505,7 @@ mod tests {
                 let here = Player::tile_of(p.pos[0], p.pos[1]);
                 let grid = p.tiles.get(&here).map_or(0, |t| t.wmos.len() - t.wmo_inst);
                 let owed = p.wmo_blocks_owed(here);
-                let step =
-                    ((p.pos[0] - was[0]).powi(2) + (p.pos[1] - was[1]).powi(2)).sqrt();
+                let step = ((p.pos[0] - was[0]).powi(2) + (p.pos[1] - was[1]).powi(2)).sqrt();
                 was = p.pos;
                 travel += step;
                 let frozen = step < 0.001

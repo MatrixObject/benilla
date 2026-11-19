@@ -72,7 +72,11 @@ fn main() {
                     continue; // MOPY_DETAIL, same skip as the loader
                 }
                 kept += 1;
-                let ts = interior || two_sided.get(mopy.material_id as usize).copied().unwrap_or(false);
+                let ts = interior
+                    || two_sided
+                        .get(mopy.material_id as usize)
+                        .copied()
+                        .unwrap_or(false);
                 if ts {
                     // Steepness gate, then the loader's reversed winding.
                     let i0 = g.vertex_indices[t * 3] as usize;
@@ -108,9 +112,15 @@ fn main() {
                 with_tris += 1;
             }
             total += kept;
-            println!("  group {:03}: flags=0x{:04x} interior={} kept_tris={}", gi, g.flags, interior, kept);
+            println!(
+                "  group {:03}: flags=0x{:04x} interior={} kept_tris={}",
+                gi, g.flags, interior, kept
+            );
         }
-        println!("SUMMARY {root_path} groups={} groups_with_tris={} total_walk_tris={}", root.n_groups, with_tris, total);
+        println!(
+            "SUMMARY {root_path} groups={} groups_with_tris={} total_walk_tris={}",
+            root.n_groups, with_tris, total
+        );
         for (z, c) in bands.iter().filter(|(_, c)| **c >= 40) {
             println!("FLOORBAND z={z} faces={c}");
         }

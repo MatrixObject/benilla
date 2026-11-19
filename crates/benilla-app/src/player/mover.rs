@@ -9,10 +9,10 @@ use std::collections::HashMap;
 
 use super::{
     move_trace, Player, CAPSULE_HEIGHT, CAPSULE_RADIUS, FEATHER_TERMINAL_VELOCITY,
-    FOOT_CONE_HEIGHT, GRAVITY,
-    GROUND_COS, GROUND_PROBE, HOVER_CLIMB_RATE, HOVER_HEIGHT, JUMP_SPEED, LAND_PROBE, SKIN_WIDTH,
-    STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE_PER_YARD, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
-    WATER_WALK_PITCH_FLOOR, WEDGE_MIN_FALL, WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
+    FOOT_CONE_HEIGHT, GRAVITY, GROUND_COS, GROUND_PROBE, HOVER_CLIMB_RATE, HOVER_HEIGHT,
+    JUMP_SPEED, LAND_PROBE, SKIN_WIDTH, STEP_SLOPE_RATIO, STEP_SNAP_SLACK,
+    STEP_UP_ADVANCE_PER_YARD, STEP_UP_HEIGHT, TERMINAL_VELOCITY, WATER_WALK_PITCH_FLOOR,
+    WEDGE_MIN_FALL, WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 
 /// The trace-mask arm `0x6315f0` as a predicate: the liquid surface [`step`] may stand on this
@@ -2509,7 +2509,10 @@ impl MoverSession {
             Transform::default(),
         ));
         if m.layer != 0 {
-            e.insert(CollisionLayers::new(LayerMask(1 << m.layer), LayerMask::ALL));
+            e.insert(CollisionLayers::new(
+                LayerMask(1 << m.layer),
+                LayerMask::ALL,
+            ));
         }
         e.id()
     }
@@ -2585,12 +2588,8 @@ impl MoverSession {
         // 只跑 mover 会让 `airborne_since` 永远停在 `set_pose` 清掉的 `None`，空中落点按地面
         // 0.2 的探测分类，人停在离地 0.13~0.19 处（`a_beam_over_the_head…` 的 z=0.1367625）。
         let now = self.app.world().resource::<Time>().elapsed_secs();
-        self.player.advance_airborne_arc(
-            !out.grounded || out.jumped,
-            out.jumped,
-            now,
-            launch_y,
-        );
+        self.player
+            .advance_airborne_arc(!out.grounded || out.jumped, out.jumped, now, launch_y);
         MoverFrame {
             pos: [-self.player.pos.z, -self.player.pos.x, self.player.pos.y],
             vel_y: self.player.vel_y,

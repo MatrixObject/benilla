@@ -34,7 +34,8 @@ impl Sink {
         while done < frames {
             let take = (frames - done).min(cap);
             let n = take * self.channels;
-            self.renderer.process(&mut self.scratch[..n], self.channels as u16);
+            self.renderer
+                .process(&mut self.scratch[..n], self.channels as u16);
             let start = done * self.channels;
             for i in 0..n {
                 data[start + i] = S::from_sample(self.scratch[i]);
@@ -126,6 +127,8 @@ where
             None,
         )
         .map_err(|e| format!("building the output stream: {e}"))?;
-    stream.play().map_err(|e| format!("starting the output stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("starting the output stream: {e}"))?;
     Ok(stream)
 }

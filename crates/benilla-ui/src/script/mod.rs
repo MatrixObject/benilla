@@ -1054,7 +1054,9 @@ impl UiScript {
         self.model_ref()
             .arena
             .iter_frames()
-            .filter(|(_, f)| matches!(f.kind_state, KindState::Button(ref bs) if bs.locked_highlight))
+            .filter(
+                |(_, f)| matches!(f.kind_state, KindState::Button(ref bs) if bs.locked_highlight),
+            )
             .filter_map(|(_, f)| f.name.clone())
             .collect()
     }

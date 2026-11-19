@@ -475,8 +475,14 @@ mod tests {
                 && (view.rect.top - view.rect.height() * 0.5 - cy).abs() < 0.01,
             "the box's centre is the arrow's: {view:?} vs {cx},{cy}"
         );
-        assert!((view.rect.width() - 0.0262 * 1280.0).abs() < 0.05, "{view:?}");
-        assert!((view.scale - 1.0).abs() < 1e-6, "g48 · 5/3 at 4:3: {view:?}");
+        assert!(
+            (view.rect.width() - 0.0262 * 1280.0).abs() < 0.05,
+            "{view:?}"
+        );
+        assert!(
+            (view.scale - 1.0).abs() < 1e-6,
+            "g48 · 5/3 at 4:3: {view:?}"
+        );
         assert!((view.facing - 1.25).abs() < 1e-6, "{view:?}");
         s.run("WM:Hide()").unwrap();
         assert!(s.world_map_arrow().is_none(), "hidden with its frame chain");

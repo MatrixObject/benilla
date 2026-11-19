@@ -13,29 +13,29 @@ fn main() {
     let frames = benilla::bn_ui_load(w);
     println!("frames = {frames}");
 
-    println!(
-        "table = {}",
-        eval("return type(MATERIAL_TEXT_COLOR_TABLE)")
-    );
+    println!("table = {}", eval("return type(MATERIAL_TEXT_COLOR_TABLE)"));
     println!(
         "parchment = {}",
-        eval("local t = MATERIAL_TEXT_COLOR_TABLE and MATERIAL_TEXT_COLOR_TABLE['Parchment']; \
-              if not t then return 'NIL' end; return table.concat({t[1],t[2],t[3]}, ',')")
+        eval(
+            "local t = MATERIAL_TEXT_COLOR_TABLE and MATERIAL_TEXT_COLOR_TABLE['Parchment']; \
+              if not t then return 'NIL' end; return table.concat({t[1],t[2],t[3]}, ',')"
+        )
     );
     println!(
         "questDesc exists = {}",
-        eval("local q = QuestDescription; if not q then return 'NIL' end; return q:GetObjectType()")
+        eval(
+            "local q = QuestDescription; if not q then return 'NIL' end; return q:GetObjectType()"
+        )
     );
     println!(
         "set/dump colour = {}",
-        eval("QuestDescription:SetText('The quick brown fox jumps over the lazy dog. 0123456789'); \
+        eval(
+            "QuestDescription:SetText('The quick brown fox jumps over the lazy dog. 0123456789'); \
               QuestFrame_SetTextColor(QuestDescription, 'Parchment'); \
-              return 'ok'")
+              return 'ok'"
+        )
     );
-    println!(
-        "get = {}",
-        eval("return QuestDescription:GetTextColor()")
-    );
+    println!("get = {}", eval("return QuestDescription:GetTextColor()"));
     println!(
         "grad = {}",
         eval("QuestDescription:SetAlphaGradient(12, 30); return 'set'")

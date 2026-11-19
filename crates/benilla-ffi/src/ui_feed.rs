@@ -3057,10 +3057,7 @@ fn feed_quest_greeting(script: &mut UiScript) -> bool {
     // so the one macro a 1.12 quest greeting uses expands here, as the gossip pass does.
     if greeting.contains("$N") {
         let names = net::ui_names();
-        let player = names
-            .get(&net::ui_self_guid())
-            .cloned()
-            .unwrap_or_default();
+        let player = names.get(&net::ui_self_guid()).cloned().unwrap_or_default();
         greeting = greeting.replace("$N", &player);
     }
     let fresh = QuestState {

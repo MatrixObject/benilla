@@ -34,8 +34,7 @@ const TIP_FONT_DEFAULT: &str = r"Fonts\FRIZQT__.TTF";
 
 /// One frame's observation, mirroring `bn_loading_screen_tick`'s argument list.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BnLoadingScreenObs
-{
+pub struct BnLoadingScreenObs {
     pub map_id: u32,
     pub ready: u32,
     pub total: u32,
@@ -47,8 +46,7 @@ pub struct BnLoadingScreenObs
 /// The FFI snapshot the host draws from. Mirrors the C++ `BnLoadingScreen`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct BnLoadingScreen
-{
+pub struct BnLoadingScreen {
     pub active: u32,
     pub blackout: u32,
     pub awaiting: u32,
@@ -59,8 +57,7 @@ pub struct BnLoadingScreen
 
 /// The process-wide state: one loading screen per client.
 #[derive(Clone, Debug, Default)]
-pub struct LoadingScreenState
-{
+pub struct LoadingScreenState {
     active: bool,
     blackout: bool,
     awaiting: bool,
@@ -77,11 +74,9 @@ pub struct LoadingScreenState
     tip_cursor: i64,
 }
 
-impl LoadingScreenState
-{
+impl LoadingScreenState {
     /// `Entry`: the glue-to-world raise. Resets the raise and takes the tip.
-    pub fn raise(&mut self, map: Option<u32>, tip: Option<String>)
-    {
+    pub fn raise(&mut self, map: Option<u32>, tip: Option<String>) {
         self.active = true;
         self.blackout = false;
         self.awaiting = true;
@@ -96,8 +91,7 @@ impl LoadingScreenState
 
     /// `Transfer`: a far snap (map change). Active: end the wait, re-resolve art when the
     /// destination differs. Inactive: a raise without a tip (the fallback path).
-    pub fn transfer(&mut self, map: Option<u32>)
-    {
+    pub fn transfer(&mut self, map: Option<u32>) {
         if self.active {
             self.awaiting = false;
             if map != self.map {
@@ -118,14 +112,12 @@ impl LoadingScreenState
     }
 
     /// `Snap`: the destination answered, only the wait ends.
-    pub fn snap(&mut self)
-    {
+    pub fn snap(&mut self) {
         self.awaiting = false;
     }
 
     /// `Blackout`: leaving the world (logout / disconnect / refused). Pure black, no tip.
-    pub fn blackout_on(&mut self)
-    {
+    pub fn blackout_on(&mut self) {
         self.active = true;
         self.blackout = true;
         self.awaiting = false;
@@ -220,13 +212,11 @@ impl LoadingScreenState
         }
     }
 
-    pub fn art(&self) -> Option<&str>
-    {
+    pub fn art(&self) -> Option<&str> {
         self.art.as_deref()
     }
 
-    pub fn tip(&self) -> Option<&str>
-    {
+    pub fn tip(&self) -> Option<&str> {
         self.tip.as_deref()
     }
 }
@@ -238,8 +228,7 @@ thread_local! {
 /// Take the next tip: the stored cursor is the *next* index, so out-of-range (and negative) reads
 /// fall back to 0 (`0x46b682` clamps, it does not wrap by modulo). With `show` off neither the
 /// text nor the cursor moves.
-fn take_tip(catalog: Option<&GameTipsCatalog>, cursor: i64, show: bool) -> (Option<String>, i64)
-{
+fn take_tip(catalog: Option<&GameTipsCatalog>, cursor: i64, show: bool) -> (Option<String>, i64) {
     let (Some(catalog), true) = (catalog, show) else {
         return (None, cursor);
     };
@@ -261,8 +250,7 @@ fn take_tip(catalog: Option<&GameTipsCatalog>, cursor: i64, show: bool) -> (Opti
 
 /// Drop the colour/link tokens, honour `||` and line breaks, and trim the data's trailing `\r\n`
 /// (the authored tips end in one, which would draw as an empty line and lift the block).
-fn strip_markup(text: &str) -> String
-{
+fn strip_markup(text: &str) -> String {
     let mut out = String::new();
     let mut at = 0;
     while let Some(token) = markup::token_at(text, at) {
@@ -271,7 +259,9 @@ fn strip_markup(text: &str) -> String
             TokenKind::Char(c) => out.push(c),
             TokenKind::EscapedPipe => out.push('|'),
             TokenKind::LineBreak => out.push('\n'),
-            TokenKind::Color(_) | TokenKind::ColorReset | TokenKind::LinkOpen { .. }
+            TokenKind::Color(_)
+            | TokenKind::ColorReset
+            | TokenKind::LinkOpen { .. }
             | TokenKind::LinkClose => {}
         }
     }
@@ -282,8 +272,7 @@ fn strip_markup(text: &str) -> String
 }
 
 /// The locale's tip face (`0x406663`: koKR `2002.TTF`, zhCN/zhTW `FZLBJW.TTF`, else `FRIZQT__`).
-fn tip_font_for(locale: Option<&str>) -> &'static str
-{
+fn tip_font_for(locale: Option<&str>) -> &'static str {
     match locale {
         Some("koKR") => TIP_FONT_KOREAN,
         Some("zhCN") | Some("zhTW") => TIP_FONT_CJK,
@@ -291,8 +280,7 @@ fn tip_font_for(locale: Option<&str>) -> &'static str
     }
 }
 
-fn write_out(buf: *mut c_char, cap: u32, text: &str) -> u32
-{
+fn write_out(buf: *mut c_char, cap: u32, text: &str) -> u32 {
     if buf.is_null() || cap == 0 {
         return 0;
     }
@@ -304,10 +292,8 @@ fn write_out(buf: *mut c_char, cap: u32, text: &str) -> u32
     n as u32
 }
 
-impl BnWorld
-{
-    fn ensure_loading_screens(&mut self) -> bool
-    {
+impl BnWorld {
+    fn ensure_loading_screens(&mut self) -> bool {
         if self.loading_screens.is_none() {
             let Some(chain) = self.chain.as_mut() else {
                 return false;
@@ -320,8 +306,7 @@ impl BnWorld
         true
     }
 
-    fn ensure_game_tips(&mut self) -> bool
-    {
+    fn ensure_game_tips(&mut self) -> bool {
         if self.game_tips.is_none() {
             let Some(chain) = self.chain.as_mut() else {
                 return false;
@@ -334,8 +319,7 @@ impl BnWorld
         true
     }
 
-    fn ensure_maps(&mut self) -> bool
-    {
+    fn ensure_maps(&mut self) -> bool {
         if self.maps.is_none() {
             let Some(chain) = self.chain.as_mut() else {
                 return false;
@@ -349,8 +333,7 @@ impl BnWorld
     }
 
     /// `Map.dbc` `LoadingScreenID` -> `LoadingScreens.dbc` BLP path; `None` = pure black.
-    fn loading_art(&mut self, map_id: u32) -> Option<String>
-    {
+    fn loading_art(&mut self, map_id: u32) -> Option<String> {
         self.ensure_maps();
         self.ensure_loading_screens();
         let id = self.maps.as_ref()?.loading_screen_id(map_id)?;
@@ -360,16 +343,14 @@ impl BnWorld
             .map(ToString::to_string)
     }
 
-    fn locale_name(&self) -> Option<&'static str>
-    {
+    fn locale_name(&self) -> Option<&'static str> {
         self.chain.as_ref().map(|chain| chain.locale().name())
     }
 }
 
 /// `edge`: 1 = Entry (picks the tip), 2 = Transfer, 3 = Snap, 4 = Blackout.
 #[no_mangle]
-pub extern "C" fn bn_loading_screen_edge(world: *mut BnWorld, edge: u32, map_id: u32) -> u32
-{
+pub extern "C" fn bn_loading_screen_edge(world: *mut BnWorld, edge: u32, map_id: u32) -> u32 {
     if world.is_null() {
         return 0;
     }
@@ -410,8 +391,7 @@ pub extern "C" fn bn_loading_screen_tick(
     in_world: u32,
     dt: f32,
     out: *mut BnLoadingScreen,
-) -> u32
-{
+) -> u32 {
     if world.is_null() || out.is_null() {
         return 0;
     }
@@ -436,8 +416,7 @@ pub extern "C" fn bn_loading_screen_tick(
 }
 
 #[no_mangle]
-pub extern "C" fn bn_loading_screen_art(world: *mut BnWorld, buf: *mut c_char, cap: u32) -> u32
-{
+pub extern "C" fn bn_loading_screen_art(world: *mut BnWorld, buf: *mut c_char, cap: u32) -> u32 {
     if world.is_null() {
         return 0;
     }
@@ -449,8 +428,7 @@ pub extern "C" fn bn_loading_screen_art(world: *mut BnWorld, buf: *mut c_char, c
 }
 
 #[no_mangle]
-pub extern "C" fn bn_loading_screen_tip(world: *mut BnWorld, buf: *mut c_char, cap: u32) -> u32
-{
+pub extern "C" fn bn_loading_screen_tip(world: *mut BnWorld, buf: *mut c_char, cap: u32) -> u32 {
     if world.is_null() {
         return 0;
     }
@@ -462,8 +440,11 @@ pub extern "C" fn bn_loading_screen_tip(world: *mut BnWorld, buf: *mut c_char, c
 }
 
 #[no_mangle]
-pub extern "C" fn bn_loading_screen_tip_font(world: *mut BnWorld, buf: *mut c_char, cap: u32) -> u32
-{
+pub extern "C" fn bn_loading_screen_tip_font(
+    world: *mut BnWorld,
+    buf: *mut c_char,
+    cap: u32,
+) -> u32 {
     if world.is_null() {
         return 0;
     }
@@ -476,12 +457,10 @@ pub extern "C" fn bn_loading_screen_tip_font(world: *mut BnWorld, buf: *mut c_ch
 }
 
 #[cfg(test)]
-mod tests
-{
+mod tests {
     use super::*;
 
-    fn obs(ready: u32, total: u32, in_world: bool) -> BnLoadingScreenObs
-    {
+    fn obs(ready: u32, total: u32, in_world: bool) -> BnLoadingScreenObs {
         BnLoadingScreenObs {
             map_id: 0,
             ready,
@@ -493,8 +472,7 @@ mod tests
     }
 
     #[test]
-    fn entry_raises_with_the_tip_and_latches_art()
-    {
+    fn entry_raises_with_the_tip_and_latches_art() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), Some("hello".to_string()));
         assert!(state.active);
@@ -517,8 +495,7 @@ mod tests
     }
 
     #[test]
-    fn clearing_needs_three_consecutive_ready_frames()
-    {
+    fn clearing_needs_three_consecutive_ready_frames() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), None);
         state.snap();
@@ -535,8 +512,7 @@ mod tests
     }
 
     #[test]
-    fn a_not_ready_frame_resets_the_latch()
-    {
+    fn a_not_ready_frame_resets_the_latch() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), None);
         state.snap();
@@ -552,8 +528,7 @@ mod tests
     }
 
     #[test]
-    fn transfer_inactive_raises_and_active_only_ends_the_wait()
-    {
+    fn transfer_inactive_raises_and_active_only_ends_the_wait() {
         let mut state = LoadingScreenState::default();
         state.transfer(Some(1));
         assert!(state.active);
@@ -567,8 +542,15 @@ mod tests
 
         state.transfer(Some(1));
         assert!(!state.awaiting);
-        assert!(!state.art_resolved, "the destination map re-resolves the art");
-        assert_eq!(state.art(), Some("a.blp"), "the old art holds until the next tick");
+        assert!(
+            !state.art_resolved,
+            "the destination map re-resolves the art"
+        );
+        assert_eq!(
+            state.art(),
+            Some("a.blp"),
+            "the old art holds until the next tick"
+        );
 
         let out = state.tick(obs(0, 9, true), |map| {
             Some(if map == 1 { "b.blp" } else { "a.blp" }.to_string())
@@ -579,8 +561,7 @@ mod tests
     }
 
     #[test]
-    fn transfer_on_the_same_map_keeps_the_art_latch()
-    {
+    fn transfer_on_the_same_map_keeps_the_art_latch() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), None);
         state.tick(obs(0, 9, true), |_| Some("a.blp".to_string()));
@@ -589,8 +570,7 @@ mod tests
     }
 
     #[test]
-    fn blackout_dismisses_once_out_of_the_world()
-    {
+    fn blackout_dismisses_once_out_of_the_world() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), Some("tip".to_string()));
         state.tick(obs(0, 9, true), |_| Some("art.blp".to_string()));
@@ -609,8 +589,7 @@ mod tests
     }
 
     #[test]
-    fn progress_is_monotonic()
-    {
+    fn progress_is_monotonic() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), None);
         state.snap();
@@ -627,8 +606,7 @@ mod tests
     }
 
     #[test]
-    fn fallback_waits_one_second_before_raising()
-    {
+    fn fallback_waits_one_second_before_raising() {
         let mut state = LoadingScreenState::default();
         let mut art = |_: u32| Some("art.blp".to_string());
         let step = BnLoadingScreenObs {
@@ -669,8 +647,7 @@ mod tests
     }
 
     #[test]
-    fn an_away_raise_times_out_after_fifteen_seconds()
-    {
+    fn an_away_raise_times_out_after_fifteen_seconds() {
         let mut state = LoadingScreenState::default();
         state.raise(Some(0), None);
         let mut art = |_: u32| Some("art.blp".to_string());
@@ -691,8 +668,7 @@ mod tests
     }
 
     #[test]
-    fn tip_cursor_advances_and_clamps()
-    {
+    fn tip_cursor_advances_and_clamps() {
         let catalog = GameTipsCatalog::from_tips(vec![
             "|cffffd100Tip:|r first\r\n".to_string(),
             "second\r\n".to_string(),
@@ -706,7 +682,11 @@ mod tests
         assert_eq!(next, 2);
 
         let (text, next) = take_tip(Some(&catalog), 2, true);
-        assert_eq!(text.as_deref(), Some("Tip: first"), "past the end clamps to 0");
+        assert_eq!(
+            text.as_deref(),
+            Some("Tip: first"),
+            "past the end clamps to 0"
+        );
         assert_eq!(next, 1);
 
         let (text, next) = take_tip(Some(&catalog), -5, true);
@@ -723,8 +703,7 @@ mod tests
     }
 
     #[test]
-    fn markup_is_stripped()
-    {
+    fn markup_is_stripped() {
         let text = strip_markup("|cffffd100Tip:|r use || and\r\n|Hitem:1|hlink|h");
         assert_eq!(text, "Tip: use | and\nlink");
         assert!(!text.contains('\r'));
@@ -733,8 +712,7 @@ mod tests
     }
 
     #[test]
-    fn tip_font_follows_the_locale()
-    {
+    fn tip_font_follows_the_locale() {
         assert_eq!(tip_font_for(Some("koKR")), r"Fonts\2002.TTF");
         assert_eq!(tip_font_for(Some("zhCN")), r"Fonts\FZLBJW.TTF");
         assert_eq!(tip_font_for(Some("zhTW")), r"Fonts\FZLBJW.TTF");

@@ -8,7 +8,10 @@ fn hull_tris(chain: &mut benilla_formats::Chain, raw: &str) -> Option<usize> {
     if raw.is_empty() {
         return None;
     }
-    let p = raw.to_ascii_lowercase().replace(".mdx", ".m2").replace(".mdl", ".m2");
+    let p = raw
+        .to_ascii_lowercase()
+        .replace(".mdx", ".m2")
+        .replace(".mdl", ".m2");
     let b = chain.read_file(&p).ok()?;
     benilla_formats::parse_m2_collision_hull(&b)
         .ok()
@@ -67,7 +70,12 @@ fn main() {
             };
             let mut tally: HashMap<String, (usize, usize)> = HashMap::new(); // name -> (count, hull or 0)
             for d in r.doodads() {
-                let name = d.model.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+                let name = d
+                    .model
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 let key = if name.contains("tree")
                     || name.contains("fence")
                     || name.contains("barrel")
@@ -97,7 +105,8 @@ fn main() {
         let mut no_names: Vec<String> = Vec::new();
         for d in &mesh.doodads {
             let name = d.model.to_ascii_lowercase();
-            let is_tree = name.contains("tree") || name.contains("fence") || name.contains("barrel");
+            let is_tree =
+                name.contains("tree") || name.contains("fence") || name.contains("barrel");
             let t = hull_tris(&mut chain, &d.model).unwrap_or(0);
             if t > 0 {
                 mhull += 1;
